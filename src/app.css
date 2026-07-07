@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+/* Dark anime-tracker theme. Tailwind v4 theme via @theme. */
+@theme {
+  --color-base: #0f1115;
+  --color-panel: #181b22;
+  --color-panel-2: #1f232c;
+  --color-edge: #2a2f3a;
+  --color-accent: #3ba55d;
+  --color-accent-2: #2d8a47;
+  --color-ink: #e6e8ec;
+  --color-ink-dim: #9aa3b2;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+html, body {
+  background: var(--color-base);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  margin: 0;
+  height: 100%;
+}
+
+/* Tell the UA the whole app is dark so every NATIVE widget — <select> option
+   popups, number spinners, tooltips, scrollbars — renders dark instead of the
+   light system default (which made the closed select's text invisible and the
+   option list white). */
+:root { color-scheme: dark; }
+
+/* Belt-and-suspenders: force dark surfaces on form controls even where
+   color-scheme isn't fully honored. */
+select, option, optgroup {
+  background-color: var(--color-panel-2);
+  color: var(--color-ink);
+}
+input, textarea {
+  color: var(--color-ink);
+}
+
+/* thin scrollbars to match a dense desktop app */
+* { scrollbar-width: thin; scrollbar-color: var(--color-edge) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--color-edge); border-radius: 6px; }

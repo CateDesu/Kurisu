@@ -1,0 +1,29 @@
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Node / SvelteKit / Vite
+node_modules/
+.svelte-kit/
+build/
+dist/
+.vite/
+
+# local app data (never ship a user's DB)
+*.db
+*.db-*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# env / local secrets
+.env
+.env.*
+!.env.example
+
+# internal working notes (not user-facing)
+project-status.md
