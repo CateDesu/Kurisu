@@ -70,11 +70,13 @@ export interface Notification {
 }
 
 /// Where a notification should link. Anime/activity/thread/user, else the inbox.
+/// `encodeURIComponent` on the username — it's AniList-controlled and could
+/// otherwise break out of the path.
 export function notificationUrl(n: Notification): string {
   if (n.media_id) return `https://anilist.co/anime/${n.media_id}`;
   if (n.activity_id) return `https://anilist.co/activity/${n.activity_id}`;
   if (n.thread_id) return `https://anilist.co/forum/thread/${n.thread_id}`;
-  if (n.user_name) return `https://anilist.co/user/${n.user_name}`;
+  if (n.user_name) return `https://anilist.co/user/${encodeURIComponent(n.user_name)}`;
   return "https://anilist.co/notifications";
 }
 

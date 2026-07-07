@@ -83,6 +83,7 @@ impl TrackingConfig {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn enabled(&self) -> bool {
         matches!(self.mode.as_str(), "prompt" | "auto")
     }

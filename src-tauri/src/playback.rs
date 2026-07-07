@@ -390,24 +390,28 @@ fn basename(url: &str) -> String {
     percent_decode(&seg)
 }
 
-/// Minimal percent-decoding for `%20` etc. (avoids pulling a url crate dep at the
-/// call site; we already get `url::Url` from mpris but operate on strings here).
+/// Minimal percent-decoding for `%20` etc. Decoded bytes are accumulated and then
+/// interpreted as UTF-8 (so multi-byte sequences like `%E3%82%AF` → ク survive,
+/// instead of being pushed byte-by-byte as garbage chars).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00"), 16) {
-                out.push(b as char);
+            if let Ok(b) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00"),
+                16,
+            ) {
+                out.push(b);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Once we know which media it is, parse the episode from the *remainder* after the

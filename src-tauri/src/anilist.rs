@@ -15,6 +15,7 @@ const GRAPHQL: &str = "https://graphql.anilist.co";
 const AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
 /// Fixed port so the user registers ONE redirect_uri in their AniList client once.
 pub const OAUTH_PORT: u16 = 39417;
+#[allow(dead_code)]
 pub const REDIRECT_URI: &str = "http://127.0.0.1:39417/callback";
 
 /// `nextAiringEpisode { episode airingAt }` — shared by the search + list queries.
@@ -212,6 +213,7 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct AniList {
+            #[allow(dead_code)]
             status: Option<String>,
             entries: Vec<Entry>,
         }

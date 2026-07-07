@@ -27,7 +27,7 @@
   }
 
   function openProfile() {
-    if (auth.user) void openUrl(`https://anilist.co/user/${auth.user.name}`);
+    if (auth.user) void openUrl(`https://anilist.co/user/${encodeURIComponent(auth.user.name)}`);
   }
 
   /// Begin a compositor resize gesture from a window edge/corner. Only works with

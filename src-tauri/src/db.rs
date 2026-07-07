@@ -209,6 +209,7 @@ impl Db {
     }
 
     // ---- watched-file log (recognizer dedup) ----
+    #[allow(dead_code)]
     pub fn mark_watched(&self, path: &str, media_id: i64, episode: i64) -> Result<()> {
         self.0.lock().unwrap().execute(
             "INSERT OR REPLACE INTO watched_file (path,media_id,episode,watched_at)
@@ -217,6 +218,7 @@ impl Db {
         )?;
         Ok(())
     }
+    #[allow(dead_code)]
     pub fn is_watched(&self, path: &str) -> Result<bool> {
         Ok(self
             .0

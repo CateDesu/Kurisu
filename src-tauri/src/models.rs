@@ -26,6 +26,7 @@ impl ListStatus {
             ListStatus::Repeating => "REPEATING",
         }
     }
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             ListStatus::Current => "Watching",
