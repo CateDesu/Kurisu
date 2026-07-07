@@ -195,8 +195,8 @@ pub async fn login_oauth(app: tauri::AppHandle, state: State<'_, AppState>) -> R
         .map_err(|e| e.to_string())?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
-    let url = anilist::authorize_url(&client_id, &redirect_uri);
-    let rx = anilist::start_callback_server().map_err(|e| e.to_string())?;
+    let (oauth_state, rx) = anilist::start_callback_server().map_err(|e| e.to_string())?;
+    let url = anilist::authorize_url(&client_id, &redirect_uri, &oauth_state);
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())?;
     // Implicit flow: the callback yields the access token itself (no exchange step).
     let token = tokio::time::timeout(std::time::Duration::from_secs(300), rx)

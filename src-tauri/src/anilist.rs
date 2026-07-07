@@ -467,12 +467,43 @@ impl AniList {
 // serves a tiny HTML page whose JS lifts the fragment into a query string the
 // server can read on a second request.
 
+/// 32 random bytes from /dev/urandom, hex-encoded. Used as the OAuth `state` so the
+/// callback can reject a token AniList didn't actually issue for THIS login
+/// attempt (CSRF / token-injection via a malicious site hitting 127.0.0.1:39417).
+fn random_state() -> String {
+    use std::fmt::Write as _;
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !filled {
+        // Shouldn't happen on Linux; fall back to a time-seeded LCG so the value at
+        // least varies (and stays unpredictable enough) per call.
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x0bad_f00d);
+        for b in buf.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (seed >> 32) as u8;
+        }
+    }
+    let mut out = String::with_capacity(64);
+    for b in &buf {
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
+}
+
 /// Build the authorize URL the user's browser should visit (response_type=token).
-pub fn authorize_url(client_id: &str, redirect_uri: &str) -> String {
+/// `state` is echoed back by AniList and checked by the callback server.
+pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
     format!(
-        "{AUTHORIZE}?client_id={cid}&response_type=token&redirect_uri={redir}",
+        "{AUTHORIZE}?client_id={cid}&response_type=token&redirect_uri={redir}&state={state}",
         cid = urlencoding::encode(client_id),
         redir = urlencoding::encode(redirect_uri),
+        state = urlencoding::encode(state),
     )
 }
 
@@ -485,9 +516,13 @@ const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-a
 const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#e74c3c'>Authorization failed.</h2><p>Return to Kurisu for details.</p></body>";
 
 /// Start a localhost HTTP listener that captures the access token AniList sends
-/// back in the implicit flow. Yields Ok(token) on success or Err(msg) if AniList
-/// reports an error / the user denies.
-pub fn start_callback_server() -> Result<oneshot::Receiver<Result<String, String>>> {
+/// back in the implicit flow. Returns `(state, receiver)`: the caller embeds
+/// `state` in the authorize URL, and the receiver yields `Ok(token)` on success
+/// or `Err(msg)` if AniList reports an error / the user denies / the CSRF `state`
+/// check fails.
+pub fn start_callback_server() -> Result<(String, oneshot::Receiver<Result<String, String>>)> {
+    let state = random_state();
+    let expected = state.clone();
     let (tx, rx) = oneshot::channel::<Result<String, String>>();
     let addr = format!("127.0.0.1:{}", OAUTH_PORT);
     let listener = std::net::TcpListener::bind(&addr)?;
@@ -534,7 +569,16 @@ pub fn start_callback_server() -> Result<oneshot::Receiver<Result<String, String
                         let msg = param("error_description").unwrap_or(err);
                         (Err(msg), ERR_HTML)
                     } else if let Some(token) = param("access_token").or_else(|| param("code")) {
-                        (Ok(token), OK_HTML)
+                        // CSRF check: the state AniList echoes back must equal the one
+                        // we sent. A mismatch / missing state means this token wasn't
+                        // for our request — reject it.
+                        match param("state") {
+                            Some(s) if s == expected => (Ok(token), OK_HTML),
+                            _ => (
+                                Err("OAuth state mismatch — possible injection attempt.".to_string()),
+                                ERR_HTML,
+                            ),
+                        }
                     } else {
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -557,7 +601,7 @@ pub fn start_callback_server() -> Result<oneshot::Receiver<Result<String, String
             }
         });
     });
-    Ok(rx)
+    Ok((state, rx))
 }
 
 // minimal URL-encode helper (avoids pulling urlencoding as a dep)
