@@ -12,6 +12,7 @@
   import Login from "$lib/Login.svelte";
   import EditEntry from "$lib/EditEntry.svelte";
   import EpisodeStepper from "$lib/EpisodeStepper.svelte";
+  import Icon from "$lib/Icon.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let loading = $state(false);
@@ -87,9 +88,9 @@
       <button
         onclick={sync}
         disabled={syncing}
-        class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+        class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50 flex items-center gap-1.5"
       >
-        {#if syncing}Syncing…{:else}↻ Sync{/if}
+        {#if syncing}Syncing…{:else}<Icon name="refresh" size={14} /> Sync{/if}
       </button>
     </div>
 
@@ -131,10 +132,10 @@
             }}
             role="button"
             tabindex="0"
-            class="flex items-center gap-3 bg-panel border border-edge rounded-lg p-2.5 hover:bg-panel-2/60 cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
+            class="cv-row flex items-center gap-3 bg-panel border border-edge rounded-lg p-2.5 hover:bg-panel-2/60 cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
           >
             {#if e.media?.cover_medium}
-              <img src={e.media.cover_medium} alt="" class="w-10 h-14 object-cover rounded shrink-0" />
+              <img src={e.media.cover_medium} alt="" loading="lazy" decoding="async" class="w-10 h-14 object-cover rounded shrink-0" />
             {:else}
               <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
             {/if}

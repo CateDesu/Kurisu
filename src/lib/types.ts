@@ -59,14 +59,61 @@ export interface Notification {
   context?: string | null;
   created_at?: number | null;
   media_id?: number | null;
+  media_title?: string | null;
+  media_cover?: string | null;
   episode?: number | null;
   activity_id?: number | null;
   thread_id?: number | null;
+  thread_title?: string | null;
   comment_id?: number | null;
   reason?: string | null;
   deleted_media_title?: string | null;
   user_name?: string | null;
   user_avatar?: string | null;
+}
+
+/// One-line text for a notification, mirroring what anilist.co/notifications
+/// shows for the same entry.
+export function notificationText(n: Notification): string {
+  const user = n.user_name ?? "Someone";
+  const media = n.media_title ?? "A media";
+  const thread = n.thread_title ? `"${n.thread_title}"` : "a thread";
+  switch (n.kind.toUpperCase()) {
+    case "AIRING":
+      return `Episode ${n.episode ?? "?"} of ${media} aired.`;
+    case "FOLLOWING":
+      return `${user} started following you.`;
+    case "ACTIVITY_MESSAGE":
+      return `${user} sent you a message.`;
+    case "ACTIVITY_MENTION":
+      return `${user} mentioned you in an activity.`;
+    case "ACTIVITY_REPLY":
+      return `${user} replied to your activity.`;
+    case "ACTIVITY_LIKE":
+      return `${user} liked your activity.`;
+    case "ACTIVITY_REPLY_LIKE":
+      return `${user} liked your reply.`;
+    case "THREAD_COMMENT_MENTION":
+      return `${user} mentioned you in ${thread}.`;
+    case "THREAD_COMMENT_REPLY":
+      return `${user} replied to you in ${thread}.`;
+    case "THREAD_COMMENT_SUBSCRIBED":
+      return `${user} commented in ${thread}.`;
+    case "THREAD_COMMENT_LIKE":
+      return `${user} liked your comment in ${thread}.`;
+    case "THREAD_LIKE":
+      return `${user} liked your thread${n.thread_title ? ` ${thread}` : ""}.`;
+    case "RELATED_MEDIA_ADDITION":
+      return `${media} was added to AniList.`;
+    case "MEDIA_DATA_CHANGE":
+      return `${media} data was changed.`;
+    case "MEDIA_MERGE":
+      return `${media} was merged.`;
+    case "MEDIA_DELETION":
+      return `${n.deleted_media_title ?? "A media"} was deleted.`;
+    default:
+      return n.context ?? n.kind.replace(/_/g, " ").toLowerCase();
+  }
 }
 
 /// Where a notification should link. Anime/activity/thread/user, else the inbox.

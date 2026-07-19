@@ -41,3 +41,15 @@ input, textarea {
 * { scrollbar-width: thin; scrollbar-color: var(--color-edge) transparent; }
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-thumb { background: var(--color-edge); border-radius: 6px; }
+
+/* Scroll performance on long lists: skip layout/paint for rows and cards that
+   are offscreen. `auto <size>` remembers the real size once rendered, so the
+   scrollbar doesn't jump as they pop in. */
+.cv-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 64px;
+}
+.cv-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 230px;
+}

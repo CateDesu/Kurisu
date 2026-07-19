@@ -18,8 +18,12 @@ use tauri::Manager;
 pub fn run() {
     // WebKit2GTK's DMA-BUF renderer crashes in Mesa/GBM teardown on exit on many
     // Wayland setups (SIGSEGV in dri_gbm.so during process exit). The long-standing
-    // workaround is to disable it and fall back to the stable path.
-    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    // workaround is to disable it and fall back to the stable path — at the cost of
+    // choppier scrolling (software raster). Set KURISU_DMABUF=1 to keep the
+    // hardware renderer for smooth scrolling, if your Mesa no longer crashes on exit.
+    if std::env::var_os("KURISU_DMABUF").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
 
     let proj = ProjectDirs::from("com", "catedesu", "kurisu")
         .expect("no home directory for app data");

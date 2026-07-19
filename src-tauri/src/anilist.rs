@@ -434,11 +434,23 @@ impl AniList {
         #[serde(rename_all = "camelCase")]
         struct MediaRef {
             id: i64,
+            title: Option<MediaTitle>,
+            cover_image: Option<MediaCover>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MediaTitle {
+            user_preferred: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct MediaCover {
+            medium: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct ThreadRef {
             id: i64,
+            title: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -451,20 +463,22 @@ impl AniList {
             large: Option<String>,
         }
         let q = "query { Page(page: 1, perPage: 50) { notifications(resetNotificationCount: false) {
-            ... on AiringNotification { id type createdAt media { id } episode contexts }
+            ... on AiringNotification { id type createdAt media { id title { userPreferred } coverImage { medium } } episode contexts }
             ... on FollowingNotification { id type createdAt context user { id name avatar { large } } }
-            ... on ActivityLikeNotification { id type createdAt context activityId }
-            ... on ActivityMentionNotification { id type createdAt context activityId }
-            ... on ActivityReplyNotification { id type createdAt context activityId }
-            ... on ActivityReplyLikeNotification { id type createdAt context activityId }
-            ... on ActivityMessageNotification { id type createdAt context activityId }
-            ... on ThreadCommentMentionNotification { id type createdAt context commentId thread { id } }
-            ... on ThreadCommentReplyNotification { id type createdAt context commentId thread { id } }
-            ... on ThreadLikeNotification { id type createdAt context thread { id } }
-            ... on RelatedMediaAdditionNotification { id type createdAt context media { id } }
-            ... on MediaDataChangeNotification { id type createdAt context media { id } reason }
-            ... on MediaMergeNotification { id type createdAt context media { id } reason }
-            ... on MediaDeletionNotification { id type createdAt context deletedMediaTitle }
+            ... on ActivityLikeNotification { id type createdAt context activityId user { name avatar { large } } }
+            ... on ActivityMentionNotification { id type createdAt context activityId user { name avatar { large } } }
+            ... on ActivityReplyNotification { id type createdAt context activityId user { name avatar { large } } }
+            ... on ActivityReplyLikeNotification { id type createdAt context activityId user { name avatar { large } } }
+            ... on ActivityMessageNotification { id type createdAt context activityId user { name avatar { large } } }
+            ... on ThreadCommentMentionNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentReplyNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentSubscribedNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentLikeNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
+            ... on ThreadLikeNotification { id type createdAt context thread { id title } user { name avatar { large } } }
+            ... on RelatedMediaAdditionNotification { id type createdAt context media { id title { userPreferred } coverImage { medium } } }
+            ... on MediaDataChangeNotification { id type createdAt context media { id title { userPreferred } coverImage { medium } } reason }
+            ... on MediaMergeNotification { id type createdAt context media { id title { userPreferred } coverImage { medium } } reason }
+            ... on MediaDeletionNotification { id type createdAt context deletedMediaTitle reason }
         } } }";
         let r: R = self.gql(q, serde_json::json!({})).await?;
         Ok(r.page
@@ -478,10 +492,21 @@ impl AniList {
                     .context
                     .or_else(|| n.contexts.as_ref().filter(|v| !v.is_empty()).map(|v| v.join(" "))),
                 created_at: n.created_at,
-                media_id: n.media.map(|m| m.id),
+                media_id: n.media.as_ref().map(|m| m.id),
+                media_title: n
+                    .media
+                    .as_ref()
+                    .and_then(|m| m.title.as_ref())
+                    .and_then(|t| t.user_preferred.clone()),
+                media_cover: n
+                    .media
+                    .as_ref()
+                    .and_then(|m| m.cover_image.as_ref())
+                    .and_then(|c| c.medium.clone()),
                 episode: n.episode,
                 activity_id: n.activity_id,
-                thread_id: n.thread.map(|t| t.id),
+                thread_id: n.thread.as_ref().map(|t| t.id),
+                thread_title: n.thread.as_ref().and_then(|t| t.title.clone()),
                 comment_id: n.comment_id,
                 reason: n.reason,
                 deleted_media_title: n.deleted_media_title,

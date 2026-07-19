@@ -4,6 +4,7 @@
   import { auth } from "$lib/auth.svelte";
   import {
     notificationIcon,
+    notificationText,
     notificationUrl,
     timeAgo,
     type Notification,
@@ -46,7 +47,7 @@
 {:else}
   <div class="p-5 max-w-2xl mx-auto">
     <div class="flex items-center gap-3 mb-4">
-      <h1 class="text-xl font-semibold flex-1">Inbox</h1>
+      <h1 class="text-xl font-semibold flex-1">Notifications</h1>
       <button
         onclick={load}
         disabled={loading}
@@ -71,24 +72,18 @@
         {#each items as n (n.id)}
           <button
             onclick={() => open(n)}
-            class="w-full text-left flex items-start gap-3 bg-panel border border-edge rounded-lg p-3 hover:bg-panel-2/60 transition-colors"
+            class="cv-row w-full text-left flex items-start gap-3 bg-panel border border-edge rounded-lg p-3 hover:bg-panel-2/60 transition-colors"
           >
             <span class="text-lg leading-none shrink-0 mt-0.5">{notificationIcon(n.kind)}</span>
             {#if n.user_avatar}
-              <img src={n.user_avatar} alt="" class="w-8 h-8 rounded-full shrink-0 object-cover" />
+              <img src={n.user_avatar} alt="" loading="lazy" decoding="async" class="w-8 h-8 rounded-full shrink-0 object-cover" />
+            {:else if n.media_cover}
+              <img src={n.media_cover} alt="" loading="lazy" decoding="async" class="w-8 h-11 rounded shrink-0 object-cover" />
             {/if}
             <div class="flex-1 min-w-0">
-              <div class="text-sm leading-snug">
-                {n.context ?? n.kind.replace(/_/g, " ").toLowerCase()}
-              </div>
-              {#if n.episode != null}
-                <div class="text-xs text-ink-dim mt-0.5">Episode {n.episode}</div>
-              {/if}
+              <div class="text-sm leading-snug">{notificationText(n)}</div>
               {#if n.reason}
                 <div class="text-xs text-ink-dim mt-0.5">{n.reason}</div>
-              {/if}
-              {#if n.deleted_media_title}
-                <div class="text-xs text-ink-dim mt-0.5">{n.deleted_media_title}</div>
               {/if}
               <div class="text-xs text-ink-dim/70 mt-1">{timeAgo(n.created_at)}</div>
             </div>

@@ -5,6 +5,7 @@
   import { library } from "$lib/library.svelte";
   import Select from "$lib/Select.svelte";
   import ScoreInput from "$lib/ScoreInput.svelte";
+  import Icon from "$lib/Icon.svelte";
   import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
 
   let {
@@ -111,7 +112,7 @@
   >
     <div class="flex items-start gap-3 mb-4">
       {#if entry.media?.cover_medium}
-        <img src={entry.media.cover_medium} alt="" class="w-12 h-16 object-cover rounded shrink-0" />
+        <img src={entry.media.cover_medium} alt="" loading="lazy" decoding="async" class="w-12 h-16 object-cover rounded shrink-0" />
       {/if}
       <div class="min-w-0 flex-1">
         <h3 class="font-semibold truncate">{displayTitle(entry.media)}</h3>
@@ -126,9 +127,9 @@
           type="button"
           onclick={() => openPath(nextFile.path)}
           title={nextFile.path}
-          class="px-2.5 py-1 rounded-md bg-accent hover:bg-accent-2 text-white text-xs shrink-0"
+          class="px-2.5 py-1 rounded-md bg-accent hover:bg-accent-2 text-white text-xs shrink-0 flex items-center gap-1"
         >
-          ▶ Play Ep {nextFile.episode}
+          <Icon name="play" size={11} /> Play Ep {nextFile.episode}
         </button>
       {/if}
     </div>
@@ -223,7 +224,7 @@
               class="w-16 shrink-0 text-left group disabled:opacity-60"
             >
               {#if r.cover_medium}
-                <img src={r.cover_medium} alt="" class="w-16 h-[5.5rem] object-cover rounded" />
+                <img src={r.cover_medium} alt="" loading="lazy" decoding="async" class="w-16 h-[5.5rem] object-cover rounded" />
               {:else}
                 <div class="w-16 h-[5.5rem] bg-panel-2 rounded"></div>
               {/if}

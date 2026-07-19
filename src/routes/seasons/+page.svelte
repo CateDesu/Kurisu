@@ -120,9 +120,9 @@
       <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
         {#each media as m (m.id)}
           {@const listed = onList.get(m.id)}
-          <div class="bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
+          <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
             {#if m.cover_large}
-              <img src={m.cover_large} alt="" class="w-full h-44 object-cover" />
+              <img src={m.cover_large} alt="" loading="lazy" decoding="async" class="w-full h-44 object-cover" />
             {:else}
               <div class="w-full h-44 bg-panel-2"></div>
             {/if}

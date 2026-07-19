@@ -5,6 +5,7 @@
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
   import { displayTitle, type LibraryFile, type ListEntry } from "$lib/types";
+  import Icon from "$lib/Icon.svelte";
   import Login from "$lib/Login.svelte";
 
   let entries = $state<ListEntry[]>([]);
@@ -142,9 +143,9 @@
               <button
                 onclick={() => removeFolder(folder)}
                 title="Remove this folder"
-                class="text-ink-dim hover:text-red-400 text-sm px-1"
+                class="text-ink-dim hover:text-red-400 px-1 grid place-items-center"
               >
-                ✕
+                <Icon name="x" size={14} />
               </button>
             </div>
           {/each}
@@ -166,10 +167,10 @@
       <div class="space-y-4">
         {#each groups.matched as g (g.mediaId)}
           {@const next = nextFile(g)}
-          <section class="bg-panel border border-edge rounded-lg overflow-hidden">
+          <section class="cv-card bg-panel border border-edge rounded-lg overflow-hidden">
             <div class="flex items-center gap-3 p-2.5 border-b border-edge">
               {#if cover(g)}
-                <img src={cover(g)} alt="" class="w-10 h-14 object-cover rounded shrink-0" />
+                <img src={cover(g)} alt="" loading="lazy" decoding="async" class="w-10 h-14 object-cover rounded shrink-0" />
               {:else}
                 <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
               {/if}
@@ -188,15 +189,15 @@
                 <button
                   onclick={() => openPath(next.path)}
                   title={basename(next.path)}
-                  class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm shrink-0"
+                  class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm shrink-0 flex items-center gap-1.5"
                 >
-                  ▶ Play Ep {next.episode}
+                  <Icon name="play" size={13} /> Play Ep {next.episode}
                 </button>
               {/if}
             </div>
             <div class="divide-y divide-edge/60">
               {#each g.files as f (f.path)}
-                <div class="flex items-center gap-2 px-3 py-1.5 text-sm">
+                <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
                   <span class="w-14 shrink-0 text-ink-dim">
                     {f.episode != null ? `Ep ${f.episode}` : "—"}
                   </span>
@@ -204,21 +205,21 @@
                     {basename(f.path)}
                   </span>
                   {#if isWatched(g, f)}
-                    <span class="text-accent text-xs shrink-0" title="Watched (per your list progress)">✓</span>
+                    <span class="text-accent shrink-0 grid place-items-center" title="Watched (per your list progress)"><Icon name="check" size={14} /></span>
                   {/if}
                   <button
                     onclick={() => openPath(f.path)}
                     title="Play"
-                    class="text-ink-dim hover:text-ink px-1"
+                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
-                    ▶
+                    <Icon name="play" size={13} />
                   </button>
                   <button
                     onclick={() => revealItemInDir(f.path)}
                     title="Show in file manager"
-                    class="text-ink-dim hover:text-ink px-1"
+                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
-                    📂
+                    <Icon name="folder-open" size={14} />
                   </button>
                 </div>
               {/each}
@@ -233,21 +234,21 @@
             </div>
             <div class="divide-y divide-edge/60">
               {#each groups.unmatched as f (f.path)}
-                <div class="flex items-center gap-2 px-3 py-1.5 text-sm">
+                <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
                   <span class="flex-1 min-w-0 truncate text-ink-dim">{basename(f.path)}</span>
                   <button
                     onclick={() => openPath(f.path)}
                     title="Play"
-                    class="text-ink-dim hover:text-ink px-1"
+                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
-                    ▶
+                    <Icon name="play" size={13} />
                   </button>
                   <button
                     onclick={() => revealItemInDir(f.path)}
                     title="Show in file manager"
-                    class="text-ink-dim hover:text-ink px-1"
+                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
-                    📂
+                    <Icon name="folder-open" size={14} />
                   </button>
                 </div>
               {/each}

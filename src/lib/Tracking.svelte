@@ -1,6 +1,7 @@
 <script lang="ts">
   import { listen, emit } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
+  import Icon from "$lib/Icon.svelte";
   import type { NowPlaying, TrackingPrompt } from "$lib/types";
 
   // `null` = nothing playing / banner hidden.
@@ -55,7 +56,7 @@
 
 {#if nowPlaying}
   <div class="flex items-center gap-3 px-4 py-1.5 border-b border-edge bg-panel text-xs shrink-0">
-    <span class="text-accent leading-none">▶</span>
+    <span class="text-accent leading-none grid place-items-center"><Icon name="play" size={12} /></span>
     <span class="truncate max-w-[40%]">
       {#if nowPlaying.matched}
         <span class="font-medium">{nowPlaying.matched}</span>
@@ -68,7 +69,9 @@
     </span>
     {#if nowPlaying.length_us > 0}
       <div class="flex-1 h-1 bg-edge rounded overflow-hidden min-w-[40px]">
-        <div class="h-full bg-accent transition-[width] duration-500" style="width:{pct}%"></div>
+        <!-- scaleX keeps this animation on the compositor; a width transition
+             forces layout every frame -->
+        <div class="h-full bg-accent origin-left transition-transform duration-500" style="transform:scaleX({pct / 100})"></div>
       </div>
       <span class="text-ink-dim tabular-nums w-9 text-right">{pct}%</span>
     {:else}

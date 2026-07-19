@@ -7,17 +7,17 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
+  import Icon from "$lib/Icon.svelte";
   let { children } = $props();
 
-  // Emoji icons render in color on every platform, so they stay legible on the
-  // dark sidebar (the old text-glyph icons were nearly invisible).
+  // Inline SVG icons (Icon.svelte) — stroke style, inherit text color.
   const nav = [
-    { href: "/", label: "My List", icon: "📋" },
-    { href: "/library", label: "Library", icon: "📁" },
-    { href: "/seasons", label: "Seasons", icon: "🗓️" },
-    { href: "/search", label: "Search", icon: "🔍" },
-    { href: "/notifications", label: "Inbox", icon: "✉️" },
-    { href: "/settings", label: "Settings", icon: "⚙️" },
+    { href: "/", label: "My List", icon: "list" },
+    { href: "/library", label: "Library", icon: "folder" },
+    { href: "/seasons", label: "Seasons", icon: "calendar" },
+    { href: "/search", label: "Search", icon: "search" },
+    { href: "/notifications", label: "Notifications", icon: "bell" },
+    { href: "/settings", label: "Settings", icon: "sliders" },
   ];
 
   const appWindow = getCurrentWindow();
@@ -60,9 +60,9 @@
             onclick={back}
             title="Back"
             aria-label="Back"
-            class="w-8 h-8 grid place-items-center rounded-md text-ink-dim hover:text-ink hover:bg-panel-2/60 text-lg"
+            class="w-8 h-8 grid place-items-center rounded-md text-ink-dim hover:text-ink hover:bg-panel-2/60"
           >
-            ←
+            <Icon name="back" />
           </button>
         </div>
         <nav class="flex-1 px-2 py-2 space-y-1 overflow-auto">
@@ -73,7 +73,9 @@
               class="flex items-center gap-3 px-3 py-2.5 rounded-md text-[15px] transition-colors
                 {active ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink hover:bg-panel-2/60'}"
             >
-              <span class="text-lg w-6 text-center {active ? 'opacity-100' : 'opacity-90'}">{item.icon}</span>
+              <span class="w-6 grid place-items-center {active ? 'opacity-100' : 'opacity-90'}">
+                <Icon name={item.icon} />
+              </span>
               <span class="truncate">{item.label}</span>
             </a>
           {/each}
@@ -81,7 +83,7 @@
         {#if auth.user}
           <div class="px-4 py-4 border-t border-edge flex items-center gap-3.5">
             {#if auth.user.avatar}
-              <img src={auth.user.avatar} alt="" class="w-12 h-12 rounded-full shrink-0 object-cover" />
+              <img src={auth.user.avatar} alt="" loading="lazy" decoding="async" class="w-12 h-12 rounded-full shrink-0 object-cover" />
             {:else}
               <div class="w-12 h-12 rounded-full bg-panel-2 shrink-0"></div>
             {/if}
@@ -96,9 +98,9 @@
             <button
               onclick={() => auth.logout()}
               title="Log out"
-              class="text-ink-dim hover:text-ink text-base px-1"
+              class="text-ink-dim hover:text-ink px-1 grid place-items-center"
             >
-              ⎋
+              <Icon name="logout" />
             </button>
           </div>
         {:else}
