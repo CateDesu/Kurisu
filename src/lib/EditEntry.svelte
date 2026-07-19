@@ -1,9 +1,11 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { openPath } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
+  import { library } from "$lib/library.svelte";
   import Select from "$lib/Select.svelte";
   import ScoreInput from "$lib/ScoreInput.svelte";
-  import { displayTitle, STATUS_LABEL, type ListEntry } from "$lib/types";
+  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
 
   let {
     entry,
@@ -16,15 +18,23 @@
   let status = $state(untrack(() => entry.status));
   let progress = $state(untrack(() => entry.progress));
   let score = $state<number | null>(untrack(() => entry.score ?? null));
+  let repeat = $state(untrack(() => entry.repeat));
   let saving = $state(false);
   let removing = $state(false);
   let err = $state("");
+
+  // Community recommendations for this title; failures just hide the strip.
+  let recs = $state<Media[]>([]);
+  let addingRec = $state<number | null>(null);
+  let addedRecs = $state<number[]>([]);
 
   const statusOptions = Object.entries(STATUS_LABEL).map(([value, label]) => ({
     value: value as ListEntry["status"],
     label,
   }));
   const total = $derived(entry.media?.episodes ?? null);
+  // Next unwatched episode on disk (from the last library scan, if any).
+  const nextFile = $derived(library.fileFor(entry.media_id, entry.progress + 1));
   const scoreUnit = $derived(
     scoreFormat === "POINT_3"
       ? "(smileys)"
@@ -37,11 +47,32 @@
             : "(0–100)"
   );
 
+  async function loadRecs() {
+    try {
+      recs = await api.getRecommendations(entry.media_id);
+    } catch {
+      recs = [];
+    }
+  }
+  loadRecs();
+
+  async function addRec(m: Media) {
+    addingRec = m.id;
+    try {
+      await api.updateEntry(m.id, "PLANNING", 0, null, 0);
+      addedRecs.push(m.id);
+    } catch {
+      // leave the button enabled so the user can retry
+    } finally {
+      addingRec = null;
+    }
+  }
+
   async function save() {
     saving = true;
     err = "";
     try {
-      await api.updateEntry(entry.media_id, status, progress, score);
+      await api.updateEntry(entry.media_id, status, progress, score, repeat);
       onclose();
     } catch (e) {
       err = String(e);
@@ -82,7 +113,7 @@
       {#if entry.media?.cover_medium}
         <img src={entry.media.cover_medium} alt="" class="w-12 h-16 object-cover rounded shrink-0" />
       {/if}
-      <div class="min-w-0">
+      <div class="min-w-0 flex-1">
         <h3 class="font-semibold truncate">{displayTitle(entry.media)}</h3>
         {#if total}
           <p class="text-xs text-ink-dim">{entry.progress}/{total} eps watched</p>
@@ -90,6 +121,16 @@
           <p class="text-xs text-ink-dim">{entry.progress} eps watched</p>
         {/if}
       </div>
+      {#if nextFile}
+        <button
+          type="button"
+          onclick={() => openPath(nextFile.path)}
+          title={nextFile.path}
+          class="px-2.5 py-1 rounded-md bg-accent hover:bg-accent-2 text-white text-xs shrink-0"
+        >
+          ▶ Play Ep {nextFile.episode}
+        </button>
+      {/if}
     </div>
 
     {#if err}
@@ -126,6 +167,16 @@
           <label class="block text-sm mb-1" for="ed-score">Score <span class="text-ink-dim">{scoreUnit}</span></label>
           <ScoreInput id="ed-score" bind:value={score} format={scoreFormat} />
         </div>
+        <div class="w-24 shrink-0">
+          <label class="block text-sm mb-1" for="ed-repeat" title="How many times you've finished this show">Rewatches</label>
+          <input
+            id="ed-repeat"
+            type="number"
+            min="0"
+            bind:value={repeat}
+            class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
+          />
+        </div>
       </div>
 
       <div class="flex items-center justify-between gap-2 pt-1">
@@ -156,5 +207,33 @@
         </div>
       </div>
     </form>
+
+    {#if recs.length > 0}
+      <div class="mt-5 pt-4 border-t border-edge">
+        <h4 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">
+          You might also like
+        </h4>
+        <div class="flex gap-2 overflow-x-auto pb-1">
+          {#each recs as r (r.id)}
+            <button
+              type="button"
+              onclick={() => addRec(r)}
+              disabled={addingRec === r.id || addedRecs.includes(r.id)}
+              title="{displayTitle(r)} — add to Plan to Watch"
+              class="w-16 shrink-0 text-left group disabled:opacity-60"
+            >
+              {#if r.cover_medium}
+                <img src={r.cover_medium} alt="" class="w-16 h-[5.5rem] object-cover rounded" />
+              {:else}
+                <div class="w-16 h-[5.5rem] bg-panel-2 rounded"></div>
+              {/if}
+              <span class="block text-[11px] leading-tight line-clamp-2 mt-1 text-ink-dim group-hover:text-ink">
+                {addedRecs.includes(r.id) ? "✓ Added" : displayTitle(r)}
+              </span>
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
   </div>
 </div>

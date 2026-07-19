@@ -13,6 +13,8 @@
   // dark sidebar (the old text-glyph icons were nearly invisible).
   const nav = [
     { href: "/", label: "My List", icon: "📋" },
+    { href: "/library", label: "Library", icon: "📁" },
+    { href: "/seasons", label: "Seasons", icon: "🗓️" },
     { href: "/search", label: "Search", icon: "🔍" },
     { href: "/notifications", label: "Inbox", icon: "✉️" },
     { href: "/settings", label: "Settings", icon: "⚙️" },

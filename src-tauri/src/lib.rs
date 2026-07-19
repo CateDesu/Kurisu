@@ -4,8 +4,10 @@
 mod anilist;
 mod commands;
 mod db;
+mod library;
 mod models;
 mod playback;
+mod recognize;
 
 use commands::AppState;
 use directories::ProjectDirs;
@@ -40,6 +42,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::get_client_id,
@@ -52,6 +55,8 @@ pub fn run() {
             commands::logout,
             commands::current_user,
             commands::search_anime,
+            commands::get_season,
+            commands::get_recommendations,
             commands::get_media,
             commands::sync_my_list,
             commands::local_entries,
@@ -63,6 +68,12 @@ pub fn run() {
             commands::get_notifications,
             commands::get_tracking_config,
             commands::set_tracking_config,
+            commands::get_app_setting,
+            commands::set_app_setting,
+            commands::get_library_folders,
+            commands::add_library_folder,
+            commands::remove_library_folder,
+            commands::scan_library,
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -112,14 +123,25 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // The window close button hides to tray instead of quitting — Quit lives
-            // in the tray menu so the user doesn't lose the app by accident.
+            // The window close button quits by default (this being the only window,
+            // closing ends the app). The Settings toggle (`close_to_tray = 1`) makes
+            // it hide to the tray instead — Quit then lives in the tray menu.
             if let Some(main_window) = app.get_webview_window("main") {
                 let w = main_window.clone();
                 main_window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w.hide();
+                        let close_to_tray = w
+                            .state::<AppState>()
+                            .db
+                            .get_setting("close_to_tray")
+                            .ok()
+                            .flatten()
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        if close_to_tray {
+                            api.prevent_close();
+                            let _ = w.hide();
+                        }
                     }
                 });
             }

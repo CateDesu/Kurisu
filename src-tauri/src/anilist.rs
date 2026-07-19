@@ -26,6 +26,59 @@ struct NextAiring {
     airing_at: Option<i64>,
 }
 
+/// The media field set every list-ish query fetches (search / user_list / season /
+/// recommendations) — one deserializer + conversion shared by all of them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AniMedia {
+    id: i64,
+    id_mal: Option<i64>,
+    title: AniTitle,
+    cover_image: AniCover,
+    episodes: Option<i64>,
+    format: Option<String>,
+    status: Option<String>,
+    average_score: Option<i64>,
+    season: Option<String>,
+    season_year: Option<i64>,
+    description: Option<String>,
+    next_airing_episode: Option<NextAiring>,
+}
+#[derive(Deserialize)]
+struct AniTitle {
+    romaji: Option<String>,
+    english: Option<String>,
+    native: Option<String>,
+}
+#[derive(Deserialize)]
+struct AniCover {
+    medium: Option<String>,
+    large: Option<String>,
+}
+
+impl From<AniMedia> for Media {
+    fn from(m: AniMedia) -> Media {
+        Media {
+            id: m.id,
+            id_mal: m.id_mal,
+            title_romaji: m.title.romaji,
+            title_english: m.title.english,
+            title_native: m.title.native,
+            cover_medium: m.cover_image.medium,
+            cover_large: m.cover_image.large,
+            episodes: m.episodes,
+            format: m.format,
+            status: m.status,
+            average_score: m.average_score,
+            season: m.season,
+            season_year: m.season_year,
+            description: m.description,
+            next_airing_episode: m.next_airing_episode.as_ref().and_then(|n| n.episode),
+            next_airing_at: m.next_airing_episode.as_ref().and_then(|n| n.airing_at),
+        }
+    }
+}
+
 /// reqwest::Client is cheap to clone (Arc-backed), so cloning AniList lets us drop
 /// the DB-style lock before any `.await` (Tauri futures must be Send).
 #[derive(Clone)]
@@ -135,33 +188,6 @@ impl AniList {
         struct Page {
             media: Vec<AniMedia>,
         }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AniMedia {
-            id: i64,
-            id_mal: Option<i64>,
-            title: Title,
-            cover_image: Cover,
-            episodes: Option<i64>,
-            format: Option<String>,
-            status: Option<String>,
-            average_score: Option<i64>,
-            season: Option<String>,
-            season_year: Option<i64>,
-            description: Option<String>,
-            next_airing_episode: Option<NextAiring>,
-        }
-        #[derive(Deserialize)]
-        struct Title {
-            romaji: Option<String>,
-            english: Option<String>,
-            native: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Cover {
-            medium: Option<String>,
-            large: Option<String>,
-        }
         let q = "query ($search: String!, $perPage: Int!) {
             Page(perPage: $perPage) {
                 media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
@@ -178,25 +204,75 @@ impl AniList {
                 serde_json::json!({ "search": query, "perPage": per_page }),
             )
             .await?;
-        Ok(r.page.media.into_iter().map(|m| Media {
-            id: m.id,
-            id_mal: m.id_mal,
-            title_romaji: m.title.romaji,
-            title_english: m.title.english,
-            title_native: m.title.native,
-            cover_medium: m.cover_image.medium,
-            cover_large: m.cover_image.large,
-            episodes: m.episodes,
-            format: m.format,
-            status: m.status,
-            average_score: m.average_score,
-            season: m.season,
-            season_year: m.season_year,
-            description: m.description,
-            next_airing_episode: m.next_airing_episode.as_ref().and_then(|n| n.episode),
-            next_airing_at: m.next_airing_episode.as_ref().and_then(|n| n.airing_at),
-        })
-        .collect())
+        Ok(r.page.media.into_iter().map(Media::from).collect())
+    }
+
+    /// One anime season (WINTER/SPRING/SUMMER/FALL + year), most popular first.
+    pub async fn season(&self, season: &str, year: i64, page: i64) -> Result<Vec<Media>> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "Page")]
+            page: Page,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            media: Vec<AniMedia>,
+        }
+        let q = "query ($season: MediaSeason!, $year: Int!, $page: Int!) {
+            Page(page: $page, perPage: 50) {
+                media(season: $season, seasonYear: $year, type: ANIME, isAdult: false, sort: POPULARITY_DESC) {
+                    id idMal title { romaji english native }
+                    coverImage { medium large }
+                    episodes format status averageScore season seasonYear description
+                    nextAiringEpisode { episode airingAt }
+                }
+            }
+        }";
+        let r: R = self
+            .gql(
+                q,
+                serde_json::json!({ "season": season, "year": year, "page": page }),
+            )
+            .await?;
+        Ok(r.page.media.into_iter().map(Media::from).collect())
+    }
+
+    /// AniList's community recommendations for one title, best-rated first.
+    pub async fn recommendations(&self, media_id: i64) -> Result<Vec<Media>> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "Page")]
+            page: Page,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            recommendations: Option<Vec<Rec>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Rec {
+            media_recommendation: Option<AniMedia>,
+        }
+        let q = "query ($mediaId: Int!) {
+            Page(perPage: 10) {
+                recommendations(mediaId: $mediaId, sort: RATING_DESC) {
+                    mediaRecommendation {
+                        id idMal title { romaji english native }
+                        coverImage { medium large }
+                        episodes format status averageScore season seasonYear description
+                        nextAiringEpisode { episode airingAt }
+                    }
+                }
+            }
+        }";
+        let r: R = self.gql(q, serde_json::json!({ "mediaId": media_id })).await?;
+        Ok(r.page
+            .recommendations
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|rec| rec.media_recommendation)
+            .map(Media::from)
+            .collect())
     }
 
     /// Pull the full list (every status group) for a user and flatten to entries.
@@ -228,34 +304,6 @@ impl AniList {
             updated_at: Option<i64>,
             media: AniMedia,
         }
-        // reuse a local copy of AniMedia (search's struct is private to that fn)
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AniMedia {
-            id: i64,
-            id_mal: Option<i64>,
-            title: Title,
-            cover_image: Cover,
-            episodes: Option<i64>,
-            format: Option<String>,
-            status: Option<String>,
-            average_score: Option<i64>,
-            season: Option<String>,
-            season_year: Option<i64>,
-            description: Option<String>,
-            next_airing_episode: Option<NextAiring>,
-        }
-        #[derive(Deserialize)]
-        struct Title {
-            romaji: Option<String>,
-            english: Option<String>,
-            native: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Cover {
-            medium: Option<String>,
-            large: Option<String>,
-        }
         let q = "query ($userName: String!) {
             MediaListCollection(userName: $userName, type: ANIME) {
                 lists {
@@ -286,24 +334,7 @@ impl AniList {
                     score: e.score,
                     repeat: e.repeat.unwrap_or(0),
                     updated_at: e.updated_at,
-                    media: Some(Media {
-                        id: e.media.id,
-                        id_mal: e.media.id_mal,
-                        title_romaji: e.media.title.romaji,
-                        title_english: e.media.title.english,
-                        title_native: e.media.title.native,
-                        cover_medium: e.media.cover_image.medium,
-                        cover_large: e.media.cover_image.large,
-                        episodes: e.media.episodes,
-                        format: e.media.format,
-                        status: e.media.status,
-                        average_score: e.media.average_score,
-                        season: e.media.season,
-                        season_year: e.media.season_year,
-                        description: e.media.description,
-                        next_airing_episode: e.media.next_airing_episode.as_ref().and_then(|n| n.episode),
-                        next_airing_at: e.media.next_airing_episode.as_ref().and_then(|n| n.airing_at),
-                    }),
+                    media: Some(e.media.into()),
                 });
             }
         }
@@ -317,6 +348,7 @@ impl AniList {
         status: ListStatus,
         progress: i64,
         score: Option<f64>,
+        repeat: i64,
     ) -> Result<i64> {
         #[derive(Deserialize)]
         struct R {
@@ -327,8 +359,8 @@ impl AniList {
         struct Entry {
             id: i64,
         }
-        let q = "mutation ($mediaId: Int!, $status: MediaListStatus!, $progress: Int!, $score: Float) {
-            SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress, score: $score) { id }
+        let q = "mutation ($mediaId: Int!, $status: MediaListStatus!, $progress: Int!, $score: Float, $repeat: Int) {
+            SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id }
         }";
         let r: R = self
             .gql(
@@ -338,6 +370,7 @@ impl AniList {
                     "status": status.as_str(),
                     "progress": progress,
                     "score": score,
+                    "repeat": repeat,
                 }),
             )
             .await?;

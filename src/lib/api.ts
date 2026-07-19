@@ -1,7 +1,7 @@
 // Typed wrappers over every Tauri command. Centralizes the invoke calls so the UI
 // never builds the call strings by hand, and gives us one place to handle errors.
 import { invoke } from "@tauri-apps/api/core";
-import type { ListEntry, Media, Notification, TrackingConfig, User } from "./types";
+import type { LibraryFile, ListEntry, Media, Notification, TrackingConfig, User } from "./types";
 
 export const api = {
   getClientId: () => invoke<string | null>("get_client_id"),
@@ -21,6 +21,11 @@ export const api = {
       autoPercent,
     }),
 
+  getAppSetting: (key: string) =>
+    invoke<string | null>("get_app_setting", { key }),
+  setAppSetting: (key: string, value: string) =>
+    invoke<void>("set_app_setting", { key, value }),
+
   isLoggedIn: () => invoke<boolean>("is_logged_in"),
   currentUser: () => invoke<User | null>("current_user"),
   loginWithToken: (token: string) => invoke<User>("login_with_token", { token }),
@@ -28,6 +33,10 @@ export const api = {
   logout: () => invoke<void>("logout"),
 
   searchAnime: (query: string) => invoke<Media[]>("search_anime", { query }),
+  getSeason: (season: string, year: number, page: number) =>
+    invoke<Media[]>("get_season", { season, year, page }),
+  getRecommendations: (mediaId: number) =>
+    invoke<Media[]>("get_recommendations", { mediaId }),
   getMedia: (id: number) => invoke<Media>("get_media", { id }),
   getEntry: (mediaId: number) =>
     invoke<ListEntry | null>("get_entry", { mediaId }),
@@ -38,9 +47,10 @@ export const api = {
     mediaId: number,
     status: string,
     progress: number,
-    score: number | null
+    score: number | null,
+    repeat: number
   ) =>
-    invoke<ListEntry>("update_entry", { mediaId, status, progress, score }),
+    invoke<ListEntry>("update_entry", { mediaId, status, progress, score, repeat }),
   incrementEpisode: (mediaId: number) =>
     invoke<ListEntry>("increment_episode", { mediaId }),
   setProgress: (mediaId: number, progress: number) =>
@@ -49,4 +59,11 @@ export const api = {
     invoke<void>("delete_entry_cmd", { mediaId }),
 
   getNotifications: () => invoke<Notification[]>("get_notifications"),
+
+  getLibraryFolders: () => invoke<string[]>("get_library_folders"),
+  addLibraryFolder: (path: string) =>
+    invoke<string[]>("add_library_folder", { path }),
+  removeLibraryFolder: (path: string) =>
+    invoke<string[]>("remove_library_folder", { path }),
+  scanLibrary: () => invoke<LibraryFile[]>("scan_library"),
 };

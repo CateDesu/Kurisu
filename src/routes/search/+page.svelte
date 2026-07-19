@@ -31,7 +31,7 @@
   async function add(m: Media, status: string) {
     adding = m.id;
     try {
-      await api.updateEntry(m.id, status, 0, null);
+      await api.updateEntry(m.id, status, 0, null, 0);
     } catch (err) {
       error = String(err);
     } finally {

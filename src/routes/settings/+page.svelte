@@ -8,6 +8,8 @@
   let trackingSaving = $state(false);
   let trackingSavedAt = $state(0);
 
+  let closeToTray = $state(true);
+
   let signingIn = $state(false);
   let signInErr = $state("");
 
@@ -19,6 +21,7 @@
 
   async function load() {
     cfg = await api.getTrackingConfig();
+    closeToTray = (await api.getAppSetting("close_to_tray")) === "1";
     trackingLoaded = true;
   }
   async function signIn() {
@@ -41,17 +44,15 @@
       trackingSaving = false;
     }
   }
+  async function toggleCloseToTray() {
+    await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
+  }
   load();
 </script>
 
 <div class="p-5 max-w-2xl mx-auto space-y-8">
   <div>
     <h1 class="text-xl font-semibold mb-1">Settings</h1>
-    <p class="text-sm text-ink-dim">
-      Sign in with AniList to sync your list. Kurisu ships with its own app client,
-      so connecting is one click — you authorize Kurisu once in your browser and
-      you're in. No developer setup required.
-    </p>
   </div>
 
   <section class="pt-4 border-t border-edge">
@@ -85,7 +86,6 @@
     <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Playback tracking</h2>
     <p class="text-sm text-ink-dim mb-3">
       Detect playback in MPV/VLC/Celluloid (any MPRIS2 player) and update your list.
-      All prompts appear in-app — there are no system-tray or desktop notifications.
     </p>
     <div class="space-y-2 mb-4">
       {#each modes as [val, label]}
@@ -134,5 +134,22 @@
         <span class="text-xs text-accent ml-2">saved ✓</span>
       {/if}
     </div>
+  </section>
+
+  <section class="pt-4 border-t border-edge">
+    <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Window</h2>
+    <label class="flex items-center gap-2 text-sm cursor-pointer">
+      <input
+        type="checkbox"
+        bind:checked={closeToTray}
+        onchange={toggleCloseToTray}
+        class="accent-accent"
+      />
+      Hide to system tray when closing the window
+    </label>
+    <p class="text-xs text-ink-dim mt-1">
+      Off by default — the close button quits Kurisu outright. Turn this on to keep
+      it running in the tray instead (Quit is always available in the tray menu).
+    </p>
   </section>
 </div>

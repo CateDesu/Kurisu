@@ -10,7 +10,9 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::anilist::{self, AniList};
 use crate::db::Db;
-use crate::models::{ListEntry, ListStatus, Media, Notification, User};
+use crate::library;
+use crate::models::{LibraryFile, ListEntry, ListStatus, Media, Notification, User};
+use crate::recognize;
 
 const TOKEN_KEY: &str = "anilist_token";
 const CLIENT_ID_KEY: &str = "anilist_client_id";
@@ -162,6 +164,19 @@ pub fn is_logged_in(state: State<'_, AppState>) -> bool {
     state.anilist.lock().unwrap().has_token()
 }
 
+/// Generic key/value settings access for small UI toggles (close-to-tray, …).
+/// No whitelist: the settings table is local-only and every key is namespaced by
+/// the caller, same trust level as the existing tracking config.
+#[tauri::command]
+pub fn get_app_setting(key: String, state: State<'_, AppState>) -> Option<String> {
+    state.db.get_setting(&key).ok().flatten()
+}
+
+#[tauri::command]
+pub fn set_app_setting(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.set_setting(&key, &value).map_err(|e| e.to_string())
+}
+
 /// Manual token entry (fallback if the browser flow can't be used). Verifies the
 /// token via Viewer, then persists it.
 #[tauri::command]
@@ -240,6 +255,33 @@ pub async fn search_anime(query: String, state: State<'_, AppState>) -> Result<V
     Ok(media)
 }
 
+/// One anime season (the `/seasons` browser). Results are cached like search hits.
+#[tauri::command]
+pub async fn get_season(
+    season: String,
+    year: i64,
+    page: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<Media>, String> {
+    let al = state.anilist.lock().unwrap().clone();
+    let media = al.season(&season, year, page).await.map_err(|e| e.to_string())?;
+    for m in &media {
+        let _ = state.db.upsert_media(m);
+    }
+    Ok(media)
+}
+
+/// Community recommendations for a title (the edit modal's "also like" strip).
+#[tauri::command]
+pub async fn get_recommendations(media_id: i64, state: State<'_, AppState>) -> Result<Vec<Media>, String> {
+    let al = state.anilist.lock().unwrap().clone();
+    let media = al.recommendations(media_id).await.map_err(|e| e.to_string())?;
+    for m in &media {
+        let _ = state.db.upsert_media(m);
+    }
+    Ok(media)
+}
+
 #[tauri::command]
 pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, String> {
     if let Some(m) = state.db.get_media(id).map_err(|e| e.to_string())? {
@@ -294,9 +336,10 @@ pub async fn update_entry(
     status: String,
     progress: i64,
     score: Option<f64>,
+    repeat: i64,
     state: State<'_, AppState>,
 ) -> Result<ListEntry, String> {
-    save_entry_inner(state.inner(), media_id, status, progress, score).await
+    save_entry_inner(state.inner(), media_id, status, progress, score, repeat).await
 }
 
 /// Shared push-to-AniList + mirror-to-cache used by the `update_entry` command and
@@ -307,11 +350,12 @@ pub async fn save_entry_inner(
     status: String,
     progress: i64,
     score: Option<f64>,
+    repeat: i64,
 ) -> Result<ListEntry, String> {
     let st = parse_status(&status)?;
     let al = state.anilist.lock().unwrap().clone();
     let entry_id = al
-        .save_entry(media_id, st, progress, score)
+        .save_entry(media_id, st, progress, score, repeat)
         .await
         .map_err(|e| e.to_string())?;
     let entry = ListEntry {
@@ -320,7 +364,7 @@ pub async fn save_entry_inner(
         status: status.clone(),
         progress,
         score,
-        repeat: 0,
+        repeat,
         updated_at: Some(chrono::Utc::now().timestamp()),
         media: state.db.get_media(media_id).map_err(|e| e.to_string())?,
     };
@@ -359,7 +403,9 @@ pub async fn increment_inner(state: &AppState, media_id: i64) -> Result<ListEntr
     } else {
         status
     };
-    save_entry_inner(state, media_id, final_status, progress, cur.and_then(|e| e.score)).await
+    let score = cur.as_ref().and_then(|e| e.score);
+    let repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
+    save_entry_inner(state, media_id, final_status, progress, score, repeat).await
 }
 
 /// Set absolute episode progress (the list's −/+ stepper). Preserves the current
@@ -390,7 +436,9 @@ pub async fn set_progress_inner(state: &AppState, media_id: i64, progress: i64) 
     } else {
         prev_status.to_string()
     };
-    save_entry_inner(state, media_id, final_status, progress, cur.and_then(|e| e.score)).await
+    let score = cur.as_ref().and_then(|e| e.score);
+    let repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
+    save_entry_inner(state, media_id, final_status, progress, score, repeat).await
 }
 
 #[tauri::command]
@@ -402,6 +450,35 @@ pub async fn delete_entry_cmd(media_id: i64, state: State<'_, AppState>) -> Resu
         }
     }
     state.db.delete_entry(media_id).map_err(|e| e.to_string())
+}
+
+// ───────────────────────────── library ─────────────────────────────
+
+#[tauri::command]
+pub fn get_library_folders(state: State<'_, AppState>) -> Vec<String> {
+    library::get_folders(&state.db)
+}
+
+#[tauri::command]
+pub fn add_library_folder(path: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    library::add_folder(&state.db, &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn remove_library_folder(path: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    library::remove_folder(&state.db, &path).map_err(|e| e.to_string())
+}
+
+/// Scan the configured folders for video files and recognize them against the
+/// cached list. Matchers/folders are read from the DB up front; the filesystem
+/// walk itself runs on a blocking thread.
+#[tauri::command]
+pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<LibraryFile>, String> {
+    let folders = library::get_folders(&state.db);
+    let matchers = recognize::build_matchers(&state.db);
+    tokio::task::spawn_blocking(move || library::scan_paths(&folders, &matchers))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ───────────────────────────── notifications ─────────────────────────────

@@ -85,6 +85,17 @@ pub struct ListEntry {
     pub media: Option<Media>,     // joined when served to the UI
 }
 
+/// One video file found by the library scan. `media_id`/`matched`/`episode` are
+/// None when the filename didn't match anything on the user's list.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LibraryFile {
+    pub path: String,
+    pub media_id: Option<i64>,
+    /// Display title of the matched list entry.
+    pub matched: Option<String>,
+    pub episode: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct User {
     pub id: i64,

@@ -122,11 +122,22 @@ export interface NowPlaying {
 }
 
 /// Prompt-mode request: shown as an in-app modal (no tray notification).
+/// `progress` is the entry's current progress, so the modal only offers
+/// "set to Ep N" when that's actually ahead.
 export interface TrackingPrompt {
   media_id: number;
   episode: number;
   title: string;
   raw_title: string;
+  progress: number;
+}
+
+/// One video file from the library scan (M3).
+export interface LibraryFile {
+  path: string;
+  media_id: number | null;
+  matched: string | null;
+  episode: number | null;
 }
 
 export const STATUS_LABEL: Record<string, string> = {

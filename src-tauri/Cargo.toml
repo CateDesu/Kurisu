@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # AniList GraphQL over HTTP
@@ -23,8 +24,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time"] }
 # local library + cache
 rusqlite = { version = "0.32", features = ["bundled"] }
-# MPRIS2 playback detection (MPV/VLC/Celluloid/etc.) — milestone 2
-mpris = "2.0"
 # XDG app-data dirs
 directories = "5"
 # timestamps
@@ -35,3 +34,15 @@ thiserror = "2"
 # filename / now-playing title parsing — milestone 2/3
 regex = "1"
 log = "0.4"
+
+# MPRIS2 playback detection (MPV/VLC/Celluloid/…) — Linux only. Windows uses
+# GSMTC via the `windows` crate below; other platforms get a no-op stub.
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris = "2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+] }

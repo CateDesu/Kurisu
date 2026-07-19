@@ -34,7 +34,9 @@
     if (!prompt || busy) return;
     busy = true;
     try {
-      const entry = await api.incrementEpisode(prompt.media_id);
+      // Set progress to the detected episode (not a blind +1), so mid-cour skips
+      // land correctly. The modal only offers this when it's ahead of progress.
+      const entry = await api.setProgress(prompt.media_id, prompt.episode);
       // Unify the list-refresh signal: auto-increment emits this from the
       // backend, the prompt path emits it here so one listener covers both.
       await emit("kurisu://episode-updated", entry);
@@ -100,20 +102,25 @@
           <span class="block text-xs mt-1 opacity-70">{prompt.raw_title}</span>
         {/if}
       </p>
-      <div class="flex justify-end gap-2">
+      <div class="flex justify-end items-center gap-2">
+        {#if prompt.episode <= prompt.progress}
+          <span class="text-xs text-ink-dim mr-auto">Already past Ep {prompt.episode} (rewatch)</span>
+        {/if}
         <button
           onclick={skip}
           class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
         >
           Skip
         </button>
-        <button
-          onclick={confirm}
-          disabled={busy}
-          class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
-        >
-          {busy ? "Updating…" : "Update (+1)"}
-        </button>
+        {#if prompt.episode > prompt.progress}
+          <button
+            onclick={confirm}
+            disabled={busy}
+            class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
+          >
+            {busy ? "Updating…" : `Set progress to Ep ${prompt.episode}`}
+          </button>
+        {/if}
       </div>
     </div>
   </div>
