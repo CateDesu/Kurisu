@@ -72,7 +72,7 @@
     saving = true;
     err = "";
     try {
-      await api.updateEntry(entry.media_id, status, progress, score, repeat);
+      await api.updateEntry(entry.media_id, status, progress, score, repeat ?? 0);
       onclose();
     } catch (e) {
       err = String(e);

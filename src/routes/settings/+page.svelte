@@ -8,7 +8,7 @@
   let trackingSaving = $state(false);
   let trackingSavedAt = $state(0);
 
-  let closeToTray = $state(true);
+  let closeToTray = $state(false);
 
   let signingIn = $state(false);
   let signInErr = $state("");

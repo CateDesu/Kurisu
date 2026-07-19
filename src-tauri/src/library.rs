@@ -97,8 +97,9 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
             continue;
         }
         let path = entry.path();
-        // follows symlinks one level via metadata(); a loop just hits MAX_DEPTH
-        let Ok(meta) = entry.metadata() else { continue };
+        // metadata() (not DirEntry::metadata) follows symlinks, so symlinked
+        // folders/files get scanned; a symlink loop just bottoms out at MAX_DEPTH.
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
         if meta.is_dir() {
             collect_videos(&path, depth + 1, out);
         } else if meta.is_file()
