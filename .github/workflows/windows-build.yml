@@ -175,11 +175,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ needs.meta.outputs.tag }}
         run: |
-          gh release list --limit 100 --json tagName,isPrerelease \
+          gh release list -R "${{ github.repository }}" --limit 100 --json tagName,isPrerelease \
             --jq '.[] | select(.isPrerelease | not) | .tagName' | while read -r t; do
             [ -z "$t" ] && continue
             [ "$t" = "$KEEP" ] && continue
             echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
             echo "Pruning superseded rolling release $t"
-            gh release delete "$t" --cleanup-tag --yes || true
+            gh release delete -R "${{ github.repository }}" "$t" --cleanup-tag --yes || true
           done
