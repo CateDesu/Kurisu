@@ -1,0 +1,185 @@
+# Builds Kurisu for Windows (single NSIS installer exe, WebView2 bootstrapper
+# embedded) and Linux (bare binary), and publishes both to a GitHub release.
+#
+# - Push to main  → ROLLING release: tag v<base>.<run_number> (base = "version"
+#                   from tauri.conf.json, e.g. v1.0.0.123), published with the
+#                   installer + Linux binary + SHA-256 sidecars attached. The
+#                   previous rolling release is pruned, so /releases/latest
+#                   always points at the newest main build — which is what the
+#                   in-app updater tracks. No manual tagging needed.
+# - Push a v* tag → a normal named release (v1.1.0). Never pruned.
+# - Manual        → Actions tab → "Release build" → Run workflow (rolling).
+#
+# The updater downloads the `.sha256` sidecar for its platform asset and fails
+# closed without it, so every asset ships one. The app learns its full release
+# version via KURISU_BUILD_VERSION (stamped at build time), keeping
+# tauri.conf.json/Cargo.toml semver-clean at X.Y.Z.
+#
+# Cross-compiling Tauri isn't practical (WebView2 + NSIS are Windows tooling),
+# so each platform builds on a native runner. Linux uses Ubuntu 22.04 for an
+# older glibc baseline.
+name: Release build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# One in-flight build per ref: a newer push supersedes an older still-building one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Resolve tag / version / rolling ONCE and create the release up front, so the
+  # platform builds can upload assets into it in any order.
+  meta:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to create the release
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ver: ${{ steps.v.outputs.ver }}
+      rolling: ${{ steps.v.outputs.rolling }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag pushes release as-is; branch pushes roll v<base>.<run_number>.
+      - id: v
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+            ROLL=false
+          else
+            BASE=$(sed -n 's/.*"version": "\([0-9.]*\)".*/\1/p' src-tauri/tauri.conf.json | head -1)
+            if [ -z "$BASE" ]; then echo "::error::no version in tauri.conf.json"; exit 1; fi
+            TAG="v${BASE}.${{ github.run_number }}"
+            ROLL=true
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "rolling=$ROLL" >> "$GITHUB_OUTPUT"
+          echo "Building tag=$TAG rolling=$ROLL"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --target "${{ github.sha }}" --title "$TAG" --generate-notes
+
+  build-windows:
+    needs: meta
+    runs-on: windows-latest
+    permissions:
+      contents: write # needed to edit releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # NSIS only: one installer exe, with the WebView2 bootstrapper embedded so
+      # users never install anything else manually (see tauri.conf.json
+      # bundle.windows.webviewInstallMode). tauri downloads NSIS itself.
+      - name: Build
+        run: npx tauri build --bundles nsis
+        env:
+          KURISU_BUILD_VERSION: ${{ needs.meta.outputs.ver }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kurisu-windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/kurisu.exe
+
+      # The in-app updater downloads this sidecar and refuses to run an
+      # installer whose SHA-256 doesn't match (fails closed when it's missing).
+      - name: Write SHA-256 sidecar
+        shell: bash
+        run: |
+          cd src-tauri/target/release/bundle/nsis
+          for f in *.exe; do sha256sum "$f" > "$f.sha256"; done
+
+      # Attaches the assets to the release meta already created.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sha256
+            src-tauri/target/release/kurisu.exe
+
+  build-linux:
+    needs: meta
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # needed to edit releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - run: npm ci
+
+      # Bare binary only — bundles (deb/rpm/AppImage) aren't the update asset.
+      - name: Build
+        run: npx tauri build --no-bundle
+        env:
+          KURISU_BUILD_VERSION: ${{ needs.meta.outputs.ver }}
+
+      # The asset name MUST stay exactly "kurisu" (+ ".sha256" sidecar): that is
+      # the name the Linux updater looks up in the release.
+      - name: Write SHA-256 sidecar
+        working-directory: src-tauri/target/release
+        run: sha256sum kurisu > kurisu.sha256
+
+      - name: Upload Linux binary to release
+        working-directory: src-tauri/target/release
+        run: gh release upload "${{ needs.meta.outputs.tag }}" kurisu kurisu.sha256 --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # After a rolling release publishes with both assets, delete the superseded
+  # rolling releases and their tags. Only 4-segment auto tags (vN.N.N.N) are
+  # touched; hand-cut vX.Y.Z releases stay as permanent milestones. Runs only
+  # on full success, so a failed build never deletes the last working rolling
+  # release.
+  prune-rolling:
+    needs: [meta, build-windows, build-linux]
+    if: needs.meta.outputs.rolling == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete superseded rolling releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ needs.meta.outputs.tag }}
+        run: |
+          gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease | not) | .tagName' | while read -r t; do
+            [ -z "$t" ] && continue
+            [ "$t" = "$KEEP" ] && continue
+            echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
+            echo "Pruning superseded rolling release $t"
+            gh release delete "$t" --cleanup-tag --yes || true
+          done

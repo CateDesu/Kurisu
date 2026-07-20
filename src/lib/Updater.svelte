@@ -4,17 +4,20 @@
   import type { UpdateInfo } from "$lib/types";
 
   // Shown when the backend's startup check finds a newer release (the
-  // `kurisu://update-available` event). Windows-only in practice — the backend
-  // never emits elsewhere. `null` = hidden.
+  // `kurisu://update-available` event). `null` = hidden.
   let update = $state<UpdateInfo | null>(null);
   let busy = $state(false);
   let err = $state("");
+  // Linux swaps the binary in place and needs a manual restart; Windows
+  // quits by itself once the installer launches.
+  let installed = $state(false);
 
   $effect(() => {
     let un: (() => void) | undefined;
     listen<UpdateInfo>("kurisu://update-available", (e) => {
       update = e.payload;
       err = "";
+      installed = false;
     }).then((u) => (un = u));
     return () => un?.();
   });
@@ -24,9 +27,9 @@
     busy = true;
     err = "";
     try {
-      // On success the installer has launched and the app quits itself, so
-      // there is nothing more to render here.
-      await api.installUpdate();
+      const result = await api.installUpdate();
+      if (result === "installed") installed = true;
+      // "restarting": the installer launched and the app quits itself.
     } catch (e) {
       err = String(e);
       busy = false;
@@ -54,33 +57,47 @@
       tabindex="-1"
     >
       <h3 class="font-semibold mb-1">Update available</h3>
-      <p class="text-sm text-ink-dim mb-3">
-        Kurisu <b class="text-ink">{update.version}</b> is out — you're on {update.current}.
-      </p>
-      {#if update.body}
-        <pre class="text-xs text-ink-dim whitespace-pre-wrap max-h-32 overflow-y-auto bg-panel-2 border border-edge rounded-md p-2 mb-4">{update.body}</pre>
+      {#if installed}
+        <p class="text-sm text-ink-dim mb-3">
+          Kurisu <b class="text-ink">{update.version}</b> is installed — restart the app to finish.
+        </p>
+        <div class="flex justify-end">
+          <button
+            onclick={later}
+            class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm"
+          >
+            Got it
+          </button>
+        </div>
+      {:else}
+        <p class="text-sm text-ink-dim mb-3">
+          Kurisu <b class="text-ink">{update.version}</b> is out — you're on {update.current}.
+        </p>
+        {#if update.body}
+          <pre class="text-xs text-ink-dim whitespace-pre-wrap max-h-32 overflow-y-auto bg-panel-2 border border-edge rounded-md p-2 mb-4">{update.body}</pre>
+        {/if}
+        {#if err}
+          <p class="text-xs text-red-400 mb-3">Update failed: {err}</p>
+        {/if}
+        <div class="flex justify-end items-center gap-2">
+          <button
+            onclick={later}
+            class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+          >
+            Later
+          </button>
+          <button
+            onclick={install}
+            disabled={busy}
+            class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
+          >
+            {busy ? "Downloading…" : "Download & install"}
+          </button>
+        </div>
+        <p class="text-xs text-ink-dim mt-3">
+          Downloads the update, then closes Kurisu so it can finish.
+        </p>
       {/if}
-      {#if err}
-        <p class="text-xs text-red-400 mb-3">Update failed: {err}</p>
-      {/if}
-      <div class="flex justify-end items-center gap-2">
-        <button
-          onclick={later}
-          class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
-        >
-          Later
-        </button>
-        <button
-          onclick={install}
-          disabled={busy}
-          class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
-        >
-          {busy ? "Downloading…" : "Download & install"}
-        </button>
-      </div>
-      <p class="text-xs text-ink-dim mt-3">
-        Downloads the installer, then closes Kurisu so it can finish.
-      </p>
     </div>
   </div>
 {/if}

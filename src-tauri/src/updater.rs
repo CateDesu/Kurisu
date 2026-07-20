@@ -1,10 +1,15 @@
 //! Self-update over the rolling GitHub release — same shape as NyaaTriggers'
 //! updater: fetch `/releases/latest`, compare numeric version tuples, download
-//! with a SHA-256 check that fails closed, then hand off. Kurisu ships an NSIS
-//! installer on Windows, so the hand-off is "launch the verified installer and
-//! quit", not a staged file swap. Only Windows builds can self-update: CI
-//! publishes no Linux/macOS asset, so `install_update` is a Windows-only
-//! command and `check_update` reports `can_install: false` elsewhere.
+//! with a SHA-256 check that fails closed, then hand off per platform:
+//!
+//! - **Windows**: launch the verified NSIS installer and quit, so it can
+//!   overwrite the install.
+//! - **Linux**: swap the running binary for the verified one (two adjacent
+//!   renames; a running Linux binary can be replaced, unlike Windows) and let
+//!   the UI prompt a restart.
+//!
+//! Anything else reports `can_install: false` and updates by hand from the
+//! release page.
 
 use std::collections::HashMap;
 use std::io;
@@ -121,18 +126,33 @@ fn parse_release(data: &Value) -> Release {
     }
 }
 
-/// The NSIS installer asset name in `rel` (`…-setup.exe`), if it ships one.
-/// The `.sha256` sidecar ends in `-setup.exe.sha256`, so it can't match.
-pub fn installer_asset(rel: &Release) -> Option<&str> {
-    rel.assets
-        .keys()
-        .find(|n| n.ends_with("-setup.exe"))
-        .map(String::as_str)
+/// The updatable asset for THIS platform in `rel`: the NSIS installer
+/// (`…-setup.exe`) on Windows, the bare `kurisu` binary on Linux. `None`
+/// elsewhere. Never matches the `.sha256` sidecars.
+pub fn platform_asset(rel: &Release) -> Option<&str> {
+    #[cfg(target_os = "windows")]
+    {
+        rel.assets
+            .keys()
+            .find(|n| n.ends_with("-setup.exe"))
+            .map(String::as_str)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        rel.assets
+            .keys()
+            .find(|n| n.as_str() == "kurisu")
+            .map(String::as_str)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = rel;
+        None
+    }
 }
 
 /// Fetch the `.sha256` sidecar text for an asset, if the release publishes one.
-/// (Only the Windows install path calls this today.)
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, target_os = "linux"))]
 pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
     let url = rel.assets.get(&format!("{asset_name}.sha256"))?;
     let client = reqwest::Client::builder()
@@ -147,8 +167,7 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
 /// Stream `url` to `dest`, writing to a `.part` and renaming on success so a
 /// half-download is never mistaken for complete. Verifies Content-Length (a
 /// clean early close is a short read with no error). `.part` removed on failure.
-/// (Only the Windows install path calls this today.)
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, target_os = "linux"))]
 pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
     use std::io::Write;
     let part = {
@@ -195,8 +214,8 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
 /// Whether the `.sha256` sidecar text authorizes `file`. `Ok(true)` = digest
 /// matches; `Ok(false)` = digest found but does NOT match; `Err(_)` = no
 /// readable digest or unreadable file. Callers fail closed on anything but
-/// `Ok(true)`. (Only the Windows install path calls this today.)
-#[cfg_attr(not(windows), allow(dead_code))]
+/// `Ok(true)`.
+#[cfg(any(windows, target_os = "linux"))]
 pub fn verify_sha256(file: &Path, sidecar_text: &str) -> io::Result<bool> {
     use sha2::{Digest, Sha256};
     let expected = sidecar_text
@@ -212,10 +231,42 @@ pub fn verify_sha256(file: &Path, sidecar_text: &str) -> io::Result<bool> {
     Ok(got_hex == expected)
 }
 
-/// Remove leftover `.kurisu-update-*` installer downloads in `dir` (a finished
-/// or aborted update leaves the installer behind). Best-effort, every launch.
-/// (Only the Windows startup task calls this today.)
-#[cfg_attr(not(windows), allow(dead_code))]
+// ── Apply: Linux in-place binary swap ───────────────────────────────────────
+
+/// Replace the running exe with the verified download: stage it next to the
+/// live exe (same filesystem), then two adjacent renames — live exe aside to
+/// `<name>.kurisu-old`, staged file in as the exe. Rolls back if the second
+/// rename fails; the backup is swept on the next launch. The caller prompts
+/// the user to restart.
+#[cfg(target_os = "linux")]
+pub fn apply_linux_update(new_bin: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("cannot locate install dir")?;
+    let name = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("cannot locate install dir")?;
+    let staging = dir.join(format!(".kurisu-new-{}", std::process::id()));
+    let backup = dir.join(format!("{name}.kurisu-old"));
+    let result = (|| -> io::Result<()> {
+        std::fs::copy(new_bin, &staging)?;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&exe, &backup)?;
+        if let Err(e) = std::fs::rename(&staging, &exe) {
+            let _ = std::fs::rename(&backup, &exe); // roll the exe swap back
+            return Err(e);
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staging);
+    result.map_err(|e| format!("could not install the update: {e}"))
+}
+
+// ── Leftover sweeps ─────────────────────────────────────────────────────────
+
+/// Remove leftover `.kurisu-update-*` downloads in `dir` (a finished or
+/// aborted update leaves the download behind). Best-effort, every launch.
 pub fn sweep_update_leftovers(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -224,6 +275,22 @@ pub fn sweep_update_leftovers(dir: &Path) {
                 .to_string_lossy()
                 .starts_with(".kurisu-update-")
             {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Remove update leftovers next to the installed exe: `.kurisu-new-*` staging
+/// files from an interrupted swap and `<name>.kurisu-old` backups (a launched
+/// build no longer needs its rollback copy — the swap already proved itself
+/// by running). Best-effort, every launch.
+pub fn sweep_install_leftovers(exe_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(exe_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".kurisu-new-") || name.ends_with(".kurisu-old") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -249,14 +316,20 @@ mod tests {
     }
 
     #[test]
-    fn installer_asset_picks_nsis_not_sidecar() {
+    fn platform_asset_picks_this_platforms_asset() {
         let mut rel = Release::default();
         rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u1".into());
-        assert_eq!(installer_asset(&rel), None);
+            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u1".into());
         rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u2".into());
+            .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u2".into());
         rel.assets.insert("kurisu.exe".into(), "u3".into());
-        assert_eq!(installer_asset(&rel), Some("Kurisu_1.0.0_x64-setup.exe"));
+        rel.assets.insert("kurisu.sha256".into(), "u4".into());
+        // Sidecars and the other platform's assets never match.
+        assert_eq!(platform_asset(&rel), None);
+        rel.assets.insert("kurisu".into(), "u5".into());
+        #[cfg(target_os = "linux")]
+        assert_eq!(platform_asset(&rel), Some("kurisu"));
+        #[cfg(target_os = "windows")]
+        assert_eq!(platform_asset(&rel), Some("Kurisu_1.0.0_x64-setup.exe"));
     }
 }

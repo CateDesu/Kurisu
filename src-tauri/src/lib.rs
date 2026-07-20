@@ -158,16 +158,19 @@ pub fn run() {
             playback::spawn(app.handle().clone());
 
             // Startup update check (Settings → Updates can turn it off; default on).
-            // Windows only: CI ships no Linux/macOS asset, so elsewhere the check
-            // would only nag. Emits `kurisu://update-available` when a newer
-            // installer is published; the UI prompts from there.
-            #[cfg(target_os = "windows")]
+            // Emits `kurisu://update-available` when a newer release ships an
+            // asset this platform can install; the UI prompts from there.
             {
                 use tauri::Emitter;
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Ok(dir) = handle.path().app_local_data_dir() {
                         updater::sweep_update_leftovers(&dir);
+                    }
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Some(dir) = exe.parent() {
+                            updater::sweep_install_leftovers(dir);
+                        }
                     }
                     // Let the window settle before hitting the network.
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -183,7 +186,7 @@ pub fn run() {
                         return;
                     }
                     if let Ok(rel) = updater::fetch_latest_release().await {
-                        if updater::installer_asset(&rel).is_some()
+                        if updater::platform_asset(&rel).is_some()
                             && updater::is_newer(&rel.version, updater::current_version())
                         {
                             let _ = handle.emit(

@@ -17,6 +17,7 @@
   let updateChecking = $state(false);
   let updateInstalling = $state(false);
   let updateError = $state("");
+  let updateStatus = $state("");
 
   let signingIn = $state(false);
   let signInErr = $state("");
@@ -74,9 +75,11 @@
   async function installUpdate() {
     updateInstalling = true;
     updateError = "";
+    updateStatus = "";
     try {
-      // On success the installer has launched and the app quits itself.
-      await api.installUpdate();
+      const result = await api.installUpdate();
+      // "restarting": the installer launched and the app quits itself.
+      if (result === "installed") updateStatus = "Installed — restart Kurisu to finish.";
     } catch (e) {
       updateError = String(e);
       updateInstalling = false;
@@ -210,7 +213,7 @@
       >
         {updateChecking ? "Checking…" : "Check for updates"}
       </button>
-      {#if update?.available && update.can_install}
+      {#if update?.available && update.can_install && !updateStatus}
         <button
           onclick={installUpdate}
           disabled={updateInstalling}
@@ -242,6 +245,9 @@
     {/if}
     {#if updateError}
       <p class="text-xs text-red-400 mt-2">Update failed: {updateError}</p>
+    {/if}
+    {#if updateStatus}
+      <p class="text-xs text-accent mt-2">{updateStatus}</p>
     {/if}
   </section>
 </div>
