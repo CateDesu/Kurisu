@@ -15,7 +15,7 @@ Named after Makise Kurisu (Steins;Gate).
 - **Playback tracking** - detects playback (platform notes below), matches the title against your list, and prompts or auto-updates progress to the detected episode. In-app only, no desktop notifications.
 - **Notifications** - your AniList inbox, mirroring anilist.co/notifications.
 - **Desktop integration** - custom dark title bar, system tray, borderless window with edge/corner resize.
-- **Self-update** - checks the rolling GitHub release on startup (Settings → Updates, on by default) and installs in place on Linux and Windows. Builds are verified against a SHA-256 sidecar before anything is run.
+- **Self-update** - CI builds check the rolling GitHub release on startup (Settings → Updates, on by default) and install in place on Linux and Windows. Builds are verified against a SHA-256 sidecar before anything is run. Locally compiled builds don't auto-check, so developing never nags.
 
 ## Windows
 

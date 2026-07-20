@@ -176,10 +176,13 @@ pub fn run() {
             // tick swallows its own errors, so a flaky player can't crash detection.
             playback::spawn(app.handle().clone());
 
-            // Startup update check (Settings → Updates can turn it off; default on).
-            // Emits `kurisu://update-available` when a newer release ships an
-            // asset this platform can install; the UI prompts from there.
-            {
+            // Startup update check — CI-stamped builds only (locally compiled
+            // builds skip it: they report the base version and would nag about
+            // every newer rolling build during development). Settings →
+            // Updates can turn it off (default on); a manual check there works
+            // on any build. Emits `kurisu://update-available` when a newer
+            // release ships an asset this platform can install.
+            if updater::is_ci_build() {
                 use tauri::Emitter;
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {

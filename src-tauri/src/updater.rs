@@ -62,6 +62,15 @@ pub fn current_version() -> &'static str {
     }
 }
 
+/// True only when this binary was stamped by CI. Unstamped (locally compiled)
+/// builds never auto-check on startup: they report the X.Y.Z base version, so
+/// the dev loop would get nagged by every newer rolling build — and an
+/// accidental install would overwrite the working tree's binary. A manual
+/// check from Settings still works on any build.
+pub fn is_ci_build() -> bool {
+    matches!(option_env!("KURISU_BUILD_VERSION"), Some(v) if !v.is_empty())
+}
+
 // ── Release lookup ──────────────────────────────────────────────────────────
 
 /// A GitHub release, reduced to what the updater needs. `assets` maps asset
