@@ -1,6 +1,6 @@
 [package]
 name = "kurisu"
-version = "0.2.0"
+version = "1.0.0"
 description = "A Taiga-style anime tracker for Linux"
 authors = ["CateDesu"]
 edition = "2021"
@@ -34,6 +34,8 @@ thiserror = "2"
 # filename / now-playing title parsing — milestone 2/3
 regex = "1"
 log = "0.4"
+# update download integrity (SHA-256 sidecar verification)
+sha2 = "0.10"
 
 # MPRIS2 playback detection (MPV/VLC/Celluloid/…) — Linux only. Windows uses
 # GSMTC via the `windows` crate below; other platforms get a no-op stub.

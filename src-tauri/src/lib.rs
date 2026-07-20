@@ -8,6 +8,7 @@ mod library;
 mod models;
 mod playback;
 mod recognize;
+mod updater;
 
 use commands::AppState;
 use directories::ProjectDirs;
@@ -78,6 +79,8 @@ pub fn run() {
             commands::add_library_folder,
             commands::remove_library_folder,
             commands::scan_library,
+            commands::check_update,
+            commands::install_update,
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -153,6 +156,52 @@ pub fn run() {
             // Background MPRIS2 playback watcher. Runs for the app's lifetime; every
             // tick swallows its own errors, so a flaky player can't crash detection.
             playback::spawn(app.handle().clone());
+
+            // Startup update check (Settings → Updates can turn it off; default on).
+            // Windows only: CI ships no Linux/macOS asset, so elsewhere the check
+            // would only nag. Emits `kurisu://update-available` when a newer
+            // installer is published; the UI prompts from there.
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::Emitter;
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(dir) = handle.path().app_local_data_dir() {
+                        updater::sweep_update_leftovers(&dir);
+                    }
+                    // Let the window settle before hitting the network.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let enabled = handle
+                        .state::<AppState>()
+                        .db
+                        .get_setting("auto_update")
+                        .ok()
+                        .flatten()
+                        .map(|v| v != "0")
+                        .unwrap_or(true);
+                    if !enabled {
+                        return;
+                    }
+                    if let Ok(rel) = updater::fetch_latest_release().await {
+                        if updater::installer_asset(&rel).is_some()
+                            && updater::is_newer(&rel.version, updater::current_version())
+                        {
+                            let _ = handle.emit(
+                                "kurisu://update-available",
+                                serde_json::json!({
+                                    "available": true,
+                                    "can_install": true,
+                                    "version": rel.version,
+                                    "tag": rel.tag,
+                                    "html_url": rel.html_url,
+                                    "body": rel.body,
+                                    "current": updater::current_version(),
+                                }),
+                            );
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

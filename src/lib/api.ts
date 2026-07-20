@@ -1,7 +1,7 @@
 // Typed wrappers over every Tauri command. Centralizes the invoke calls so the UI
 // never builds the call strings by hand, and gives us one place to handle errors.
 import { invoke } from "@tauri-apps/api/core";
-import type { LibraryFile, ListEntry, Media, Notification, TrackingConfig, User } from "./types";
+import type { LibraryFile, ListEntry, Media, Notification, TrackingConfig, UpdateInfo, User } from "./types";
 
 export const api = {
   getClientId: () => invoke<string | null>("get_client_id"),
@@ -66,4 +66,7 @@ export const api = {
   removeLibraryFolder: (path: string) =>
     invoke<string[]>("remove_library_folder", { path }),
   scanLibrary: () => invoke<LibraryFile[]>("scan_library"),
+
+  checkUpdate: () => invoke<UpdateInfo>("check_update"),
+  installUpdate: () => invoke<string>("install_update"),
 };

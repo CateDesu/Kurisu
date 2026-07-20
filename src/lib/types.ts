@@ -179,6 +179,17 @@ export interface TrackingPrompt {
   progress: number;
 }
 
+/// Self-update check result (settings page + the startup prompt).
+export interface UpdateInfo {
+  available: boolean; // a newer release exists on GitHub
+  can_install: boolean; // this build can update in place (Windows + installer asset)
+  version: string; // latest release version
+  tag: string;
+  html_url: string;
+  body: string; // release notes
+  current: string; // this build's version
+}
+
 /// One video file from the library scan (M3).
 export interface LibraryFile {
   path: string;

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import type { TrackingConfig } from "$lib/types";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import type { TrackingConfig, UpdateInfo } from "$lib/types";
 
   let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80 });
   let trackingLoaded = $state(false);
@@ -9,6 +10,13 @@
   let trackingSavedAt = $state(0);
 
   let closeToTray = $state(false);
+
+  // Auto-update defaults ON: only an explicit "0" turns it off.
+  let autoUpdate = $state(true);
+  let update = $state<UpdateInfo | null>(null);
+  let updateChecking = $state(false);
+  let updateInstalling = $state(false);
+  let updateError = $state("");
 
   let signingIn = $state(false);
   let signInErr = $state("");
@@ -22,6 +30,7 @@
   async function load() {
     cfg = await api.getTrackingConfig();
     closeToTray = (await api.getAppSetting("close_to_tray")) === "1";
+    autoUpdate = (await api.getAppSetting("auto_update")) !== "0";
     trackingLoaded = true;
   }
   async function signIn() {
@@ -46,6 +55,32 @@
   }
   async function toggleCloseToTray() {
     await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
+  }
+  async function toggleAutoUpdate() {
+    await api.setAppSetting("auto_update", autoUpdate ? "1" : "0");
+  }
+  async function checkForUpdate() {
+    updateChecking = true;
+    updateError = "";
+    update = null;
+    try {
+      update = await api.checkUpdate();
+    } catch (e) {
+      updateError = String(e);
+    } finally {
+      updateChecking = false;
+    }
+  }
+  async function installUpdate() {
+    updateInstalling = true;
+    updateError = "";
+    try {
+      // On success the installer has launched and the app quits itself.
+      await api.installUpdate();
+    } catch (e) {
+      updateError = String(e);
+      updateInstalling = false;
+    }
   }
   load();
 </script>
@@ -151,5 +186,62 @@
       Off by default — the close button quits Kurisu outright. Turn this on to keep
       it running in the tray instead (Quit is always available in the tray menu).
     </p>
+  </section>
+
+  <section class="pt-4 border-t border-edge">
+    <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Updates</h2>
+    <label class="flex items-center gap-2 text-sm cursor-pointer">
+      <input
+        type="checkbox"
+        bind:checked={autoUpdate}
+        onchange={toggleAutoUpdate}
+        class="accent-accent"
+      />
+      Automatically check for updates on startup
+    </label>
+    <p class="text-xs text-ink-dim mt-1 mb-3">
+      On by default. Checks GitHub for a newer build and offers to install it.
+    </p>
+    <div class="flex items-center gap-2">
+      <button
+        onclick={checkForUpdate}
+        disabled={updateChecking || updateInstalling}
+        class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+      >
+        {updateChecking ? "Checking…" : "Check for updates"}
+      </button>
+      {#if update?.available && update.can_install}
+        <button
+          onclick={installUpdate}
+          disabled={updateInstalling}
+          class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
+        >
+          {updateInstalling ? "Downloading…" : `Install ${update.version}`}
+        </button>
+      {/if}
+    </div>
+    {#if update}
+      {#if update.available}
+        <p class="text-xs text-accent mt-2">
+          Version {update.version} is available (you're on {update.current}).
+          {#if !update.can_install}
+            <button
+              onclick={() => openUrl(update!.html_url)}
+              class="underline hover:text-accent-2 cursor-pointer"
+            >
+              Download it from GitHub
+            </button>
+          {/if}
+        </p>
+        {#if update.body}
+          <pre class="text-xs text-ink-dim whitespace-pre-wrap max-h-32 overflow-y-auto bg-panel-2 border border-edge rounded-md p-2 mt-2">{update.body}</pre>
+        {/if}
+      {:else}
+        <p class="text-xs text-ink-dim mt-2">Up to date — you're on {update.current}.</p>
+      {/if}
+    {/if}
+    {#if updateError}
+      <p class="text-xs text-red-400 mt-2">Update failed: {updateError}</p>
+    {/if}
   </section>
 </div>

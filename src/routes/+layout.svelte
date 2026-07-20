@@ -7,6 +7,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
+  import Updater from "$lib/Updater.svelte";
   import Icon from "$lib/Icon.svelte";
   let { children } = $props();
 
@@ -48,6 +49,7 @@
     </div>
   {:else}
     <Tracking />
+    <Updater />
     <div class="flex flex-1 overflow-hidden">
       <aside class="w-56 shrink-0 border-r border-edge bg-panel flex flex-col">
         <div class="px-4 py-4 flex items-center gap-2">

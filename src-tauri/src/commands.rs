@@ -489,6 +489,91 @@ pub async fn get_notifications(state: State<'_, AppState>) -> Result<Vec<Notific
     al.notifications().await.map_err(|e| e.to_string())
 }
 
+// ───────────────────────────── self-update ─────────────────────────────
+
+/// Check GitHub for a newer release. Returns `{available, can_install, version,
+/// tag, html_url, body, current}`: `available` = a newer release exists;
+/// `can_install` = this build can update in place (Windows + the release ships
+/// an NSIS installer). Other platforms get `can_install: false` and update
+/// manually from the release page.
+#[tauri::command]
+pub async fn check_update() -> Result<serde_json::Value, String> {
+    let rel = crate::updater::fetch_latest_release().await?;
+    let available = crate::updater::is_newer(&rel.version, crate::updater::current_version());
+    let can_install = cfg!(windows) && crate::updater::installer_asset(&rel).is_some();
+    Ok(serde_json::json!({
+        "available": available,
+        "can_install": can_install,
+        "version": rel.version,
+        "tag": rel.tag,
+        "html_url": rel.html_url,
+        "body": rel.body,
+        "current": crate::updater::current_version(),
+    }))
+}
+
+/// Download, verify, and install the latest release: the verified NSIS
+/// installer is launched and the app quits so it can overwrite the install.
+/// Returns "restarting" on hand-off. Fails closed on a checksum problem.
+/// Windows-only — CI publishes no other platform's asset.
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let rel = crate::updater::fetch_latest_release().await?;
+        let asset = crate::updater::installer_asset(&rel)
+            .ok_or_else(|| "the latest release has no Windows installer".to_string())?
+            .to_string();
+        let url = rel
+            .assets
+            .get(&asset)
+            .cloned()
+            .ok_or_else(|| "the latest release has no Windows installer".to_string())?;
+
+        // Download into the app-data dir (always user-writable) under a
+        // pid-unique name; swept on the next launch.
+        let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let tmp = dir.join(format!(".kurisu-update-{}-{asset}", std::process::id()));
+        crate::updater::download(&url, &tmp).await?;
+
+        // Verify against the published `.sha256` sidecar and FAIL CLOSED: an
+        // unverifiable installer is refused, never run.
+        let verify = async {
+            let sidecar = crate::updater::fetch_sidecar(&rel, &asset)
+                .await
+                .ok_or_else(|| "no SHA-256 checksum available for this release; refusing to install unverified".to_string())?;
+            match crate::updater::verify_sha256(&tmp, &sidecar) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("update failed integrity check (SHA-256 mismatch)".to_string()),
+                Err(e) => Err(format!("could not verify the download: {e}")),
+            }
+        }
+        .await;
+        if let Err(e) = verify {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+
+        // Hand off: launch the installer, then quit so it can overwrite us.
+        std::process::Command::new(&tmp)
+            .spawn()
+            .map_err(|e| format!("could not launch the installer: {e}"))?;
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            handle.exit(0);
+        });
+        Ok("restarting".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("in-app update is only supported on Windows builds".to_string())
+    }
+}
+
 fn parse_status(s: &str) -> Result<ListStatus, String> {
     Ok(match s.to_uppercase().as_str() {
         "CURRENT" | "WATCHING" => ListStatus::Current,
