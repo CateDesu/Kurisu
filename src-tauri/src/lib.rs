@@ -17,6 +17,12 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Logger for the `log` facade calls (playback tick diagnostics): our crate
+    // at debug, deps at info. Override with RUST_LOG; stderr lands in the
+    // systemd user journal on most desktops.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("kurisu_lib=debug,info"))
+        .init();
+
     // WebKit2GTK's DMA-BUF renderer crashes in Mesa/GBM teardown on exit on many
     // Wayland setups (SIGSEGV in dri_gbm.so during process exit). The long-standing
     // workaround is to disable it and fall back to the stable path — at the cost of
@@ -26,29 +32,9 @@ pub fn run() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
-    let proj = ProjectDirs::from("com", "catedesu", "kurisu")
-        .expect("no home directory for app data");
-    let db_path = proj.data_local_dir().join("kurisu.db");
-    let db = db::Db::open(&db_path).expect("failed to open kurisu.db");
-
-    // Restore a saved token so the app starts logged in.
-    let mut anilist = anilist::AniList::new();
-    if let Ok(Some(token)) = db.get_setting("anilist_token") {
-        if !token.is_empty() {
-            anilist.set_token(Some(token));
-        }
-    }
-
-    let state = AppState {
-        anilist: Mutex::new(anilist),
-        db,
-        user: Mutex::new(None),
-    };
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::get_client_id,
             commands::set_client_id,
@@ -85,6 +71,39 @@ pub fn run() {
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+            // All app data lives under Tauri's app-data dir (derived from the
+            // bundle identifier), so backup/reset touches ONE path. Pre-1.0
+            // builds kept the DB under ProjectDirs (e.g. ~/.local/share/kurisu);
+            // migrate it over — but never clobber a real DB already at the new
+            // path (an empty placeholder left by an old WebKit run is fair game).
+            let data_dir = app.path().app_local_data_dir().expect("no app data dir");
+            std::fs::create_dir_all(&data_dir).expect("cannot create app data dir");
+            let db_path = data_dir.join("kurisu.db");
+            if let Some(legacy) = ProjectDirs::from("com", "catedesu", "kurisu")
+                .map(|p| p.data_local_dir().join("kurisu.db"))
+                .filter(|p| p != &db_path)
+            {
+                let target_free = std::fs::metadata(&db_path).map(|m| m.len() == 0).unwrap_or(true);
+                let legacy_has_data = std::fs::metadata(&legacy).map(|m| m.len() > 0).unwrap_or(false);
+                if target_free && legacy_has_data {
+                    let _ = std::fs::copy(&legacy, &db_path);
+                }
+            }
+            let db = db::Db::open(&db_path).expect("failed to open kurisu.db");
+
+            // Restore a saved token so the app starts logged in.
+            let mut anilist = anilist::AniList::new();
+            if let Ok(Some(token)) = db.get_setting("anilist_token") {
+                if !token.is_empty() {
+                    anilist.set_token(Some(token));
+                }
+            }
+            app.manage(AppState {
+                anilist: Mutex::new(anilist),
+                db,
+                user: Mutex::new(None),
+            });
 
             let show = MenuItem::with_id(app, "show", "Show Kurisu", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -167,13 +186,30 @@ pub fn run() {
                     if let Ok(dir) = handle.path().app_local_data_dir() {
                         updater::sweep_update_leftovers(&dir);
                     }
+                    // A leftover failure marker means a previous update's swap
+                    // AND its rollback both failed; the user only gets here by
+                    // manually restoring the backup. Surface it once.
+                    let mut update_failed = false;
                     if let Ok(exe) = std::env::current_exe() {
                         if let Some(dir) = exe.parent() {
                             updater::sweep_install_leftovers(dir);
+                            let marker = dir.join(updater::FAILED_MARKER);
+                            if marker.exists() {
+                                let _ = std::fs::remove_file(&marker);
+                                update_failed = true;
+                            }
                         }
                     }
-                    // Let the window settle before hitting the network.
+                    // Let the window settle before emitting / hitting the network.
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if update_failed {
+                        let _ = handle.emit(
+                            "kurisu://update-failed",
+                            serde_json::json!({
+                                "message": "The last update failed to install cleanly, so the previous version was kept. Nothing was lost — you can retry the update from Settings."
+                            }),
+                        );
+                    }
                     let enabled = handle
                         .state::<AppState>()
                         .db

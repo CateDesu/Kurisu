@@ -21,6 +21,11 @@ use serde_json::Value;
 const REPO: &str = "CateDesu/Kurisu";
 const USER_AGENT: &str = "Kurisu";
 
+/// Dropped next to the exe when a swap fails so badly the rollback rename also
+/// failed (exe missing, only the `.kurisu-old` backup remains). The next
+/// launch — possible only after a manual restore — surfaces it and removes it.
+pub const FAILED_MARKER: &str = ".kurisu-update-failed";
+
 // ── Version comparison (same semantics as NyaaTriggers' parse_version) ──────
 
 /// `"v1.0.0.8" -> (1, 0, 0, 8)`. Each dot segment contributes only its leading
@@ -254,7 +259,13 @@ pub fn apply_linux_update(new_bin: &Path) -> Result<(), String> {
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
         std::fs::rename(&exe, &backup)?;
         if let Err(e) = std::fs::rename(&staging, &exe) {
-            let _ = std::fs::rename(&backup, &exe); // roll the exe swap back
+            // Roll the exe swap back. If even that fails, the install is left
+            // with no working exe (only the backup): drop a marker the next
+            // launch surfaces, and sweep_install_leftovers keeps the orphaned
+            // backup, so a manual restore is always possible.
+            if std::fs::rename(&backup, &exe).is_err() {
+                let _ = std::fs::write(dir.join(FAILED_MARKER), "");
+            }
             return Err(e);
         }
         Ok(())
@@ -284,14 +295,19 @@ pub fn sweep_update_leftovers(dir: &Path) {
 /// Remove update leftovers next to the installed exe: `.kurisu-new-*` staging
 /// files from an interrupted swap and `<name>.kurisu-old` backups (a launched
 /// build no longer needs its rollback copy — the swap already proved itself
-/// by running). Best-effort, every launch.
+/// by running). A backup whose exe is MISSING is kept: after a doubly-failed
+/// swap it's the only working copy, and deleting it would brick the install.
 pub fn sweep_install_leftovers(exe_dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(exe_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".kurisu-new-") || name.ends_with(".kurisu-old") {
+            if name.starts_with(".kurisu-new-") {
                 let _ = std::fs::remove_file(entry.path());
+            } else if let Some(exe_name) = name.strip_suffix(".kurisu-old") {
+                if exe_dir.join(exe_name).exists() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
     }

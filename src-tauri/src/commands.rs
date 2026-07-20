@@ -186,7 +186,15 @@ pub async fn login_with_token(token: String, state: State<'_, AppState>) -> Resu
         a.set_token(Some(token.clone()));
     }
     let al = state.anilist.lock().unwrap().clone();
-    let user = al.viewer().await.map_err(|e| e.to_string())?;
+    let user = match al.viewer().await {
+        Ok(u) => u,
+        Err(e) => {
+            // Don't leave the rejected token in memory: is_logged_in would keep
+            // reporting true and every API call would fail until restart.
+            state.anilist.lock().unwrap().set_token(None);
+            return Err(e.to_string());
+        }
+    };
     state.db.set_setting(TOKEN_KEY, &token).map_err(|e| e.to_string())?;
     state.db.set_setting(USERNAME_KEY, &user.name).map_err(|e| e.to_string())?;
     *state.user.lock().unwrap() = Some(user.clone());
@@ -231,6 +239,8 @@ pub fn logout(state: State<'_, AppState>) {
 
 #[tauri::command]
 pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, String> {
+    // Cached user wins: a name/avatar change on AniList only shows after
+    // logout/login (no re-fetch per call). Acceptable for a single-user app.
     if let Some(u) = state.user.lock().unwrap().clone() {
         return Ok(Some(u));
     }

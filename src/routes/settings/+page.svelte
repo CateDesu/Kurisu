@@ -18,6 +18,7 @@
   let updateInstalling = $state(false);
   let updateError = $state("");
   let updateStatus = $state("");
+  let loadError = $state("");
 
   let signingIn = $state(false);
   let signInErr = $state("");
@@ -29,10 +30,14 @@
   ];
 
   async function load() {
-    cfg = await api.getTrackingConfig();
-    closeToTray = (await api.getAppSetting("close_to_tray")) === "1";
-    autoUpdate = (await api.getAppSetting("auto_update")) !== "0";
-    trackingLoaded = true;
+    try {
+      cfg = await api.getTrackingConfig();
+      closeToTray = (await api.getAppSetting("close_to_tray")) === "1";
+      autoUpdate = (await api.getAppSetting("auto_update")) !== "0";
+      trackingLoaded = true;
+    } catch (e) {
+      loadError = String(e);
+    }
   }
   async function signIn() {
     signingIn = true;
@@ -91,6 +96,11 @@
 <div class="p-5 max-w-2xl mx-auto space-y-8">
   <div>
     <h1 class="text-xl font-semibold mb-1">Settings</h1>
+    {#if loadError}
+      <p class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-2">
+        Couldn't load settings: {loadError}
+      </p>
+    {/if}
   </div>
 
   <section class="pt-4 border-t border-edge">

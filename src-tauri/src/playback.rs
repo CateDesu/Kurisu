@@ -76,13 +76,14 @@ struct ActiveTrack {
     key: String,
     accumulated: Duration,
     last_tick: Instant,
+    was_playing: bool,
     prompted: bool,
     incremented: bool,
 }
 
 impl ActiveTrack {
     fn new(key: String) -> Self {
-        Self { key, accumulated: Duration::ZERO, last_tick: Instant::now(), prompted: false, incremented: false }
+        Self { key, accumulated: Duration::ZERO, last_tick: Instant::now(), was_playing: false, prompted: false, incremented: false }
     }
 }
 
@@ -154,16 +155,18 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
 
     // Advance / reset the per-track state machine.
     let key = if !info.trackid.is_empty() { info.trackid.clone() } else { info.title.clone() };
-    let track = match active {
-        Some(t) if t.key == key => t,
-        _ => {
-            *active = Some(ActiveTrack::new(key));
-            active.as_mut().unwrap()
-        }
-    };
-    if info.playing {
+    if active.as_ref().map(|t| &t.key) != Some(&key) {
+        *active = Some(ActiveTrack::new(key));
+    }
+    let track = active.as_mut().unwrap();
+    // Credit the interval only when playing at BOTH ticks: sampling every 5s
+    // can't see intra-interval pauses, so counting a pause→resume interval in
+    // full would reach the prompt threshold early. Under-counting (a slightly
+    // late prompt) is the safe direction.
+    if info.playing && track.was_playing {
         track.accumulated += track.last_tick.elapsed();
     }
+    track.was_playing = info.playing;
     track.last_tick = Instant::now();
 
     // Tracking only applies once we've matched a list entry AND parsed an episode.

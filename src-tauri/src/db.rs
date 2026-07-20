@@ -109,7 +109,7 @@ impl Db {
                     next_airing_episode,next_airing_at
              FROM media WHERE id = ?",
         )?;
-        let row = stmt.query_row([id], |r| row_to_media(r)).ok();
+        let row = stmt.query_row([id], row_to_media).ok();
         Ok(row)
     }
 

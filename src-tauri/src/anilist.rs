@@ -15,8 +15,6 @@ const GRAPHQL: &str = "https://graphql.anilist.co";
 const AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
 /// Fixed port so the user registers ONE redirect_uri in their AniList client once.
 pub const OAUTH_PORT: u16 = 39417;
-#[allow(dead_code)]
-pub const REDIRECT_URI: &str = "http://127.0.0.1:39417/callback";
 
 /// `nextAiringEpisode { episode airingAt }` — shared by the search + list queries.
 #[derive(Deserialize)]
@@ -123,7 +121,10 @@ impl AniList {
             .await?;
         // AniList error envelope: { "errors": [ { "message": "..." } ] }
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("AniList ({}): {}", status, e))?;
         if let Some(errs) = body.get("errors") {
             let msg = errs
                 .get(0)
@@ -594,9 +595,19 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<Result<Strin
             Err(_) => return,
         };
         rt.block_on(async move {
+            // `closed()` takes &mut self; rebind so the select can poll it.
+            let mut tx = tx;
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             loop {
-                let (mut sock, _) = match listener.accept().await {
+                // Stop waiting when the caller dropped the receiver (login
+                // timed out or was abandoned): the listener drops with this
+                // task, freeing the port so a retry can bind it. Without this
+                // the port stayed bound for the process's lifetime and a
+                // second "Sign in" click always failed.
+                let (mut sock, _) = match tokio::select! {
+                    _ = tx.closed() => return,
+                    acc = listener.accept() => acc,
+                } {
                     Ok(s) => s,
                     Err(_) => continue,
                 };

@@ -40,14 +40,12 @@ pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
         let Some(m) = e.media else { continue };
         let mut variants = Vec::new();
         let mut norms = Vec::new();
-        for v in [m.title_english.as_deref(), m.title_romaji.as_deref(), m.title_native.as_deref()] {
-            if let Some(v) = v {
-                if !v.trim().is_empty() {
-                    let n = clean_title(v);
-                    if !n.is_empty() {
-                        variants.push(v.to_string());
-                        norms.push(n);
-                    }
+        for v in [m.title_english.as_deref(), m.title_romaji.as_deref(), m.title_native.as_deref()].into_iter().flatten() {
+            if !v.trim().is_empty() {
+                let n = clean_title(v);
+                if !n.is_empty() {
+                    variants.push(v.to_string());
+                    norms.push(n);
                 }
             }
         }
@@ -162,7 +160,7 @@ pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<
     let lp = playing.to_lowercase();
     for v in variants {
         let lv = v.to_lowercase();
-        if lv.is_empty() || lp.len() < lv.len() {
+        if lv.is_empty() {
             continue;
         }
         if lp.contains(&lv) {
@@ -180,12 +178,19 @@ pub(crate) fn parse_episode_guess(s: &str) -> Option<i64> {
     parse_last_episode_number(s)
 }
 
+/// Years read as "year, not episode": 1930 through next year. The upper bound
+/// tracks the current year instead of a hardcoded 2099.
+fn looks_like_year(n: i64) -> bool {
+    use chrono::Datelike;
+    (1930..=chrono::Utc::now().year() as i64 + 1).contains(&n)
+}
+
 /// Last integer that looks like an episode (excludes resolutions and 4-digit years).
 fn parse_last_episode_number(s: &str) -> Option<i64> {
     RE_NUM
         .find_iter(s)
         .filter_map(|m| m.as_str().parse::<i64>().ok())
-        .filter(|n| !NOISE_NUMBERS.contains(n) && !(*n >= 1930 && *n <= 2099))
+        .filter(|n| !NOISE_NUMBERS.contains(n) && !looks_like_year(*n))
         .filter(|n| *n >= 1 && *n <= 9999)
         .last()
 }

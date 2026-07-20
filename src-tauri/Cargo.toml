@@ -30,10 +30,10 @@ directories = "5"
 chrono = { version = "0.4", features = ["serde"] }
 # error handling
 anyhow = "1"
-thiserror = "2"
 # filename / now-playing title parsing — milestone 2/3
 regex = "1"
 log = "0.4"
+env_logger = "0.11"
 # update download integrity (SHA-256 sidecar verification)
 sha2 = "0.10"
 

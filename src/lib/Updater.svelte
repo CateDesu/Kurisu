@@ -11,15 +11,24 @@
   // Linux swaps the binary in place and needs a manual restart; Windows
   // quits by itself once the installer launches.
   let installed = $state(false);
+  // One-shot notice after a doubly-failed swap (see the backend marker).
+  let failedMsg = $state("");
 
   $effect(() => {
-    let un: (() => void) | undefined;
+    let un1: (() => void) | undefined;
+    let un2: (() => void) | undefined;
     listen<UpdateInfo>("kurisu://update-available", (e) => {
       update = e.payload;
       err = "";
       installed = false;
-    }).then((u) => (un = u));
-    return () => un?.();
+    }).then((u) => (un1 = u));
+    listen<{ message: string }>("kurisu://update-failed", (e) => {
+      failedMsg = e.payload.message;
+    }).then((u) => (un2 = u));
+    return () => {
+      un1?.();
+      un2?.();
+    };
   });
 
   async function install() {
@@ -98,6 +107,31 @@
           Downloads the update, then closes Kurisu so it can finish.
         </p>
       {/if}
+    </div>
+  </div>
+{/if}
+
+{#if failedMsg}
+  <div
+    class="fixed inset-0 bg-black/60 grid place-items-center z-50 backdrop-blur-sm"
+    role="presentation"
+  >
+    <div
+      class="bg-panel border border-edge rounded-xl p-5 max-w-sm w-full mx-4 shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+    >
+      <h3 class="font-semibold mb-1">Update failed</h3>
+      <p class="text-sm text-ink-dim mb-4">{failedMsg}</p>
+      <div class="flex justify-end">
+        <button
+          onclick={() => (failedMsg = "")}
+          class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm"
+        >
+          Got it
+        </button>
+      </div>
     </div>
   </div>
 {/if}
