@@ -82,7 +82,7 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-5xl mx-auto">
+  <div class="p-5 max-w-7xl mx-auto">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-xl font-semibold flex-1">My List</h1>
       <button
