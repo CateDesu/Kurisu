@@ -41,6 +41,8 @@ npm run tauri dev            # live dev
 
 Dependencies: `webkit2gtk-4.1`, `rustup`, and a C toolchain.
 
+> **Use `npx tauri build`, not a bare `cargo build` in `src-tauri`.** The Tauri CLI runs the frontend build first and embeds the output in the binary. A bare `cargo build` skips that step, so the binary ships with no frontend and the window opens to "Could not connect to localhost: Connection refused" with no list visible.
+
 ## License
 
 MIT
