@@ -17,6 +17,12 @@
 
   // Snapshot the entry's current values once (untrack = read, don't subscribe).
   // The modal edits a copy; the source list is reloaded on close.
+  const snap = untrack(() => ({
+    status: entry.status,
+    progress: entry.progress,
+    score: entry.score ?? null,
+    repeat: entry.repeat,
+  }));
   let status = $state(untrack(() => entry.status));
   let progress = $state(untrack(() => entry.progress));
   let score = $state<number | null>(untrack(() => entry.score ?? null));
@@ -79,7 +85,17 @@
     saving = true;
     err = "";
     try {
-      await api.updateEntry(entry.media_id, status, progress, score, repeat ?? 0);
+      // Merge with a FRESH read: fields the user didn't touch in the modal follow
+      // the live entry, so saving can't rewind progress that advanced (the
+      // auto-tracker, the row stepper) while the modal was open.
+      const fresh = await api.getEntry(entry.media_id);
+      await api.updateEntry(
+        entry.media_id,
+        status !== snap.status ? status : (fresh?.status ?? status),
+        progress !== snap.progress ? progress : (fresh?.progress ?? progress),
+        score !== snap.score ? score : (fresh?.score ?? null),
+        repeat !== snap.repeat ? (repeat ?? snap.repeat) : (fresh?.repeat ?? snap.repeat)
+      );
       onclose();
     } catch (e) {
       err = String(e);

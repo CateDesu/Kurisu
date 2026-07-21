@@ -30,6 +30,15 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
         .map_err(|e| format!("no app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+    // The DB holds the AniList token in plaintext. Keep the WHOLE data dir
+    // owner-only: the -wal/-shm sidecars are created lazily at the first write
+    // with the process umask, so chmodding the db file at open time misses
+    // them for the entire session.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let db_path = data_dir.join("kurisu.db");
     if let Some(legacy) = ProjectDirs::from("com", "catedesu", "kurisu")
         .map(|p| p.data_local_dir().join("kurisu.db"))
@@ -38,7 +47,32 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
         let target_free = std::fs::metadata(&db_path).map(|m| m.len() == 0).unwrap_or(true);
         let legacy_has_data = std::fs::metadata(&legacy).map(|m| m.len() > 0).unwrap_or(false);
         if target_free && legacy_has_data {
-            let _ = std::fs::copy(&legacy, &db_path);
+            // Copy to a temp name and rename into place: a mid-copy crash must
+            // not leave a truncated "real" DB (its presence would block every
+            // future migration attempt). Sidecars ride along so writes sitting
+            // in an un-checkpointed legacy WAL survive the move.
+            let tmp = data_dir.join(".kurisu-migrate.tmp");
+            let result = (|| -> std::io::Result<()> {
+                std::fs::copy(&legacy, &tmp)?;
+                for suffix in ["-wal", "-shm"] {
+                    let mut side = legacy.as_os_str().to_os_string();
+                    side.push(suffix);
+                    let side = std::path::PathBuf::from(side);
+                    if side.exists() {
+                        let mut tmp_side = tmp.as_os_str().to_os_string();
+                        tmp_side.push(suffix);
+                        let mut dst_side = db_path.as_os_str().to_os_string();
+                        dst_side.push(suffix);
+                        std::fs::copy(&side, &tmp_side)?;
+                        std::fs::rename(&tmp_side, dst_side)?;
+                    }
+                }
+                std::fs::rename(&tmp, &db_path)
+            })();
+            if let Err(e) = result {
+                log::warn!("legacy DB migration failed: {e}");
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
     db::Db::open(&db_path).map_err(|e| format!("cannot open {}: {e}", db_path.display()))

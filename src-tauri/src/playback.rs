@@ -26,7 +26,7 @@ use crate::commands::{self, AppState, TrackingConfig};
 #[cfg(target_os = "linux")]
 use crate::recognize::basename;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
-use crate::recognize::{match_title, parse_episode_after, parse_episode_guess};
+use crate::recognize::{match_title, resolve_episode};
 
 /// Poll interval. 5s is responsive enough for a 2-minute prompt threshold while
 /// keeping D-Bus chatter negligible.
@@ -311,10 +311,8 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     // rebuilding them from the DB every 5s tick was the hot path's main cost.
     let matchers = state.matchers.lock().clone();
     let matched = match_title(&matchers, &title, &url);
-    let episode = matched
-        .and_then(|m| parse_episode_after(&title, &m.variants).or_else(|| parse_episode_after(&basename(&url), &m.variants)))
-        .or_else(|| parse_episode_guess(&title))
-        .or_else(|| parse_episode_guess(&basename(&url)));
+    let base = basename(&url);
+    let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
 
     Ok(Some(TickInfo {
         playing,
@@ -399,9 +397,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let state = app.state::<AppState>();
     let matchers = state.matchers.lock().clone();
     let matched = match_title(&matchers, &title, "");
-    let episode = matched
-        .and_then(|m| parse_episode_after(&title, &m.variants))
-        .or_else(|| parse_episode_guess(&title));
+    let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str()]));
 
     Ok(Some(TickInfo {
         playing,

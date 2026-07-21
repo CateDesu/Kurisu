@@ -276,6 +276,26 @@ impl AniList {
             .collect())
     }
 
+    /// One anime by AniList id (the `get_media` cache-miss fallback — full-text
+    /// `search` can't look up by id).
+    pub async fn media_by_id(&self, id: i64) -> Result<Media> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "Media")]
+            media: AniMedia,
+        }
+        let q = "query ($id: Int!) {
+            Media(id: $id, type: ANIME) {
+                id idMal title { romaji english native }
+                coverImage { medium large }
+                episodes format status averageScore season seasonYear description
+                nextAiringEpisode { episode airingAt }
+            }
+        }";
+        let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
+        Ok(Media::from(r.media))
+    }
+
     /// Pull the full list (every status group) for a user and flatten to entries.
     /// AniList chunks big lists at 500 entries per status group — walk the chunks
     /// via `hasNextChunk` or large accounts sync an incomplete list.
@@ -481,6 +501,7 @@ impl AniList {
             ... on ActivityLikeNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ActivityMentionNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ActivityReplyNotification { id type createdAt context activityId user { name avatar { large } } }
+            ... on ActivityReplySubscribedNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ActivityReplyLikeNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ActivityMessageNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ThreadCommentMentionNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
@@ -498,6 +519,11 @@ impl AniList {
             .notifications
             .unwrap_or_default()
             .into_iter()
+            // A notification type this query has no fragment for comes back as
+            // `{}` → kind "" and id 0. Drop it: rendering a ghost row (with a
+            // duplicate `id` for the frontend's keyed each) is worse than
+            // hiding it until the type is added.
+            .filter(|n| !n.kind.is_empty())
             .map(|n| Notification {
                 id: n.id,
                 kind: n.kind,

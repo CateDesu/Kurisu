@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::db::Db;
 use crate::models::LibraryFile;
-use crate::recognize::{basename, match_title, parse_episode_after, parse_episode_guess, Matcher};
+use crate::recognize::{basename, match_title, resolve_episode, Matcher};
 
 const FOLDERS_KEY: &str = "library_folders";
 /// Recursion cap — plenty for `Anime/Series/Season 2/file.mkv` layouts, and keeps
@@ -76,9 +76,7 @@ pub fn scan_paths(folders: &[String], matchers: &[Matcher]) -> Vec<LibraryFile> 
         .map(|path| {
             let base = basename(&path);
             let matched = match_title(matchers, "", &path);
-            let episode = matched
-                .and_then(|m| parse_episode_after(&base, &m.variants))
-                .or_else(|| parse_episode_guess(&base));
+            let episode = matched.and_then(|m| resolve_episode(m, &[base.as_str()]));
             LibraryFile {
                 path,
                 media_id: matched.map(|m| m.media_id),

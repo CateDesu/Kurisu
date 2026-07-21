@@ -334,13 +334,7 @@ pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, Str
         return Ok(m);
     }
     let al = state.anilist.lock().clone();
-    let v = al
-        .search(&id.to_string(), 5)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| "media not found".to_string())?;
+    let v = al.media_by_id(id).await.map_err(|e| e.to_string())?;
     state.db.upsert_media(&v).map_err(|e| e.to_string())?;
     Ok(v)
 }
@@ -359,12 +353,18 @@ pub async fn sync_my_list(state: State<'_, AppState>) -> Result<Vec<ListEntry>, 
     // over the fresh local write when the upserts land.
     let _write = state.entry_lock.lock().await;
     let entries = al.user_list(&user_name).await.map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
     for e in &entries {
+        seen.insert(e.media_id);
         if let Some(m) = &e.media {
             let _ = state.db.upsert_media(m);
         }
         let _ = state.db.upsert_entry(e);
     }
+    // Reconcile: rows the remote no longer has were deleted elsewhere (or belong
+    // to a previously signed-in account). Dropping them keeps the recognizer and
+    // the watcher from resurrecting entries the user deliberately removed.
+    state.db.delete_entries_not_in(&seen).map_err(|e| e.to_string())?;
     state.refresh_matchers();
     state.db.entries_with_media().map_err(|e| e.to_string())
 }
@@ -486,17 +486,37 @@ pub async fn increment_inner(state: &AppState, media_id: i64) -> Result<ListEntr
 /// Set absolute episode progress (the list's −/+ stepper). Preserves the current
 /// status + score, clamps to the known episode count, auto-completes at the last
 /// episode, and drops a Completed entry back to Current if you rewind past the end.
+/// `expected` is the caller's compare-and-swap baseline: the stepper buffers edits
+/// for 3s, so it passes the progress it sampled; if a concurrent write (the
+/// auto-tracker, another stepper) moved progress since, the write is skipped and
+/// the CURRENT entry is returned for the caller to adopt — no rewind.
 #[tauri::command]
 pub async fn set_progress(
     media_id: i64,
     progress: i64,
+    expected: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<ListEntry, String> {
-    set_progress_inner(state.inner(), media_id, progress).await
+    set_progress_inner(state.inner(), media_id, progress, expected).await
 }
 
-pub async fn set_progress_inner(state: &AppState, media_id: i64, progress: i64) -> Result<ListEntry, String> {
+pub async fn set_progress_inner(
+    state: &AppState,
+    media_id: i64,
+    progress: i64,
+    expected: Option<i64>,
+) -> Result<ListEntry, String> {
     let _write = state.entry_lock.lock().await;
+    if let Some(exp) = expected {
+        let cur = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
+        let current = cur.as_ref().map(|e| e.progress).unwrap_or(0);
+        if current != exp {
+            let mut entry = cur.unwrap_or_default();
+            entry.media_id = media_id;
+            entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
+            return Ok(entry);
+        }
+    }
     let (final_status, progress, score, repeat) = compute_set_progress(state, media_id, progress)?;
     save_entry_unlocked(state, media_id, final_status, progress, score, repeat).await
 }
@@ -508,13 +528,13 @@ pub async fn set_progress_inner(state: &AppState, media_id: i64, progress: i64) 
 /// Ok(None) = skipped (entry already at or past `episode`).
 pub async fn watcher_set_progress(state: &AppState, media_id: i64, episode: i64) -> Result<Option<ListEntry>, String> {
     let _write = state.entry_lock.lock().await;
-    let current = state
-        .db
-        .get_entry(media_id)
-        .map_err(|e| e.to_string())?
-        .map(|e| e.progress)
-        .unwrap_or(0);
-    if episode <= current {
+    // Auto-tracking must never CREATE an entry: a missing row means the user
+    // deleted it (possibly seconds ago, winning the lock before us) — writing
+    // now would resurrect it locally and on AniList.
+    let Some(cur) = state.db.get_entry(media_id).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    if episode <= cur.progress {
         return Ok(None);
     }
     let (final_status, progress, score, repeat) = compute_set_progress(state, media_id, episode)?;
@@ -566,7 +586,9 @@ pub async fn delete_entry_cmd(media_id: i64, state: State<'_, AppState>) -> Resu
     if let Some(entry) = state.db.get_entry(media_id).map_err(|e| e.to_string())? {
         if let Some(id) = entry.id {
             let al = state.anilist.lock().clone();
-            let _ = al.delete_entry(id).await;
+            // Propagate a remote failure instead of deleting locally anyway: a
+            // silent local-only delete would pop back to life on the next sync.
+            al.delete_entry(id).await.map_err(|e| e.to_string())?;
         }
     }
     state.db.delete_entry(media_id).map_err(|e| e.to_string())?;

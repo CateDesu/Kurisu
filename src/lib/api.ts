@@ -53,8 +53,8 @@ export const api = {
     invoke<ListEntry>("update_entry", { mediaId, status, progress, score, repeat }),
   incrementEpisode: (mediaId: number) =>
     invoke<ListEntry>("increment_episode", { mediaId }),
-  setProgress: (mediaId: number, progress: number) =>
-    invoke<ListEntry>("set_progress", { mediaId, progress }),
+  setProgress: (mediaId: number, progress: number, expected?: number) =>
+    invoke<ListEntry>("set_progress", { mediaId, progress, expected }),
   deleteEntry: (mediaId: number) =>
     invoke<void>("delete_entry_cmd", { mediaId }),
 

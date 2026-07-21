@@ -88,6 +88,7 @@
   async function checkForUpdate() {
     updateChecking = true;
     updateError = "";
+    updateStatus = "";
     update = null;
     try {
       update = await api.checkUpdate();
@@ -159,7 +160,7 @@
     <div class="space-y-2 mb-4">
       {#each modes as [val, label]}
         <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="radio" name="tmode" value={val} bind:group={cfg.mode} class="accent-accent" />
+          <input type="radio" name="tmode" value={val} bind:group={cfg.mode} oninput={() => (trackingSavedAt = 0)} class="accent-accent" />
           {label}
         </label>
       {/each}
@@ -170,6 +171,7 @@
         <input
           type="number"
           bind:value={cfg.prompt_seconds}
+          oninput={() => (trackingSavedAt = 0)}
           min="1"
           max="3600"
           class="w-20 bg-panel border border-edge rounded-md px-2 py-1 focus:outline-none focus:border-accent"
@@ -184,6 +186,7 @@
         <input
           type="number"
           bind:value={cfg.auto_percent}
+          oninput={() => (trackingSavedAt = 0)}
           min="1"
           max="100"
           class="w-20 bg-panel border border-edge rounded-md px-2 py-1 focus:outline-none focus:border-accent"

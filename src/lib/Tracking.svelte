@@ -8,6 +8,7 @@
   let nowPlaying = $state<NowPlaying | null>(null);
   let prompt = $state<TrackingPrompt | null>(null);
   let busy = $state(false);
+  let err = $state("");
 
   const pct = $derived(
     nowPlaying && nowPlaying.length_us > 0
@@ -27,6 +28,7 @@
     }).then((u) => (alive ? (un1 = u) : u()));
     listen<TrackingPrompt>("kurisu://tracking-prompt", (e) => {
       prompt = e.payload;
+      err = "";
     }).then((u) => (alive ? (un2 = u) : u()));
     return () => {
       alive = false;
@@ -49,18 +51,30 @@
 
   async function confirm() {
     if (!prompt || busy) return;
+    const p = prompt;
     busy = true;
+    err = "";
     try {
+      // The modal can sit open for a while — progress may have moved past the
+      // detected episode since the prompt was emitted. Don't rewind it.
+      const fresh = await api.getEntry(p.media_id);
+      if (fresh && fresh.progress >= p.episode) {
+        if (prompt === p) prompt = null;
+        return;
+      }
       // Set progress to the detected episode (not a blind +1), so mid-cour skips
       // land correctly. The modal only offers this when it's ahead of progress.
-      const entry = await api.setProgress(prompt.media_id, prompt.episode);
+      const entry = await api.setProgress(p.media_id, p.episode);
       // Unify the list-refresh signal: auto-increment emits this from the
       // backend, the prompt path emits it here so one listener covers both.
       await emit("kurisu://episode-updated", entry);
+      // A NEWER prompt may have replaced ours while the write was in flight —
+      // only close the one we actually confirmed.
+      if (prompt === p) prompt = null;
     } catch (e) {
-      console.error("tracking prompt update failed", e);
+      // Keep the prompt open and say why — closing on failure reads as success.
+      err = String(e);
     } finally {
-      prompt = null;
       busy = false;
     }
   }
@@ -144,6 +158,9 @@
           </button>
         {/if}
       </div>
+      {#if err}
+        <p class="text-xs text-red-400 mt-2">Update failed: {err}</p>
+      {/if}
     </div>
   </div>
 {/if}

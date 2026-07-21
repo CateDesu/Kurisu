@@ -36,6 +36,11 @@
   // Overlapping loads (initial + episode-updated + edit-close) resolve
   // latest-wins; stale responses are dropped.
   let loadId = 0;
+  // The local cache isn't namespaced per account: if the user changes under us
+  // (logout → different login), force a sync — it also purges rows the new
+  // account doesn't have. Auto-sync on an empty list happens once per session.
+  let syncedFor = $state<number | null>(null);
+  let autoSynced = false;
   async function load() {
     const id = ++loadId;
     loading = true;
@@ -44,7 +49,13 @@
       const list = await api.localEntries();
       if (id !== loadId) return;
       entries = list;
-      if (entries.length === 0) await sync(id);
+      const uid = auth.user?.id ?? null;
+      const switched = syncedFor !== null && uid !== syncedFor;
+      if (syncedFor !== uid) syncedFor = uid;
+      if ((entries.length === 0 && !autoSynced) || switched) {
+        autoSynced = true;
+        await sync(id);
+      }
     } catch (e) {
       if (id === loadId) error = String(e);
     } finally {

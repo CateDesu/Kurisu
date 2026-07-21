@@ -91,6 +91,8 @@ export function notificationText(n: Notification): string {
       return `${user} mentioned you in an activity.`;
     case "ACTIVITY_REPLY":
       return `${user} replied to your activity.`;
+    case "ACTIVITY_REPLY_SUBSCRIBED":
+      return `${user} replied in an activity you're following.`;
     case "ACTIVITY_LIKE":
       return `${user} liked your activity.`;
     case "ACTIVITY_REPLY_LIKE":
@@ -146,6 +148,7 @@ export function notificationIcon(kind: string): string {
       return "✉️";
     case "ACTIVITY_MENTION":
     case "ACTIVITY_REPLY":
+    case "ACTIVITY_REPLY_SUBSCRIBED":
     case "THREAD_COMMENT_MENTION":
     case "THREAD_COMMENT_REPLY":
     case "THREAD_COMMENT_SUBSCRIBED":

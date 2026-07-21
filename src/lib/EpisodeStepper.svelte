@@ -46,10 +46,19 @@
     saving = true;
     const v = pending;
     try {
-      const entry = await api.setProgress(mediaId, v);
-      saved = v;
-      onchange?.(entry);
-      await emit("kurisu://episode-updated", entry);
+      // Compare-and-swap on `saved`: if the auto-tracker (or anything else) moved
+      // progress while this commit was in flight, the backend skips our stale
+      // absolute write and returns the live entry — adopt it instead of rewinding.
+      const entry = await api.setProgress(mediaId, v, saved);
+      if (entry.progress === v) {
+        saved = v;
+        onchange?.(entry);
+        await emit("kurisu://episode-updated", entry);
+      } else {
+        pending = entry.progress;
+        saved = entry.progress;
+        onchange?.(entry);
+      }
     } catch (e) {
       // revert so the UI reflects what actually saved
       pending = saved;

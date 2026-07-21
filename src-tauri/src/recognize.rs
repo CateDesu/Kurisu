@@ -19,7 +19,9 @@ static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
 static RE_EP_TAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\s*[-_·]?\s*(?:ep(?:isode)?\.?|e|#)?\s*0*\d{1,3}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
 });
-static RE_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
+/// One episode-number candidate: digits with an optional `vN` revision suffix
+/// ("04v2" is episode 4 — not episodes 4 and 2).
+static RE_EP_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:v\d+)?").unwrap());
 
 /// Resolutions / common bitrates to discard when picking the episode number.
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
@@ -70,10 +72,20 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
         if let Some(m) = matchers.iter().find(|m| m.norms.iter().any(|n| n == &cand)) {
             return Some(m);
         }
-        // containment (one inside the other)
+        // containment (one inside the other) — longest MATCHING norm wins, so a
+        // prefix pair ("Toradora" vs "Toradora SOS") resolves to the more
+        // specific show instead of whichever row comes first in DB order.
         if let Some(m) = matchers
             .iter()
-            .find(|m| m.norms.iter().any(|n| n.contains(&cand) || cand.contains(n)))
+            .filter(|m| m.norms.iter().any(|n| n.contains(&cand) || cand.contains(n)))
+            .max_by_key(|m| {
+                m.norms
+                    .iter()
+                    .filter(|n| n.contains(&cand) || cand.contains(n.as_str()))
+                    .map(|n| n.len())
+                    .max()
+                    .unwrap_or(0)
+            })
         {
             return Some(m);
         }
@@ -156,7 +168,13 @@ fn percent_decode(s: &str) -> String {
 /// Once we know which media it is, parse the episode from the *remainder* after the
 /// matched title variant is removed — avoids misreading a number in the title
 /// itself (e.g. "91 Days").
-pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<i64> {
+///
+/// Tri-state: `Some(Some(n))` = a variant matched and the remainder yielded
+/// episode n. `Some(None)` = a variant matched but there IS no episode in the
+/// string (a batch file) — callers must not fall back to guessing, or the
+/// title's own number comes back as the "episode". `None` = no variant in the
+/// string at all (the normalized match used an alias) — guessing is fair game.
+pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<Option<i64>> {
     let lp = playing.to_lowercase();
     for v in variants {
         let lv = v.to_lowercase();
@@ -165,17 +183,36 @@ pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<
         }
         if lp.contains(&lv) {
             let remainder = lp.replace(&lv, " ");
-            if let Some(n) = parse_last_episode_number(&remainder) {
-                return Some(n);
-            }
+            return Some(parse_last_episode_number(&remainder));
         }
     }
     None
 }
 
-/// Fallback: pick the last plausible episode number from a raw string.
+/// Fallback: pick the last plausible episode number from a raw string. Only for
+/// strings where NO title variant matched (see parse_episode_after).
 pub(crate) fn parse_episode_guess(s: &str) -> Option<i64> {
     parse_last_episode_number(s)
+}
+
+/// Resolve the episode for a matched title from candidate strings (player title,
+/// then file basename): a matched variant with digits wins; a matched variant
+/// with no digits in ANY candidate means a batch file (no episode, no guessing);
+/// no raw variant anywhere means the normalized match used an alias — guess.
+pub(crate) fn resolve_episode(matched: &Matcher, candidates: &[&str]) -> Option<i64> {
+    let mut variant_hit = false;
+    for cand in candidates {
+        match parse_episode_after(cand, &matched.variants) {
+            Some(Some(n)) => return Some(n),
+            Some(None) => variant_hit = true,
+            None => {}
+        }
+    }
+    if variant_hit {
+        None
+    } else {
+        candidates.iter().find_map(|c| parse_episode_guess(c))
+    }
 }
 
 /// Years read as "year, not episode": 1900 through next year. The upper bound
@@ -186,11 +223,17 @@ fn looks_like_year(n: i64) -> bool {
     (1900..=chrono::Utc::now().year() as i64 + 1).contains(&n)
 }
 
-/// Last integer that looks like an episode (excludes resolutions and 4-digit years).
+/// Last integer that looks like an episode. Bracketed groups (CRC32 hashes,
+/// codec tags) and resolution/codec noise are stripped FIRST — their digits
+/// would otherwise beat the real episode number: "... - 28 (1080p) [AB12CD34]"
+/// is episode 28, not 34. Excludes resolutions, 4-digit years, and anything
+/// outside 1–9999. A `vN` revision suffix belongs to the number it follows.
 fn parse_last_episode_number(s: &str) -> Option<i64> {
-    RE_NUM
-        .find_iter(s)
-        .filter_map(|m| m.as_str().parse::<i64>().ok())
+    let s = RE_BRACKETS.replace_all(s, " ");
+    let s = RE_RES.replace_all(&s, " ");
+    RE_EP_NUM
+        .find_iter(&s)
+        .filter_map(|m| m.as_str().split('v').next()?.parse::<i64>().ok())
         .filter(|n| !NOISE_NUMBERS.contains(n) && !looks_like_year(*n))
         .filter(|n| *n >= 1 && *n <= 9999)
         .last()
@@ -233,14 +276,58 @@ mod tests {
     }
 
     #[test]
+    fn episode_guess_ignores_crc_and_codec_digits() {
+        // The trailing CRC32 must not beat the real episode number.
+        assert_eq!(
+            parse_episode_guess("[SubsPlease] Sousou no Frieren - 28 (1080p) [AB12CD34].mkv"),
+            Some(28)
+        );
+        // Codec digits in a bracket group are noise too (264, 10).
+        assert_eq!(
+            parse_episode_guess("[Group] Show - 07 [1080p x264-10bit].mkv"),
+            Some(7)
+        );
+        // A v2 revision suffix belongs to the episode it follows.
+        assert_eq!(parse_episode_guess("Some Show - 04v2 [BD 1080p].mkv"), Some(4));
+        assert_eq!(parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"), Some(11));
+    }
+
+    #[test]
     fn episode_after_title_removal_avoids_title_numbers() {
         // The "91 Days" trap: the number in the title must not become the episode.
         let variants = vec!["91 Days".to_string()];
         assert_eq!(
             parse_episode_after("[Group] 91 Days - 05 [1080p]", &variants),
-            Some(5)
+            Some(Some(5))
         );
-        assert_eq!(parse_episode_after("91 Days [BD]", &variants), None);
+        // A batch file: the title matched but there IS no episode — Some(None),
+        // which must stop callers from guessing (guessing would return 91).
+        assert_eq!(parse_episode_after("91 Days [BD 1080p]", &variants), Some(None));
+        // No variant in the string at all → None → guessing is allowed.
+        assert_eq!(parse_episode_after("Something Else - 03", &variants), None);
+    }
+
+    #[test]
+    fn resolve_episode_batch_alias_and_crc() {
+        let days = Matcher {
+            media_id: 1,
+            display: "91 Days".into(),
+            variants: vec!["91 Days".into()],
+            norms: vec!["91 days".into()],
+        };
+        // Batch file: matched, no episode → None (NOT 91).
+        assert_eq!(resolve_episode(&days, &["91 Days", "91 Days [BD 1080p]"]), None);
+        // Player title cleaned, filename carries the episode → read it there.
+        assert_eq!(resolve_episode(&days, &["91 Days", "91 Days - 05 [BD]"]), Some(5));
+        // Alias case: the raw variant never appears (colon dropped), so the
+        // normalized match falls back to guessing.
+        let rezero = Matcher {
+            media_id: 2,
+            display: "Re:Zero".into(),
+            variants: vec!["Re:Zero kara Hajimeru Isekai Seikatsu".into()],
+            norms: vec!["re zero kara hajimeru isekai seikatsu".into()],
+        };
+        assert_eq!(resolve_episode(&rezero, &["Re Zero - 05", "Re Zero - 05"]), Some(5));
     }
 
     #[test]

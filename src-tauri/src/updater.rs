@@ -345,14 +345,26 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
 
 /// Remove leftover `.kurisu-update-*` downloads in `dir` (a finished or
 /// aborted update leaves the download behind). Best-effort, every launch.
+/// Files younger than an hour are left alone: without a single-instance guard
+/// a second Kurisu could be mid-download (chunk writes keep the mtime fresh)
+/// or in the verify gap, and unlinking its file out from under it aborts that
+/// update. (The download timeout is 30 minutes, so an hour means certainly dead.)
 pub fn sweep_update_leftovers(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry
+            if !entry
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".kurisu-update-")
             {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().map(|age| age > Duration::from_secs(3600)).unwrap_or(true))
+                .unwrap_or(true);
+            if stale {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

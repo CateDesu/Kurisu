@@ -32,9 +32,11 @@
   /// whole tab session (forward entries included), so we track our own navigation
   /// depth instead. At the root there's nothing to go back to → no-op (desired).
   let navDepth = $state(0);
-  afterNavigate(({ type }) => {
+  afterNavigate(({ type, to, from }) => {
     if (type === "popstate") navDepth = Math.max(0, navDepth - 1);
-    else if (type !== "enter") navDepth += 1;
+    // Clicking the current page's own link is a navigation that goes nowhere —
+    // counting it would make Back return to the identical URL (looks dead).
+    else if (type !== "enter" && to?.url.pathname !== from?.url.pathname) navDepth += 1;
   });
   function back() {
     if (navDepth > 0) history.back();
@@ -124,6 +126,11 @@
       <main class="flex-1 overflow-auto">
         {@render children?.()}
       </main>
+      <!-- East resize grip, in-flow: as an absolute overlay it sat on top of
+           main's scrollbar (same 6px at the right edge) and won every hit test.
+           Taking layout space keeps both the grip and the scrollbar usable. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+      <div class="w-1.5 shrink-0 cursor-e-resize" onpointerdown={() => resize("East")}></div>
     </div>
   {/if}
 
@@ -135,8 +142,7 @@
   <div class="absolute bottom-0 inset-x-0 h-1.5 cursor-s-resize z-50" onpointerdown={() => resize("South")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute left-0 inset-y-0 w-1.5 cursor-w-resize z-50" onpointerdown={() => resize("West")}></div>
-  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-  <div class="absolute right-0 inset-y-0 w-1.5 cursor-e-resize z-50" onpointerdown={() => resize("East")}></div>
+  <!-- (East grip lives in-flow after <main> — see above.) -->
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute top-0 left-0 w-2 h-2 cursor-nw-resize z-50" onpointerdown={() => resize("NorthWest")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->

@@ -8,6 +8,9 @@ let files = $state<LibraryFile[]>([]);
 let folders = $state<string[]>([]);
 let scanning = $state(false);
 let lastScanAt = $state(0);
+// Set when a scan is requested mid-scan (e.g. removeFolder's keep-it-honest
+// re-scan): run one follow-up with the current folders when the active scan ends.
+let pendingScan = false;
 
 async function loadFolders() {
   try {
@@ -18,13 +21,20 @@ async function loadFolders() {
 }
 
 async function scan() {
-  if (scanning) return;
+  if (scanning) {
+    pendingScan = true;
+    return;
+  }
   scanning = true;
   try {
     files = await api.scanLibrary();
     lastScanAt = Date.now();
   } finally {
     scanning = false;
+    if (pendingScan) {
+      pendingScan = false;
+      await scan();
+    }
   }
 }
 

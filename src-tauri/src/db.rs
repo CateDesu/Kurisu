@@ -167,6 +167,30 @@ impl Db {
         Ok(())
     }
 
+    /// Delete every local entry whose media_id is NOT in `keep`. Used after a
+    /// successful full-list sync: rows the remote no longer has were deleted
+    /// elsewhere (or belong to a previously signed-in account) and must not
+    /// linger — the recognizer would still match them and the watcher could
+    /// resurrect them on AniList.
+    pub fn delete_entries_not_in(&self, keep: &std::collections::HashSet<i64>) -> Result<()> {
+        let mut c = self.0.lock();
+        let stale: Vec<i64> = {
+            let mut stmt = c.prepare("SELECT media_id FROM list_entry")?;
+            let ids = stmt
+                .query_map([], |r| r.get(0))?
+                .filter_map(Result::ok)
+                .filter(|id| !keep.contains(id))
+                .collect();
+            ids
+        };
+        let tx = c.transaction()?;
+        for id in stale {
+            tx.execute("DELETE FROM list_entry WHERE media_id = ?", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// All local entries with their cached media joined in. The frontend list view.
     pub fn entries_with_media(&self) -> Result<Vec<ListEntry>> {
         let c = self.0.lock();
