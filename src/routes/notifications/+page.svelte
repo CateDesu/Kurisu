@@ -10,20 +10,26 @@
     type Notification,
   } from "$lib/types";
   import Login from "$lib/Login.svelte";
+  import Img from "$lib/Img.svelte";
 
   let items = $state<Notification[]>([]);
   let loading = $state(true);
   let error = $state("");
 
+  // Overlapping loads (login flip + manual refresh) resolve latest-wins.
+  let loadId = 0;
   async function load() {
+    const id = ++loadId;
     loading = true;
     error = "";
     try {
-      items = await api.getNotifications();
+      const list = await api.getNotifications();
+      if (id !== loadId) return;
+      items = list;
     } catch (e) {
-      error = String(e);
+      if (id === loadId) error = String(e);
     } finally {
-      loading = false;
+      if (id === loadId) loading = false;
     }
   }
 
@@ -76,9 +82,9 @@
           >
             <span class="text-lg leading-none shrink-0 mt-0.5">{notificationIcon(n.kind)}</span>
             {#if n.user_avatar}
-              <img src={n.user_avatar} alt="" loading="lazy" decoding="async" class="w-8 h-8 rounded-full shrink-0 object-cover" />
+              <Img src={n.user_avatar} class="w-8 h-8 rounded-full shrink-0 object-cover" />
             {:else if n.media_cover}
-              <img src={n.media_cover} alt="" loading="lazy" decoding="async" class="w-8 h-11 rounded shrink-0 object-cover" />
+              <Img src={n.media_cover} class="w-8 h-11 rounded shrink-0 object-cover" />
             {/if}
             <div class="flex-1 min-w-0">
               <div class="text-sm leading-snug">{notificationText(n)}</div>

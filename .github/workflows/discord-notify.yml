@@ -36,4 +36,4 @@ jobs:
 
           ${COMMIT_MSG}
           ${COMMIT_URL}" '{content:$c, username:"Kurisu"}' \
-            | curl -sS -X POST -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
+            | curl -sSf -X POST -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK" || true

@@ -277,6 +277,8 @@ impl AniList {
     }
 
     /// Pull the full list (every status group) for a user and flatten to entries.
+    /// AniList chunks big lists at 500 entries per status group — walk the chunks
+    /// via `hasNextChunk` or large accounts sync an incomplete list.
     pub async fn user_list(&self, user_name: &str) -> Result<Vec<ListEntry>> {
         #[derive(Deserialize)]
         struct R {
@@ -284,8 +286,10 @@ impl AniList {
             collection: Collection,
         }
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Collection {
             lists: Option<Vec<AniList>>,
+            has_next_chunk: Option<bool>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -305,8 +309,9 @@ impl AniList {
             updated_at: Option<i64>,
             media: AniMedia,
         }
-        let q = "query ($userName: String!) {
-            MediaListCollection(userName: $userName, type: ANIME) {
+        let q = "query ($userName: String!, $chunk: Int!) {
+            MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk) {
+                hasNextChunk
                 lists {
                     status
                     entries {
@@ -321,23 +326,30 @@ impl AniList {
                 }
             }
         }";
-        let r: R = self
-            .gql(q, serde_json::json!({ "userName": user_name }))
-            .await?;
         let mut out = Vec::new();
-        for list in r.collection.lists.unwrap_or_default() {
-            for e in list.entries {
-                out.push(ListEntry {
-                    id: Some(e.id),
-                    media_id: e.media.id,
-                    status: e.status,
-                    progress: e.progress,
-                    score: e.score,
-                    repeat: e.repeat.unwrap_or(0),
-                    updated_at: e.updated_at,
-                    media: Some(e.media.into()),
-                });
+        let mut chunk = 1;
+        loop {
+            let r: R = self
+                .gql(q, serde_json::json!({ "userName": user_name, "chunk": chunk }))
+                .await?;
+            for list in r.collection.lists.unwrap_or_default() {
+                for e in list.entries {
+                    out.push(ListEntry {
+                        id: Some(e.id),
+                        media_id: e.media.id,
+                        status: e.status,
+                        progress: e.progress,
+                        score: e.score,
+                        repeat: e.repeat.unwrap_or(0),
+                        updated_at: e.updated_at,
+                        media: Some(e.media.into()),
+                    });
+                }
             }
+            if !r.collection.has_next_chunk.unwrap_or(false) {
+                break;
+            }
+            chunk += 1;
         }
         Ok(out)
     }
@@ -526,33 +538,22 @@ impl AniList {
 // serves a tiny HTML page whose JS lifts the fragment into a query string the
 // server can read on a second request.
 
-/// 32 random bytes from /dev/urandom, hex-encoded. Used as the OAuth `state` so the
-/// callback can reject a token AniList didn't actually issue for THIS login
+/// 32 random bytes from the OS CSPRNG, hex-encoded. Used as the OAuth `state` so
+/// the callback can reject a token AniList didn't actually issue for THIS login
 /// attempt (CSRF / token-injection via a malicious site hitting 127.0.0.1:39417).
-fn random_state() -> String {
+/// No software fallback: an OAuth flow that can't randomize its state must not start.
+fn random_state() -> Result<String> {
+    use ring::rand::SecureRandom;
     use std::fmt::Write as _;
-    use std::io::Read;
     let mut buf = [0u8; 32];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !filled {
-        // Shouldn't happen on Linux; fall back to a time-seeded LCG so the value at
-        // least varies (and stays unpredictable enough) per call.
-        let mut seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x0bad_f00d);
-        for b in buf.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            *b = (seed >> 32) as u8;
-        }
-    }
+    ring::rand::SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| anyhow!("OS random source unavailable"))?;
     let mut out = String::with_capacity(64);
     for b in &buf {
         let _ = write!(out, "{:02x}", b);
     }
-    out
+    Ok(out)
 }
 
 /// Build the authorize URL the user's browser should visit (response_type=token).
@@ -576,13 +577,16 @@ const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-
 
 /// Start a localhost HTTP listener that captures the access token AniList sends
 /// back in the implicit flow. Returns `(state, receiver)`: the caller embeds
-/// `state` in the authorize URL, and the receiver yields `Ok(token)` on success
-/// or `Err(msg)` if AniList reports an error / the user denies / the CSRF `state`
-/// check fails.
-pub fn start_callback_server() -> Result<(String, oneshot::Receiver<Result<String, String>>)> {
-    let state = random_state();
+/// `state` in the authorize URL, and the receiver resolves with the token once a
+/// request passes the CSRF `state` check. AniList errors, state mismatches, and
+/// stray probes are answered and LOGGED but never resolve the receiver or stop
+/// the listener — any web page can fire `http://127.0.0.1:39417/?error=x`, and
+/// that must not kill a login in flight. The listener shuts down when the caller
+/// drops the receiver (timeout / cancel), freeing the port for a retry.
+pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
+    let state = random_state()?;
     let expected = state.clone();
-    let (tx, rx) = oneshot::channel::<Result<String, String>>();
+    let (tx, rx) = oneshot::channel::<String>();
     let addr = format!("127.0.0.1:{}", OAUTH_PORT);
     let listener = std::net::TcpListener::bind(&addr)?;
     listener.set_nonblocking(true)?;
@@ -633,20 +637,25 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<Result<Strin
                 //    (?access_token=…), or a code-style redirect slipped through.
                 // 3) Otherwise (initial implicit redirect with the token still in the
                 //    fragment, or a probe) → serve the shim, don't resolve yet.
-                let (result, body): (Result<String, String>, &str) =
+                // Failures (error param, state mismatch) answer the browser but do
+                // NOT resolve the login or stop the listener: any web page can hit
+                // 127.0.0.1:39417 with ?error=…, and that must not kill a login in
+                // flight before the real AniList redirect arrives.
+                let (token, body): (Option<String>, &str) =
                     if let Some(err) = param("error") {
                         let msg = param("error_description").unwrap_or(err);
-                        (Err(msg), ERR_HTML)
+                        log::warn!("OAuth callback: AniList denied access: {msg}");
+                        (None, ERR_HTML)
                     } else if let Some(token) = param("access_token").or_else(|| param("code")) {
                         // CSRF check: the state AniList echoes back must equal the one
                         // we sent. A mismatch / missing state means this token wasn't
-                        // for our request — reject it.
+                        // for our request — reject it and keep listening.
                         match param("state") {
-                            Some(s) if s == expected => (Ok(token), OK_HTML),
-                            _ => (
-                                Err("OAuth state mismatch — possible injection attempt.".to_string()),
-                                ERR_HTML,
-                            ),
+                            Some(s) if s == expected => (Some(token), OK_HTML),
+                            _ => {
+                                log::warn!("OAuth callback: state mismatch — rejected a token not issued for this login");
+                                (None, ERR_HTML)
+                            }
                         }
                     } else {
                         let resp = format!(
@@ -665,8 +674,11 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<Result<Strin
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
-                let _ = tx.send(result);
-                break;
+                // Only a state-verified token resolves the login and frees the port.
+                if let Some(token) = token {
+                    let _ = tx.send(token);
+                    break;
+                }
             }
         });
     });
@@ -684,5 +696,54 @@ mod urlencoding {
             }
         }
         out
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    /// C3 regression: a hostile probe (`?error=…`), a token with the WRONG
+    /// state, and a bare hit must all be answered WITHOUT resolving the login
+    /// or killing the listener — only a state-verified token resolves it.
+    #[test]
+    fn oauth_callback_survives_probes_and_accepts_verified_token() {
+        let (state, rx) = super::start_callback_server().expect("bind callback listener");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async move {
+            let base = format!("http://127.0.0.1:{}", super::OAUTH_PORT);
+            let http = reqwest::Client::new();
+            // Bare probe → shim, still listening.
+            let r = http.get(&base).send().await.unwrap();
+            assert!(r.status().is_success());
+            // The one-shot DoS from the review: ?error= from any web page.
+            let r = http
+                .get(format!("{base}/?error=access_denied"))
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+            // Token with a wrong state → rejected, still listening.
+            let r = http
+                .get(format!("{base}/__capture__?access_token=bad&state=nope"))
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+            // Token with the RIGHT state → the receiver resolves.
+            let r = http
+                .get(format!("{base}/__capture__?access_token=good-token&state={state}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+            let token = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .expect("listener must still be alive after the probes")
+                .unwrap();
+            assert_eq!(token, "good-token");
+        });
     }
 }

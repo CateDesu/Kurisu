@@ -15,20 +15,36 @@
       : 0
   );
 
+  let promptDialog = $state<HTMLDivElement | null>(null);
+
   $effect(() => {
+    let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
     listen<NowPlaying>("kurisu://now-playing", (e) => {
       // `active: false` means playback stopped → hide the banner.
       nowPlaying = e.payload?.active ? e.payload : null;
-    }).then((u) => (un1 = u));
+    }).then((u) => (alive ? (un1 = u) : u()));
     listen<TrackingPrompt>("kurisu://tracking-prompt", (e) => {
       prompt = e.payload;
-    }).then((u) => (un2 = u));
+    }).then((u) => (alive ? (un2 = u) : u()));
     return () => {
+      alive = false;
       un1?.();
       un2?.();
     };
+  });
+
+  // Escape dismisses the prompt. The prompt renders above page modals (z-[60]),
+  // so it gets first claim on Escape and stops it reaching modals below.
+  function onWindowKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape" && prompt) {
+      e.stopImmediatePropagation();
+      skip();
+    }
+  }
+  $effect(() => {
+    if (prompt) promptDialog?.focus();
   });
 
   async function confirm() {
@@ -53,6 +69,8 @@
     prompt = null;
   }
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 {#if nowPlaying}
   <div class="flex items-center gap-3 px-4 py-1.5 border-b border-edge bg-panel text-xs shrink-0">
@@ -84,12 +102,13 @@
 {#if prompt}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
-    class="fixed inset-0 bg-black/60 grid place-items-center z-50 backdrop-blur-sm"
+    class="fixed inset-0 bg-black/60 grid place-items-center z-[60] backdrop-blur-sm"
     onclick={skip}
     role="presentation"
   >
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div
+      bind:this={promptDialog}
       class="bg-panel border border-edge rounded-xl p-5 max-w-sm w-full mx-4 shadow-2xl"
       onclick={(e) => e.stopPropagation()}
       role="dialog"

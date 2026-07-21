@@ -2,14 +2,19 @@
   import "../app.css";
   import { auth } from "$lib/auth.svelte";
   import { page as pageStore } from "$app/stores";
-  import { get } from "svelte/store";
+  import { afterNavigate } from "$app/navigation";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { runClock } from "$lib/now.svelte";
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
   import Updater from "$lib/Updater.svelte";
   import Icon from "$lib/Icon.svelte";
+  import Img from "$lib/Img.svelte";
   let { children } = $props();
+
+  // Ticks the shared clock so relative labels (timeAgo, airingLabel) refresh.
+  $effect(() => runClock());
 
   // Inline SVG icons (Icon.svelte) — stroke style, inherit text color.
   const nav = [
@@ -23,10 +28,16 @@
 
   const appWindow = getCurrentWindow();
 
-  /// Persistent back button: walks the in-app history. At the root the webview has
-  /// nothing to go back to, so this is a no-op (the user's stated desired behavior).
+  /// Persistent back button: walks the in-app history. `history.length` counts the
+  /// whole tab session (forward entries included), so we track our own navigation
+  /// depth instead. At the root there's nothing to go back to → no-op (desired).
+  let navDepth = $state(0);
+  afterNavigate(({ type }) => {
+    if (type === "popstate") navDepth = Math.max(0, navDepth - 1);
+    else if (type !== "enter") navDepth += 1;
+  });
   function back() {
-    if (history.length > 1) history.back();
+    if (navDepth > 0) history.back();
   }
 
   function openProfile() {
@@ -69,7 +80,7 @@
         </div>
         <nav class="flex-1 px-2 py-2 space-y-1 overflow-auto">
           {#each nav as item}
-            {@const active = get(pageStore).url.pathname === item.href}
+            {@const active = $pageStore.url.pathname === item.href}
             <a
               href={item.href}
               class="flex items-center gap-3 px-3 py-2.5 rounded-md text-[15px] transition-colors
@@ -85,7 +96,7 @@
         {#if auth.user}
           <div class="px-4 py-4 border-t border-edge flex items-center gap-3.5">
             {#if auth.user.avatar}
-              <img src={auth.user.avatar} alt="" loading="lazy" decoding="async" class="w-12 h-12 rounded-full shrink-0 object-cover" />
+              <Img src={auth.user.avatar} class="w-12 h-12 rounded-full shrink-0 object-cover" />
             {:else}
               <div class="w-12 h-12 rounded-full bg-panel-2 shrink-0"></div>
             {/if}
@@ -127,11 +138,11 @@
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute right-0 inset-y-0 w-1.5 cursor-e-resize z-50" onpointerdown={() => resize("East")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-  <div class="absolute top-0 left-0 w-3 h-3 cursor-nw-resize z-50" onpointerdown={() => resize("NorthWest")}></div>
+  <div class="absolute top-0 left-0 w-2 h-2 cursor-nw-resize z-50" onpointerdown={() => resize("NorthWest")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-  <div class="absolute top-0 right-0 w-3 h-3 cursor-ne-resize z-50" onpointerdown={() => resize("NorthEast")}></div>
+  <div class="absolute top-0 right-0 w-2 h-2 cursor-ne-resize z-50" onpointerdown={() => resize("NorthEast")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-  <div class="absolute bottom-0 left-0 w-3 h-3 cursor-sw-resize z-50" onpointerdown={() => resize("SouthWest")}></div>
+  <div class="absolute bottom-0 left-0 w-2 h-2 cursor-sw-resize z-50" onpointerdown={() => resize("SouthWest")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-  <div class="absolute bottom-0 right-0 w-3 h-3 cursor-se-resize z-50" onpointerdown={() => resize("SouthEast")}></div>
+  <div class="absolute bottom-0 right-0 w-2 h-2 cursor-se-resize z-50" onpointerdown={() => resize("SouthEast")}></div>
 </div>

@@ -22,6 +22,9 @@ const MAX_DEPTH: usize = 8;
 const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv",
 ];
+/// The folder list is a read-modify-write JSON array in the settings table —
+/// serialize add/remove so two concurrent calls can't lose one folder.
+static FOLDERS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 // ─────────────────────────── folder settings ───────────────────────────
 
@@ -38,6 +41,7 @@ fn save_folders(db: &Db, folders: &[String]) -> Result<()> {
 }
 
 pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
+    let _guard = FOLDERS_LOCK.lock();
     let mut folders = get_folders(db);
     if !folders.iter().any(|f| f == path) {
         folders.push(path.to_string());
@@ -47,6 +51,7 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
 }
 
 pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
+    let _guard = FOLDERS_LOCK.lock();
     let mut folders = get_folders(db);
     folders.retain(|f| f != path);
     save_folders(db, &folders)?;

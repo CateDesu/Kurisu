@@ -1,6 +1,8 @@
 // Types mirroring the Rust models in src-tauri/src/models.rs. Kept in sync by hand;
 // the invoke wrappers in api.ts are the only call sites.
 
+import { nowMs } from "./now.svelte";
+
 export type ListStatus =
   | "CURRENT"
   | "PLANNING"
@@ -127,22 +129,41 @@ export function notificationUrl(n: Notification): string {
   return "https://anilist.co/notifications";
 }
 
-/// Per-kind emoji for the inbox list.
+/// Per-kind emoji for the inbox list. Exact match on the AniList kind — substring
+/// matching made the result depend on arm order (THREAD_LIKE hit "LIKE" first).
 export function notificationIcon(kind: string): string {
-  const k = kind.toUpperCase();
-  if (k === "AIRING") return "📺";
-  if (k === "FOLLOWING") return "👤";
-  if (k.includes("LIKE")) return "❤️";
-  if (k.includes("MESSAGE")) return "✉️";
-  if (k.includes("MENTION") || k.includes("REPLY") || k.includes("THREAD")) return "💬";
-  if (k.includes("MEDIA") || k.includes("RELATED")) return "📺";
-  return "🔔";
+  switch (kind.toUpperCase()) {
+    case "AIRING":
+      return "📺";
+    case "FOLLOWING":
+      return "👤";
+    case "ACTIVITY_LIKE":
+    case "ACTIVITY_REPLY_LIKE":
+    case "THREAD_LIKE":
+    case "THREAD_COMMENT_LIKE":
+      return "❤️";
+    case "ACTIVITY_MESSAGE":
+      return "✉️";
+    case "ACTIVITY_MENTION":
+    case "ACTIVITY_REPLY":
+    case "THREAD_COMMENT_MENTION":
+    case "THREAD_COMMENT_REPLY":
+    case "THREAD_COMMENT_SUBSCRIBED":
+      return "💬";
+    case "RELATED_MEDIA_ADDITION":
+    case "MEDIA_DATA_CHANGE":
+    case "MEDIA_MERGE":
+    case "MEDIA_DELETION":
+      return "📺";
+    default:
+      return "🔔";
+  }
 }
 
 /// Compact relative timestamp.
 export function timeAgo(unix: number | null | undefined): string {
   if (!unix) return "";
-  const s = Date.now() / 1000 - unix;
+  const s = nowMs() / 1000 - unix;
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   if (s < 86400) return `${Math.floor(s / 3600)}h`;
@@ -232,8 +253,7 @@ export function scoreLabel(score: number | null | undefined, format?: string | n
 /// Human-readable "next episode airs" line, or null if none / already aired.
 export function airingLabel(m: Media | null | undefined): string | null {
   if (!m?.next_airing_episode || !m?.next_airing_at) return null;
-  const now = Date.now() / 1000;
-  const diff = m.next_airing_at - now;
+  const diff = m.next_airing_at - nowMs() / 1000;
   if (diff <= 0) return null;
   const ep = m.next_airing_episode;
   const hours = diff / 3600;

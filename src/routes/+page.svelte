@@ -13,6 +13,7 @@
   import EditEntry from "$lib/EditEntry.svelte";
   import EpisodeStepper from "$lib/EpisodeStepper.svelte";
   import Icon from "$lib/Icon.svelte";
+  import Img from "$lib/Img.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let loading = $state(false);
@@ -25,30 +26,42 @@
 
   const visible = $derived(
     entries.filter((e) => e.status === filter).sort((a, b) =>
-      displayTitle(a.media).localeCompare(displayTitle(b.media))
+      displayTitle(a.media).localeCompare(displayTitle(b.media), undefined, {
+        sensitivity: "base",
+        numeric: true,
+      })
     )
   );
 
+  // Overlapping loads (initial + episode-updated + edit-close) resolve
+  // latest-wins; stale responses are dropped.
+  let loadId = 0;
   async function load() {
+    const id = ++loadId;
     loading = true;
     error = "";
     try {
-      entries = await api.localEntries();
-      if (entries.length === 0) await sync();
+      const list = await api.localEntries();
+      if (id !== loadId) return;
+      entries = list;
+      if (entries.length === 0) await sync(id);
     } catch (e) {
-      error = String(e);
+      if (id === loadId) error = String(e);
     } finally {
-      loading = false;
+      if (id === loadId) loading = false;
     }
   }
 
-  async function sync() {
+  // `fromLoad` ties this sync to a load()'s request id: if a newer load started
+  // while the sync was in flight, the stale result is dropped like any other.
+  async function sync(fromLoad?: number) {
     syncing = true;
     error = "";
     try {
-      entries = await api.syncMyList();
+      const list = await api.syncMyList();
+      if (fromLoad === undefined || fromLoad === loadId) entries = list;
     } catch (e) {
-      error = String(e);
+      if (fromLoad === undefined || fromLoad === loadId) error = String(e);
     } finally {
       syncing = false;
     }
@@ -66,14 +79,25 @@
     if (auth.isLoggedIn) load();
   });
 
-  // Refresh when the watcher (auto mode) or the prompt modal updates an episode,
-  // so the list reflects new progress even if we're sitting on this page idle.
+  // Refresh when the watcher (auto mode) or the prompt modal updates an episode —
+  // those paths have no in-place row update here, unlike the stepper which calls
+  // applyEntry itself. Debounced so a burst of events collapses into one reload.
   $effect(() => {
+    let alive = true;
     let un: (() => void) | undefined;
+    let debounce: ReturnType<typeof setTimeout> | null = null;
     listen("kurisu://episode-updated", () => {
-      load();
-    }).then((u) => (un = u));
-    return () => un?.();
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        debounce = null;
+        load();
+      }, 300);
+    }).then((u) => (alive ? (un = u) : u()));
+    return () => {
+      alive = false;
+      un?.();
+      if (debounce) clearTimeout(debounce);
+    };
   });
 </script>
 
@@ -86,7 +110,7 @@
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-xl font-semibold flex-1">My List</h1>
       <button
-        onclick={sync}
+        onclick={() => sync()}
         disabled={syncing}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50 flex items-center gap-1.5"
       >
@@ -135,7 +159,7 @@
             class="cv-row flex items-center gap-3 bg-panel border border-edge rounded-lg p-2.5 hover:bg-panel-2/60 cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
           >
             {#if e.media?.cover_medium}
-              <img src={e.media.cover_medium} alt="" loading="lazy" decoding="async" class="w-10 h-14 object-cover rounded shrink-0" />
+              <Img src={e.media.cover_medium} class="w-10 h-14 object-cover rounded shrink-0" />
             {:else}
               <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
             {/if}

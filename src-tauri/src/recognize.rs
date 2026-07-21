@@ -178,11 +178,12 @@ pub(crate) fn parse_episode_guess(s: &str) -> Option<i64> {
     parse_last_episode_number(s)
 }
 
-/// Years read as "year, not episode": 1930 through next year. The upper bound
-/// tracks the current year instead of a hardcoded 2099.
+/// Years read as "year, not episode": 1900 through next year. The upper bound
+/// tracks the current year instead of a hardcoded 2099; the lower bound covers
+/// the handful of pre-1930 shorts AniList lists.
 fn looks_like_year(n: i64) -> bool {
     use chrono::Datelike;
-    (1930..=chrono::Utc::now().year() as i64 + 1).contains(&n)
+    (1900..=chrono::Utc::now().year() as i64 + 1).contains(&n)
 }
 
 /// Last integer that looks like an episode (excludes resolutions and 4-digit years).

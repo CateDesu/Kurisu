@@ -8,6 +8,7 @@
   let trackingLoaded = $state(false);
   let trackingSaving = $state(false);
   let trackingSavedAt = $state(0);
+  let trackingError = $state("");
 
   let closeToTray = $state(false);
 
@@ -51,10 +52,29 @@
     }
   }
   async function saveTracking() {
+    if (trackingSaving) return;
     trackingSaving = true;
+    trackingError = "";
+    // Snapshot what's being saved: the inputs bind straight into `cfg`, so an edit
+    // made while the request is in flight must not change what we send — and the
+    // response must not clobber that newer edit when it lands.
+    const snap = {
+      mode: cfg.mode,
+      prompt_seconds: cfg.prompt_seconds,
+      auto_percent: cfg.auto_percent,
+    };
     try {
-      cfg = await api.setTrackingConfig(cfg.mode, cfg.prompt_seconds, cfg.auto_percent);
+      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent);
+      if (
+        cfg.mode === snap.mode &&
+        cfg.prompt_seconds === snap.prompt_seconds &&
+        cfg.auto_percent === snap.auto_percent
+      ) {
+        cfg = saved;
+      }
       trackingSavedAt = Date.now();
+    } catch (e) {
+      trackingError = String(e);
     } finally {
       trackingSaving = false;
     }
@@ -87,6 +107,7 @@
       if (result === "installed") updateStatus = "Installed — restart Kurisu to finish.";
     } catch (e) {
       updateError = String(e);
+    } finally {
       updateInstalling = false;
     }
   }
@@ -180,6 +201,9 @@
       </button>
       {#if trackingSavedAt}
         <span class="text-xs text-accent ml-2">saved ✓</span>
+      {/if}
+      {#if trackingError}
+        <p class="text-xs text-red-400 mt-2">Save failed: {trackingError}</p>
       {/if}
     </div>
   </section>

@@ -26,7 +26,7 @@ use crate::commands::{self, AppState, TrackingConfig};
 #[cfg(target_os = "linux")]
 use crate::recognize::basename;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
-use crate::recognize::{build_matchers, match_title, parse_episode_after, parse_episode_guess};
+use crate::recognize::{match_title, parse_episode_after, parse_episode_guess};
 
 /// Poll interval. 5s is responsive enough for a 2-minute prompt threshold while
 /// keeping D-Bus chatter negligible.
@@ -89,8 +89,10 @@ impl ActiveTrack {
 
 // ─────────────────────────── entrypoint ───────────────────────────
 
-/// Launch the background watcher. Runs for the app's lifetime; never panics —
-/// every tick swallows its own errors so a flaky player can't kill detection.
+/// Launch the background watcher. Runs for the app's lifetime. Each tick is
+/// supervised as its own task: a tick ERROR is logged and skipped, and even a
+/// PANIC is caught at the join boundary — it costs the per-track state, but the
+/// loop itself keeps running (a single bad tick must not end tracking silently).
 ///
 /// Spawned via `tauri::async_runtime` (not `tokio::spawn`) because the call site
 /// is Tauri's `setup()` closure, where no Tokio reactor is entered. The Tauri
@@ -100,8 +102,25 @@ pub fn spawn(app: AppHandle) {
         let mut active: Option<ActiveTrack> = None;
         loop {
             tokio::time::sleep(TICK).await;
-            if let Err(e) = tick(&app, &mut active).await {
-                log::debug!("playback tick error: {e}");
+            let app_tick = app.clone();
+            let prev = active.take();
+            let joined = tauri::async_runtime::spawn(async move {
+                let mut track = prev;
+                let result = tick(&app_tick, &mut track).await;
+                (track, result)
+            })
+            .await;
+            match joined {
+                Ok((track, result)) => {
+                    active = track;
+                    if let Err(e) = result {
+                        log::debug!("playback tick error: {e}");
+                    }
+                }
+                Err(e) => {
+                    active = None; // per-track state died with the panicked task
+                    log::warn!("playback tick panicked (watcher continues): {e}");
+                }
             }
         }
     });
@@ -207,12 +226,18 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
             // Set progress to the detected episode (never rewind): identical to +1
             // for sequential viewing, catches up on skips, and leaves rewatches alone.
             if !track.incremented && pct >= cfg.auto_percent as f64 && episode > progress {
-                track.incremented = true;
                 let st = app.state::<AppState>();
-                match commands::set_progress_inner(st.inner(), media_id, episode).await {
-                    Ok(entry) => {
+                // watcher_set_progress re-checks "episode > progress" under the
+                // write lock: the user may have rewound while we were deciding.
+                // `incremented` is set only once the outcome is known, so a failed
+                // push (offline hiccup) retries on a later tick instead of never
+                // firing for this track.
+                match commands::watcher_set_progress(st.inner(), media_id, episode).await {
+                    Ok(Some(entry)) => {
+                        track.incremented = true;
                         let _ = app.emit("kurisu://episode-updated", entry);
                     }
+                    Ok(None) => track.incremented = true, // rewound past `episode` between check and write
                     Err(e) => log::warn!("auto progress-update of {} failed: {e}", media_id),
                 }
             }
@@ -282,7 +307,9 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let trackid = if !url.is_empty() { url.clone() } else { title.clone() };
 
     let state = app.state::<AppState>();
-    let matchers = build_matchers(&state.db);
+    // Matchers come from the shared cache (rebuilt on every list mutation) —
+    // rebuilding them from the DB every 5s tick was the hot path's main cost.
+    let matchers = state.matchers.lock().clone();
     let matched = match_title(&matchers, &title, &url);
     let episode = matched
         .and_then(|m| parse_episode_after(&title, &m.variants).or_else(|| parse_episode_after(&basename(&url), &m.variants)))
@@ -370,7 +397,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let position_us = timeline.Position().map(|t| t.Duration / 10).unwrap_or(0);
 
     let state = app.state::<AppState>();
-    let matchers = build_matchers(&state.db);
+    let matchers = state.matchers.lock().clone();
     let matched = match_title(&matchers, &title, "");
     let episode = matched
         .and_then(|m| parse_episode_after(&title, &m.variants))

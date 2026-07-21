@@ -34,6 +34,10 @@ anyhow = "1"
 regex = "1"
 log = "0.4"
 env_logger = "0.11"
+# non-poisoning mutexes (a panic while holding one must not wedge every command)
+parking_lot = "0.12"
+# OAuth state randomness (already in the tree via rustls)
+ring = "0.17"
 # update download integrity (SHA-256 sidecar verification)
 sha2 = "0.10"
 

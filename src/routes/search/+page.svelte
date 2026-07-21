@@ -1,6 +1,9 @@
 <script lang="ts">
   import { api } from "$lib/api";
+  import { auth } from "$lib/auth.svelte";
   import { displayTitle, type Media } from "$lib/types";
+  import Login from "$lib/Login.svelte";
+  import Img from "$lib/Img.svelte";
 
   let query = $state("");
   let results = $state<Media[]>([]);
@@ -30,7 +33,14 @@
 
   async function add(m: Media, status: string) {
     adding = m.id;
+    error = "";
     try {
+      // Adding writes status/progress unconditionally — refuse to clobber an
+      // entry that's already on the list.
+      if (await api.getEntry(m.id)) {
+        error = `${displayTitle(m)} is already on your list.`;
+        return;
+      }
       await api.updateEntry(m.id, status, 0, null, 0);
     } catch (err) {
       error = String(err);
@@ -40,6 +50,11 @@
   }
 </script>
 
+{#if !auth.isLoggedIn}
+  <div class="grid place-items-center min-h-full p-6">
+    <Login />
+  </div>
+{:else}
 <div class="p-5 max-w-5xl mx-auto">
   <h1 class="text-xl font-semibold mb-4">Search</h1>
 
@@ -64,7 +79,7 @@
     {#each results as m (m.id)}
       <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
         {#if m.cover_large}
-          <img src={m.cover_large} alt="" loading="lazy" decoding="async" class="w-full h-44 object-cover" />
+          <Img src={m.cover_large} class="w-full h-44 object-cover" />
         {:else}
           <div class="w-full h-44 bg-panel-2"></div>
         {/if}
@@ -92,3 +107,4 @@
     {/each}
   </div>
 </div>
+{/if}

@@ -1,10 +1,12 @@
 //! Tauri commands: the only surface the frontend can call. Each is a thin wrapper
 //! over the AniList client + DB cache. State (AniList client, DB, current user) is
-//! held behind std Mutex; async commands CLONE the AniList client out of the lock
-//! before awaiting so the futures stay Send (Tauri's hard requirement).
+//! held behind (non-poisoning) parking_lot Mutexes; async commands CLONE the
+//! AniList client out of the lock before awaiting so the futures stay Send
+//! (Tauri's hard requirement).
 
-use std::sync::Mutex;
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
@@ -26,11 +28,34 @@ const DEFAULT_CLIENT_ID: &str = "45266";
 /// URI registered for the AniList client. The callback server always binds
 /// 127.0.0.1:39417 and reads the token from the query of any path.
 const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:39417/";
+/// The only redirect URIs the callback server can actually answer (it binds
+/// 127.0.0.1:39417 and nothing else). Anything else would deliver the token —
+/// in the URL fragment — to a page we don't serve.
+const ALLOWED_REDIRECT_URIS: &[&str] = &[
+    "http://127.0.0.1:39417/",
+    "http://localhost:39417/",
+];
 
 pub struct AppState {
     pub anilist: Mutex<AniList>,
     pub db: Db,
     pub user: Mutex<Option<User>>,
+    /// Serializes the list-entry read-modify-write (compute from the local cache
+    /// → push to AniList → mirror locally) so a user click and the auto-tracker
+    /// can't clobber each other with values computed from a stale read. Async
+    /// (tokio) because it's held across the AniList HTTP await.
+    pub entry_lock: tokio::sync::Mutex<()>,
+    /// Recognizer matchers, cached so the playback watcher and library scanner
+    /// don't rebuild them (a full-list JOIN + per-entry allocations) every few
+    /// seconds. Rebuilt on every local list mutation (`refresh_matchers`).
+    pub matchers: Mutex<Arc<Vec<recognize::Matcher>>>,
+}
+
+impl AppState {
+    /// Rebuild the recognizer matcher cache after a local list mutation.
+    pub fn refresh_matchers(&self) {
+        *self.matchers.lock() = Arc::new(recognize::build_matchers(&self.db));
+    }
 }
 
 /// Playback tracking configuration. All three are stored in the settings table and
@@ -79,10 +104,14 @@ impl TrackingConfig {
     }
 
     pub fn save(&self, db: &Db) -> Result<(), String> {
-        db.set_setting(TRACKING_MODE_KEY, &self.mode).map_err(|e| e.to_string())?;
-        db.set_setting(TRACKING_PROMPT_KEY, &self.prompt_seconds.to_string()).map_err(|e| e.to_string())?;
-        db.set_setting(TRACKING_AUTO_KEY, &self.auto_percent.to_string()).map_err(|e| e.to_string())?;
-        Ok(())
+        // One transaction: the playback tick re-loads every few seconds and must
+        // never see a half-saved config (new mode + old threshold).
+        db.set_settings(&[
+            (TRACKING_MODE_KEY, &self.mode),
+            (TRACKING_PROMPT_KEY, &self.prompt_seconds.to_string()),
+            (TRACKING_AUTO_KEY, &self.auto_percent.to_string()),
+        ])
+        .map_err(|e| e.to_string())
     }
 
     #[allow(dead_code)]
@@ -126,6 +155,12 @@ pub fn get_redirect_uri(state: State<'_, AppState>) -> Option<String> {
 
 #[tauri::command]
 pub fn set_redirect_uri(uri: String, state: State<'_, AppState>) -> Result<(), String> {
+    if !ALLOWED_REDIRECT_URIS.contains(&uri.as_str()) {
+        return Err(format!(
+            "redirect URI must be one of: {}",
+            ALLOWED_REDIRECT_URIS.join(", ")
+        ));
+    }
     state
         .db
         .set_setting(REDIRECT_URI_KEY, &uri)
@@ -161,7 +196,7 @@ pub fn set_tracking_config(
 
 #[tauri::command]
 pub fn is_logged_in(state: State<'_, AppState>) -> bool {
-    state.anilist.lock().unwrap().has_token()
+    state.anilist.lock().has_token()
 }
 
 /// Generic key/value settings access for small UI toggles (close-to-tray, …).
@@ -181,23 +216,19 @@ pub fn set_app_setting(key: String, value: String, state: State<'_, AppState>) -
 /// token via Viewer, then persists it.
 #[tauri::command]
 pub async fn login_with_token(token: String, state: State<'_, AppState>) -> Result<User, String> {
-    {
-        let mut a = state.anilist.lock().unwrap();
-        a.set_token(Some(token.clone()));
-    }
-    let al = state.anilist.lock().unwrap().clone();
-    let user = match al.viewer().await {
-        Ok(u) => u,
-        Err(e) => {
-            // Don't leave the rejected token in memory: is_logged_in would keep
-            // reporting true and every API call would fail until restart.
-            state.anilist.lock().unwrap().set_token(None);
-            return Err(e.to_string());
-        }
-    };
+    // Verify on a CLONE first: the shared client's token (possibly a working one)
+    // stays untouched until the new token proves valid — a rejected token must
+    // not clobber it and log the user out.
+    let mut probe = state.anilist.lock().clone();
+    probe.set_token(Some(token.clone()));
+    let user = probe.viewer().await.map_err(|e| e.to_string())?;
+    // Persist BEFORE mutating in-memory state: if the DB write fails, the app
+    // keeps running coherently on the previous login instead of holding a token
+    // in memory that a restart would silently drop.
     state.db.set_setting(TOKEN_KEY, &token).map_err(|e| e.to_string())?;
     state.db.set_setting(USERNAME_KEY, &user.name).map_err(|e| e.to_string())?;
-    *state.user.lock().unwrap() = Some(user.clone());
+    state.anilist.lock().set_token(Some(token));
+    *state.user.lock() = Some(user.clone());
     Ok(user)
 }
 
@@ -221,35 +252,40 @@ pub async fn login_oauth(app: tauri::AppHandle, state: State<'_, AppState>) -> R
     let (oauth_state, rx) = anilist::start_callback_server().map_err(|e| e.to_string())?;
     let url = anilist::authorize_url(&client_id, &redirect_uri, &oauth_state);
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())?;
-    // Implicit flow: the callback yields the access token itself (no exchange step).
+    // Implicit flow: the callback yields the access token itself (no exchange
+    // step). The listener keeps running through AniList errors / probes and only
+    // resolves here on a verified token — so this wait ends on success, on the
+    // 5-minute timeout, or when the listener task dies.
     let token = tokio::time::timeout(std::time::Duration::from_secs(300), rx)
         .await
         .map_err(|_| "Timed out waiting for AniList to redirect.".to_string())?
-        .map_err(|_| "OAuth callback channel closed.".to_string())?
-        .map_err(|e| format!("AniList denied access: {}", e))?;
+        .map_err(|_| "OAuth callback channel closed.".to_string())?;
     login_with_token(token, state).await
 }
 
 #[tauri::command]
 pub fn logout(state: State<'_, AppState>) {
-    state.anilist.lock().unwrap().set_token(None);
+    state.anilist.lock().set_token(None);
     let _ = state.db.set_setting(TOKEN_KEY, "");
-    *state.user.lock().unwrap() = None;
+    // Flush the WAL so the old token doesn't sit recoverable in the -wal sidecar.
+    let _ = state.db.checkpoint();
+    *state.user.lock() = None;
 }
 
 #[tauri::command]
 pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, String> {
-    // Cached user wins: a name/avatar change on AniList only shows after
-    // logout/login (no re-fetch per call). Acceptable for a single-user app.
-    if let Some(u) = state.user.lock().unwrap().clone() {
-        return Ok(Some(u));
-    }
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     if !al.has_token() {
         return Ok(None);
     }
+    // Cached user wins: a name/avatar change on AniList only shows after
+    // logout/login (no re-fetch per call). Acceptable for a single-user app.
+    // Checked AFTER the token so a stale cache can't outlive the login.
+    if let Some(u) = state.user.lock().clone() {
+        return Ok(Some(u));
+    }
     let u = al.viewer().await.map_err(|e| e.to_string())?;
-    *state.user.lock().unwrap() = Some(u.clone());
+    *state.user.lock() = Some(u.clone());
     Ok(Some(u))
 }
 
@@ -257,7 +293,7 @@ pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, St
 
 #[tauri::command]
 pub async fn search_anime(query: String, state: State<'_, AppState>) -> Result<Vec<Media>, String> {
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     let media = al.search(&query, 25).await.map_err(|e| e.to_string())?;
     for m in &media {
         let _ = state.db.upsert_media(m);
@@ -273,7 +309,7 @@ pub async fn get_season(
     page: i64,
     state: State<'_, AppState>,
 ) -> Result<Vec<Media>, String> {
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     let media = al.season(&season, year, page).await.map_err(|e| e.to_string())?;
     for m in &media {
         let _ = state.db.upsert_media(m);
@@ -284,7 +320,7 @@ pub async fn get_season(
 /// Community recommendations for a title (the edit modal's "also like" strip).
 #[tauri::command]
 pub async fn get_recommendations(media_id: i64, state: State<'_, AppState>) -> Result<Vec<Media>, String> {
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     let media = al.recommendations(media_id).await.map_err(|e| e.to_string())?;
     for m in &media {
         let _ = state.db.upsert_media(m);
@@ -297,7 +333,7 @@ pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, Str
     if let Some(m) = state.db.get_media(id).map_err(|e| e.to_string())? {
         return Ok(m);
     }
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     let v = al
         .search(&id.to_string(), 5)
         .await
@@ -317,7 +353,11 @@ pub async fn sync_my_list(state: State<'_, AppState>) -> Result<Vec<ListEntry>, 
         .get_setting(USERNAME_KEY)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not logged in".to_string())?;
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
+    // The lock covers the FETCH too, not just the upserts: a list snapshot pulled
+    // before a concurrent save's push would resurrect that entry's pre-save values
+    // over the fresh local write when the upserts land.
+    let _write = state.entry_lock.lock().await;
     let entries = al.user_list(&user_name).await.map_err(|e| e.to_string())?;
     for e in &entries {
         if let Some(m) = &e.media {
@@ -325,6 +365,7 @@ pub async fn sync_my_list(state: State<'_, AppState>) -> Result<Vec<ListEntry>, 
         }
         let _ = state.db.upsert_entry(e);
     }
+    state.refresh_matchers();
     state.db.entries_with_media().map_err(|e| e.to_string())
 }
 
@@ -354,6 +395,7 @@ pub async fn update_entry(
 
 /// Shared push-to-AniList + mirror-to-cache used by the `update_entry` command and
 /// the playback watcher. Takes `&AppState` so it works outside the command layer.
+/// Serialized under `entry_lock` against the read-modify-write paths below.
 pub async fn save_entry_inner(
     state: &AppState,
     media_id: i64,
@@ -362,8 +404,23 @@ pub async fn save_entry_inner(
     score: Option<f64>,
     repeat: i64,
 ) -> Result<ListEntry, String> {
+    let _write = state.entry_lock.lock().await;
+    save_entry_unlocked(state, media_id, status, progress, score, repeat).await
+}
+
+/// The body of `save_entry_inner`, for callers already holding `entry_lock`
+/// (increment / set_progress computed their values from a read taken under the
+/// same lock, so no other writer can have invalidated them in between).
+async fn save_entry_unlocked(
+    state: &AppState,
+    media_id: i64,
+    status: String,
+    progress: i64,
+    score: Option<f64>,
+    repeat: i64,
+) -> Result<ListEntry, String> {
     let st = parse_status(&status)?;
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     let entry_id = al
         .save_entry(media_id, st, progress, score, repeat)
         .await
@@ -379,6 +436,7 @@ pub async fn save_entry_inner(
         media: state.db.get_media(media_id).map_err(|e| e.to_string())?,
     };
     state.db.upsert_entry(&entry).map_err(|e| e.to_string())?;
+    state.refresh_matchers();
     Ok(entry)
 }
 
@@ -393,12 +451,17 @@ pub async fn increment_episode(
 
 /// Shared +1 logic used by the `increment_episode` command and the watcher's
 /// auto-increment. Clamps to the known episode count and auto-completes at the last
-/// episode, mirroring the command's visible behavior exactly.
+/// episode, mirroring the command's visible behavior exactly. The whole
+/// read-compute-push runs under `entry_lock`, so concurrent writes can't be
+/// clobbered by values computed from a stale read.
 pub async fn increment_inner(state: &AppState, media_id: i64) -> Result<ListEntry, String> {
+    let _write = state.entry_lock.lock().await;
     let cur = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
     let mut progress = cur.as_ref().map(|e| e.progress).unwrap_or(0) + 1;
     let media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
-    let total = media.as_ref().and_then(|m| m.episodes).unwrap_or(i64::MAX);
+    // Unknown episode total: still cap at a sane ceiling so the +1 button can't
+    // push unbounded bogus progress to AniList.
+    let total = media.as_ref().and_then(|m| m.episodes).unwrap_or(9999);
     if progress > total {
         progress = total;
     }
@@ -407,15 +470,17 @@ pub async fn increment_inner(state: &AppState, media_id: i64) -> Result<ListEntr
         .map(|e| e.status.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ListStatus::Current.as_str().to_string());
-    // auto-complete when we hit the last episode
-    let final_status = if media.as_ref().and_then(|m| m.episodes) == Some(progress) {
-        ListStatus::Completed.as_str().to_string()
+    let prev_repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
+    // Auto-complete at the last episode. Finishing while REPEATING also bumps the
+    // rewatch count — AniList's own convention — instead of silently losing it.
+    let (final_status, repeat) = if media.as_ref().and_then(|m| m.episodes) == Some(progress) {
+        let repeat = if status == ListStatus::Repeating.as_str() { prev_repeat + 1 } else { prev_repeat };
+        (ListStatus::Completed.as_str().to_string(), repeat)
     } else {
-        status
+        (status, prev_repeat)
     };
     let score = cur.as_ref().and_then(|e| e.score);
-    let repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
-    save_entry_inner(state, media_id, final_status, progress, score, repeat).await
+    save_entry_unlocked(state, media_id, final_status, progress, score, repeat).await
 }
 
 /// Set absolute episode progress (the list's −/+ stepper). Preserves the current
@@ -431,6 +496,42 @@ pub async fn set_progress(
 }
 
 pub async fn set_progress_inner(state: &AppState, media_id: i64, progress: i64) -> Result<ListEntry, String> {
+    let _write = state.entry_lock.lock().await;
+    let (final_status, progress, score, repeat) = compute_set_progress(state, media_id, progress)?;
+    save_entry_unlocked(state, media_id, final_status, progress, score, repeat).await
+}
+
+/// The auto-tracker's variant of `set_progress_inner`. The watcher decided to
+/// write from a seconds-old sample; if the user rewound past the detected
+/// episode in the meantime, writing now would resurrect stale progress — so
+/// re-check, under the write lock, that the set still moves the entry forward.
+/// Ok(None) = skipped (entry already at or past `episode`).
+pub async fn watcher_set_progress(state: &AppState, media_id: i64, episode: i64) -> Result<Option<ListEntry>, String> {
+    let _write = state.entry_lock.lock().await;
+    let current = state
+        .db
+        .get_entry(media_id)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.progress)
+        .unwrap_or(0);
+    if episode <= current {
+        return Ok(None);
+    }
+    let (final_status, progress, score, repeat) = compute_set_progress(state, media_id, episode)?;
+    save_entry_unlocked(state, media_id, final_status, progress, score, repeat)
+        .await
+        .map(Some)
+}
+
+/// Compute status/progress/score/repeat for an absolute progress set. Caller
+/// must hold `entry_lock`; the reads are then consistent against other writers.
+/// Clamps to the known episode count, auto-completes at the last episode, and
+/// drops a Completed entry back to Current if you rewind past the end.
+fn compute_set_progress(
+    state: &AppState,
+    media_id: i64,
+    progress: i64,
+) -> Result<(String, i64, Option<f64>, i64), String> {
     let cur = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
     let media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
     let total = media.as_ref().and_then(|m| m.episodes);
@@ -439,27 +540,38 @@ pub async fn set_progress_inner(state: &AppState, media_id: i64, progress: i64) 
         progress = progress.min(t);
     }
     let prev_status = cur.as_ref().map(|e| e.status.as_str()).unwrap_or("");
-    let final_status = if total == Some(progress) && progress > 0 {
-        ListStatus::Completed.as_str().to_string()
+    let prev_repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
+    let at_end = total == Some(progress) && progress > 0;
+    // Auto-complete at the last episode — bumping the rewatch count when a
+    // REPEATING entry finishes, per AniList's own convention, instead of
+    // silently dropping the rewatch.
+    let (final_status, repeat) = if at_end && prev_status == "REPEATING" {
+        (ListStatus::Completed.as_str().to_string(), prev_repeat + 1)
+    } else if at_end {
+        (ListStatus::Completed.as_str().to_string(), prev_repeat)
     } else if prev_status == "COMPLETED" || prev_status.is_empty() {
-        ListStatus::Current.as_str().to_string()
+        (ListStatus::Current.as_str().to_string(), prev_repeat)
     } else {
-        prev_status.to_string()
+        (prev_status.to_string(), prev_repeat)
     };
     let score = cur.as_ref().and_then(|e| e.score);
-    let repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
-    save_entry_inner(state, media_id, final_status, progress, score, repeat).await
+    Ok((final_status, progress, score, repeat))
 }
 
 #[tauri::command]
 pub async fn delete_entry_cmd(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    // Serialized with entry writes: a delete racing a save must not end with the
+    // save resurrecting the row afterwards.
+    let _write = state.entry_lock.lock().await;
     if let Some(entry) = state.db.get_entry(media_id).map_err(|e| e.to_string())? {
         if let Some(id) = entry.id {
-            let al = state.anilist.lock().unwrap().clone();
+            let al = state.anilist.lock().clone();
             let _ = al.delete_entry(id).await;
         }
     }
-    state.db.delete_entry(media_id).map_err(|e| e.to_string())
+    state.db.delete_entry(media_id).map_err(|e| e.to_string())?;
+    state.refresh_matchers();
+    Ok(())
 }
 
 // ───────────────────────────── library ─────────────────────────────
@@ -480,12 +592,12 @@ pub fn remove_library_folder(path: String, state: State<'_, AppState>) -> Result
 }
 
 /// Scan the configured folders for video files and recognize them against the
-/// cached list. Matchers/folders are read from the DB up front; the filesystem
-/// walk itself runs on a blocking thread.
+/// cached list. Matchers come from the shared cache (rebuilt on every list
+/// mutation); the filesystem walk itself runs on a blocking thread.
 #[tauri::command]
 pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<LibraryFile>, String> {
     let folders = library::get_folders(&state.db);
-    let matchers = recognize::build_matchers(&state.db);
+    let matchers = state.matchers.lock().clone();
     tokio::task::spawn_blocking(move || library::scan_paths(&folders, &matchers))
         .await
         .map_err(|e| e.to_string())
@@ -495,7 +607,7 @@ pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<LibraryFile>
 
 #[tauri::command]
 pub async fn get_notifications(state: State<'_, AppState>) -> Result<Vec<Notification>, String> {
-    let al = state.anilist.lock().unwrap().clone();
+    let al = state.anilist.lock().clone();
     al.notifications().await.map_err(|e| e.to_string())
 }
 
@@ -529,6 +641,11 @@ pub async fn check_update() -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
     let rel = crate::updater::fetch_latest_release().await?;
+    // Re-check freshness HERE, not only in the check that opened the modal: a
+    // re-published or reordered "latest" release must never downgrade us.
+    if !crate::updater::is_newer(&rel.version, crate::updater::current_version()) {
+        return Err("the latest release is not newer than this build".to_string());
+    }
     let asset = crate::updater::platform_asset(&rel)
         .ok_or_else(|| "the latest release has no build for this platform".to_string())?
         .to_string();
@@ -544,34 +661,51 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
         // Download into the app-data dir (always user-writable) under a
         // pid-unique name; swept on the next launch.
         let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dir2 = dir.clone();
+        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir2))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         let tmp = dir.join(format!(".kurisu-update-{}-{asset}", std::process::id()));
         crate::updater::download(&url, &tmp).await?;
 
         // Verify against the published `.sha256` sidecar and FAIL CLOSED: an
-        // unverifiable download is refused, never installed.
+        // unverifiable download is refused, never installed. The digest is taken
+        // from an OPEN handle, and that same handle is what gets installed /
+        // executed below — another process swapping the file between verify and
+        // use (TOCTOU) can't slide different bytes under the green stamp.
+        // (Hashing a ~150 MB file is blocking I/O: off the async runtime.)
         let verify = async {
             let sidecar = crate::updater::fetch_sidecar(&rel, &asset)
                 .await
                 .ok_or_else(|| "no SHA-256 checksum available for this release; refusing to install unverified".to_string())?;
-            match crate::updater::verify_sha256(&tmp, &sidecar) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("update failed integrity check (SHA-256 mismatch)".to_string()),
+            let tmp2 = tmp.clone();
+            match tokio::task::spawn_blocking(move || crate::updater::verify_and_open(&tmp2, &sidecar)).await {
+                Ok(Ok(Some(f))) => Ok(f),
+                Ok(Ok(None)) => Err("update failed integrity check (SHA-256 mismatch)".to_string()),
+                Ok(Err(e)) => Err(format!("could not verify the download: {e}")),
                 Err(e) => Err(format!("could not verify the download: {e}")),
             }
         }
         .await;
-        if let Err(e) = verify {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
+        let verified = match verify {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
 
         #[cfg(windows)]
         let outcome = (|| {
             // Hand off: launch the installer, then quit so it can overwrite us.
+            // `verified` is held (open with read-only sharing) until AFTER the
+            // spawn: the file can't be renamed or overwritten under us, so the
+            // loader reads exactly the bytes we hashed.
             std::process::Command::new(&tmp)
                 .spawn()
                 .map_err(|e| format!("could not launch the installer: {e}"))?;
+            drop(verified);
             let handle = app.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -581,7 +715,12 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
         })();
         #[cfg(target_os = "linux")]
         let outcome = {
-            let result = crate::updater::apply_linux_update(&tmp);
+            // The swap copies FROM the verified handle (not the path) and does
+            // blocking renames — off the async runtime.
+            let mut verified = verified;
+            let result = tokio::task::spawn_blocking(move || crate::updater::apply_linux_update(&mut verified))
+                .await
+                .map_err(|e| e.to_string())?;
             let _ = std::fs::remove_file(&tmp);
             result.map(|_| "installed".to_string())
         };
@@ -604,4 +743,75 @@ fn parse_status(s: &str) -> Result<ListStatus, String> {
         "REPEATING" => ListStatus::Repeating,
         other => return Err(format!("unknown list status: {}", other)),
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An AppState backed by an in-memory DB (no network needed: the progress
+    /// compute helpers are pure local read-modify logic).
+    fn test_state() -> AppState {
+        AppState {
+            anilist: Mutex::new(AniList::new()),
+            db: Db::open(std::path::Path::new(":memory:")).expect("in-memory db"),
+            user: Mutex::new(None),
+            entry_lock: tokio::sync::Mutex::new(()),
+            matchers: Mutex::new(Arc::new(vec![])),
+        }
+    }
+
+    fn seed(state: &AppState, episodes: Option<i64>, status: &str, progress: i64, repeat: i64) {
+        state
+            .db
+            .upsert_media(&Media { id: 1, episodes, ..Default::default() })
+            .unwrap();
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(10),
+                media_id: 1,
+                status: status.into(),
+                progress,
+                score: None,
+                repeat,
+                updated_at: None,
+                media: None,
+            })
+            .unwrap();
+    }
+
+    /// C1: finishing the last episode while REPEATING completes the entry AND
+    /// bumps the rewatch count — never silently drops the rewatch.
+    #[test]
+    fn finishing_a_rewatch_bumps_repeat() {
+        let state = test_state();
+        seed(&state, Some(12), "REPEATING", 11, 2);
+        let (status, progress, _, repeat) = compute_set_progress(&state, 1, 12).unwrap();
+        assert_eq!((status.as_str(), progress, repeat), ("COMPLETED", 12, 3));
+    }
+
+    /// C1: a plain CURRENT entry completing at the last episode keeps repeat=0.
+    #[test]
+    fn finishing_first_watch_keeps_repeat() {
+        let state = test_state();
+        seed(&state, Some(12), "CURRENT", 11, 0);
+        let (status, progress, _, repeat) = compute_set_progress(&state, 1, 12).unwrap();
+        assert_eq!((status.as_str(), progress, repeat), ("COMPLETED", 12, 0));
+    }
+
+    /// Rewinding a COMPLETED entry drops it back to CURRENT (rewatch preserved
+    /// for a REPEATING entry still mid-run).
+    #[test]
+    fn rewinding_past_the_end_reopens_completed() {
+        let state = test_state();
+        seed(&state, Some(12), "COMPLETED", 12, 1);
+        let (status, _, _, repeat) = compute_set_progress(&state, 1, 5).unwrap();
+        assert_eq!((status.as_str(), repeat), ("CURRENT", 1));
+        let state = test_state();
+        seed(&state, Some(12), "REPEATING", 6, 2);
+        let (status, _, _, repeat) = compute_set_progress(&state, 1, 4).unwrap();
+        assert_eq!((status.as_str(), repeat), ("REPEATING", 2));
+    }
 }

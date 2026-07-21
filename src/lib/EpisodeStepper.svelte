@@ -26,12 +26,14 @@
 
   const dirty = $derived(pending !== saved);
   const atMin = $derived(pending <= 0);
-  const atMax = $derived(total != null && pending >= total);
+  // No known episode count → cap at a sane ceiling instead of spinning forever.
+  const atMax = $derived(pending >= (total ?? 9999));
 
   function step(delta: number) {
     let next = pending + delta;
     if (next < 0) next = 0;
-    if (total != null && next > total) next = total;
+    const max = total ?? 9999;
+    if (next > max) next = max;
     if (next === pending) return;
     pending = next;
     if (timer) clearTimeout(timer);
@@ -79,6 +81,9 @@
         saved = p;
       } else if (p !== saved) {
         saved = p;
+        // External update jumped past the buffered edit — adopt it. Otherwise the
+        // 3s timer would commit the older, lower pending value and rewind progress.
+        if (p > pending) pending = p;
       }
     });
   });

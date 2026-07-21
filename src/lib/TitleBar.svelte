@@ -17,9 +17,13 @@
   refresh();
   // keep the maximize/restore icon in sync when the user resizes via the WM edges
   $effect(() => {
+    let alive = true;
     let un: (() => void) | undefined;
-    appWindow.onResized(() => refresh()).then((u) => (un = u));
-    return () => un?.();
+    appWindow.onResized(() => refresh()).then((u) => (alive ? (un = u) : u()));
+    return () => {
+      alive = false;
+      un?.();
+    };
   });
 </script>
 

@@ -14,18 +14,23 @@
   // One-shot notice after a doubly-failed swap (see the backend marker).
   let failedMsg = $state("");
 
+  let updateDialog = $state<HTMLDivElement | null>(null);
+  let failedDialog = $state<HTMLDivElement | null>(null);
+
   $effect(() => {
+    let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
     listen<UpdateInfo>("kurisu://update-available", (e) => {
       update = e.payload;
       err = "";
       installed = false;
-    }).then((u) => (un1 = u));
+    }).then((u) => (alive ? (un1 = u) : u()));
     listen<{ message: string }>("kurisu://update-failed", (e) => {
       failedMsg = e.payload.message;
-    }).then((u) => (un2 = u));
+    }).then((u) => (alive ? (un2 = u) : u()));
     return () => {
+      alive = false;
       un1?.();
       un2?.();
     };
@@ -41,6 +46,7 @@
       // "restarting": the installer launched and the app quits itself.
     } catch (e) {
       err = String(e);
+    } finally {
       busy = false;
     }
   }
@@ -48,7 +54,27 @@
   function later() {
     update = null;
   }
+
+  // Modal behavior: Escape dismisses, dialog takes focus on open.
+  function onWindowKeydown(e: KeyboardEvent) {
+    if (e.key !== "Escape") return;
+    if (failedMsg) {
+      e.stopImmediatePropagation();
+      failedMsg = "";
+    } else if (update) {
+      e.stopImmediatePropagation();
+      later();
+    }
+  }
+  $effect(() => {
+    if (update) updateDialog?.focus();
+  });
+  $effect(() => {
+    if (failedMsg) failedDialog?.focus();
+  });
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 {#if update}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
@@ -59,6 +85,7 @@
   >
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div
+      bind:this={updateDialog}
       class="bg-panel border border-edge rounded-xl p-5 max-w-sm w-full mx-4 shadow-2xl"
       onclick={(e) => e.stopPropagation()}
       role="dialog"
@@ -117,6 +144,7 @@
     role="presentation"
   >
     <div
+      bind:this={failedDialog}
       class="bg-panel border border-edge rounded-xl p-5 max-w-sm w-full mx-4 shadow-2xl"
       role="dialog"
       aria-modal="true"

@@ -4,6 +4,7 @@
   import { auth } from "$lib/auth.svelte";
   import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
+  import Img from "$lib/Img.svelte";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;
   const SEASON_LABEL: Record<string, string> = {
@@ -34,16 +35,22 @@
   // media_id → list status, for the on-list badges.
   const onList = $derived(new Map(entries.map((e) => [e.media_id, e.status])));
 
+  // Rapid Prev/Next (or a login change mid-fetch) resolves latest-wins.
+  let loadId = 0;
   async function load() {
+    const id = ++loadId;
     loading = true;
     error = "";
     try {
-      media = await api.getSeason(season, year, 1);
-      entries = await api.localEntries();
+      const seasonMedia = await api.getSeason(season, year, 1);
+      const myEntries = await api.localEntries();
+      if (id !== loadId) return;
+      media = seasonMedia;
+      entries = myEntries;
     } catch (e) {
-      error = String(e);
+      if (id === loadId) error = String(e);
     } finally {
-      loading = false;
+      if (id === loadId) loading = false;
     }
   }
 
@@ -122,7 +129,7 @@
           {@const listed = onList.get(m.id)}
           <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
             {#if m.cover_large}
-              <img src={m.cover_large} alt="" loading="lazy" decoding="async" class="w-full h-44 object-cover" />
+              <Img src={m.cover_large} class="w-full h-44 object-cover" />
             {:else}
               <div class="w-full h-44 bg-panel-2"></div>
             {/if}

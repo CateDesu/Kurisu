@@ -6,6 +6,7 @@
   import Select from "$lib/Select.svelte";
   import ScoreInput from "$lib/ScoreInput.svelte";
   import Icon from "$lib/Icon.svelte";
+  import Img from "$lib/Img.svelte";
   import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
 
   let {
@@ -60,7 +61,11 @@
   async function addRec(m: Media) {
     addingRec = m.id;
     try {
-      await api.updateEntry(m.id, "PLANNING", 0, null, 0);
+      // updateEntry writes status/progress unconditionally — only push when the
+      // show isn't already on the list, or its entry would be reset.
+      if (!(await api.getEntry(m.id))) {
+        await api.updateEntry(m.id, "PLANNING", 0, null, 0);
+      }
       addedRecs.push(m.id);
     } catch {
       // leave the button enabled so the user can retry
@@ -70,6 +75,7 @@
   }
 
   async function save() {
+    if (saving || removing) return; // form still submits on Enter mid-save
     saving = true;
     err = "";
     try {
@@ -83,6 +89,7 @@
   }
 
   async function remove() {
+    if (removing || saving) return;
     removing = true;
     err = "";
     try {
@@ -94,7 +101,17 @@
       removing = false;
     }
   }
+
+  // Modal behavior: Escape closes (Select swallows it first when its dropdown is
+  // open), and the dialog takes focus so Tab stays inside the modal.
+  let dialog = $state<HTMLDivElement | null>(null);
+  function onWindowKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") onclose();
+  }
+  $effect(() => dialog?.focus());
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
@@ -104,6 +121,7 @@
 >
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
+    bind:this={dialog}
     class="bg-panel border border-edge rounded-xl p-5 max-w-md w-full mx-4 shadow-2xl"
     onclick={(e) => e.stopPropagation()}
     role="dialog"
@@ -112,7 +130,7 @@
   >
     <div class="flex items-start gap-3 mb-4">
       {#if entry.media?.cover_medium}
-        <img src={entry.media.cover_medium} alt="" loading="lazy" decoding="async" class="w-12 h-16 object-cover rounded shrink-0" />
+        <Img src={entry.media.cover_medium} class="w-12 h-16 object-cover rounded shrink-0" />
       {/if}
       <div class="min-w-0 flex-1">
         <h3 class="font-semibold truncate">{displayTitle(entry.media)}</h3>
@@ -224,7 +242,7 @@
               class="w-16 shrink-0 text-left group disabled:opacity-60"
             >
               {#if r.cover_medium}
-                <img src={r.cover_medium} alt="" loading="lazy" decoding="async" class="w-16 h-[5.5rem] object-cover rounded" />
+                <Img src={r.cover_medium} class="w-16 h-[5.5rem] object-cover rounded" />
               {:else}
                 <div class="w-16 h-[5.5rem] bg-panel-2 rounded"></div>
               {/if}

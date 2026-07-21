@@ -7,6 +7,7 @@
   import { displayTitle, type LibraryFile, type ListEntry } from "$lib/types";
   import Icon from "$lib/Icon.svelte";
   import Login from "$lib/Login.svelte";
+  import Img from "$lib/Img.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let error = $state("");
@@ -37,7 +38,9 @@
     for (const g of byMedia.values()) {
       g.files.sort((a, b) => (a.episode ?? 9999) - (b.episode ?? 9999));
     }
-    const matched = [...byMedia.values()].sort((a, b) => a.title.localeCompare(b.title));
+    const matched = [...byMedia.values()].sort((a, b) =>
+      a.title.localeCompare(b.title, undefined, { sensitivity: "base", numeric: true })
+    );
     return { matched, unmatched };
   });
 
@@ -167,10 +170,11 @@
       <div class="space-y-4">
         {#each groups.matched as g (g.mediaId)}
           {@const next = nextFile(g)}
+          {@const cov = cover(g)}
           <section class="cv-card bg-panel border border-edge rounded-lg overflow-hidden">
             <div class="flex items-center gap-3 p-2.5 border-b border-edge">
-              {#if cover(g)}
-                <img src={cover(g)} alt="" loading="lazy" decoding="async" class="w-10 h-14 object-cover rounded shrink-0" />
+              {#if cov}
+                <Img src={cov} class="w-10 h-14 object-cover rounded shrink-0" />
               {:else}
                 <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
               {/if}

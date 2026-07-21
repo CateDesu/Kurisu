@@ -4,10 +4,14 @@
 //! this scale.
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::sync::Mutex;
 
 use crate::models::{ListEntry, Media};
+
+/// Current schema version (PRAGMA user_version). Bump and add a rung to the
+/// ladder in `migrate` for every schema change.
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -17,14 +21,35 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+        )?;
         Self::migrate(&conn)?;
+        // The settings table holds the AniList token in plaintext: keep the DB
+        // and its WAL sidecars owner-only (Connection::open uses the process
+        // umask, typically 0644). Best-effort fix-up on every open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut wal = path.as_os_str().to_os_string();
+            wal.push("-wal");
+            let mut shm = path.as_os_str().to_os_string();
+            shm.push("-shm");
+            for p in [path.to_path_buf(), wal.into(), shm.into()] {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         Ok(Db(Mutex::new(conn)))
     }
 
+    /// Schema ladder keyed off PRAGMA user_version: each `if version < N` rung
+    /// upgrades N-1 → N. CREATE TABLEs stay IF NOT EXISTS so a fresh DB (version
+    /// 0) and an old one converge on the same schema.
     fn migrate(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS media (
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS media (
                 id              INTEGER PRIMARY KEY,
                 id_mal          INTEGER,
                 title_romaji    TEXT,
@@ -60,16 +85,24 @@ impl Db {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );",
-        )?;
-        // Columns added after launch: back-fill them on existing DBs (CREATE TABLE
-        // IF NOT EXISTS won't add columns to an existing table).
-        Self::ensure_column(conn, "media", "next_airing_episode", "INTEGER")?;
-        Self::ensure_column(conn, "media", "next_airing_at", "INTEGER")?;
+            )?;
+        }
+        if version < 2 {
+            // Columns added after launch: back-fill them on existing DBs (CREATE
+            // TABLE IF NOT EXISTS won't add columns to an existing table).
+            Self::ensure_column(conn, "media", "next_airing_episode", "INTEGER")?;
+            Self::ensure_column(conn, "media", "next_airing_at", "INTEGER")?;
+        }
+        if version < SCHEMA_VERSION {
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        }
         Ok(())
     }
 
     /// Add `col` to `table` if it isn't already there. Lets us evolve the schema
-    /// without a migration framework.
+    /// without a migration framework. NOTE: only nullable columns (or ones with a
+    /// DEFAULT) can go through here — SQLite refuses ADD COLUMN ... NOT NULL on
+    /// an existing table.
     fn ensure_column(conn: &Connection, table: &str, col: &str, ty: &str) -> Result<()> {
         let present: Vec<String> = conn
             .prepare(&format!("PRAGMA table_info({table})"))?
@@ -83,7 +116,7 @@ impl Db {
     }
 
     pub fn upsert_media(&self, m: &Media) -> Result<()> {
-        let c = self.0.lock().unwrap();
+        let c = self.0.lock();
         c.execute(
             "INSERT OR REPLACE INTO media
              (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
@@ -102,7 +135,7 @@ impl Db {
     }
 
     pub fn get_media(&self, id: i64) -> Result<Option<Media>> {
-        let c = self.0.lock().unwrap();
+        let c = self.0.lock();
         let mut stmt = c.prepare(
             "SELECT id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
                     episodes,format,status,average_score,season,season_year,description,
@@ -114,7 +147,7 @@ impl Db {
     }
 
     pub fn upsert_entry(&self, e: &ListEntry) -> Result<()> {
-        let c = self.0.lock().unwrap();
+        let c = self.0.lock();
         c.execute(
             "INSERT OR REPLACE INTO list_entry
              (media_id,entry_id,status,progress,score,repeat,updated_at)
@@ -127,7 +160,7 @@ impl Db {
     }
 
     pub fn delete_entry(&self, media_id: i64) -> Result<()> {
-        self.0.lock().unwrap().execute(
+        self.0.lock().execute(
             "DELETE FROM list_entry WHERE media_id = ?",
             [media_id],
         )?;
@@ -136,7 +169,7 @@ impl Db {
 
     /// All local entries with their cached media joined in. The frontend list view.
     pub fn entries_with_media(&self) -> Result<Vec<ListEntry>> {
-        let c = self.0.lock().unwrap();
+        let c = self.0.lock();
         let mut stmt = c.prepare(
             "SELECT e.media_id,e.entry_id,e.status,e.progress,e.score,e.repeat,e.updated_at,
                     m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
@@ -164,7 +197,7 @@ impl Db {
     }
 
     pub fn get_entry(&self, media_id: i64) -> Result<Option<ListEntry>> {
-        let c = self.0.lock().unwrap();
+        let c = self.0.lock();
         let row = c
             .query_row(
                 "SELECT media_id,entry_id,status,progress,score,repeat,updated_at
@@ -189,17 +222,36 @@ impl Db {
 
     // ---- settings (key/value) ----
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.0.lock().unwrap().execute(
+        self.0.lock().execute(
             "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
             [key, value],
         )?;
+        Ok(())
+    }
+    /// Multi-key upsert in ONE transaction: a concurrent reader never sees a
+    /// half-saved group (e.g. the tracking config's three keys).
+    pub fn set_settings(&self, kvs: &[(&str, &str)]) -> Result<()> {
+        let mut c = self.0.lock();
+        let tx = c.transaction()?;
+        for (k, v) in kvs {
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                [k, v],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Flush + truncate the WAL. Used on logout so the old token doesn't linger
+    /// in the -wal sidecar after the settings row is overwritten.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.0.lock().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .0
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM settings WHERE key = ?",
                 [key],
@@ -211,7 +263,7 @@ impl Db {
     // ---- watched-file log (recognizer dedup) ----
     #[allow(dead_code)]
     pub fn mark_watched(&self, path: &str, media_id: i64, episode: i64) -> Result<()> {
-        self.0.lock().unwrap().execute(
+        self.0.lock().execute(
             "INSERT OR REPLACE INTO watched_file (path,media_id,episode,watched_at)
              VALUES (?,?,?,?)",
             rusqlite::params![path, media_id, episode, chrono::Utc::now().timestamp()],
@@ -223,7 +275,6 @@ impl Db {
         Ok(self
             .0
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT 1 FROM watched_file WHERE path = ?",
                 [path],

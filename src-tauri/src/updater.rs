@@ -30,25 +30,49 @@ pub const FAILED_MARKER: &str = ".kurisu-update-failed";
 
 /// `"v1.0.0.8" -> (1, 0, 0, 8)`. Each dot segment contributes only its leading
 /// digits; no leading digit means 0. Handles the rolling 4-segment tags.
+/// (Comparisons go through `version_key`; this stays for the tests and as a
+/// plain release-tuple view.)
+#[allow(dead_code)]
 pub fn parse_version(s: &str) -> Vec<u64> {
+    version_key(s).0
+}
+
+/// Comparable version key: release segments, then a prerelease marker that sorts
+/// ANY prerelease below the plain release of the same numbers
+/// (`1.0.0-rc1 < 1.0.0 < 1.0.0.8`); the prerelease's first digit run breaks
+/// rc1/rc2-style ties.
+fn version_key(s: &str) -> (Vec<u64>, u8, u64) {
     let trimmed = s.trim().trim_start_matches(['v', 'V']);
-    let out: Vec<u64> = trimmed
+    let (core, pre) = match trimmed.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (trimmed, None),
+    };
+    let release: Vec<u64> = core
         .split('.')
         .map(|seg| {
             let digits: String = seg.chars().take_while(char::is_ascii_digit).collect();
             digits.parse().unwrap_or(0)
         })
         .collect();
-    if out.is_empty() {
-        vec![0]
-    } else {
-        out
-    }
+    let release = if release.is_empty() { vec![0] } else { release };
+    let (pre_rank, pre_num) = match pre {
+        // No prerelease sorts above any prerelease of the same release numbers.
+        None => (1, 0),
+        Some(p) => {
+            let digits: String = p
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect();
+            (0, digits.parse().unwrap_or(0))
+        }
+    };
+    (release, pre_rank, pre_num)
 }
 
 /// True if `remote` is strictly newer than `current`.
 pub fn is_newer(remote: &str, current: &str) -> bool {
-    parse_version(remote) > parse_version(current)
+    version_key(remote) > version_key(current)
 }
 
 /// This build's version: the CI-stamped release version when present
@@ -181,21 +205,25 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
 /// Stream `url` to `dest`, writing to a `.part` and renaming on success so a
 /// half-download is never mistaken for complete. Verifies Content-Length (a
 /// clean early close is a short read with no error). `.part` removed on failure.
+/// File I/O goes through tokio::fs so the writes stay off the async workers.
 #[cfg(any(windows, target_os = "linux"))]
 pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
-    use std::io::Write;
+    use tokio::io::AsyncWriteExt;
     let part = {
         let mut p = dest.as_os_str().to_os_string();
         p.push(".part");
         PathBuf::from(p)
     };
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
     let res: Result<(), String> = async {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(600))
+            // NSIS + embedded WebView2 bootstrapper is ~150 MB — at ~1 Mbps that
+            // is a 20-minute pull, so give slow links 30 minutes before cutting
+            // off (the half-download is deleted either way).
+            .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|e| e.to_string())?;
         let mut resp = client
@@ -206,54 +234,82 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
             .error_for_status()
             .map_err(|e| e.to_string())?;
         let total = resp.content_length().unwrap_or(0);
-        let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+        let mut file = tokio::fs::File::create(&part).await.map_err(|e| e.to_string())?;
         let mut got: u64 = 0;
         while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-            file.write_all(&chunk).map_err(|e| e.to_string())?;
+            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             got += chunk.len() as u64;
         }
+        file.flush().await.map_err(|e| e.to_string())?;
+        drop(file);
         if total != 0 && got < total {
             return Err(format!("download incomplete: {got} of {total} bytes"));
         }
-        std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+        tokio::fs::rename(&part, dest).await.map_err(|e| e.to_string())?;
         Ok(())
     }
     .await;
     if res.is_err() {
-        let _ = std::fs::remove_file(&part);
+        let _ = tokio::fs::remove_file(&part).await;
     }
     res
 }
 
-/// Whether the `.sha256` sidecar text authorizes `file`. `Ok(true)` = digest
-/// matches; `Ok(false)` = digest found but does NOT match; `Err(_)` = no
+/// Whether the `.sha256` sidecar authorizes `path`. `Ok(Some(_))` = digest
+/// matches; `Ok(None)` = digest found but does NOT match; `Err(_)` = no
 /// readable digest or unreadable file. Callers fail closed on anything but
-/// `Ok(true)`.
+/// `Ok(Some(_))`.
+///
+/// The digest is computed from a freshly opened handle and that handle
+/// (rewound) is returned on success, so the caller installs / executes THE
+/// SAME BYTES it verified — a process that swaps the file between verify and
+/// use (TOCTOU) gets nowhere:
+///
+/// - Linux: the apply step copies FROM this handle, never re-opening the path.
+/// - Windows: the handle is opened with read-only sharing, so the file can't be
+///   renamed or overwritten while it's held; the caller keeps it open until the
+///   installer has been launched from the path.
 #[cfg(any(windows, target_os = "linux"))]
-pub fn verify_sha256(file: &Path, sidecar_text: &str) -> io::Result<bool> {
+pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std::fs::File>> {
     use sha2::{Digest, Sha256};
     let expected = sidecar_text
         .split_whitespace()
         .find(|tok| tok.len() == 64 && tok.chars().all(|c| c.is_ascii_hexdigit()))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no sha256 digest in sidecar"))?
         .to_ascii_lowercase();
-    let mut f = std::fs::File::open(file)?;
+    #[cfg(windows)]
+    let mut f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)?
+    };
+    #[cfg(target_os = "linux")]
+    let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     io::copy(&mut f, &mut hasher)?;
     let got = hasher.finalize();
     let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(got_hex == expected)
+    if got_hex != expected {
+        return Ok(None);
+    }
+    use std::io::Seek;
+    f.seek(io::SeekFrom::Start(0))?;
+    Ok(Some(f))
 }
 
 // ── Apply: Linux in-place binary swap ───────────────────────────────────────
 
-/// Replace the running exe with the verified download: stage it next to the
-/// live exe (same filesystem), then two adjacent renames — live exe aside to
-/// `<name>.kurisu-old`, staged file in as the exe. Rolls back if the second
-/// rename fails; the backup is swept on the next launch. The caller prompts
-/// the user to restart.
+/// Replace the running exe with the verified download: copy FROM the verified
+/// handle (never re-open the download path — that keeps the verify→use chain on
+/// the same bytes), stage it next to the live exe (same filesystem), then two
+/// adjacent renames — live exe aside to `<name>.kurisu-old`, staged file in as
+/// the exe. Rolls back if the second rename fails; the backup is swept on the
+/// next launch. The caller prompts the user to restart.
 #[cfg(target_os = "linux")]
-pub fn apply_linux_update(new_bin: &Path) -> Result<(), String> {
+pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("cannot locate install dir")?;
@@ -264,7 +320,9 @@ pub fn apply_linux_update(new_bin: &Path) -> Result<(), String> {
     let staging = dir.join(format!(".kurisu-new-{}", std::process::id()));
     let backup = dir.join(format!("{name}.kurisu-old"));
     let result = (|| -> io::Result<()> {
-        std::fs::copy(new_bin, &staging)?;
+        let mut staged = std::fs::File::create(&staging)?;
+        io::copy(new_bin, &mut staged)?;
+        drop(staged);
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
         std::fs::rename(&exe, &backup)?;
         if let Err(e) = std::fs::rename(&staging, &exe) {
@@ -338,6 +396,12 @@ mod tests {
         assert!(is_newer("1.1.0", "1.0.0.99"));
         assert!(!is_newer("1.0.0", "1.0.0"));
         assert!(!is_newer("1.0.0.7", "1.0.0.8"));
+        // Prereleases sort BELOW the plain release of the same numbers; digit
+        // runs order rc1 < rc2. A rolling 4th segment still beats any rc.
+        assert!(is_newer("1.0.0", "1.0.0-rc1"));
+        assert!(!is_newer("1.0.0-rc1", "1.0.0"));
+        assert!(is_newer("1.0.0-rc2", "1.0.0-rc1"));
+        assert!(is_newer("1.0.0.1", "1.0.0-rc9"));
     }
 
     #[test]
