@@ -1,7 +1,9 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
+  import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
+  import { nowMs } from "$lib/now.svelte";
   import {
     airingLabel,
     displayTitle,
@@ -14,6 +16,7 @@
   import EpisodeStepper from "$lib/EpisodeStepper.svelte";
   import Icon from "$lib/Icon.svelte";
   import Img from "$lib/Img.svelte";
+  import Select from "$lib/Select.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let loading = $state(false);
@@ -24,14 +27,109 @@
 
   const statuses = ["CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"];
 
-  const visible = $derived(
-    entries.filter((e) => e.status === filter).sort((a, b) =>
-      displayTitle(a.media).localeCompare(displayTitle(b.media), undefined, {
-        sensitivity: "base",
-        numeric: true,
-      })
-    )
-  );
+  // ---- filter + sort (persisted UI state) ----
+  type SortKey = "title" | "score" | "progress" | "updated" | "airing";
+  const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
+    { value: "title", label: "Title" },
+    { value: "score", label: "Score" },
+    { value: "progress", label: "Progress" },
+    { value: "updated", label: "Last updated" },
+    { value: "airing", label: "Next airing" },
+  ];
+  /// Natural direction per key — picking a key resets to it; the arrow flips it.
+  const SORT_DEFAULT_DESC: Record<SortKey, boolean> = {
+    title: false,
+    score: true,
+    progress: true,
+    updated: true,
+    airing: false,
+  };
+  function readSort(): SortKey {
+    try {
+      const v = localStorage.getItem("kurisu.list.sort");
+      return SORT_OPTIONS.some((o) => o.value === v) ? (v as SortKey) : "title";
+    } catch {
+      return "title";
+    }
+  }
+  function readDesc(key: SortKey): boolean {
+    try {
+      const v = localStorage.getItem("kurisu.list.dir");
+      return v === null ? SORT_DEFAULT_DESC[key] : v === "desc";
+    } catch {
+      return SORT_DEFAULT_DESC[key];
+    }
+  }
+  let q = $state("");
+  let sortKey = $state<SortKey>(readSort());
+  let sortDesc = $state(readDesc(readSort()));
+  function persistSort() {
+    try {
+      localStorage.setItem("kurisu.list.sort", sortKey);
+      localStorage.setItem("kurisu.list.dir", sortDesc ? "desc" : "asc");
+    } catch {
+      // storage unavailable — the choice just won't persist
+    }
+  }
+  function pickSort(k: SortKey) {
+    sortDesc = SORT_DEFAULT_DESC[k];
+    persistSort();
+  }
+  function flipDir() {
+    sortDesc = !sortDesc;
+    persistSort();
+  }
+
+  function matchesQuery(e: ListEntry, needle: string): boolean {
+    const m = e.media;
+    if (!m) return false;
+    return [m.title_english, m.title_romaji, m.title_native].some((t) =>
+      t?.toLowerCase().includes(needle)
+    );
+  }
+
+  const titleCmp = (a: ListEntry, b: ListEntry) =>
+    displayTitle(a.media).localeCompare(displayTitle(b.media), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+
+  /// Sort value for the active key; null = "doesn't apply" → always sorts last.
+  function keyVal(e: ListEntry): number | null {
+    switch (sortKey) {
+      case "score":
+        return e.score && e.score > 0 ? e.score : null;
+      case "progress":
+        return e.progress;
+      case "updated":
+        return e.updated_at ?? null;
+      case "airing": {
+        const at = e.media?.next_airing_at;
+        return at && at * 1000 > nowMs() ? at : null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  const visible = $derived.by(() => {
+    const needle = q.trim().toLowerCase();
+    const filtered = entries.filter(
+      (e) => e.status === filter && (!needle || matchesQuery(e, needle))
+    );
+    if (sortKey === "title") {
+      return filtered.sort((a, b) => (sortDesc ? -titleCmp(a, b) : titleCmp(a, b)));
+    }
+    return filtered.sort((a, b) => {
+      const va = keyVal(a);
+      const vb = keyVal(b);
+      if (va == null && vb == null) return titleCmp(a, b);
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      const r = sortDesc ? vb - va : va - vb;
+      return r !== 0 ? r : titleCmp(a, b);
+    });
+  });
 
   // Overlapping loads (initial + episode-updated + edit-close) resolve
   // latest-wins; stale responses are dropped.
@@ -118,8 +216,21 @@
   </div>
 {:else}
   <div class="p-5 max-w-7xl mx-auto">
-    <div class="flex items-center gap-3 mb-4">
+    <div class="flex items-center gap-2 mb-4 flex-wrap">
       <h1 class="text-xl font-semibold flex-1">My List</h1>
+      <input
+        bind:value={q}
+        placeholder="Filter…"
+        class="w-40 bg-panel border border-edge rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-accent"
+      />
+      <Select bind:value={sortKey} options={SORT_OPTIONS} class="w-36" onchange={pickSort} />
+      <button
+        onclick={flipDir}
+        title={sortDesc ? "Descending — click for ascending" : "Ascending — click for descending"}
+        class="px-2.5 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+      >
+        {sortDesc ? "↓" : "↑"}
+      </button>
       <button
         onclick={() => sync()}
         disabled={syncing}
@@ -151,7 +262,7 @@
     {#if loading}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
     {:else if visible.length === 0}
-      <div class="text-ink-dim py-10 text-center">Nothing here yet.</div>
+      <div class="text-ink-dim py-10 text-center">{q.trim() ? "No matches." : "Nothing here yet."}</div>
     {:else}
       <div class="grid grid-cols-1 gap-2">
         {#each visible as e (e.media_id)}
@@ -170,7 +281,17 @@
             class="cv-row flex items-center gap-3 bg-panel border border-edge rounded-lg p-2.5 hover:bg-panel-2/60 cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
           >
             {#if e.media?.cover_medium}
-              <Img src={e.media.cover_medium} class="w-10 h-14 object-cover rounded shrink-0" />
+              <button
+                type="button"
+                onclick={(ev) => {
+                  ev.stopPropagation();
+                  goto(`/anime/${e.media_id}`);
+                }}
+                title="Open details"
+                class="shrink-0"
+              >
+                <Img src={e.media.cover_medium} class="w-10 h-14 object-cover rounded" />
+              </button>
             {:else}
               <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
             {/if}

@@ -112,6 +112,8 @@ pub fn run() {
             commands::get_season,
             commands::get_recommendations,
             commands::get_media,
+            commands::get_media_detail,
+            commands::get_airing_schedule,
             commands::sync_my_list,
             commands::local_entries,
             commands::get_entry,
@@ -128,6 +130,8 @@ pub fn run() {
             commands::add_library_folder,
             commands::remove_library_folder,
             commands::scan_library,
+            commands::bind_library_path,
+            commands::unbind_library_media,
             commands::check_update,
             commands::install_update,
         ])

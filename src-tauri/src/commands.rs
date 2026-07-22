@@ -13,7 +13,9 @@ use tauri_plugin_opener::OpenerExt;
 use crate::anilist::{self, AniList};
 use crate::db::Db;
 use crate::library;
-use crate::models::{LibraryFile, ListEntry, ListStatus, Media, Notification, User};
+use crate::models::{
+    AiringItem, LibraryFile, ListEntry, ListStatus, Media, MediaDetail, Notification, User,
+};
 use crate::recognize;
 
 const TOKEN_KEY: &str = "anilist_token";
@@ -339,6 +341,55 @@ pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, Str
     Ok(v)
 }
 
+/// The detail page: fetch the rich media + relations fresh, fall back to the
+/// cached media (relations empty) when AniList is unreachable so the page still
+/// renders offline.
+#[tauri::command]
+pub async fn get_media_detail(id: i64, state: State<'_, AppState>) -> Result<MediaDetail, String> {
+    let al = state.anilist.lock().clone();
+    match al.media_detail(id).await {
+        Ok((media, relations)) => {
+            let _ = state.db.upsert_media(&media);
+            for r in &relations {
+                let _ = state.db.upsert_media(&r.media);
+            }
+            Ok(MediaDetail { media, relations })
+        }
+        Err(e) => match state.db.get_media(id).map_err(|e| e.to_string())? {
+            Some(media) => Ok(MediaDetail { media, relations: vec![] }),
+            None => Err(e.to_string()),
+        },
+    }
+}
+
+/// Everything airing in [start, end) for the calendar. Only media already on the
+/// user's list are upserted into the cache — that refreshes their airing info
+/// without bloating the cache with hundreds of transient rows every week view.
+#[tauri::command]
+pub async fn get_airing_schedule(
+    start: i64,
+    end: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<AiringItem>, String> {
+    if end <= start || end - start > 15 * 86_400 {
+        return Err("invalid schedule range".to_string());
+    }
+    let al = state.anilist.lock().clone();
+    let items = al.airing_schedule(start, end).await.map_err(|e| e.to_string())?;
+    let on_list: std::collections::HashSet<i64> = state
+        .db
+        .entry_media_ids()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    for item in &items {
+        if on_list.contains(&item.media.id) {
+            let _ = state.db.upsert_media(&item.media);
+        }
+    }
+    Ok(items)
+}
+
 /// Sync the user's remote list into the local cache, then return the local view.
 #[tauri::command]
 pub async fn sync_my_list(state: State<'_, AppState>) -> Result<Vec<ListEntry>, String> {
@@ -619,10 +670,32 @@ pub fn remove_library_folder(path: String, state: State<'_, AppState>) -> Result
 #[tauri::command]
 pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<LibraryFile>, String> {
     let folders = library::get_folders(&state.db);
+    let bindings = library::get_bindings(&state.db);
     let matchers = state.matchers.lock().clone();
-    tokio::task::spawn_blocking(move || library::scan_paths(&folders, &matchers))
+    tokio::task::spawn_blocking(move || library::scan_paths(&folders, &matchers, &bindings))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Manually link a file or folder to a show on the list (the Library's
+/// "unmatched" fix-up). Only list members can be linked — the scan needs the
+/// entry's titles and progress to do anything useful with the files.
+#[tauri::command]
+pub fn bind_library_path(
+    path: String,
+    media_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if state.db.get_entry(media_id).map_err(|e| e.to_string())?.is_none() {
+        return Err("only shows on your list can be linked".to_string());
+    }
+    library::bind_path(&state.db, &path, media_id).map_err(|e| e.to_string())
+}
+
+/// Remove every manual link pointing at this show.
+#[tauri::command]
+pub fn unbind_library_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    library::unbind_media(&state.db, media_id).map_err(|e| e.to_string())
 }
 
 // ───────────────────────────── notifications ─────────────────────────────

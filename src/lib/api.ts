@@ -1,7 +1,17 @@
 // Typed wrappers over every Tauri command. Centralizes the invoke calls so the UI
 // never builds the call strings by hand, and gives us one place to handle errors.
 import { invoke } from "@tauri-apps/api/core";
-import type { LibraryFile, ListEntry, Media, Notification, TrackingConfig, UpdateInfo, User } from "./types";
+import type {
+  AiringItem,
+  LibraryFile,
+  ListEntry,
+  Media,
+  MediaDetail,
+  Notification,
+  TrackingConfig,
+  UpdateInfo,
+  User,
+} from "./types";
 
 export const api = {
   getClientId: () => invoke<string | null>("get_client_id"),
@@ -38,6 +48,9 @@ export const api = {
   getRecommendations: (mediaId: number) =>
     invoke<Media[]>("get_recommendations", { mediaId }),
   getMedia: (id: number) => invoke<Media>("get_media", { id }),
+  getMediaDetail: (id: number) => invoke<MediaDetail>("get_media_detail", { id }),
+  getAiringSchedule: (start: number, end: number) =>
+    invoke<AiringItem[]>("get_airing_schedule", { start, end }),
   getEntry: (mediaId: number) =>
     invoke<ListEntry | null>("get_entry", { mediaId }),
 
@@ -66,6 +79,10 @@ export const api = {
   removeLibraryFolder: (path: string) =>
     invoke<string[]>("remove_library_folder", { path }),
   scanLibrary: () => invoke<LibraryFile[]>("scan_library"),
+  bindLibraryPath: (path: string, mediaId: number) =>
+    invoke<void>("bind_library_path", { path, mediaId }),
+  unbindLibraryMedia: (mediaId: number) =>
+    invoke<void>("unbind_library_media", { mediaId }),
 
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
   installUpdate: () => invoke<string>("install_update"),

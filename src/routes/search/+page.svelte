@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { displayTitle, type Media } from "$lib/types";
@@ -78,13 +79,22 @@
   <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
     {#each results as m (m.id)}
       <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
-        {#if m.cover_large}
-          <Img src={m.cover_large} class="w-full h-44 object-cover" />
-        {:else}
-          <div class="w-full h-44 bg-panel-2"></div>
-        {/if}
+        <button type="button" onclick={() => goto(`/anime/${m.id}`)} title="Open details" class="block">
+          {#if m.cover_large}
+            <Img src={m.cover_large} class="w-full h-44 object-cover" />
+          {:else}
+            <div class="w-full h-44 bg-panel-2"></div>
+          {/if}
+        </button>
         <div class="p-2.5 flex-1 flex flex-col">
-          <div class="text-sm font-medium leading-tight line-clamp-2 mb-1">{displayTitle(m)}</div>
+          <button
+            type="button"
+            onclick={() => goto(`/anime/${m.id}`)}
+            title="Open details"
+            class="text-sm font-medium leading-tight line-clamp-2 mb-1 text-left hover:text-accent transition-colors"
+          >
+            {displayTitle(m)}
+          </button>
           <div class="text-xs text-ink-dim mb-2">
             {#if m.format}{m.format}{/if}
             {#if m.season_year}· {m.season_year}{/if}

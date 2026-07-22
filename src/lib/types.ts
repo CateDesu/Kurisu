@@ -28,6 +28,30 @@ export interface Media {
   description?: string | null;
   next_airing_episode?: number | null;
   next_airing_at?: number | null;
+  banner_image?: string | null;
+  genres?: string[] | null;
+  duration?: number | null;
+  source?: string | null;
+  studios?: string[] | null;
+}
+
+/// One anime related to another (detail page strip). `relation` is the raw
+/// AniList edge type (SEQUEL / PREQUEL / SIDE_STORY / …).
+export interface MediaRelation {
+  relation: string;
+  media: Media;
+}
+
+export interface MediaDetail {
+  media: Media;
+  relations: MediaRelation[];
+}
+
+/// One scheduled episode airing (calendar view).
+export interface AiringItem {
+  airing_at: number;
+  episode: number;
+  media: Media;
 }
 
 export interface ListEntry {
@@ -214,12 +238,14 @@ export interface UpdateInfo {
   current: string; // this build's version
 }
 
-/// One video file from the library scan (M3).
+/// One video file from the library scan (M3). `bound` = matched via a manual
+/// file/folder link rather than the recognizer.
 export interface LibraryFile {
   path: string;
   media_id: number | null;
   matched: string | null;
   episode: number | null;
+  bound?: boolean;
 }
 
 export const STATUS_LABEL: Record<string, string> = {
@@ -230,6 +256,61 @@ export const STATUS_LABEL: Record<string, string> = {
   DROPPED: "Dropped",
   REPEATING: "Rewatching",
 };
+
+/// AniList media (airing) status → display label.
+export const MEDIA_STATUS_LABEL: Record<string, string> = {
+  RELEASING: "Airing",
+  FINISHED: "Finished",
+  NOT_YET_RELEASED: "Not yet aired",
+  CANCELLED: "Cancelled",
+  HIATUS: "On hiatus",
+};
+
+/// AniList relation edge type → display label (detail page strips).
+export const RELATION_LABEL: Record<string, string> = {
+  PREQUEL: "Prequel",
+  SEQUEL: "Sequel",
+  PARENT: "Parent story",
+  SIDE_STORY: "Side story",
+  SPIN_OFF: "Spin-off",
+  ALTERNATIVE: "Alternative",
+  SUMMARY: "Summary",
+  CHARACTER: "Shared cast",
+  ADAPTATION: "Adaptation",
+  SOURCE: "Source",
+  COMPILATION: "Compilation",
+  CONTAINS: "Contains",
+  OTHER: "Related",
+};
+
+/// AniList `source` enum → display label ("LIGHT_NOVEL" → "Light Novel").
+export function sourceLabel(source: string | null | undefined): string {
+  if (!source) return "";
+  return source
+    .toLowerCase()
+    .split("_")
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+/// AniList descriptions arrive as limited HTML (<br>, <i>, <b>, entities).
+/// Render them as plain text — strip tags, decode the common entities — instead
+/// of trusting remote HTML into {@html}.
+export function plainDescription(d: string | null | undefined): string {
+  if (!d) return "";
+  return d
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 /// AniList score formats. The user's chosen format (from Viewer.mediaListOptions)
 /// decides how scores are shown and edited.

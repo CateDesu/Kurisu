@@ -11,7 +11,7 @@ use crate::models::{ListEntry, Media};
 
 /// Current schema version (PRAGMA user_version). Bump and add a rung to the
 /// ladder in `migrate` for every schema change.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -93,6 +93,14 @@ impl Db {
             Self::ensure_column(conn, "media", "next_airing_episode", "INTEGER")?;
             Self::ensure_column(conn, "media", "next_airing_at", "INTEGER")?;
         }
+        if version < 3 {
+            // Detail-page fields (M5). genres/studios are JSON arrays as TEXT.
+            Self::ensure_column(conn, "media", "banner_image", "TEXT")?;
+            Self::ensure_column(conn, "media", "genres", "TEXT")?;
+            Self::ensure_column(conn, "media", "duration", "INTEGER")?;
+            Self::ensure_column(conn, "media", "source", "TEXT")?;
+            Self::ensure_column(conn, "media", "studios", "TEXT")?;
+        }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
@@ -117,17 +125,40 @@ impl Db {
 
     pub fn upsert_media(&self, m: &Media) -> Result<()> {
         let c = self.0.lock();
+        // The rich detail-only fields (banner/genres/duration/source/studios) are
+        // COALESCEd: a lean upsert (search / season / list sync doesn't fetch
+        // them) must not wipe values a detail fetch already cached. Everything
+        // the lean queries DO fetch takes the fresh value.
         c.execute(
-            "INSERT OR REPLACE INTO media
+            "INSERT INTO media
              (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
               episodes,format,status,average_score,season,season_year,description,
-              next_airing_episode,next_airing_at,cached_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,cached_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET
+              id_mal=excluded.id_mal, title_romaji=excluded.title_romaji,
+              title_english=excluded.title_english, title_native=excluded.title_native,
+              cover_medium=excluded.cover_medium, cover_large=excluded.cover_large,
+              episodes=excluded.episodes, format=excluded.format, status=excluded.status,
+              average_score=excluded.average_score, season=excluded.season,
+              season_year=excluded.season_year, description=excluded.description,
+              next_airing_episode=excluded.next_airing_episode,
+              next_airing_at=excluded.next_airing_at,
+              banner_image=COALESCE(excluded.banner_image, banner_image),
+              genres=COALESCE(excluded.genres, genres),
+              duration=COALESCE(excluded.duration, duration),
+              source=COALESCE(excluded.source, source),
+              studios=COALESCE(excluded.studios, studios),
+              cached_at=excluded.cached_at",
             rusqlite::params![
                 m.id, m.id_mal, m.title_romaji, m.title_english, m.title_native,
                 m.cover_medium, m.cover_large, m.episodes, m.format, m.status,
                 m.average_score, m.season, m.season_year, m.description,
                 m.next_airing_episode, m.next_airing_at,
+                m.banner_image,
+                m.genres.as_ref().and_then(|g| serde_json::to_string(g).ok()),
+                m.duration, m.source,
+                m.studios.as_ref().and_then(|s| serde_json::to_string(s).ok()),
                 chrono::Utc::now().timestamp(),
             ],
         )?;
@@ -139,7 +170,7 @@ impl Db {
         let mut stmt = c.prepare(
             "SELECT id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
                     episodes,format,status,average_score,season,season_year,description,
-                    next_airing_episode,next_airing_at
+                    next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios
              FROM media WHERE id = ?",
         )?;
         let row = stmt.query_row([id], row_to_media).ok();
@@ -198,7 +229,8 @@ impl Db {
             "SELECT e.media_id,e.entry_id,e.status,e.progress,e.score,e.repeat,e.updated_at,
                     m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
                     m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,
-                    m.season_year,m.description,m.next_airing_episode,m.next_airing_at
+                    m.season_year,m.description,m.next_airing_episode,m.next_airing_at,
+                    m.banner_image,m.genres,m.duration,m.source,m.studios
              FROM list_entry e LEFT JOIN media m ON m.id = e.media_id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -218,6 +250,18 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Just the media ids of the local list (cheap membership set — used by the
+    /// calendar to decide which airing media are worth caching).
+    pub fn entry_media_ids(&self) -> Result<Vec<i64>> {
+        let c = self.0.lock();
+        let mut stmt = c.prepare("SELECT media_id FROM list_entry")?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(ids)
     }
 
     pub fn get_entry(&self, media_id: i64) -> Result<Option<ListEntry>> {
@@ -313,6 +357,10 @@ fn row_to_media(r: &rusqlite::Row) -> rusqlite::Result<Media> {
 }
 
 fn row_to_media_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Media> {
+    // genres/studios live in the DB as JSON text.
+    let json_vec = |v: Option<String>| -> Option<Vec<String>> {
+        v.and_then(|s| serde_json::from_str(&s).ok())
+    };
     Ok(Media {
         id: r.get(o)?,
         id_mal: r.get(o + 1)?,
@@ -330,5 +378,47 @@ fn row_to_media_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Media> {
         description: r.get(o + 13)?,
         next_airing_episode: r.get(o + 14)?,
         next_airing_at: r.get(o + 15)?,
+        banner_image: r.get(o + 16)?,
+        genres: json_vec(r.get(o + 17)?),
+        duration: r.get(o + 18)?,
+        source: r.get(o + 19)?,
+        studios: json_vec(r.get(o + 20)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lean upsert (search/season/sync — no detail fields) must not wipe the
+    /// rich fields a detail fetch already cached; everything lean queries do
+    /// fetch takes the fresh value.
+    #[test]
+    fn lean_upsert_preserves_detail_fields() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&Media {
+            id: 1,
+            title_english: Some("Old Title".into()),
+            banner_image: Some("banner.jpg".into()),
+            genres: Some(vec!["Action".into(), "Drama".into()]),
+            duration: Some(24),
+            source: Some("MANGA".into()),
+            studios: Some(vec!["MAPPA".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_media(&Media {
+            id: 1,
+            title_english: Some("New Title".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let m = db.get_media(1).unwrap().unwrap();
+        assert_eq!(m.title_english.as_deref(), Some("New Title"));
+        assert_eq!(m.banner_image.as_deref(), Some("banner.jpg"));
+        assert_eq!(m.genres, Some(vec!["Action".to_string(), "Drama".to_string()]));
+        assert_eq!(m.duration, Some(24));
+        assert_eq!(m.source.as_deref(), Some("MANGA"));
+        assert_eq!(m.studios, Some(vec!["MAPPA".to_string()]));
+    }
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import {
@@ -34,6 +35,13 @@
   }
 
   async function open(n: Notification) {
+    // Anime notifications stay in-app (native detail page); activity / thread /
+    // user pages need the browser's AniList session cookie, so those still
+    // open externally.
+    if (n.media_id) {
+      goto(`/anime/${n.media_id}`);
+      return;
+    }
     try {
       await openUrl(notificationUrl(n));
     } catch (e) {

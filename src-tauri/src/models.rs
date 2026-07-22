@@ -61,6 +61,16 @@ pub struct Media {
     pub next_airing_episode: Option<i64>,
     /// When that next episode airs (Unix seconds). None = unknown / finished.
     pub next_airing_at: Option<i64>,
+    // Detail-only fields (fetched by `media_detail`, not the lean list queries).
+    // The DB upsert COALESCEs them so a lean re-fetch never wipes cached values.
+    pub banner_image: Option<String>,
+    pub genres: Option<Vec<String>>,
+    /// Episode length in minutes.
+    pub duration: Option<i64>,
+    /// Adaptation source (MANGA / LIGHT_NOVEL / ORIGINAL / …).
+    pub source: Option<String>,
+    /// Main studio names.
+    pub studios: Option<Vec<String>>,
 }
 
 impl Media {
@@ -85,8 +95,32 @@ pub struct ListEntry {
     pub media: Option<Media>,     // joined when served to the UI
 }
 
+/// One anime related to another (AniList `relations` edge), shown on the detail
+/// page. `relation` is the raw edge type (SEQUEL / PREQUEL / SIDE_STORY / …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaRelation {
+    pub relation: String,
+    pub media: Media,
+}
+
+/// Full detail-page payload: the (rich) media plus its anime relations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaDetail {
+    pub media: Media,
+    pub relations: Vec<MediaRelation>,
+}
+
+/// One scheduled episode airing (the calendar view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiringItem {
+    pub airing_at: i64,
+    pub episode: i64,
+    pub media: Media,
+}
+
 /// One video file found by the library scan. `media_id`/`matched`/`episode` are
-/// None when the filename didn't match anything on the user's list.
+/// None when the filename didn't match anything on the user's list. `bound` marks
+/// a match that came from a manual file/folder link rather than the recognizer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LibraryFile {
     pub path: String,
@@ -94,6 +128,8 @@ pub struct LibraryFile {
     /// Display title of the matched list entry.
     pub matched: Option<String>,
     pub episode: Option<i64>,
+    #[serde(default)]
+    pub bound: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

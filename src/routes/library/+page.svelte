@@ -1,16 +1,20 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+  import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
   import { displayTitle, type LibraryFile, type ListEntry } from "$lib/types";
   import Icon from "$lib/Icon.svelte";
+  import LinkAnime from "$lib/LinkAnime.svelte";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let error = $state("");
+  /// Path of the unmatched file being manually linked (LinkAnime modal).
+  let linking = $state<string | null>(null);
 
   interface Group {
     mediaId: number;
@@ -103,6 +107,21 @@
     return g.entry?.media?.cover_medium ?? null;
   }
 
+  /// Whether any of the group's files got here via a manual link.
+  function hasBound(g: Group): boolean {
+    return g.files.some((f) => f.bound);
+  }
+
+  async function unlink(g: Group) {
+    error = "";
+    try {
+      await api.unbindLibraryMedia(g.mediaId);
+      await library.scan();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   $effect(() => {
     if (auth.isLoggedIn) load();
   });
@@ -174,12 +193,26 @@
           <section class="cv-card bg-panel border border-edge rounded-lg overflow-hidden">
             <div class="flex items-center gap-3 p-2.5 border-b border-edge">
               {#if cov}
-                <Img src={cov} class="w-10 h-14 object-cover rounded shrink-0" />
+                <button
+                  type="button"
+                  onclick={() => goto(`/anime/${g.mediaId}`)}
+                  title="Open details"
+                  class="shrink-0"
+                >
+                  <Img src={cov} class="w-10 h-14 object-cover rounded" />
+                </button>
               {:else}
                 <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
               {/if}
               <div class="flex-1 min-w-0">
-                <div class="truncate font-medium">{g.entry ? displayTitle(g.entry.media) : g.title}</div>
+                <button
+                  type="button"
+                  onclick={() => goto(`/anime/${g.mediaId}`)}
+                  title="Open details"
+                  class="block max-w-full truncate font-medium text-left hover:text-accent transition-colors"
+                >
+                  {g.entry ? displayTitle(g.entry.media) : g.title}
+                </button>
                 <div class="text-xs text-ink-dim">
                   {#if g.entry}
                     Ep {g.entry.progress}{g.entry.media?.episodes ? `/${g.entry.media.episodes}` : ""} watched
@@ -189,6 +222,15 @@
                   · {g.files.length} file{g.files.length === 1 ? "" : "s"}
                 </div>
               </div>
+              {#if hasBound(g)}
+                <button
+                  onclick={() => unlink(g)}
+                  title="Manually linked — click to remove the link"
+                  class="text-ink-dim hover:text-red-400 px-1 grid place-items-center shrink-0"
+                >
+                  <Icon name="unlink" size={15} />
+                </button>
+              {/if}
               {#if next}
                 <button
                   onclick={() => openPath(next.path)}
@@ -241,6 +283,13 @@
                 <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
                   <span class="flex-1 min-w-0 truncate text-ink-dim">{basename(f.path)}</span>
                   <button
+                    onclick={() => (linking = f.path)}
+                    title="Link to a show on your list"
+                    class="text-ink-dim hover:text-accent px-1 grid place-items-center"
+                  >
+                    <Icon name="link" size={14} />
+                  </button>
+                  <button
                     onclick={() => openPath(f.path)}
                     title="Play"
                     class="text-ink-dim hover:text-ink px-1 grid place-items-center"
@@ -262,4 +311,14 @@
       </div>
     {/if}
   </div>
+{/if}
+
+{#if linking}
+  <LinkAnime
+    path={linking}
+    {entries}
+    roots={library.folders}
+    onclose={() => (linking = null)}
+    onlinked={() => library.scan()}
+  />
 {/if}

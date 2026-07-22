@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-use crate::models::{ListEntry, ListStatus, Media, Notification, User};
+use crate::models::{AiringItem, ListEntry, ListStatus, Media, MediaRelation, Notification, User};
 
 const GRAPHQL: &str = "https://graphql.anilist.co";
 const AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
@@ -25,9 +25,11 @@ struct NextAiring {
 }
 
 /// The media field set every list-ish query fetches (search / user_list / season /
-/// recommendations) — one deserializer + conversion shared by all of them.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// recommendations) — one deserializer + conversion shared by all of them. The
+/// detail-only fields (banner/genres/duration/source/studios) are Options the lean
+/// queries simply never populate.
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
 struct AniMedia {
     id: i64,
     id_mal: Option<i64>,
@@ -41,17 +43,32 @@ struct AniMedia {
     season_year: Option<i64>,
     description: Option<String>,
     next_airing_episode: Option<NextAiring>,
+    banner_image: Option<String>,
+    // AniList types the list's ITEMS as nullable too — a stray null must not
+    // fail the whole query.
+    genres: Option<Vec<Option<String>>>,
+    duration: Option<i64>,
+    source: Option<String>,
+    studios: Option<AniStudios>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct AniTitle {
     romaji: Option<String>,
     english: Option<String>,
     native: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct AniCover {
     medium: Option<String>,
     large: Option<String>,
+}
+#[derive(Deserialize)]
+struct AniStudios {
+    nodes: Option<Vec<AniStudioNode>>,
+}
+#[derive(Deserialize)]
+struct AniStudioNode {
+    name: String,
 }
 
 impl From<AniMedia> for Media {
@@ -73,6 +90,18 @@ impl From<AniMedia> for Media {
             description: m.description,
             next_airing_episode: m.next_airing_episode.as_ref().and_then(|n| n.episode),
             next_airing_at: m.next_airing_episode.as_ref().and_then(|n| n.airing_at),
+            banner_image: m.banner_image,
+            genres: m
+                .genres
+                .map(|g| g.into_iter().flatten().collect::<Vec<_>>())
+                .filter(|g: &Vec<String>| !g.is_empty()),
+            duration: m.duration,
+            source: m.source,
+            studios: m
+                .studios
+                .and_then(|s| s.nodes)
+                .map(|n| n.into_iter().map(|s| s.name).collect::<Vec<_>>())
+                .filter(|s: &Vec<String>| !s.is_empty()),
         }
     }
 }
@@ -294,6 +323,159 @@ impl AniList {
         }";
         let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
         Ok(Media::from(r.media))
+    }
+
+    /// One anime with the full detail-page field set plus its anime relations
+    /// (sequels/prequels/side stories — manga nodes are dropped, the app is
+    /// anime-only and can't open them).
+    pub async fn media_detail(&self, id: i64) -> Result<(Media, Vec<MediaRelation>)> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "Media")]
+            media: DetailMedia,
+        }
+        #[derive(Deserialize)]
+        struct DetailMedia {
+            relations: Option<Relations>,
+            #[serde(flatten)]
+            media: AniMedia,
+        }
+        #[derive(Deserialize)]
+        struct Relations {
+            edges: Option<Vec<RelEdge>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RelEdge {
+            relation_type: Option<String>,
+            node: Option<RelNode>,
+        }
+        #[derive(Deserialize)]
+        struct RelNode {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            #[serde(flatten)]
+            media: AniMedia,
+        }
+        let q = "query ($id: Int!) {
+            Media(id: $id, type: ANIME) {
+                id idMal title { romaji english native }
+                coverImage { medium large } bannerImage
+                episodes duration format status source averageScore season seasonYear description
+                genres studios(isMain: true) { nodes { name } }
+                nextAiringEpisode { episode airingAt }
+                relations {
+                    edges {
+                        relationType
+                        node {
+                            type
+                            id idMal title { romaji english native }
+                            coverImage { medium large }
+                            episodes format status averageScore season seasonYear description
+                            nextAiringEpisode { episode airingAt }
+                        }
+                    }
+                }
+            }
+        }";
+        let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
+        let relations = r
+            .media
+            .relations
+            .and_then(|rel| rel.edges)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let node = e.node?;
+                if node.kind.as_deref() != Some("ANIME") {
+                    return None;
+                }
+                Some(MediaRelation {
+                    relation: e.relation_type.unwrap_or_else(|| "OTHER".to_string()),
+                    media: node.media.into(),
+                })
+            })
+            .collect();
+        Ok((r.media.media.into(), relations))
+    }
+
+    /// Every episode airing in [start, end) (Unix seconds), in airing order.
+    /// Pages through AniList's 50-per-page chunks; capped at 12 pages (600
+    /// entries — more than any real week) so a bad range can't loop forever.
+    /// Adult titles are dropped.
+    pub async fn airing_schedule(&self, start: i64, end: i64) -> Result<Vec<AiringItem>> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "Page")]
+            page: Page,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            page_info: Option<PageInfo>,
+            airing_schedules: Option<Vec<Sched>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Sched {
+            airing_at: i64,
+            episode: i64,
+            media: Option<SchedMedia>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SchedMedia {
+            is_adult: Option<bool>,
+            #[serde(flatten)]
+            media: AniMedia,
+        }
+        let q = "query ($start: Int!, $end: Int!, $page: Int!) {
+            Page(page: $page, perPage: 50) {
+                pageInfo { hasNextPage }
+                airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: TIME) {
+                    airingAt episode
+                    media {
+                        isAdult
+                        id idMal title { romaji english native }
+                        coverImage { medium large }
+                        episodes format status averageScore season seasonYear description
+                        nextAiringEpisode { episode airingAt }
+                    }
+                }
+            }
+        }";
+        let mut out = Vec::new();
+        for page in 1..=12 {
+            let r: R = self
+                .gql(q, serde_json::json!({ "start": start, "end": end, "page": page }))
+                .await?;
+            let scheds = r.page.airing_schedules.unwrap_or_default();
+            for s in scheds {
+                let Some(m) = s.media else { continue };
+                if m.is_adult == Some(true) {
+                    continue;
+                }
+                out.push(AiringItem {
+                    airing_at: s.airing_at,
+                    episode: s.episode,
+                    media: m.media.into(),
+                });
+            }
+            if !r
+                .page
+                .page_info
+                .and_then(|p| p.has_next_page)
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Pull the full list (every status group) for a user and flatten to entries.

@@ -7,8 +7,10 @@ Kurisu is an anime tracker inspired by [Taiga](https://taiga.moe), built in Rust
 ## Features
 
 - **AniList sync** - OAuth2 sign-in (built-in client, no setup), search, list management, scoring in your format (100 / 10 / 10-decimal / 5-star / 3-smiley). The token is stored locally in plaintext (`kurisu.db`).
-- **My List** - grouped by status, −/+ episode stepper that auto-commits, "next episode airs" countdowns, in-place edit dialog.
-- **Library scan** - point it at your anime folders; files are matched against your list, watched state follows your progress, play the next episode directly.
+- **My List** - grouped by status, −/+ episode stepper that auto-commits, "next episode airs" countdowns, in-place edit dialog, text filter and sorting (title / score / progress / last updated / next airing).
+- **Detail pages** - native anime pages with banner, genres, description, your entry controls, related anime and recommendations. Covers and titles link to them everywhere.
+- **Airing calendar** - the week's airing schedule grouped by day, for your shows or everything.
+- **Library scan** - point it at your anime folders; files are matched against your list, watched state follows your progress, play the next episode directly. Unmatched files can be linked to a show by hand (per file or whole folder).
 - **Seasons + recommendations** - browse any AniList season; the edit dialog shows community recommendations.
 - **Playback tracking** - detects playback, matches the title against your list, and prompts or auto-updates progress to the detected episode.
 - **Notifications** - your AniList inbox, mirroring anilist.co/notifications.

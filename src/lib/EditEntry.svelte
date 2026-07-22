@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
   import { library } from "$lib/library.svelte";
@@ -149,7 +150,17 @@
         <Img src={entry.media.cover_medium} class="w-12 h-16 object-cover rounded shrink-0" />
       {/if}
       <div class="min-w-0 flex-1">
-        <h3 class="font-semibold truncate">{displayTitle(entry.media)}</h3>
+        <button
+          type="button"
+          onclick={() => {
+            onclose();
+            goto(`/anime/${entry.media_id}`);
+          }}
+          title="Open details"
+          class="block max-w-full font-semibold truncate text-left hover:text-accent transition-colors"
+        >
+          {displayTitle(entry.media)}
+        </button>
         {#if total}
           <p class="text-xs text-ink-dim">{entry.progress}/{total} eps watched</p>
         {:else}
