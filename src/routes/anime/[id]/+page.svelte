@@ -291,6 +291,48 @@
       </div>
     {/if}
 
+    {#if detail && detail.characters.length > 0}
+      <div class="mb-6">
+        <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">Characters</h2>
+        <div class="flex gap-2.5 overflow-x-auto pb-1">
+          {#each detail.characters as c, i (`${c.name}-${i}`)}
+            <div class="w-20 shrink-0" title={c.va_name ? `${c.name} — CV: ${c.va_name}` : c.name}>
+              {#if c.image}
+                <Img src={c.image} class="w-20 h-28 object-cover rounded" />
+              {:else}
+                <div class="w-20 h-28 bg-panel-2 rounded"></div>
+              {/if}
+              <span class="block text-[11px] leading-tight line-clamp-2 mt-1">{c.name}</span>
+              {#if c.va_name}
+                <span class="block text-[10px] text-ink-dim line-clamp-1">{c.va_name}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    {#if detail && detail.staff.length > 0}
+      <div class="mb-6">
+        <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">Staff</h2>
+        <div class="flex gap-2.5 overflow-x-auto pb-1">
+          {#each detail.staff as s, i (`${s.name}-${i}`)}
+            <div class="w-20 shrink-0" title="{s.name}{s.role ? ` — ${s.role}` : ''}">
+              {#if s.image}
+                <Img src={s.image} class="w-20 h-28 object-cover rounded" />
+              {:else}
+                <div class="w-20 h-28 bg-panel-2 rounded"></div>
+              {/if}
+              <span class="block text-[11px] leading-tight line-clamp-2 mt-1">{s.name}</span>
+              {#if s.role}
+                <span class="block text-[10px] text-ink-dim line-clamp-1">{s.role}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
     {#if recs.length > 0}
       <div class="mb-2">
         <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">

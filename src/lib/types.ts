@@ -42,9 +42,58 @@ export interface MediaRelation {
   media: Media;
 }
 
+/// One character (with Japanese VA) on the detail page.
+export interface MediaCharacter {
+  role?: string | null;
+  name: string;
+  image?: string | null;
+  va_name?: string | null;
+  va_image?: string | null;
+}
+
+/// One staff credit on the detail page.
+export interface MediaStaff {
+  role?: string | null;
+  name: string;
+  image?: string | null;
+}
+
 export interface MediaDetail {
   media: Media;
   relations: MediaRelation[];
+  characters: MediaCharacter[];
+  staff: MediaStaff[];
+}
+
+/// One RSS feed entry matched against the list (Torrents page).
+export interface TorrentItem {
+  title: string;
+  link: string;
+  guid: string;
+  magnet?: string | null;
+  size?: string | null;
+  seeders?: number | null;
+  leechers?: number | null;
+  published?: number | null;
+  media_id?: number | null;
+  matched?: string | null;
+  episode?: number | null;
+  is_new: boolean;
+  seen: boolean;
+}
+
+/// AniList server-side profile statistics (Stats page).
+export interface UserStats {
+  count: number;
+  episodes_watched: number;
+  minutes_watched: number;
+  mean_score: number;
+  standard_deviation: number;
+  scores: { score: number; count: number }[];
+  statuses: { status: string; count: number }[];
+  formats: { format: string; count: number }[];
+  genres: { genre: string; count: number; minutes_watched: number }[];
+  release_years: { year: number; count: number }[];
 }
 
 /// One scheduled episode airing (calendar view).

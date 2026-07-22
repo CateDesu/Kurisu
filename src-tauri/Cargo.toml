@@ -40,6 +40,8 @@ parking_lot = "0.12"
 ring = "0.17"
 # update download integrity (SHA-256 sidecar verification)
 sha2 = "0.10"
+# RSS feed parsing (torrent awareness — milestone 6)
+quick-xml = "0.37"
 
 # MPRIS2 playback detection (MPV/VLC/Celluloid/…) — Linux only. Windows uses
 # GSMTC via the `windows` crate below; other platforms get a no-op stub.

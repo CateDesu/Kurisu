@@ -8,9 +8,11 @@ import type {
   Media,
   MediaDetail,
   Notification,
+  TorrentItem,
   TrackingConfig,
   UpdateInfo,
   User,
+  UserStats,
 } from "./types";
 
 export const api = {
@@ -83,6 +85,15 @@ export const api = {
     invoke<void>("bind_library_path", { path, mediaId }),
   unbindLibraryMedia: (mediaId: number) =>
     invoke<void>("unbind_library_media", { mediaId }),
+
+  getRssFeeds: () => invoke<string[]>("get_rss_feeds"),
+  addRssFeed: (url: string) => invoke<string[]>("add_rss_feed", { url }),
+  removeRssFeed: (url: string) => invoke<string[]>("remove_rss_feed", { url }),
+  fetchTorrents: () => invoke<TorrentItem[]>("fetch_torrents"),
+  markTorrentsSeen: (guids: string[]) =>
+    invoke<void>("mark_torrents_seen", { guids }),
+
+  getUserStats: () => invoke<UserStats>("get_user_stats"),
 
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
   installUpdate: () => invoke<string>("install_update"),

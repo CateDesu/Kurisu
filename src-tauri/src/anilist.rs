@@ -9,7 +9,10 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-use crate::models::{AiringItem, ListEntry, ListStatus, Media, MediaRelation, Notification, User};
+use crate::models::{
+    AiringItem, FormatCount, GenreStat, ListEntry, ListStatus, Media, MediaCharacter,
+    MediaRelation, MediaStaff, Notification, ScoreBucket, StatusCount, User, UserStats, YearCount,
+};
 
 const GRAPHQL: &str = "https://graphql.anilist.co";
 const AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
@@ -327,8 +330,12 @@ impl AniList {
 
     /// One anime with the full detail-page field set plus its anime relations
     /// (sequels/prequels/side stories — manga nodes are dropped, the app is
-    /// anime-only and can't open them).
-    pub async fn media_detail(&self, id: i64) -> Result<(Media, Vec<MediaRelation>)> {
+    /// anime-only and can't open them), main characters (with their Japanese
+    /// voice actors), and key staff credits.
+    pub async fn media_detail(
+        &self,
+        id: i64,
+    ) -> Result<(Media, Vec<MediaRelation>, Vec<MediaCharacter>, Vec<MediaStaff>)> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Media")]
@@ -337,6 +344,8 @@ impl AniList {
         #[derive(Deserialize)]
         struct DetailMedia {
             relations: Option<Relations>,
+            characters: Option<CharConn>,
+            staff: Option<StaffConn>,
             #[serde(flatten)]
             media: AniMedia,
         }
@@ -357,6 +366,39 @@ impl AniList {
             #[serde(flatten)]
             media: AniMedia,
         }
+        #[derive(Deserialize)]
+        struct CharConn {
+            edges: Option<Vec<CharEdge>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CharEdge {
+            role: Option<String>,
+            node: Option<NamedNode>,
+            voice_actors: Option<Vec<NamedNode>>,
+        }
+        #[derive(Deserialize)]
+        struct StaffConn {
+            edges: Option<Vec<StaffEdge>>,
+        }
+        #[derive(Deserialize)]
+        struct StaffEdge {
+            role: Option<String>,
+            node: Option<NamedNode>,
+        }
+        #[derive(Deserialize)]
+        struct NamedNode {
+            name: Option<NodeName>,
+            image: Option<NodeImage>,
+        }
+        #[derive(Deserialize)]
+        struct NodeName {
+            full: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct NodeImage {
+            medium: Option<String>,
+        }
         let q = "query ($id: Int!) {
             Media(id: $id, type: ANIME) {
                 id idMal title { romaji english native }
@@ -375,6 +417,16 @@ impl AniList {
                             nextAiringEpisode { episode airingAt }
                         }
                     }
+                }
+                characters(sort: [ROLE, RELEVANCE, ID], perPage: 12) {
+                    edges {
+                        role
+                        node { name { full } image { medium } }
+                        voiceActors(language: JAPANESE, sort: [RELEVANCE, ID]) { name { full } image { medium } }
+                    }
+                }
+                staff(sort: [RELEVANCE, ID], perPage: 8) {
+                    edges { role node { name { full } image { medium } } }
                 }
             }
         }";
@@ -396,7 +448,168 @@ impl AniList {
                 })
             })
             .collect();
-        Ok((r.media.media.into(), relations))
+        let characters = r
+            .media
+            .characters
+            .and_then(|c| c.edges)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let node = e.node?;
+                let name = node.name.and_then(|n| n.full)?;
+                let va = e.voice_actors.unwrap_or_default().into_iter().next();
+                Some(MediaCharacter {
+                    role: e.role,
+                    name,
+                    image: node.image.and_then(|i| i.medium),
+                    va_name: va.as_ref().and_then(|v| v.name.as_ref()).and_then(|n| n.full.clone()),
+                    va_image: va.and_then(|v| v.image).and_then(|i| i.medium),
+                })
+            })
+            .collect();
+        let staff = r
+            .media
+            .staff
+            .and_then(|s| s.edges)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let node = e.node?;
+                let name = node.name.and_then(|n| n.full)?;
+                Some(MediaStaff {
+                    role: e.role,
+                    name,
+                    image: node.image.and_then(|i| i.medium),
+                })
+            })
+            .collect();
+        Ok((r.media.media.into(), relations, characters, staff))
+    }
+
+    /// AniList's server-side profile statistics for a user. Whole-list
+    /// aggregates (counts, time watched, score/status/format/genre/year
+    /// breakdowns) — nothing to compute locally.
+    pub async fn user_statistics(&self, user_name: &str) -> Result<UserStats> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "User")]
+            user: UserNode,
+        }
+        #[derive(Deserialize)]
+        struct UserNode {
+            statistics: Option<Statistics>,
+        }
+        #[derive(Deserialize)]
+        struct Statistics {
+            anime: Option<Anime>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default, rename_all = "camelCase")]
+        struct Anime {
+            count: i64,
+            episodes_watched: i64,
+            minutes_watched: i64,
+            mean_score: f64,
+            standard_deviation: f64,
+            scores: Option<Vec<Score>>,
+            statuses: Option<Vec<Status>>,
+            formats: Option<Vec<Format>>,
+            genres: Option<Vec<Genre>>,
+            release_years: Option<Vec<Year>>,
+        }
+        #[derive(Deserialize)]
+        struct Score {
+            score: i64,
+            count: i64,
+        }
+        #[derive(Deserialize)]
+        struct Status {
+            status: Option<String>,
+            count: i64,
+        }
+        #[derive(Deserialize)]
+        struct Format {
+            format: Option<String>,
+            count: i64,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Genre {
+            genre: Option<String>,
+            count: i64,
+            minutes_watched: Option<i64>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Year {
+            release_year: Option<i64>,
+            count: i64,
+        }
+        let q = "query ($name: String!) {
+            User(name: $name) {
+                statistics {
+                    anime {
+                        count episodesWatched minutesWatched meanScore standardDeviation
+                        scores { score count }
+                        statuses { status count }
+                        formats { format count }
+                        genres(limit: 12, sort: COUNT_DESC) { genre count minutesWatched }
+                        releaseYears { releaseYear count }
+                    }
+                }
+            }
+        }";
+        let r: R = self.gql(q, serde_json::json!({ "name": user_name })).await?;
+        let a = r
+            .user
+            .statistics
+            .and_then(|s| s.anime)
+            .unwrap_or_default();
+        let mut release_years: Vec<YearCount> = a
+            .release_years
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|y| Some(YearCount { year: y.release_year?, count: y.count }))
+            .collect();
+        release_years.sort_by_key(|y| y.year);
+        Ok(UserStats {
+            count: a.count,
+            episodes_watched: a.episodes_watched,
+            minutes_watched: a.minutes_watched,
+            mean_score: a.mean_score,
+            standard_deviation: a.standard_deviation,
+            scores: a
+                .scores
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| ScoreBucket { score: s.score, count: s.count })
+                .collect(),
+            statuses: a
+                .statuses
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| Some(StatusCount { status: s.status?, count: s.count }))
+                .collect(),
+            formats: a
+                .formats
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|f| Some(FormatCount { format: f.format?, count: f.count }))
+                .collect(),
+            genres: a
+                .genres
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|g| {
+                    Some(GenreStat {
+                        genre: g.genre?,
+                        count: g.count,
+                        minutes_watched: g.minutes_watched.unwrap_or(0),
+                    })
+                })
+                .collect(),
+            release_years,
+        })
     }
 
     /// Every episode airing in [start, end) (Unix seconds), in airing order.
@@ -893,8 +1106,9 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
     Ok((state, rx))
 }
 
-// minimal URL-encode helper (avoids pulling urlencoding as a dep)
-mod urlencoding {
+// minimal URL-encode helper (avoids pulling urlencoding as a dep); also used by
+// rss.rs to build magnet display names
+pub(crate) mod urlencoding {
     pub fn encode(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         for b in s.bytes() {

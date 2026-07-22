@@ -103,11 +103,35 @@ pub struct MediaRelation {
     pub media: Media,
 }
 
-/// Full detail-page payload: the (rich) media plus its anime relations.
+/// One character on the detail page, with their (Japanese) voice actor.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MediaCharacter {
+    /// MAIN / SUPPORTING / BACKGROUND.
+    pub role: Option<String>,
+    pub name: String,
+    pub image: Option<String>,
+    pub va_name: Option<String>,
+    pub va_image: Option<String>,
+}
+
+/// One staff credit on the detail page (`role` is free text: "Director", …).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MediaStaff {
+    pub role: Option<String>,
+    pub name: String,
+    pub image: Option<String>,
+}
+
+/// Full detail-page payload: the (rich) media plus its anime relations and
+/// credits. Characters/staff are not cached — offline fallback serves them empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaDetail {
     pub media: Media,
     pub relations: Vec<MediaRelation>,
+    #[serde(default)]
+    pub characters: Vec<MediaCharacter>,
+    #[serde(default)]
+    pub staff: Vec<MediaStaff>,
 }
 
 /// One scheduled episode airing (the calendar view).
@@ -116,6 +140,77 @@ pub struct AiringItem {
     pub airing_at: i64,
     pub episode: i64,
     pub media: Media,
+}
+
+/// One RSS feed entry, matched against the local list. `is_new` = matched, the
+/// parsed episode is past the entry's progress, and the item hasn't been marked
+/// seen. Unmatched items ride along with `media_id: None`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TorrentItem {
+    pub title: String,
+    /// The feed's `<link>` — for nyaa-style feeds, the .torrent download URL.
+    pub link: String,
+    /// Stable identity for seen-state (feed `<guid>`, falling back to the link).
+    pub guid: String,
+    /// magnet: URI built from the feed's info hash, when it publishes one.
+    pub magnet: Option<String>,
+    pub size: Option<String>,
+    pub seeders: Option<i64>,
+    pub leechers: Option<i64>,
+    /// Unix seconds from `<pubDate>`.
+    pub published: Option<i64>,
+    pub media_id: Option<i64>,
+    pub matched: Option<String>,
+    pub episode: Option<i64>,
+    pub is_new: bool,
+    pub seen: bool,
+}
+
+/// AniList-computed profile statistics (`User.statistics.anime`). Server-side
+/// aggregates, so they cover the whole list regardless of what's cached locally.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserStats {
+    pub count: i64,
+    pub episodes_watched: i64,
+    pub minutes_watched: i64,
+    pub mean_score: f64,
+    pub standard_deviation: f64,
+    pub scores: Vec<ScoreBucket>,
+    pub statuses: Vec<StatusCount>,
+    pub formats: Vec<FormatCount>,
+    pub genres: Vec<GenreStat>,
+    pub release_years: Vec<YearCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScoreBucket {
+    pub score: i64,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StatusCount {
+    pub status: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FormatCount {
+    pub format: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GenreStat {
+    pub genre: String,
+    pub count: i64,
+    pub minutes_watched: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct YearCount {
+    pub year: i64,
+    pub count: i64,
 }
 
 /// One video file found by the library scan. `media_id`/`matched`/`episode` are

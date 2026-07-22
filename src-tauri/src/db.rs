@@ -11,7 +11,7 @@ use crate::models::{ListEntry, Media};
 
 /// Current schema version (PRAGMA user_version). Bump and add a rung to the
 /// ladder in `migrate` for every schema change.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -100,6 +100,16 @@ impl Db {
             Self::ensure_column(conn, "media", "duration", "INTEGER")?;
             Self::ensure_column(conn, "media", "source", "TEXT")?;
             Self::ensure_column(conn, "media", "studios", "TEXT")?;
+        }
+        if version < 4 {
+            // Torrent-feed seen-state (M6): which feed items the user has
+            // already acted on / dismissed. Pruned by age, so it stays small.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS rss_seen (
+                guid    TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
+            );",
+            )?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -326,6 +336,43 @@ impl Db {
                 |r| r.get::<_, String>(0),
             )
             .ok())
+    }
+
+    // ---- torrent-feed seen state (M6) ----
+
+    /// Every guid the user has marked seen. Loaded as a set per feed refresh —
+    /// bounded by the age prune, so this stays a few hundred rows at most.
+    pub fn rss_seen_set(&self) -> Result<std::collections::HashSet<String>> {
+        let c = self.0.lock();
+        let mut stmt = c.prepare("SELECT guid FROM rss_seen")?;
+        let set = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(set)
+    }
+
+    pub fn mark_rss_seen(&self, guids: &[String]) -> Result<()> {
+        let mut c = self.0.lock();
+        let tx = c.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        for g in guids {
+            tx.execute(
+                "INSERT OR REPLACE INTO rss_seen (guid, seen_at) VALUES (?,?)",
+                rusqlite::params![g, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop seen-marks older than `days` — the items left every feed long ago.
+    pub fn prune_rss_seen(&self, days: i64) -> Result<()> {
+        let cutoff = chrono::Utc::now().timestamp() - days * 86_400;
+        self.0
+            .lock()
+            .execute("DELETE FROM rss_seen WHERE seen_at < ?", [cutoff])?;
+        Ok(())
     }
 
     // ---- watched-file log (recognizer dedup) ----

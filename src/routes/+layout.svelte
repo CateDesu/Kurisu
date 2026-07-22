@@ -20,9 +20,11 @@
   const nav = [
     { href: "/", label: "My List", icon: "list" },
     { href: "/library", label: "Library", icon: "folder" },
+    { href: "/torrents", label: "Torrents", icon: "download" },
     { href: "/seasons", label: "Seasons", icon: "sun" },
     { href: "/calendar", label: "Calendar", icon: "calendar" },
     { href: "/search", label: "Search", icon: "search" },
+    { href: "/stats", label: "Stats", icon: "chart" },
     { href: "/notifications", label: "Notifications", icon: "bell" },
     { href: "/settings", label: "Settings", icon: "sliders" },
   ];

@@ -8,6 +8,7 @@ mod library;
 mod models;
 mod playback;
 mod recognize;
+mod rss;
 mod updater;
 
 use commands::AppState;
@@ -132,6 +133,12 @@ pub fn run() {
             commands::scan_library,
             commands::bind_library_path,
             commands::unbind_library_media,
+            commands::get_rss_feeds,
+            commands::add_rss_feed,
+            commands::remove_rss_feed,
+            commands::fetch_torrents,
+            commands::mark_torrents_seen,
+            commands::get_user_stats,
             commands::check_update,
             commands::install_update,
         ])

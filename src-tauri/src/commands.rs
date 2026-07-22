@@ -14,9 +14,11 @@ use crate::anilist::{self, AniList};
 use crate::db::Db;
 use crate::library;
 use crate::models::{
-    AiringItem, LibraryFile, ListEntry, ListStatus, Media, MediaDetail, Notification, User,
+    AiringItem, LibraryFile, ListEntry, ListStatus, Media, MediaDetail, Notification,
+    TorrentItem, User, UserStats,
 };
 use crate::recognize;
+use crate::rss;
 
 const TOKEN_KEY: &str = "anilist_token";
 const CLIENT_ID_KEY: &str = "anilist_client_id";
@@ -341,22 +343,27 @@ pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, Str
     Ok(v)
 }
 
-/// The detail page: fetch the rich media + relations fresh, fall back to the
-/// cached media (relations empty) when AniList is unreachable so the page still
-/// renders offline.
+/// The detail page: fetch the rich media + relations + credits fresh, fall back
+/// to the cached media (relations/credits empty) when AniList is unreachable so
+/// the page still renders offline.
 #[tauri::command]
 pub async fn get_media_detail(id: i64, state: State<'_, AppState>) -> Result<MediaDetail, String> {
     let al = state.anilist.lock().clone();
     match al.media_detail(id).await {
-        Ok((media, relations)) => {
+        Ok((media, relations, characters, staff)) => {
             let _ = state.db.upsert_media(&media);
             for r in &relations {
                 let _ = state.db.upsert_media(&r.media);
             }
-            Ok(MediaDetail { media, relations })
+            Ok(MediaDetail { media, relations, characters, staff })
         }
         Err(e) => match state.db.get_media(id).map_err(|e| e.to_string())? {
-            Some(media) => Ok(MediaDetail { media, relations: vec![] }),
+            Some(media) => Ok(MediaDetail {
+                media,
+                relations: vec![],
+                characters: vec![],
+                staff: vec![],
+            }),
             None => Err(e.to_string()),
         },
     }
@@ -696,6 +703,89 @@ pub fn bind_library_path(
 #[tauri::command]
 pub fn unbind_library_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
     library::unbind_media(&state.db, media_id).map_err(|e| e.to_string())
+}
+
+// ───────────────────────────── torrents (M6) ─────────────────────────────
+
+#[tauri::command]
+pub fn get_rss_feeds(state: State<'_, AppState>) -> Vec<String> {
+    rss::get_feeds(&state.db)
+}
+
+#[tauri::command]
+pub fn add_rss_feed(url: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    rss::add_feed(&state.db, &url).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn remove_rss_feed(url: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    rss::remove_feed(&state.db, &url).map_err(|e| e.to_string())
+}
+
+/// Refresh the configured feeds and match every item against the list with the
+/// shared recognizer. `is_new` = matched + episode past the entry's progress +
+/// not marked seen. Items are newest-first; unmatched ones ride along so the
+/// UI can report what the feed carried.
+#[tauri::command]
+pub async fn fetch_torrents(state: State<'_, AppState>) -> Result<Vec<TorrentItem>, String> {
+    let feeds = rss::get_feeds(&state.db);
+    if feeds.is_empty() {
+        return Ok(vec![]);
+    }
+    let raw = rss::fetch_all(&feeds).await.map_err(|e| e.to_string())?;
+    let _ = state.db.prune_rss_seen(60);
+    let seen = state.db.rss_seen_set().map_err(|e| e.to_string())?;
+    let matchers = state.matchers.lock().clone();
+    let mut items: Vec<TorrentItem> = raw
+        .into_iter()
+        .map(|r| {
+            let matched = recognize::match_title(&matchers, &r.title, "");
+            let episode = matched.and_then(|m| recognize::resolve_episode(m, &[r.title.as_str()]));
+            let progress = matched
+                .and_then(|m| state.db.get_entry(m.media_id).ok().flatten())
+                .map(|e| e.progress);
+            let was_seen = seen.contains(&r.guid);
+            let is_new = !was_seen
+                && matched.is_some()
+                && matches!((episode, progress), (Some(ep), Some(p)) if ep > p);
+            TorrentItem {
+                magnet: r.info_hash.as_deref().map(|h| rss::magnet_for(h, &r.title)),
+                title: r.title,
+                link: r.link,
+                guid: r.guid,
+                size: r.size,
+                seeders: r.seeders,
+                leechers: r.leechers,
+                published: r.published,
+                media_id: matched.map(|m| m.media_id),
+                matched: matched.map(|m| m.display.clone()),
+                episode,
+                is_new,
+                seen: was_seen,
+            }
+        })
+        .collect();
+    items.sort_by_key(|i| std::cmp::Reverse(i.published.unwrap_or(0)));
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn mark_torrents_seen(guids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.mark_rss_seen(&guids).map_err(|e| e.to_string())
+}
+
+// ───────────────────────────── stats (M6) ─────────────────────────────
+
+/// AniList's server-side profile statistics for the signed-in user.
+#[tauri::command]
+pub async fn get_user_stats(state: State<'_, AppState>) -> Result<UserStats, String> {
+    let user_name = state
+        .db
+        .get_setting(USERNAME_KEY)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "not logged in".to_string())?;
+    let al = state.anilist.lock().clone();
+    al.user_statistics(&user_name).await.map_err(|e| e.to_string())
 }
 
 // ───────────────────────────── notifications ─────────────────────────────
