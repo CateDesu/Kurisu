@@ -44,7 +44,10 @@ pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
         let mut norms = Vec::new();
         for v in [m.title_english.as_deref(), m.title_romaji.as_deref(), m.title_native.as_deref()].into_iter().flatten() {
             if !v.trim().is_empty() {
-                let n = clean_title(v);
+                // norm_title, NOT clean_title: the episode-tail strip is for
+                // release names — on list titles it ate numeric suffixes
+                // ("No.6" → "no", "86" → "", "Steins;Gate 0" → "steins gate").
+                let n = norm_title(v);
                 if !n.is_empty() {
                     variants.push(v.to_string());
                     norms.push(n);
@@ -59,34 +62,77 @@ pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
     out
 }
 
+/// Word-boundary containment: does `long` contain `short` as a contiguous run
+/// of whole TOKENS? Both sides are normalized (lowercase, single-space-joined),
+/// so a boundary check is a space check. Some(true) = at the very start (the
+/// title position in release names), Some(false) = later in the string. Raw
+/// char containment is NOT enough: "dr" lives inside "dreaming", "ost" inside
+/// "lost" — short norms char-matched half the feed.
+fn contains_tokens(long: &str, short: &str) -> Option<bool> {
+    if short.is_empty() || short.len() > long.len() {
+        return None;
+    }
+    if long.starts_with(short)
+        && (long.len() == short.len() || long.as_bytes()[short.len()] == b' ')
+    {
+        return Some(true);
+    }
+    // interior / suffix occurrence, both edges on token boundaries
+    let padded = format!(" {short}");
+    let mut from = 0;
+    while let Some(i) = long[from..].find(&padded) {
+        let start = from + i + 1;
+        let end = start + short.len();
+        if end == long.len() || long.as_bytes()[end] == b' ' {
+            return Some(false);
+        }
+        from = start;
+    }
+    None
+}
+
+/// Match quality of one norm against one candidate. None = no match.
+/// 3 = exact; 2 = one is a whole-token PREFIX of the other (the title leads in
+/// release names, or the release uses a shortened title); 1 = a long multi-word
+/// norm phrase sits mid-string (secondary titles: "… | The Ghost in the Shell").
+/// Short strings only match exactly — single common words ("another", "dr") and
+/// tiny norms appear inside unrelated titles far too often to trust.
+fn norm_match_tier(norm: &str, cand: &str) -> Option<u8> {
+    if norm == cand {
+        return Some(3);
+    }
+    let (short, long) = if norm.len() <= cand.len() { (norm, cand) } else { (cand, norm) };
+    if short.len() < 4 {
+        return None;
+    }
+    match contains_tokens(long, short) {
+        Some(true) => Some(2),
+        Some(false) if short.len() >= 8 && short.contains(' ') => Some(1),
+        _ => None,
+    }
+}
+
 /// Match a now-playing string against the cached list. Tries the raw title first,
-/// then the file basename. Returns the first matcher that matches exactly, then
-/// falls back to substring containment.
+/// then the file basename. Best (tier, norm length) wins, so an exact hit beats
+/// a prefix, a prefix beats an interior phrase, and a prefix pair ("Toradora"
+/// vs "Toradora SOS") resolves to the more specific show.
 pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -> Option<&'a Matcher> {
     let candidates = [clean_title(title), clean_title(&basename(url))];
     for cand in candidates {
         if cand.is_empty() {
             continue;
         }
-        // exact normalized match
-        if let Some(m) = matchers.iter().find(|m| m.norms.iter().any(|n| n == &cand)) {
-            return Some(m);
-        }
-        // containment (one inside the other) — longest MATCHING norm wins, so a
-        // prefix pair ("Toradora" vs "Toradora SOS") resolves to the more
-        // specific show instead of whichever row comes first in DB order.
-        if let Some(m) = matchers
+        let best = matchers
             .iter()
-            .filter(|m| m.norms.iter().any(|n| n.contains(&cand) || cand.contains(n)))
-            .max_by_key(|m| {
+            .filter_map(|m| {
                 m.norms
                     .iter()
-                    .filter(|n| n.contains(&cand) || cand.contains(n.as_str()))
-                    .map(|n| n.len())
+                    .filter_map(|n| norm_match_tier(n, &cand).map(|t| (t, n.len())))
                     .max()
-                    .unwrap_or(0)
+                    .map(|score| (score, m))
             })
-        {
+            .max_by_key(|(score, _)| *score);
+        if let Some((_, m)) = best {
             return Some(m);
         }
     }
@@ -95,13 +141,24 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
 
 // ─────────────────────────── parsing helpers ───────────────────────────
 
-/// Normalize a title for fuzzy comparison: lowercase, split on non-alphanumeric,
-/// drop the noise tokens, collapse spaces.
+/// Normalize a RELEASE name / now-playing string for comparison: lowercase,
+/// split on non-alphanumeric, drop bracket groups + resolution noise, and strip
+/// the trailing episode marker.
 pub(crate) fn clean_title(s: &str) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
     let s = RE_EP_TAIL.replace(&s, "");
+    normalize(&s)
+}
+
+/// Normalize a LIST TITLE for comparison. Same cleaning as `clean_title` minus
+/// the episode-tail strip — a trailing number in a list title is part of the
+/// name ("No.6", "86", "Mob Psycho 100", "Steins;Gate 0"), not an episode.
+pub(crate) fn norm_title(s: &str) -> String {
+    let s = strip_ext(s);
+    let s = RE_BRACKETS.replace_all(&s, " ");
+    let s = RE_RES.replace_all(&s, " ");
     normalize(&s)
 }
 
@@ -122,12 +179,25 @@ fn normalize(s: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// Strip a trailing file extension, if any.
+/// File extensions worth stripping from a title/basename. ONLY these — the old
+/// naive last-dot strip mutilated titles like "No.6" (→ "No") and "D.Gray-man"
+/// (→ "D"), and truncated torrent names at codec tags ("… AAC2.0 H.264 (…)" →
+/// "… AAC2"), feeding the matcher degenerate norms and candidates that then
+/// substring-matched everything.
+const STRIP_EXTS: &[&str] = &[
+    "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv", "mpg", "mpeg", "m2ts",
+    "ogv",
+];
+
+/// Strip a trailing KNOWN media extension, if any.
 fn strip_ext(s: &str) -> String {
-    match s.rfind('.') {
-        Some(i) if i > 0 && !s[i..].contains('/') && !s[i..].contains('\\') => s[..i].to_string(),
-        _ => s.to_string(),
+    if let Some(i) = s.rfind('.') {
+        let ext = &s[i + 1..];
+        if STRIP_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+            return s[..i].to_string();
+        }
     }
+    s.to_string()
 }
 
 /// Last path segment of a `file://` URL (or any path-ish string), extension
@@ -343,5 +413,93 @@ mod tests {
         // containment: playing string contains the normalized title
         assert!(match_title(&matchers, "", "file:///x/[G] Sousou no Frieren - 28.mkv").is_some());
         assert!(match_title(&matchers, "Totally Different Show", "").is_none());
+    }
+
+    fn mk(media_id: i64, title: &str) -> Matcher {
+        Matcher {
+            media_id,
+            display: title.into(),
+            variants: vec![title.into()],
+            norms: vec![norm_title(title)],
+        }
+    }
+
+    /// Only KNOWN media extensions are stripped, and list-title norms keep
+    /// their trailing numbers: the naive last-dot strip turned "No.6" into "no"
+    /// and "D.Gray-man" into "d", the episode-tail strip then ate what was
+    /// left — matcher norms that substring-matched everything.
+    #[test]
+    fn strip_ext_and_norms_keep_real_titles() {
+        assert_eq!(norm_title("No.6"), "no 6");
+        assert_eq!(norm_title("D.Gray-man"), "d gray man");
+        assert_eq!(norm_title("Dr. STONE"), "dr stone");
+        assert_eq!(norm_title("86"), "86");
+        assert_eq!(norm_title("Steins;Gate 0"), "steins gate 0");
+        assert_eq!(norm_title("Ghost in the Shell 2.0"), "ghost in the shell 2 0");
+        // release names still get the episode tail + extension stripped
+        assert_eq!(clean_title("Show Name - 03.mkv"), "show name");
+        assert_eq!(clean_title("Show Name - 03.MKV"), "show name");
+        // a torrent title that is not a filename is no longer truncated at the
+        // last dot (only the codec/episode noise goes)
+        assert_eq!(
+            clean_title("Clevatess S02E03 CR WEB-DL DUAL AAC2.0 H.264 (Clevatess: Majuu no Ou)"),
+            "clevatess s02e03 cr dual aac2"
+        );
+    }
+
+    /// The mismatch epidemic: short/single-word list titles must not match
+    /// unrelated releases via raw substring containment.
+    #[test]
+    fn short_titles_do_not_mismatch() {
+        let matchers = vec![
+            mk(1, "Another"),
+            mk(2, "86"),
+            mk(3, "Dr. STONE"),
+            mk(4, "No.6"),
+            mk(5, "K"),
+        ];
+        // "another" mid-string in an unrelated title: single word → no match
+        assert!(match_title(&matchers, "[G] Re:Zero Starting Life in Another World - 05", "").is_none());
+        // "dr" must not live inside "dreaming", "no 6" needs whole tokens
+        assert!(match_title(&matchers, "[ToonsHub] Grand Blue Dreaming S03E03 1080p", "").is_none());
+        assert!(match_title(&matchers, "[G] Sora wa Akai Kawa no Hotori - 03", "").is_none());
+        // 1-char norm ("K") matches nothing but itself
+        assert!(match_title(&matchers, "Walking the Way All Alone S01E16 1080p", "").is_none());
+        assert_eq!(match_title(&matchers, "K - 05", "").map(|m| m.media_id), Some(5));
+        // the real shows still match
+        assert_eq!(match_title(&matchers, "[SubsPlease] Another - 05 (1080p)", "").map(|m| m.media_id), Some(1));
+        assert_eq!(match_title(&matchers, "[SubsPlease] 86 - 11 (1080p)", "").map(|m| m.media_id), Some(2));
+        assert_eq!(match_title(&matchers, "[SubsPlease] Dr. Stone S3 - 05 (1080p)", "").map(|m| m.media_id), Some(3));
+        assert_eq!(match_title(&matchers, "[G] No.6 - 03 [720p]", "").map(|m| m.media_id), Some(4));
+    }
+
+    /// Prefix (either direction) and long interior phrases still match; token
+    /// boundaries are respected.
+    #[test]
+    fn token_boundary_prefix_and_interior() {
+        let matchers = vec![mk(1, "Ghost in the Shell"), mk(2, "Shiro")];
+        // secondary title after a pipe: long multi-word phrase mid-string
+        assert_eq!(
+            match_title(&matchers, "[Kotobuki] Koukaku Kidoutai (2026) 03 [1080p HEVC Multisub] | The Ghost in the Shell", "")
+                .map(|m| m.media_id),
+            Some(1)
+        );
+        // "shiro" is not a token inside "shirobako"
+        assert!(match_title(&matchers, "[G] Shirobako - 05", "").is_none());
+        // shortened release title = prefix of the full list title
+        let rezero = vec![mk(1, "Re:Zero kara Hajimeru Isekai Seikatsu")];
+        assert_eq!(match_title(&rezero, "Re Zero - 05", "").map(|m| m.media_id), Some(1));
+        // list title = prefix of a longer release string
+        let yama = vec![mk(1, "Yama no Susume")];
+        assert_eq!(
+            match_title(&yama, "[G] Yama no Susume Next Summit - 03", "").map(|m| m.media_id),
+            Some(1)
+        );
+        // prefix pair resolves to the more specific show
+        let pair = vec![mk(1, "Toradora"), mk(2, "Toradora SOS")];
+        assert_eq!(
+            match_title(&pair, "[G] Toradora SOS - 02", "").map(|m| m.media_id),
+            Some(2)
+        );
     }
 }

@@ -741,12 +741,23 @@ pub async fn fetch_torrents(state: State<'_, AppState>) -> Result<Vec<TorrentIte
         .map(|r| {
             let matched = recognize::match_title(&matchers, &r.title, "");
             let episode = matched.and_then(|m| recognize::resolve_episode(m, &[r.title.as_str()]));
-            let progress = matched
-                .and_then(|m| state.db.get_entry(m.media_id).ok().flatten())
-                .map(|e| e.progress);
+            let (progress, total) = match matched {
+                Some(m) => (
+                    state.db.get_entry(m.media_id).ok().flatten().map(|e| e.progress),
+                    state.db.get_media(m.media_id).ok().flatten().and_then(|md| md.episodes),
+                ),
+                None => (None, None),
+            };
             let was_seen = seen.contains(&r.guid);
+            // An episode past the entry's known total is another part of the
+            // franchise (a new season/series matching an older completed
+            // entry) — group it, but never flag it NEW.
+            let within_total = match (episode, total) {
+                (Some(ep), Some(t)) => ep <= t,
+                _ => true,
+            };
             let is_new = !was_seen
-                && matched.is_some()
+                && within_total
                 && matches!((episode, progress), (Some(ep), Some(p)) if ep > p);
             TorrentItem {
                 magnet: r.info_hash.as_deref().map(|h| rss::magnet_for(h, &r.title)),
