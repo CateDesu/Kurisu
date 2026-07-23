@@ -320,10 +320,17 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
-    /// Flush + truncate the WAL. Used on logout so the old token doesn't linger
-    /// in the -wal sidecar after the settings row is overwritten.
-    pub fn checkpoint(&self) -> Result<()> {
-        self.0.lock().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    /// Remove a settings row so thoroughly the value can't be carved back out of
+    /// the database files: DELETE the row, VACUUM (rebuilds the file from live
+    /// content, dropping the freed page that still held the bytes), then
+    /// truncate the WAL so the journal's copies go too. Used on logout for the
+    /// token row; overkill for anything less sensitive.
+    pub fn scrub_setting(&self, key: &str) -> Result<()> {
+        let c = self.0.lock();
+        c.execute("DELETE FROM settings WHERE key = ?", [key])?;
+        // VACUUM refuses to run inside a transaction; execute_batch runs these
+        // as plain top-level statements.
+        c.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -467,5 +474,46 @@ mod tests {
         assert_eq!(m.duration, Some(24));
         assert_eq!(m.source.as_deref(), Some("MANGA"));
         assert_eq!(m.studios, Some(vec!["MAPPA".to_string()]));
+    }
+
+    /// Logout scrub: after `scrub_setting`, the secret's bytes must be gone from
+    /// the main db file AND the WAL sidecars — not just unreachable via SQL.
+    /// (Needs a file-backed db; :memory: has no file to inspect.)
+    #[test]
+    fn scrub_setting_removes_the_value_from_the_db_files() {
+        let path = std::env::temp_dir().join(format!("kurisu-scrub-test-{}.db", std::process::id()));
+        let needle = b"sekrit-token-value-1234567890";
+        let mut files = vec![path.clone()];
+        for suffix in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_os_string();
+            side.push(suffix);
+            files.push(side.into());
+        }
+        for f in &files {
+            let _ = std::fs::remove_file(f);
+        }
+        {
+            let db = Db::open(&path).unwrap();
+            db.set_setting("anilist_token", std::str::from_utf8(needle).unwrap()).unwrap();
+            // Checkpoint first so the row reaches the MAIN file: the scrub must
+            // clean a long-since-checkpointed page, not just the fresh WAL.
+            db.0.lock().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            db.scrub_setting("anilist_token").unwrap();
+            assert_eq!(db.get_setting("anilist_token").unwrap(), None);
+            // Inspect while the connection is still open: closing it would
+            // checkpoint + delete the WAL and hide a leak there.
+            for f in &files {
+                if let Ok(raw) = std::fs::read(f) {
+                    assert!(
+                        !raw.windows(needle.len()).any(|w| w == needle),
+                        "token bytes survived scrub in {}",
+                        f.display()
+                    );
+                }
+            }
+        }
+        for f in &files {
+            let _ = std::fs::remove_file(f);
+        }
     }
 }

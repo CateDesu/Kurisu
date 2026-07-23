@@ -203,16 +203,31 @@ pub fn is_logged_in(state: State<'_, AppState>) -> bool {
     state.anilist.lock().has_token()
 }
 
-/// Generic key/value settings access for small UI toggles (close-to-tray, …).
-/// No whitelist: the settings table is local-only and every key is namespaced by
-/// the caller, same trust level as the existing tracking config.
+/// The only keys the generic accessors below may touch. Everything else in the
+/// settings table has a dedicated command with its own validation — above all
+/// the AniList token, which must not be one generic invoke away from any script
+/// that ever runs in the webview. Add UI toggles here as they appear.
+const APP_SETTING_KEYS: &[&str] = &["close_to_tray", "auto_update"];
+
+fn check_app_setting_key(key: &str) -> Result<(), String> {
+    if APP_SETTING_KEYS.contains(&key) {
+        Ok(())
+    } else {
+        Err(format!("not a UI setting key: {key}"))
+    }
+}
+
+/// Generic key/value settings access for small UI toggles, allowlisted to
+/// exactly the keys in `APP_SETTING_KEYS`.
 #[tauri::command]
-pub fn get_app_setting(key: String, state: State<'_, AppState>) -> Option<String> {
-    state.db.get_setting(&key).ok().flatten()
+pub fn get_app_setting(key: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    check_app_setting_key(&key)?;
+    Ok(state.db.get_setting(&key).ok().flatten())
 }
 
 #[tauri::command]
 pub fn set_app_setting(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+    check_app_setting_key(&key)?;
     state.db.set_setting(&key, &value).map_err(|e| e.to_string())
 }
 
@@ -270,9 +285,10 @@ pub async fn login_oauth(app: tauri::AppHandle, state: State<'_, AppState>) -> R
 #[tauri::command]
 pub fn logout(state: State<'_, AppState>) {
     state.anilist.lock().set_token(None);
-    let _ = state.db.set_setting(TOKEN_KEY, "");
-    // Flush the WAL so the old token doesn't sit recoverable in the -wal sidecar.
-    let _ = state.db.checkpoint();
+    // Scrub, don't overwrite: an emptied row can survive on a freed SQLite page.
+    // scrub_setting DELETEs the row, VACUUMs the freed page away, and truncates
+    // the WAL, so no copy of the token outlives the logout in the db files.
+    let _ = state.db.scrub_setting(TOKEN_KEY);
     *state.user.lock() = None;
 }
 

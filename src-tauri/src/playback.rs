@@ -177,7 +177,9 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     if active.as_ref().map(|t| &t.key) != Some(&key) {
         *active = Some(ActiveTrack::new(key));
     }
-    let track = active.as_mut().unwrap();
+    // Provably Some (the branch above just set it if it wasn't), but spelled as
+    // a let-else so a future edit to that condition can't turn it into a panic.
+    let Some(track) = active.as_mut() else { return Ok(()) };
     // Credit the interval only when playing at BOTH ticks: sampling every 5s
     // can't see intra-interval pauses, so counting a pause→resume interval in
     // full would reach the prompt threshold early. Under-counting (a slightly
@@ -417,4 +419,27 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn read_now(_app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same drift guard as models.rs, for the event payloads the watcher emits
+    /// (mirrored by hand as `NowPlaying` / `TrackingPrompt` in types.ts).
+    #[test]
+    fn event_payload_field_names_exist_in_types_ts() {
+        crate::models::assert_ts_declares("NowPlaying", &serde_json::to_value(idle()).unwrap());
+        crate::models::assert_ts_declares(
+            "TrackingPrompt",
+            &serde_json::to_value(TrackingPrompt {
+                media_id: 0,
+                episode: 0,
+                title: String::new(),
+                raw_title: String::new(),
+                progress: 0,
+            })
+            .unwrap(),
+        );
+    }
 }

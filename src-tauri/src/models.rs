@@ -261,3 +261,75 @@ pub struct Notification {
     pub user_name: Option<String>,
     pub user_avatar: Option<String>,
 }
+
+/// Drift guard for the hand-maintained TS mirror: assert every field name
+/// `value` (a serialized command/event payload) carries is declared somewhere
+/// in src/lib/types.ts. A Rust rename or addition that would land as
+/// `undefined` in the UI fails here instead. Shared with playback.rs for its
+/// event payload structs.
+#[cfg(test)]
+pub(crate) fn assert_ts_declares(name: &str, value: &serde_json::Value) {
+    let ts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/lib/types.ts"))
+        .expect("read src/lib/types.ts");
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{name} must serialize to a JSON object"));
+    for key in obj.keys() {
+        assert!(
+            ts.contains(&format!("{key}:")) || ts.contains(&format!("{key}?:")),
+            "{name}.{key} is serialized to the frontend but not declared in src/lib/types.ts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every model a command returns, serialized with all keys present (serde
+    /// keeps `None` fields as null), checked against the TS mirror.
+    #[test]
+    fn serialized_field_names_exist_in_types_ts() {
+        let models: Vec<(&str, serde_json::Value)> = vec![
+            ("Media", serde_json::to_value(Media::default()).unwrap()),
+            ("ListEntry", serde_json::to_value(ListEntry::default()).unwrap()),
+            (
+                "MediaRelation",
+                serde_json::to_value(MediaRelation { relation: String::new(), media: Media::default() }).unwrap(),
+            ),
+            ("MediaCharacter", serde_json::to_value(MediaCharacter::default()).unwrap()),
+            ("MediaStaff", serde_json::to_value(MediaStaff::default()).unwrap()),
+            (
+                "MediaDetail",
+                serde_json::to_value(MediaDetail {
+                    media: Media::default(),
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                })
+                .unwrap(),
+            ),
+            (
+                "AiringItem",
+                serde_json::to_value(AiringItem { airing_at: 0, episode: 0, media: Media::default() }).unwrap(),
+            ),
+            ("TorrentItem", serde_json::to_value(TorrentItem::default()).unwrap()),
+            ("UserStats", serde_json::to_value(UserStats::default()).unwrap()),
+            ("ScoreBucket", serde_json::to_value(ScoreBucket::default()).unwrap()),
+            ("StatusCount", serde_json::to_value(StatusCount::default()).unwrap()),
+            ("FormatCount", serde_json::to_value(FormatCount::default()).unwrap()),
+            ("GenreStat", serde_json::to_value(GenreStat::default()).unwrap()),
+            ("YearCount", serde_json::to_value(YearCount::default()).unwrap()),
+            ("LibraryFile", serde_json::to_value(LibraryFile::default()).unwrap()),
+            ("User", serde_json::to_value(User::default()).unwrap()),
+            ("Notification", serde_json::to_value(Notification::default()).unwrap()),
+            (
+                "TrackingConfig",
+                serde_json::to_value(crate::commands::TrackingConfig::default()).unwrap(),
+            ),
+        ];
+        for (name, value) in &models {
+            assert_ts_declares(name, value);
+        }
+    }
+}

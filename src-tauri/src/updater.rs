@@ -202,9 +202,17 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
 
 // ── Download + integrity ────────────────────────────────────────────────────
 
+/// Hard ceiling on an update download. The real assets are ~20 MB (Linux
+/// binary) and ~150 MB (NSIS installer with the WebView2 bootstrapper); this
+/// leaves room for an offline-installer future while bounding how much disk a
+/// pathological or compromised asset can fill.
+#[cfg(any(windows, target_os = "linux"))]
+const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
+
 /// Stream `url` to `dest`, writing to a `.part` and renaming on success so a
 /// half-download is never mistaken for complete. Verifies Content-Length (a
-/// clean early close is a short read with no error). `.part` removed on failure.
+/// clean early close is a short read with no error) and refuses anything past
+/// `MAX_DOWNLOAD_BYTES`, header-claimed or streamed. `.part` removed on failure.
 /// File I/O goes through tokio::fs so the writes stay off the async workers.
 #[cfg(any(windows, target_os = "linux"))]
 pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
@@ -234,11 +242,18 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
             .error_for_status()
             .map_err(|e| e.to_string())?;
         let total = resp.content_length().unwrap_or(0);
+        if total > MAX_DOWNLOAD_BYTES {
+            return Err(format!("update download is implausibly large ({total} bytes)"));
+        }
         let mut file = tokio::fs::File::create(&part).await.map_err(|e| e.to_string())?;
         let mut got: u64 = 0;
         while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             got += chunk.len() as u64;
+            // The header can lie (or be absent): enforce the cap on the stream too.
+            if got > MAX_DOWNLOAD_BYTES {
+                return Err(format!("update download exceeded {MAX_DOWNLOAD_BYTES} bytes"));
+            }
         }
         file.flush().await.map_err(|e| e.to_string())?;
         drop(file);

@@ -146,31 +146,6 @@ pub fn scan_paths(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::binding_for;
-    use std::collections::HashMap;
-
-    #[test]
-    fn binding_prefix_matching() {
-        let mut b = HashMap::new();
-        b.insert("/a/Show".to_string(), 1_i64);
-        b.insert("/a/Show/Specials".to_string(), 2);
-        b.insert("/a/file.mkv".to_string(), 3);
-        // exact file binding
-        assert_eq!(binding_for(&b, "/a/file.mkv"), Some(3));
-        // dir binding covers files below it
-        assert_eq!(binding_for(&b, "/a/Show/ep01.mkv"), Some(1));
-        // deepest dir wins
-        assert_eq!(binding_for(&b, "/a/Show/Specials/sp1.mkv"), Some(2));
-        // "Show 2" is NOT under the "Show" binding (no separator boundary)
-        assert_eq!(binding_for(&b, "/a/Show 2/ep01.mkv"), None);
-        // Windows separators count as a boundary too
-        assert_eq!(binding_for(&b, "/a/Show\\ep01.mkv"), Some(1));
-        assert_eq!(binding_for(&b, "/other/x.mkv"), None);
-    }
-}
-
 /// Recursively collect video files under `dir`, skipping hidden entries.
 fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
     if depth > MAX_DEPTH {
@@ -198,5 +173,30 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
         {
             out.push(path.to_string_lossy().into_owned());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binding_for;
+    use std::collections::HashMap;
+
+    #[test]
+    fn binding_prefix_matching() {
+        let mut b = HashMap::new();
+        b.insert("/a/Show".to_string(), 1_i64);
+        b.insert("/a/Show/Specials".to_string(), 2);
+        b.insert("/a/file.mkv".to_string(), 3);
+        // exact file binding
+        assert_eq!(binding_for(&b, "/a/file.mkv"), Some(3));
+        // dir binding covers files below it
+        assert_eq!(binding_for(&b, "/a/Show/ep01.mkv"), Some(1));
+        // deepest dir wins
+        assert_eq!(binding_for(&b, "/a/Show/Specials/sp1.mkv"), Some(2));
+        // "Show 2" is NOT under the "Show" binding (no separator boundary)
+        assert_eq!(binding_for(&b, "/a/Show 2/ep01.mkv"), None);
+        // Windows separators count as a boundary too
+        assert_eq!(binding_for(&b, "/a/Show\\ep01.mkv"), Some(1));
+        assert_eq!(binding_for(&b, "/other/x.mkv"), None);
     }
 }

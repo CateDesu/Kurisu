@@ -996,6 +996,42 @@ const SHIM_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><sty
 const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#3ba55d'>Connected to Kurisu.</h2><p>You can close this tab and return to the app.</p></body>";
 const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#e74c3c'>Authorization failed.</h2><p>Return to Kurisu for details.</p></body>";
 
+/// Minimal query-value decoder: %XX escapes plus '+' as space. Today's values
+/// (base64url token, hex state) contain neither, so this is a no-op — it only
+/// starts mattering if AniList ever changes the token alphabet. Malformed
+/// escapes pass through literally.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Start a localhost HTTP listener that captures the access token AniList sends
 /// back in the implicit flow. Returns `(state, receiver)`: the caller embeds
 /// `state` in the authorize URL, and the receiver resolves with the token once a
@@ -1037,8 +1073,30 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
                     Err(_) => continue,
                 };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read until the request headers are complete (or the buffer
+                // fills, the peer closes, or 10s passes). One read usually
+                // delivers the whole GET over loopback, but that's a TCP
+                // accident, not a guarantee — and a speculative browser
+                // preconnect that never sends a byte must not park the accept
+                // loop until the browser gives up on the socket.
                 let mut buf = [0u8; 8192];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let mut n = 0;
+                let read_headers = async {
+                    loop {
+                        match sock.read(&mut buf[n..]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(r) => {
+                                n += r;
+                                if n == buf.len()
+                                    || buf[..n].windows(4).any(|w| w == b"\r\n\r\n")
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(10), read_headers).await;
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let path = req
                     .lines()
@@ -1049,13 +1107,15 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
                 let param = |k: &str| -> Option<String> {
                     query.split('&').find_map(|kv| {
                         let (key, val) = kv.split_once('=')?;
-                        (key == k).then(|| val.to_string())
+                        (key == k).then(|| percent_decode(val))
                     })
                 };
 
                 // 1) AniList denied → error comes in the query (?error=…).
                 // 2) The shim re-requested with the fragment as a query
-                //    (?access_token=…), or a code-style redirect slipped through.
+                //    (?access_token=…). The flow is response_type=token, so
+                //    that's the ONLY parameter that can carry credentials — a
+                //    `code` would need an exchange step this app doesn't have.
                 // 3) Otherwise (initial implicit redirect with the token still in the
                 //    fragment, or a probe) → serve the shim, don't resolve yet.
                 // Failures (error param, state mismatch) answer the browser but do
@@ -1067,7 +1127,7 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
                         let msg = param("error_description").unwrap_or(err);
                         log::warn!("OAuth callback: AniList denied access: {msg}");
                         (None, ERR_HTML)
-                    } else if let Some(token) = param("access_token").or_else(|| param("code")) {
+                    } else if let Some(token) = param("access_token") {
                         // CSRF check: the state AniList echoes back must equal the one
                         // we sent. A mismatch / missing state means this token wasn't
                         // for our request — reject it and keep listening.
@@ -1124,6 +1184,16 @@ pub(crate) mod urlencoding {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn percent_decode_handles_escapes_plus_and_junk() {
+        assert_eq!(super::percent_decode("abc-123_x.y~z"), "abc-123_x.y~z");
+        assert_eq!(super::percent_decode("a%20b+c"), "a b c");
+        assert_eq!(super::percent_decode("%41%6eiList"), "AniList");
+        // Malformed / truncated escapes pass through literally.
+        assert_eq!(super::percent_decode("100%"), "100%");
+        assert_eq!(super::percent_decode("%zz%4"), "%zz%4");
+    }
+
     /// C3 regression: a hostile probe (`?error=…`), a token with the WRONG
     /// state, and a bare hit must all be answered WITHOUT resolving the login
     /// or killing the listener — only a state-verified token resolves it.
