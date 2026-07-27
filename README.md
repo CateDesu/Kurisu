@@ -1,5 +1,7 @@
 # ク Kurisu
 
+**Platform:** Linux · Windows  ·  [Discord](https://discord.com/invite/TQJrbZcgKF)
+
 Kurisu is an anime tracker inspired by [Taiga](https://taiga.moe), built in Rust. It runs on Linux and Windows, syncs with [AniList](https://anilist.co), detects what you're watching through the OS media APIs, and caches your list locally.
 
 > ⚠️ **Early development.** Kurisu is a work in progress. Features are incomplete and things will change as it evolves. It's a personal project, not a polished release. Expect bugs.
