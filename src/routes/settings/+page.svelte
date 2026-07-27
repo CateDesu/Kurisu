@@ -1,7 +1,7 @@
 <script lang="ts">
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import { installInFlight, runInstallUpdate } from "$lib/updater.svelte";
+  import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
-  import { installInFlight, runInstallUpdate } from "$lib/updater.svelte";
+  import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
   import type { UpdateInfo } from "$lib/types";
 
   // Shown when the backend's startup check finds a newer release (the
