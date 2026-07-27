@@ -39,6 +39,12 @@ const TICK: Duration = Duration::from_secs(5);
 const BROWSER_PLAYERS: &[&str] = &[
     "firefox", "librewolf", "mozilla", "zen", "waterfox", "floorp", "chrome", "chromium", "brave",
     "vivaldi", "opera", "edge",
+    // Bridges that re-expose another device's or app's media on the bus under
+    // their own name, bypassing the browser check above: KDE's browser
+    // integration (Firefox/Chrome tabs appear as plasma.browser.integration),
+    // KDE Connect (the paired phone's media sessions), and playerctld (mirrors
+    // whatever player it last controlled, browsers included).
+    "browser", "kdeconnect", "playerctld",
     // Opaque AppUserModelIDs. A name-substring denylist cannot catch a browser
     // whose AUMID carries no name: the classic (non-Store) Firefox installer
     // registers this hash, so YouTube in Firefox would otherwise drive tracking
@@ -662,6 +668,10 @@ mod tests {
         assert!(is_browser_str("org.mpris.MediaPlayer2.firefox.instance_1 Firefox"));
         assert!(is_browser_str("308046B0AF4A39CB"), "opaque Firefox AUMID");
         assert!(is_browser_str("Chromium"));
+        // Bridges re-exposing browser/phone media under their own name.
+        assert!(is_browser_str("org.mpris.MediaPlayer2.plasma.browser.integration Plasma Browser Integration"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.kdeconnect.pixel_7 KDE Connect"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.playerctld playerctld"));
         assert!(!is_browser_str("org.mpris.MediaPlayer2.mpv mpv"));
         assert!(!is_browser_str("io.github.celluloid_player.Celluloid"));
         assert!(!is_browser_str("VLC media player"));
