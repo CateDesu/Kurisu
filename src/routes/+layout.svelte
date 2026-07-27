@@ -114,7 +114,7 @@
               <div class="text-xs text-ink-dim truncate">View AniList</div>
             </button>
             <button
-              onclick={() => auth.logout()}
+              onclick={() => auth.logout().catch(() => {})}
               title="Log out"
               class="text-ink-dim hover:text-ink px-1 grid place-items-center"
             >

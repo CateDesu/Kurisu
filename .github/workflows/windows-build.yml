@@ -1,23 +1,26 @@
 # Builds Kurisu for Windows (single NSIS installer exe, WebView2 bootstrapper
 # embedded) and Linux (bare binary), and publishes both to a GitHub release.
 #
-# - Push to main  → ROLLING release: tag v<base>.<run_number> (base = "version"
-#                   from tauri.conf.json, e.g. v1.0.0.123), published with the
+# - Push to main  → ROLLING release: tag v<base>.<commit_count> (base =
+#                   "version" from tauri.conf.json; the 4th segment is the
+#                   monotonic main commit count, e.g. v1.0.0.412), published with the
 #                   installer + Linux binary + SHA-256 sidecars attached. The
 #                   previous rolling release is pruned, so /releases/latest
 #                   always points at the newest main build — which is what the
 #                   in-app updater tracks. No manual tagging needed.
 # - Push a v* tag → a normal named release (v1.1.0). Never pruned.
 # - Manual        → Actions tab → "Release build" → Run workflow (rolling).
+#                   Dispatches on any ref other than main fail fast in meta.
 #
 # DRAFT-UNTIL-COMPLETE (same shape as NyaaTriggers' release.yml): the release
 # is created as a DRAFT, the platform jobs upload assets into it, and a final
 # publish job un-drafts it only after BOTH builds succeeded. /releases/latest
 # excludes drafts, so the in-app updater never sees a release that is missing
 # an asset or a checksum — no update window where installing could fail or a
-# platform is left behind. If a build fails, the draft stays invisible, users
-# keep updating from the previous complete release, and the next successful
-# run's prune sweeps the orphan draft.
+# platform is left behind. If a build fails, the draft stays invisible and
+# users keep updating from the previous complete release. Prune never touches
+# drafts (a draft may belong to another in-flight run), so orphan drafts are
+# cleaned up by hand.
 #
 # The updater downloads the `.sha256` sidecar for its platform asset and fails
 # closed without it, so every asset ships one. The app learns its full release
@@ -41,9 +44,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Gate every release path: the rolling release feeds the in-app updater
+  # directly, so nothing reaches it without green tests, clippy and typecheck.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Same system deps as build-linux: compiling the crate for tests pulls
+      # in webkit2gtk/gtk through the tauri dependency chain.
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - run: npm ci
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy -- -D warnings
+
+      - name: Frontend typecheck
+        run: npm run check
+
   # Resolve tag / version / rolling ONCE and create the release up front, so the
   # platform builds can upload assets into it in any order.
   meta:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write # needed to create the release
@@ -52,9 +88,24 @@ jobs:
       ver: ${{ steps.v.outputs.ver }}
       rolling: ${{ steps.v.outputs.rolling }}
     steps:
+      # Full history: the rolling 4th segment is the commit count on main.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Tag pushes release as-is; branch pushes roll v<base>.<run_number>.
+      # A dispatch from any ref other than main would roll that branch into
+      # the rolling latest and ship it to every user — fail fast instead.
+      - name: Manual runs only from main
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::manual runs are only allowed from main (this ref: ${{ github.ref }})"
+            exit 1
+          fi
+
+      # Tag pushes release as-is; branch pushes roll v<base>.<commit_count>.
+      # The 4th segment is the main commit count, never github.run_number:
+      # run_number is scoped to this file and resets if it is renamed, which
+      # would rank new tags below already-installed builds and strand users.
       - id: v
         shell: bash
         run: |
@@ -64,13 +115,35 @@ jobs:
           else
             BASE=$(sed -n 's/.*"version": "\([0-9.]*\)".*/\1/p' src-tauri/tauri.conf.json | head -1)
             if [ -z "$BASE" ]; then echo "::error::no version in tauri.conf.json"; exit 1; fi
-            TAG="v${BASE}.${{ github.run_number }}"
+            TAG="v${BASE}.$(git rev-list --count HEAD)"
             ROLL=true
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "rolling=$ROLL" >> "$GITHUB_OUTPUT"
           echo "Building tag=$TAG rolling=$ROLL"
+
+      # A re-run of an old run computes an old commit count. Never let it
+      # regress the channel: the new tag must sort strictly above the newest
+      # published (non-draft, non-prerelease) rolling release. No such release
+      # yet (first run) passes.
+      - name: Refuse to regress the rolling channel
+        if: steps.v.outputs.rolling == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          LATEST=$(gh release list -R "${{ github.repository }}" --limit 100 --json tagName,isDraft,isPrerelease \
+            --jq '.[] | select(.isDraft | not) | select(.isPrerelease | not) | .tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -z "$LATEST" ]; then
+            echo "No published rolling release yet; $TAG is the first"
+          elif [ "$TAG" = "$LATEST" ] || [ "$(printf '%s\n%s\n' "${TAG#v}" "${LATEST#v}" | sort -V | tail -1)" != "${TAG#v}" ]; then
+            echo "::error::$TAG is not newer than the current latest rolling release $LATEST; refusing to regress the channel (re-run of an old run?)"
+            exit 1
+          else
+            echo "$TAG sorts above current latest $LATEST"
+          fi
 
       # Created as a DRAFT: invisible to /releases/latest (and the release
       # page) until the publish job un-drafts it after both platform builds
@@ -81,8 +154,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.v.outputs.tag }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || \
+          # Only ever mutate an INVISIBLE draft. The old check asked merely
+          # whether a release existed, so re-running a finished run (or
+          # dispatching against an existing tag) reused the LIVE release and the
+          # build jobs then `gh release upload --clobber`ed it — deleting the
+          # published assets before re-uploading, with nothing to restore them
+          # if that build then failed. Users would be offered a release whose
+          # binary or checksum was missing.
+          if STATE=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$STATE" != "true" ]; then
+              echo "::error::release $TAG is already published; refusing to overwrite its assets." \
+                   "Bump the version (or delete the release) instead of re-running this build."
+              exit 1
+            fi
+            echo "Reusing existing draft $TAG"
+          else
             gh release create "$TAG" --target "${{ github.sha }}" --title "$TAG" --generate-notes --draft
+          fi
 
   build-windows:
     needs: meta
@@ -177,8 +265,7 @@ jobs:
   # uploaded their assets. Until this runs, /releases/latest still points at
   # the previous complete release, so the in-app updater can never offer a
   # half-uploaded build. If either build failed, this job is skipped and the
-  # draft stays invisible: users keep the previous release, and the next
-  # successful run's prune sweeps the orphan draft.
+  # draft stays invisible: users keep the previous release.
   publish:
     needs: [meta, build-windows, build-linux]
     runs-on: ubuntu-latest
@@ -194,12 +281,13 @@ jobs:
           echo "Published $TAG"
 
   # After a rolling release is published with both assets, delete the
-  # superseded rolling releases and their tags. Only 4-segment auto tags
-  # (vN.N.N.N) are touched; hand-cut vX.Y.Z releases stay as permanent
-  # milestones. Needs publish, so the previous rolling release is never
-  # deleted before the new one is visible, and a failed build never deletes
-  # the last working release. Orphan DRAFTS from failed or canceled rolling
-  # runs match the same tag shape and get swept here too.
+  # superseded rolling releases and their tags. A release is pruned only if its
+  # tag is a 4-segment auto tag (vN.N.N.N) AND sorts at or below the tag just
+  # built (sort -V) — anything newer belongs to a concurrent run and stays.
+  # Hand-cut vX.Y.Z releases stay as permanent milestones, and drafts are never
+  # pruned (a draft may be another in-flight run's release). Needs publish, so
+  # the previous rolling release is never deleted before the new one is
+  # visible, and a failed build never deletes the last working release.
   prune-rolling:
     needs: [meta, publish]
     if: needs.meta.outputs.rolling == 'true'
@@ -212,11 +300,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ needs.meta.outputs.tag }}
         run: |
-          gh release list -R "${{ github.repository }}" --limit 100 --json tagName,isPrerelease \
-            --jq '.[] | select(.isPrerelease | not) | .tagName' | while read -r t; do
+          gh release list -R "${{ github.repository }}" --limit 100 --json tagName,isPrerelease,isDraft \
+            --jq '.[] | select(.isPrerelease | not) | select(.isDraft | not) | .tagName' | while read -r t; do
             [ -z "$t" ] && continue
             [ "$t" = "$KEEP" ] && continue
             echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
+            if [ "$(printf '%s\n%s\n' "${t#v}" "${KEEP#v}" | sort -V | tail -1)" != "${KEEP#v}" ]; then
+              echo "Keeping $t: newer than $KEEP"
+              continue
+            fi
             echo "Pruning superseded rolling release $t"
             gh release delete -R "${{ github.repository }}" "$t" --cleanup-tag --yes || true
           done

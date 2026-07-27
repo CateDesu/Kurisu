@@ -2,9 +2,11 @@
 // page and the edit modal's "play next" share one scan instead of each re-walking
 // the disk. Scans are cheap (a full walk is sub-second), so nothing is persisted.
 import { api } from "./api";
-import type { LibraryFile } from "./types";
+import type { LibraryFile, UnreadableFolder } from "./types";
 
 let files = $state<LibraryFile[]>([]);
+// Configured roots the last scan could not read (unmounted drive, permissions).
+let unreadable = $state<UnreadableFolder[]>([]);
 let folders = $state<string[]>([]);
 let scanning = $state(false);
 let lastScanAt = $state(0);
@@ -27,7 +29,9 @@ async function scan() {
   }
   scanning = true;
   try {
-    files = await api.scanLibrary();
+    const result = await api.scanLibrary();
+    files = result.files;
+    unreadable = result.unreadable;
     lastScanAt = Date.now();
   } finally {
     scanning = false;
@@ -41,6 +45,9 @@ async function scan() {
 export const library = {
   get files() {
     return files;
+  },
+  get unreadable() {
+    return unreadable;
   },
   get folders() {
     return folders;
@@ -60,6 +67,14 @@ export const library = {
   },
   loadFolders,
   scan,
+  /** Drop everything cached for the signed-in account (called from logout). */
+  reset() {
+    files = [];
+    folders = [];
+    unreadable = [];
+    lastScanAt = 0;
+    pendingScan = false;
+  },
   async addFolder(path: string) {
     folders = await api.addLibraryFolder(path);
   },

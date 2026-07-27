@@ -14,14 +14,31 @@ use crate::db::Db;
 static RE_BRACKETS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\[\(【][^\]\)】]*[\]\)】]").unwrap());
 static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc|x264|h\.?264|avc|aac|flac|10bit|hi10|yuv420)\b").unwrap()
+    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[45]|avc|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
 });
+// Trailing episode marker. The bare `E05` form needs a separator or a season
+// prefix before the `e` — otherwise the title's own final `e` is eaten
+// ("Steins;Gate 01" → "steins gat"). `\d{1,4}` covers 1000+ episode runs.
 static RE_EP_TAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*[-_·]?\s*(?:ep(?:isode)?\.?|e|#)?\s*0*\d{1,3}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
+    Regex::new(r"(?i)\s*[-_·]?\s*(?:[sS]\d{1,2}[eE]|ep(?:isode)?\.?|[-_·\s][eE]|#)?\s*0*\d{1,4}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
 });
 /// One episode-number candidate: digits with an optional `vN` revision suffix
 /// ("04v2" is episode 4 — not episodes 4 and 2).
 static RE_EP_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:v\d+)?").unwrap());
+/// Season markers on an ALREADY-NORMALIZED string (lowercase, space-separated),
+/// collapsed to the bare ordinal AniList uses in romaji sequel titles.
+/// "7th season" / "2nd season" -> "7" / "2".
+static RE_NTH_SEASON: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?P<n>\d{1,2})(?:st|nd|rd|th) season\b").unwrap());
+/// "season 7" -> "7" (also covers the English titles AniList stores).
+static RE_SEASON_N: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bseason (?P<n>\d{1,2})\b").unwrap());
+/// Audio channel layouts ("2.0", "5.1"). Stripped before the codec names so
+/// their digits cannot outrank the episode number ("Show - 12 Opus2.0" is
+/// episode 12, not 2 — and "… DDP5.1" is not episode 1). No leading `\b`:
+/// the layout is usually glued to its codec ("AAC2.0"); the trailing `\b`
+/// alone keeps dot-separated tags like "S01E01.1080p" intact.
+static RE_CHANNEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d\.\d\b").unwrap());
 
 /// Resolutions / common bitrates to discard when picking the episode number.
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
@@ -33,6 +50,25 @@ pub(crate) struct Matcher {
     pub display: String,
     pub variants: Vec<String>, // raw english / romaji / native titles
     norms: Vec<String>,        // normalized variants for comparison
+    /// Rank of the entry's list status, used only to break an otherwise exact
+    /// tie. Lower is preferred.
+    status_rank: u8,
+}
+
+/// Two list entries can normalize to the SAME title (a duplicate, or a special
+/// that shares its parent's name). The winner used to be whichever row the
+/// unordered DB scan happened to yield last, so the same file could resolve to a
+/// different show between runs. Prefer what the user is actually watching, then
+/// fall back to the lowest media_id so the choice is at least stable.
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "CURRENT" => 0,
+        "REPEATING" => 1,
+        "PAUSED" => 2,
+        "PLANNING" => 3,
+        "COMPLETED" => 4,
+        _ => 5, // DROPPED and anything AniList adds later
+    }
 }
 
 pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
@@ -57,8 +93,17 @@ pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
         if norms.is_empty() {
             continue;
         }
-        out.push(Matcher { media_id: m.id, display: m.display_title(), variants, norms });
+        out.push(Matcher {
+            media_id: m.id,
+            display: m.display_title(),
+            variants,
+            norms,
+            status_rank: status_rank(&e.status),
+        });
     }
+    // Stable order so the tie-break below is deterministic regardless of the
+    // order SQLite happened to return the rows in.
+    out.sort_by_key(|m| (m.status_rank, m.media_id));
     out
 }
 
@@ -77,16 +122,24 @@ fn contains_tokens(long: &str, short: &str) -> Option<bool> {
     {
         return Some(true);
     }
-    // interior / suffix occurrence, both edges on token boundaries
-    let padded = format!(" {short}");
+    // Interior / suffix occurrence, both edges on token boundaries. Searching for
+    // `short` directly and checking the byte BEFORE it avoids allocating a padded
+    // copy: this is the recognizer's innermost loop (every list norm against
+    // every candidate), so a String per comparison is thousands of allocations
+    // per scanned file.
+    let bytes = long.as_bytes();
     let mut from = 0;
-    while let Some(i) = long[from..].find(&padded) {
-        let start = from + i + 1;
+    while let Some(i) = long[from..].find(short) {
+        let start = from + i;
         let end = start + short.len();
-        if end == long.len() || long.as_bytes()[end] == b' ' {
+        let left_ok = start > 0 && bytes[start - 1] == b' ';
+        let right_ok = end == long.len() || bytes[end] == b' ';
+        if left_ok && right_ok {
             return Some(false);
         }
-        from = start;
+        // Advance one CHARACTER, not one byte: norms keep unicode (Japanese
+        // titles), and slicing mid-codepoint would panic.
+        from = start + long[start..].chars().next().map_or(1, char::len_utf8);
     }
     None
 }
@@ -131,7 +184,12 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
                     .max()
                     .map(|score| (score, m))
             })
-            .max_by_key(|(score, _)| *score);
+            // On an exact tie prefer the better status, then the lower media_id.
+            // `max_by_key` keeps the LAST maximum, so the ranks are negated to
+            // turn "smaller is better" into "larger wins".
+            .max_by_key(|((tier, len), m)| {
+                (*tier, *len, std::cmp::Reverse(m.status_rank), std::cmp::Reverse(m.media_id))
+            });
         if let Some((_, m)) = best {
             return Some(m);
         }
@@ -148,8 +206,14 @@ pub(crate) fn clean_title(s: &str) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
-    let s = RE_EP_TAIL.replace(&s, "");
-    normalize(&s)
+    let stripped = RE_EP_TAIL.replace(&s, "");
+    // The tail strip must never eat the WHOLE title. A bare-number show ("86",
+    // "91 Days" as "91") is all episode-tail as far as the regex is concerned,
+    // and an empty candidate matches nothing at all — so keep the unstripped
+    // form when stripping leaves us with nothing to match on.
+    let normed = normalize(&stripped);
+    let out = if normed.is_empty() { normalize(&s) } else { normed };
+    season_ordinals(&out)
 }
 
 /// Normalize a LIST TITLE for comparison. Same cleaning as `clean_title` minus
@@ -159,7 +223,19 @@ pub(crate) fn norm_title(s: &str) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
-    normalize(&s)
+    season_ordinals(&normalize(&s))
+}
+
+/// Collapse season markers to a bare ordinal so both sides of a comparison agree:
+/// `"… 7th season"` and `"… season 7"` both become `"… 7"`, which is how AniList
+/// writes the romaji sequel title (`"Boku no Hero Academia 7"`). Without this a
+/// release named MAL-style lost its own sequel entry to the base series: the
+/// sequel norm failed the token-boundary check against "…academia 7th season"
+/// while the base "…academia" matched as a clean prefix, so progress was written
+/// to season 1. Applied to list titles and release names alike.
+fn season_ordinals(normed: &str) -> String {
+    let out = RE_NTH_SEASON.replace_all(normed, "$n");
+    RE_SEASON_N.replace_all(&out, "$n").into_owned()
 }
 
 fn normalize(s: &str) -> String {
@@ -219,8 +295,18 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        // Both digits must be ASCII hex. The old code passed non-UTF-8 pairs
+        // through `unwrap_or("00")`, which parsed as 0 — so a literal '%' before
+        // a multi-byte character (a real filename like "50% オフ") emitted a NUL
+        // byte AND swallowed the next two bytes, corrupting the title it was
+        // supposed to be decoding.
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             if let Ok(b) = u8::from_str_radix(
+                // Both bytes are ASCII hex, so this slice is always valid UTF-8.
                 std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00"),
                 16,
             ) {
@@ -294,12 +380,15 @@ fn looks_like_year(n: i64) -> bool {
 }
 
 /// Last integer that looks like an episode. Bracketed groups (CRC32 hashes,
-/// codec tags) and resolution/codec noise are stripped FIRST — their digits
-/// would otherwise beat the real episode number: "... - 28 (1080p) [AB12CD34]"
-/// is episode 28, not 34. Excludes resolutions, 4-digit years, and anything
-/// outside 1–9999. A `vN` revision suffix belongs to the number it follows.
+/// codec tags), audio channel layouts ("2.0", "5.1"), and resolution/codec
+/// noise are stripped FIRST — their digits would otherwise beat the real
+/// episode number: "... - 28 (1080p) [AB12CD34]" is episode 28, not 34, and
+/// "... - 05 AAC2.0 x265" is episode 5, not 265. Excludes resolutions,
+/// 4-digit years, and anything outside 1–9999. A `vN` revision suffix belongs
+/// to the number it follows.
 fn parse_last_episode_number(s: &str) -> Option<i64> {
     let s = RE_BRACKETS.replace_all(s, " ");
+    let s = RE_CHANNEL.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
     RE_EP_NUM
         .find_iter(&s)
@@ -329,6 +418,21 @@ mod tests {
     fn clean_handles_v2_and_ep_prefix() {
         assert_eq!(clean_title("Some Show - 04v2 [BD 1080p].mkv"), "some show");
         assert_eq!(clean_title("Another Show EP11.mkv"), "another show");
+    }
+
+    /// No separator before the episode must not eat the title's final "e",
+    /// and 1000+ episode runs must not leave a stray digit behind.
+    #[test]
+    fn clean_keeps_title_final_e_and_4_digit_episodes() {
+        assert_eq!(clean_title("Steins;Gate 01"), "steins gate");
+        assert_eq!(clean_title("Fate 01"), "fate");
+        // the dash-separated form already worked
+        assert_eq!(clean_title("Steins;Gate - 01"), "steins gate");
+        assert_eq!(clean_title("One Piece 1015"), "one piece");
+        // E05 / S02E05 marker forms still strip, season prefix included
+        assert_eq!(clean_title("Show E05"), "show");
+        assert_eq!(clean_title("Show - E05"), "show");
+        assert_eq!(clean_title("Show S02E05"), "show");
     }
 
     #[test]
@@ -362,6 +466,21 @@ mod tests {
         assert_eq!(parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"), Some(11));
     }
 
+    /// Digits in trailing release tags (x265, H 264, AAC2.0, Opus2.0, DDP5.1)
+    /// must not beat the real episode number.
+    #[test]
+    fn episode_guess_ignores_trailing_release_tags() {
+        assert_eq!(parse_episode_guess("[Group] Show - 05 [1080p] AAC2.0 x265"), Some(5));
+        assert_eq!(parse_episode_guess("Show - 05 DDP2.0 H 264"), Some(5));
+        assert_eq!(parse_episode_guess("Show S02E05 AAC2.0"), Some(5));
+        assert_eq!(parse_episode_guess("Show - 12 Opus2.0"), Some(12));
+        assert_eq!(parse_episode_guess("Show - 05 [Multi-Subs] DDP5.1"), Some(5));
+        assert_eq!(
+            parse_episode_guess("[SubsPlease] Frieren - 28 (1080p) [AB12CD34]"),
+            Some(28)
+        );
+    }
+
     #[test]
     fn episode_after_title_removal_avoids_title_numbers() {
         // The "91 Days" trap: the number in the title must not become the episode.
@@ -384,6 +503,7 @@ mod tests {
             display: "91 Days".into(),
             variants: vec!["91 Days".into()],
             norms: vec!["91 days".into()],
+            status_rank: 0,
         };
         // Batch file: matched, no episode → None (NOT 91).
         assert_eq!(resolve_episode(&days, &["91 Days", "91 Days [BD 1080p]"]), None);
@@ -396,6 +516,7 @@ mod tests {
             display: "Re:Zero".into(),
             variants: vec!["Re:Zero kara Hajimeru Isekai Seikatsu".into()],
             norms: vec!["re zero kara hajimeru isekai seikatsu".into()],
+            status_rank: 0,
         };
         assert_eq!(resolve_episode(&rezero, &["Re Zero - 05", "Re Zero - 05"]), Some(5));
     }
@@ -407,6 +528,7 @@ mod tests {
             display: "Frieren".into(),
             variants: vec!["Sousou no Frieren".into()],
             norms: vec!["sousou no frieren".into()],
+            status_rank: 0,
         };
         let matchers = vec![m];
         assert!(match_title(&matchers, "Sousou no Frieren - 28", "").is_some());
@@ -415,13 +537,106 @@ mod tests {
         assert!(match_title(&matchers, "Totally Different Show", "").is_none());
     }
 
+    /// End to end for the separatorless-episode fix: "Steins;Gate 01" (no
+    /// dash) must clean to the list norm and match, not lose its final "e".
+    #[test]
+    fn match_title_without_separator_before_episode() {
+        let matchers = vec![mk(1, "Steins;Gate"), mk(2, "Fate"), mk(3, "One Piece")];
+        assert_eq!(match_title(&matchers, "Steins;Gate 01", "").map(|m| m.media_id), Some(1));
+        assert_eq!(match_title(&matchers, "Fate 01", "").map(|m| m.media_id), Some(2));
+        assert_eq!(match_title(&matchers, "One Piece 1015", "").map(|m| m.media_id), Some(3));
+    }
+
     fn mk(media_id: i64, title: &str) -> Matcher {
         Matcher {
             media_id,
             display: title.into(),
             variants: vec![title.into()],
             norms: vec![norm_title(title)],
+            status_rank: 0,
         }
+    }
+
+    fn mk_status(media_id: i64, title: &str, status: &str) -> Matcher {
+        Matcher { status_rank: status_rank(status), ..mk(media_id, title) }
+    }
+
+    /// A sequel that IS on the list must win over its own base series. AniList
+    /// writes romaji sequels as a bare ordinal ("Boku no Hero Academia 7") while
+    /// release groups write "7th Season" / "Season 7"; without collapsing those
+    /// the sequel norm failed the token-boundary check and the base matched as a
+    /// clean prefix, so the episode landed on season 1.
+    #[test]
+    fn sequels_beat_the_base_series() {
+        let matchers = vec![
+            mk(1, "Boku no Hero Academia"),
+            mk(2, "Boku no Hero Academia 7"),
+        ];
+        for release in [
+            "[Erai-raws] Boku no Hero Academia 7th Season - 05 [1080p].mkv",
+            "Boku no Hero Academia Season 7 - 05.mkv",
+            "Boku no Hero Academia 7 - 05.mkv",
+        ] {
+            assert_eq!(
+                match_title(&matchers, release, "").map(|m| m.media_id),
+                Some(2),
+                "{release} should resolve to the sequel"
+            );
+        }
+        // The base series alone still resolves to the base series.
+        assert_eq!(
+            match_title(&matchers, "Boku no Hero Academia - 05.mkv", "").map(|m| m.media_id),
+            Some(1)
+        );
+    }
+
+    /// The episode-tail strip must never consume the entire title: a bare-number
+    /// show is all "episode tail" to the regex, and an empty candidate matches
+    /// nothing at all.
+    #[test]
+    fn a_bare_number_title_survives_the_tail_strip() {
+        assert_eq!(clean_title("86.mkv"), "86");
+        assert_eq!(clean_title("91.mkv"), "91");
+        // ...while a real title plus an episode still strips normally.
+        assert_eq!(clean_title("86 - 05.mkv"), "86");
+    }
+
+    /// Identical normalized titles used to resolve to whichever row SQLite
+    /// happened to return last. Prefer what the user is watching, then the
+    /// lowest media_id, so the answer is stable across runs.
+    #[test]
+    fn duplicate_titles_break_ties_deterministically() {
+        let watching = vec![
+            mk_status(10, "Some Show", "COMPLETED"),
+            mk_status(20, "Some Show", "CURRENT"),
+        ];
+        assert_eq!(match_title(&watching, "Some Show - 03", "").map(|m| m.media_id), Some(20));
+        // Same status on both: the lower id wins, and it wins in either order.
+        let a = vec![mk_status(20, "Some Show", "CURRENT"), mk_status(10, "Some Show", "CURRENT")];
+        let b = vec![mk_status(10, "Some Show", "CURRENT"), mk_status(20, "Some Show", "CURRENT")];
+        assert_eq!(match_title(&a, "Some Show - 03", "").map(|m| m.media_id), Some(10));
+        assert_eq!(match_title(&b, "Some Show - 03", "").map(|m| m.media_id), Some(10));
+    }
+
+    /// A literal '%' in a filename must not be decoded. The old code parsed a
+    /// non-hex pair as 0, emitting a NUL byte and swallowing two more bytes.
+    #[test]
+    fn percent_decode_leaves_stray_percent_signs_alone() {
+        assert_eq!(basename("file:///x/50%20off.mkv"), "50 off");
+        // '%' followed by a multi-byte char: previously produced "50\0フ".
+        assert_eq!(basename("file:///x/50% オフ.mkv"), "50% オフ");
+        assert_eq!(basename("file:///x/100%.mkv"), "100%");
+        assert_eq!(basename("file:///x/%zz.mkv"), "%zz");
+        // Real escapes still decode, including multi-byte sequences.
+        assert_eq!(basename("file:///x/%E3%82%AF%E3%83%AA%E3%82%B9.mkv"), "クリス");
+    }
+
+    /// Unicode norms must not panic the token scan (byte indices vs codepoints).
+    #[test]
+    fn token_containment_handles_multibyte_titles() {
+        let matchers = vec![mk(1, "四月は君の嘘"), mk(2, "Shigatsu wa Kimi no Uso")];
+        assert!(match_title(&matchers, "[G] 四月は君の嘘 - 05 [1080p].mkv", "").is_some());
+        assert!(match_title(&matchers, "ぜんぜん違う番組", "").is_none());
     }
 
     /// Only KNOWN media extensions are stripped, and list-title norms keep

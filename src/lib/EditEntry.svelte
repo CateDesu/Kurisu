@@ -1,3 +1,11 @@
+<script module lang="ts">
+  import type { Media as MediaType } from "$lib/types";
+  // Recommendations for a show never change within a session, but the modal
+  // re-fetched them from AniList on every single open — a network round trip
+  // (and a slice of the 30 req/min budget) just to reopen the same entry.
+  const RECS_CACHE = new Map<number, MediaType[]>();
+</script>
+
 <script lang="ts">
   import { untrack } from "svelte";
   import { goto } from "$app/navigation";
@@ -57,10 +65,20 @@
   );
 
   async function loadRecs() {
+    const id = entry.media_id;
+    const cached = RECS_CACHE.get(id);
+    if (cached) {
+      recs = cached;
+      return;
+    }
     try {
-      recs = await api.getRecommendations(entry.media_id);
+      const r = await api.getRecommendations(id);
+      RECS_CACHE.set(id, r);
+      // The modal may have been closed and reopened on another show meanwhile.
+      if (entry.media_id === id) recs = r;
     } catch {
-      recs = [];
+      // Don't cache a failure: a transient network error should retry next open.
+      if (entry.media_id === id) recs = [];
     }
   }
   loadRecs();
@@ -93,7 +111,7 @@
       await api.updateEntry(
         entry.media_id,
         status !== snap.status ? status : (fresh?.status ?? status),
-        progress !== snap.progress ? progress : (fresh?.progress ?? progress),
+        progress !== snap.progress ? (progress ?? snap.progress) : (fresh?.progress ?? progress),
         score !== snap.score ? score : (fresh?.score ?? null),
         repeat !== snap.repeat ? (repeat ?? snap.repeat) : (fresh?.repeat ?? snap.repeat)
       );
@@ -122,8 +140,15 @@
   // Modal behavior: Escape closes (Select swallows it first when its dropdown is
   // open), and the dialog takes focus so Tab stays inside the modal.
   let dialog = $state<HTMLDivElement | null>(null);
+  /// Dismissal is refused while a write is in flight: closing mid-save threw
+  /// away the error banner, so a rejected save looked exactly like a successful
+  /// one and the list kept showing the value the server never accepted.
+  function tryClose() {
+    if (saving || removing) return;
+    onclose();
+  }
   function onWindowKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") onclose();
+    if (e.key === "Escape") tryClose();
   }
   $effect(() => dialog?.focus());
 </script>
@@ -133,7 +158,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
   class="fixed inset-0 bg-black/60 grid place-items-center z-50 backdrop-blur-sm"
-  onclick={onclose}
+  onclick={tryClose}
   role="presentation"
 >
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
@@ -238,8 +263,9 @@
         <div class="flex gap-2">
           <button
             type="button"
-            onclick={onclose}
-            class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+            onclick={tryClose}
+            disabled={saving || removing}
+            class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
           >
             Cancel
           </button>

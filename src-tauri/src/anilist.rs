@@ -109,6 +109,19 @@ impl From<AniMedia> for Media {
     }
 }
 
+/// The entry fields a SaveMediaListEntry mutation / MediaList query returns.
+/// This is AniList's true post-write state — the local cache mirrors THESE
+/// values, never the values that were sent (arguments Kurisu omits keep
+/// their remote values, and only the response knows them).
+#[derive(Deserialize)]
+pub struct SavedEntry {
+    pub id: i64,
+    pub status: Option<String>,
+    pub progress: Option<i64>,
+    pub score: Option<f64>,
+    pub repeat: Option<i64>,
+}
+
 /// reqwest::Client is cheap to clone (Arc-backed), so cloning AniList lets us drop
 /// the DB-style lock before any `.await` (Tauri futures must be Send).
 #[derive(Clone)]
@@ -142,21 +155,45 @@ impl AniList {
             .token
             .as_ref()
             .ok_or_else(|| anyhow!("not authenticated"))?;
-        let resp = self
-            .http
-            .post(GRAPHQL)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&serde_json::json!({ "query": query, "variables": vars }))
-            .send()
-            .await?;
+        let payload = serde_json::json!({ "query": query, "variables": vars });
+        let mut retries = 0;
         // AniList error envelope: { "errors": [ { "message": "..." } ] }
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("AniList ({}): {}", status, e))?;
+        let (status, body) = loop {
+            let resp = self
+                .http
+                .post(GRAPHQL)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .json(&payload)
+                .send()
+                .await?;
+            let status = resp.status();
+            // Rate-limited: honor Retry-After and retry (bounded) instead of
+            // failing the whole operation on a transient 429.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && retries < 2 {
+                retries += 1;
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .min(30);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("AniList ({}): {}", status, e))?;
+            break (status, body);
+        };
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(anyhow!(
+                "AniList is rate-limiting this app (429, still limited after {retries} retries); wait a minute and try again"
+            ));
+        }
         if let Some(errs) = body.get("errors") {
             let msg = errs
                 .get(0)
@@ -647,10 +684,16 @@ impl AniList {
             #[serde(flatten)]
             media: AniMedia,
         }
-        let q = "query ($start: Int!, $end: Int!, $page: Int!) {
+        // `airingAt_greater` is EXCLUSIVE, so passing the window start dropped an
+        // episode airing exactly on the boundary — and the calendar tiles a week
+        // as [start, end), so that episode fell through the crack between two
+        // adjacent weeks and appeared in neither. Shift the lower bound by one
+        // second to make it inclusive; `airingAt_lesser: end` stays exclusive.
+        let start_exclusive = start.saturating_sub(1);
+        let q = "query ($startExclusive: Int!, $end: Int!, $page: Int!) {
             Page(page: $page, perPage: 50) {
                 pageInfo { hasNextPage }
-                airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: TIME) {
+                airingSchedules(airingAt_greater: $startExclusive, airingAt_lesser: $end, sort: TIME) {
                     airingAt episode
                     media {
                         isAdult
@@ -664,8 +707,17 @@ impl AniList {
         }";
         let mut out = Vec::new();
         for page in 1..=12 {
+            if page > 1 {
+                // Pace the page walk: one calendar view can cost a dozen
+                // requests and AniList's rate budget is tight — don't burn it
+                // in a single burst.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
             let r: R = self
-                .gql(q, serde_json::json!({ "start": start, "end": end, "page": page }))
+                .gql(
+                    q,
+                    serde_json::json!({ "startExclusive": start_exclusive, "end": end, "page": page }),
+                )
                 .await?;
             let scheds = r.page.airing_schedules.unwrap_or_default();
             for s in scheds {
@@ -693,7 +745,11 @@ impl AniList {
 
     /// Pull the full list (every status group) for a user and flatten to entries.
     /// AniList chunks big lists at 500 entries per status group — walk the chunks
-    /// via `hasNextChunk` or large accounts sync an incomplete list.
+    /// via `hasNextChunk` or large accounts sync an incomplete list. Ok is only
+    /// ever returned after a COMPLETE walk (`hasNextChunk == false`); any error
+    /// aborts the whole fetch, because the sync caller reconcile-deletes local
+    /// rows the remote did not return. AniList types every entry field nullable,
+    /// so they are Options here: one malformed row costs that row, not the sync.
     pub async fn user_list(&self, user_name: &str) -> Result<Vec<ListEntry>> {
         #[derive(Deserialize)]
         struct R {
@@ -717,15 +773,15 @@ impl AniList {
         #[serde(rename_all = "camelCase")]
         struct Entry {
             id: i64,
-            status: String,
-            progress: i64,
+            status: Option<String>,
+            progress: Option<i64>,
             score: Option<f64>,
             repeat: Option<i64>,
             updated_at: Option<i64>,
-            media: AniMedia,
+            media: Option<AniMedia>,
         }
         let q = "query ($userName: String!, $chunk: Int!) {
-            MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk) {
+            MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk, perChunk: 500) {
                 hasNextChunk
                 lists {
                     status
@@ -749,15 +805,18 @@ impl AniList {
                 .await?;
             for list in r.collection.lists.unwrap_or_default() {
                 for e in list.entries {
+                    // A null media object can't be mapped to a cache row at all
+                    // (no media_id) — drop just this entry.
+                    let Some(media) = e.media else { continue };
                     out.push(ListEntry {
                         id: Some(e.id),
-                        media_id: e.media.id,
-                        status: e.status,
-                        progress: e.progress,
+                        media_id: media.id,
+                        status: e.status.unwrap_or_else(|| "CURRENT".into()),
+                        progress: e.progress.unwrap_or(0),
                         score: e.score,
                         repeat: e.repeat.unwrap_or(0),
                         updated_at: e.updated_at,
-                        media: Some(e.media.into()),
+                        media: Some(media.into()),
                     });
                 }
             }
@@ -769,58 +828,86 @@ impl AniList {
         Ok(out)
     }
 
-    /// Create or update an entry. Returns the (entry_id) AniList assigned.
+    /// The viewer's list entry for one media (None = not on their list). Used
+    /// to tell a genuine add-to-list apart from a local-cache miss on an entry
+    /// that already exists remotely.
+    pub async fn entry_by_media_id(&self, media_id: i64) -> Result<Option<SavedEntry>> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(rename = "MediaList")]
+            entry: Option<SavedEntry>,
+        }
+        let q = "query ($mediaId: Int!) {
+            MediaList(mediaId: $mediaId) { id status progress score repeat }
+        }";
+        let r: R = self.gql(q, serde_json::json!({ "mediaId": media_id })).await?;
+        Ok(r.entry)
+    }
+
+    /// Create or update an entry. Only the `Some(..)` fields are sent — AniList
+    /// treats omitted arguments as unchanged, so a write that isn't meant to
+    /// touch score/repeat can't clobber values set elsewhere. Returns the entry
+    /// as AniList stored it.
     pub async fn save_entry(
         &self,
         media_id: i64,
-        status: ListStatus,
-        progress: i64,
+        status: Option<ListStatus>,
+        progress: Option<i64>,
         score: Option<f64>,
-        repeat: i64,
-    ) -> Result<i64> {
+        repeat: Option<i64>,
+    ) -> Result<SavedEntry> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "SaveMediaListEntry")]
-            entry: Entry,
+            entry: SavedEntry,
         }
-        #[derive(Deserialize)]
-        struct Entry {
-            id: i64,
-        }
-        let q = "mutation ($mediaId: Int!, $status: MediaListStatus!, $progress: Int!, $score: Float, $repeat: Int) {
-            SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id }
+        let q = "mutation ($mediaId: Int!, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int) {
+            SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score repeat }
         }";
-        let r: R = self
-            .gql(
-                q,
-                serde_json::json!({
-                    "mediaId": media_id,
-                    "status": status.as_str(),
-                    "progress": progress,
-                    "score": score,
-                    "repeat": repeat,
-                }),
-            )
-            .await?;
-        Ok(r.entry.id)
+        let mut vars = serde_json::json!({ "mediaId": media_id });
+        let obj = vars.as_object_mut().expect("vars object");
+        if let Some(st) = status {
+            obj.insert("status".into(), st.as_str().into());
+        }
+        if let Some(p) = progress {
+            obj.insert("progress".into(), p.into());
+        }
+        if let Some(s) = score {
+            obj.insert("score".into(), s.into());
+        }
+        if let Some(r) = repeat {
+            obj.insert("repeat".into(), r.into());
+        }
+        let r: R = self.gql(q, vars).await?;
+        Ok(r.entry)
     }
 
-    pub async fn delete_entry(&self, entry_id: i64) -> Result<()> {
+    /// Delete a list entry. Ok(true) = deleted; Ok(false) = the entry was
+    /// already absent remotely (deleted on anilist.co / another client), which
+    /// IS the desired end state — the caller should drop the local row too
+    /// instead of hard-failing and stranding it.
+    pub async fn delete_entry(&self, entry_id: i64) -> Result<bool> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "DeleteMediaListEntry")]
-            entry: Entry,
+            entry: Option<Entry>,
         }
         #[derive(Deserialize)]
         struct Entry {
-            deleted: bool,
+            // Nullable in the schema: a null maps to the friendly decline below,
+            // not a serde type error.
+            deleted: Option<bool>,
         }
         let q = "mutation ($id: Int!) { DeleteMediaListEntry(id: $id) { deleted } }";
-        let r: R = self.gql(q, serde_json::json!({ "id": entry_id })).await?;
-        if !r.entry.deleted {
+        let r: R = match self.gql(q, serde_json::json!({ "id": entry_id })).await {
+            Ok(r) => r,
+            Err(e) if is_not_found(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if r.entry.and_then(|e| e.deleted) != Some(true) {
             return Err(anyhow!("AniList declined the delete"));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The user's recent notifications (union of Airing / Following / Activity /
@@ -952,6 +1039,14 @@ impl AniList {
 }
 
 // ───────────────────────── OAuth2 desktop flow (implicit) ─────────────────────────
+
+/// AniList answers a mutation against an already-gone entry with
+/// `{"data":{"DeleteMediaListEntry":null},"errors":[{"message":"Not Found"}]}`
+/// (HTTP 200) or, more rarely, a real 404. Both spell "no such entry".
+fn is_not_found(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("Not Found") || s.contains("404")
+}
 //
 // Implicit grant: no client_secret is needed (a desktop app can't keep one
 // private anyway). The token arrives in the redirect URL *fragment*
@@ -1041,11 +1136,35 @@ fn percent_decode(s: &str) -> String {
 /// that must not kill a login in flight. The listener shuts down when the caller
 /// drops the receiver (timeout / cancel), freeing the port for a retry.
 pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
+    let (state, _port, rx) = start_callback_server_on(OAUTH_PORT)?;
+    Ok((state, rx))
+}
+
+/// `start_callback_server`, with the port injectable. Production always uses
+/// `OAUTH_PORT` (it has to match the registered redirect URI); tests pass 0 so
+/// the OS assigns a free port, which keeps them off the real singleton and lets
+/// them run concurrently with each other and with a running Kurisu.
+pub fn start_callback_server_on(
+    port: u16,
+) -> Result<(String, u16, oneshot::Receiver<String>)> {
     let state = random_state()?;
     let expected = state.clone();
     let (tx, rx) = oneshot::channel::<String>();
-    let addr = format!("127.0.0.1:{}", OAUTH_PORT);
-    let listener = std::net::TcpListener::bind(&addr)?;
+    let addr = format!("127.0.0.1:{port}");
+    let listener = std::net::TcpListener::bind(&addr).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            // Without this the user just saw "Address already in use". The usual
+            // cause is their own abandoned sign-in still holding the port.
+            anyhow::anyhow!(
+                "a sign-in is already in progress (port {port} is busy) — finish it in your \
+                 browser, or wait a moment and try again"
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
+    // Read back what the OS actually gave us, so port 0 resolves to the real one.
+    let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     listener.set_nonblocking(true)?;
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1163,7 +1282,7 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
             }
         });
     });
-    Ok((state, rx))
+    Ok((state, bound_port, rx))
 }
 
 // minimal URL-encode helper (avoids pulling urlencoding as a dep); also used by
@@ -1199,13 +1318,17 @@ mod tests {
     /// or killing the listener — only a state-verified token resolves it.
     #[test]
     fn oauth_callback_survives_probes_and_accepts_verified_token() {
-        let (state, rx) = super::start_callback_server().expect("bind callback listener");
+        // Port 0: the OS picks a free one. Binding the real OAUTH_PORT made this
+        // test fail whenever Kurisu was running (or another copy of the test
+        // was), and it could steal the port from a sign-in in progress.
+        let (state, port, rx) =
+            super::start_callback_server_on(0).expect("bind callback listener");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio rt");
         rt.block_on(async move {
-            let base = format!("http://127.0.0.1:{}", super::OAUTH_PORT);
+            let base = format!("http://127.0.0.1:{port}");
             let http = reqwest::Client::new();
             // Bare probe → shim, still listening.
             let r = http.get(&base).send().await.unwrap();

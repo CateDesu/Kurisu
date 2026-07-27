@@ -51,6 +51,12 @@
     DROPPED: 4,
     COMPLETED: 5,
   };
+  // One collator for the session; localeCompare with an options object builds a
+  // fresh Intl.Collator on every comparison.
+  const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+  // This picker is meant to be searched, not scrolled. Rendering all 1280 rows
+  // with their cover images on every keystroke is what made it stutter.
+  const MAX_ROWS = 100;
   const candidates = $derived.by(() => {
     const needle = q.trim().toLowerCase();
     return entries
@@ -64,12 +70,11 @@
       .sort((a, b) => {
         const s = (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9);
         if (s !== 0) return s;
-        return displayTitle(a.media).localeCompare(displayTitle(b.media), undefined, {
-          sensitivity: "base",
-          numeric: true,
-        });
-      });
+        return COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
+      })
+      .slice(0, MAX_ROWS);
   });
+  const truncated = $derived(entries.length > candidates.length && candidates.length === MAX_ROWS);
 
   async function pick(e: ListEntry) {
     if (busy !== null) return;
@@ -159,7 +164,7 @@
             type="button"
             onclick={() => pick(e)}
             disabled={busy !== null}
-            class="w-full text-left flex items-center gap-2.5 rounded-md p-1.5 hover:bg-panel-2/60 disabled:opacity-50"
+            class="cv-row w-full text-left flex items-center gap-2.5 rounded-md p-1.5 hover:bg-panel-2/60 disabled:opacity-50"
           >
             {#if e.media?.cover_medium}
               <Img src={e.media.cover_medium} class="w-8 h-11 object-cover rounded shrink-0" />
@@ -172,6 +177,11 @@
             <span class="shrink-0 text-xs text-ink-dim">{STATUS_LABEL[e.status] ?? e.status}</span>
           </button>
         {/each}
+        {#if truncated}
+          <div class="text-xs text-ink-dim py-2 text-center">
+            Showing the first {MAX_ROWS}. Type to narrow it down.
+          </div>
+        {/if}
       {/if}
     </div>
 

@@ -39,6 +39,20 @@ const TICK: Duration = Duration::from_secs(5);
 const BROWSER_PLAYERS: &[&str] = &[
     "firefox", "librewolf", "mozilla", "zen", "waterfox", "floorp", "chrome", "chromium", "brave",
     "vivaldi", "opera", "edge",
+    // Opaque AppUserModelIDs. A name-substring denylist cannot catch a browser
+    // whose AUMID carries no name: the classic (non-Store) Firefox installer
+    // registers this hash, so YouTube in Firefox would otherwise drive tracking
+    // on Windows even though the Linux side catches it via the MPRIS bus name.
+    "308046b0af4a39cb", // Firefox, default install path
+    "e7cf176e110c211b", // Firefox, common alternate install hash
+];
+
+/// Windows GSMTC exposes only an AppUserModelId, so a denylist can never be
+/// complete. Anything on this list is treated as a real video player even if a
+/// future denylist entry would otherwise match it.
+#[cfg_attr(not(windows), allow(dead_code))]
+const KNOWN_VIDEO_PLAYERS: &[&str] = &[
+    "mpv", "vlc", "mpc-hc", "mpc-be", "potplayer", "celluloid", "haruna", "smplayer",
 ];
 
 // ─────────────────────────── event payloads ───────────────────────────
@@ -79,12 +93,95 @@ struct ActiveTrack {
     was_playing: bool,
     prompted: bool,
     incremented: bool,
+    /// Consecutive failed auto-pushes for this track, and the earliest instant
+    /// the next attempt may run. Without these a failing push retries on every
+    /// 5s tick for as long as the file plays.
+    fail_count: u32,
+    retry_at: Option<Instant>,
 }
 
 impl ActiveTrack {
     fn new(key: String) -> Self {
-        Self { key, accumulated: Duration::ZERO, last_tick: Instant::now(), was_playing: false, prompted: false, incremented: false }
+        Self {
+            key,
+            accumulated: Duration::ZERO,
+            last_tick: Instant::now(),
+            was_playing: false,
+            prompted: false,
+            incremented: false,
+            fail_count: 0,
+            retry_at: None,
+        }
     }
+}
+
+/// Give up on a track after this many consecutive failed auto-pushes. The user
+/// can still set progress by hand, and the next file starts a fresh track.
+const MAX_AUTO_PUSH_FAILURES: u32 = 4;
+
+/// Backoff before retrying a failed auto-push: 30s, 2m, 10m.
+fn auto_push_backoff(fail_count: u32) -> Duration {
+    match fail_count {
+        0 | 1 => Duration::from_secs(30),
+        2 => Duration::from_secs(120),
+        _ => Duration::from_secs(600),
+    }
+}
+
+/// Everything the auto arm needs to decide whether to write progress, lifted out
+/// of `tick` so the ONE code path that mutates the user's AniList list without
+/// asking is testable without D-Bus, a database, or the network.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+struct AutoGate {
+    incremented: bool,
+    was_playing_before: bool,
+    accumulated: Duration,
+    fail_count: u32,
+    retry_due: bool,
+    length_us: i64,
+    position_us: i64,
+    auto_percent: u64,
+    episode: i64,
+    progress: i64,
+}
+
+impl AutoGate {
+    /// Fraction of the file played, 0.0 when the player reports no duration.
+    fn pct(&self) -> f64 {
+        if self.length_us > 0 {
+            (self.position_us as f64 / self.length_us as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Position alone is NOT evidence of watching. Require that the track was
+    /// already playing on the previous tick and has actually played for
+    /// `min_watch_time`, so a file that merely RESUMES past the threshold (mpv
+    /// watch_later, VLC continue-where-you-left-off) or is seeked straight to the
+    /// credits cannot write progress from a single 5s sample.
+    fn should_push(&self) -> bool {
+        !self.incremented
+            && self.was_playing_before
+            && self.accumulated >= min_watch_time(self.length_us)
+            && self.retry_due
+            && self.fail_count < MAX_AUTO_PUSH_FAILURES
+            && self.pct() >= self.auto_percent as f64
+            && self.episode > self.progress
+    }
+}
+
+/// Minimum time a track must have actually PLAYED before an auto-push may fire.
+/// Position alone is not evidence of watching: mpv's `watch_later` and VLC's
+/// "continue where you left off" both reopen a file at the position it was
+/// closed at, and a single seek to the credits reaches any percentage instantly.
+/// A quarter of the runtime, capped at a minute, so short specials still track.
+fn min_watch_time(length_us: i64) -> Duration {
+    if length_us <= 0 {
+        return Duration::from_secs(60);
+    }
+    let quarter = Duration::from_micros((length_us / 4) as u64);
+    quarter.min(Duration::from_secs(60))
 }
 
 // ─────────────────────────── entrypoint ───────────────────────────
@@ -184,6 +281,9 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     // can't see intra-interval pauses, so counting a pause→resume interval in
     // full would reach the prompt threshold early. Under-counting (a slightly
     // late prompt) is the safe direction.
+    // Capture the PREVIOUS tick's playing state before overwriting it: the auto
+    // arm needs "was already playing one tick ago", not "is playing right now".
+    let was_playing_before = track.was_playing;
     if info.playing && track.was_playing {
         track.accumulated += track.last_tick.elapsed();
     }
@@ -220,14 +320,21 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
             }
         }
         "auto" if info.playing => {
-            let pct = if info.length_us > 0 {
-                (info.position_us as f64 / info.length_us as f64) * 100.0
-            } else {
-                0.0
+            let gate = AutoGate {
+                incremented: track.incremented,
+                was_playing_before,
+                accumulated: track.accumulated,
+                fail_count: track.fail_count,
+                retry_due: track.retry_at.map(|t| Instant::now() >= t).unwrap_or(true),
+                length_us: info.length_us,
+                position_us: info.position_us,
+                auto_percent: cfg.auto_percent,
+                episode,
+                progress,
             };
             // Set progress to the detected episode (never rewind): identical to +1
             // for sequential viewing, catches up on skips, and leaves rewatches alone.
-            if !track.incremented && pct >= cfg.auto_percent as f64 && episode > progress {
+            if gate.should_push() {
                 let st = app.state::<AppState>();
                 // watcher_set_progress re-checks "episode > progress" under the
                 // write lock: the user may have rewound while we were deciding.
@@ -240,7 +347,21 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
                         let _ = app.emit("kurisu://episode-updated", entry);
                     }
                     Ok(None) => track.incremented = true, // rewound past `episode` between check and write
-                    Err(e) => log::warn!("auto progress-update of {} failed: {e}", media_id),
+                    Err(e) => {
+                        track.fail_count += 1;
+                        track.retry_at = Some(Instant::now() + auto_push_backoff(track.fail_count));
+                        if track.fail_count >= MAX_AUTO_PUSH_FAILURES {
+                            log::warn!(
+                                "auto progress-update of {media_id} failed {} times, giving up on this track: {e}",
+                                track.fail_count
+                            );
+                        } else {
+                            log::warn!(
+                                "auto progress-update of {media_id} failed (attempt {}), retrying later: {e}",
+                                track.fail_count
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -339,6 +460,11 @@ fn read_config(app: &AppHandle) -> TrackingConfig {
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 fn is_browser_str(id: &str) -> bool {
     let id = id.to_lowercase();
+    // A known player always wins: "mpv" must not be excluded by a substring that
+    // happens to appear in its install path or package family name.
+    if KNOWN_VIDEO_PLAYERS.iter().any(|p| id.contains(p)) {
+        return false;
+    }
     BROWSER_PLAYERS.iter().any(|b| id.contains(b))
 }
 
@@ -424,6 +550,124 @@ fn read_now(_app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 24-minute episode, played to 90%, on a track that has been running long
+    /// enough to count. The baseline every case below perturbs by ONE field.
+    fn watched() -> AutoGate {
+        AutoGate {
+            incremented: false,
+            was_playing_before: true,
+            accumulated: Duration::from_secs(600),
+            fail_count: 0,
+            retry_due: true,
+            length_us: 24 * 60 * 1_000_000,
+            position_us: 24 * 60 * 1_000_000 * 9 / 10,
+            auto_percent: 80,
+            episode: 5,
+            progress: 4,
+        }
+    }
+
+    #[test]
+    fn auto_push_fires_for_a_genuinely_watched_episode() {
+        assert!(watched().should_push());
+    }
+
+    #[test]
+    fn seeking_to_the_credits_does_not_push() {
+        // The whole point of the accumulated-time gate: a file opened and dragged
+        // straight to 90% has position but no playback behind it.
+        let g = AutoGate { accumulated: Duration::from_secs(5), ..watched() };
+        assert!(!g.should_push());
+        // ...and one 5s sample of a file that only just appeared cannot push
+        // either, however far into it the player resumed.
+        let g = AutoGate {
+            was_playing_before: false,
+            accumulated: Duration::ZERO,
+            ..watched()
+        };
+        assert!(!g.should_push());
+    }
+
+    #[test]
+    fn resume_on_open_does_not_complete_a_show() {
+        // mpv watch_later / VLC continue-where-you-left-off reopen at the saved
+        // position. First tick: playing, already at 97%, nothing accumulated.
+        let g = AutoGate {
+            was_playing_before: false,
+            accumulated: Duration::ZERO,
+            position_us: 24 * 60 * 1_000_000 * 97 / 100,
+            episode: 24,
+            progress: 3,
+            ..watched()
+        };
+        assert!(!g.should_push());
+    }
+
+    #[test]
+    fn short_specials_still_track() {
+        // min_watch_time caps at a quarter of the runtime, so a 4-minute short
+        // does not need a full minute of playback to count.
+        let len = 4 * 60 * 1_000_000_i64;
+        let g = AutoGate {
+            length_us: len,
+            position_us: len * 9 / 10,
+            accumulated: Duration::from_secs(65),
+            ..watched()
+        };
+        assert!(g.should_push());
+        assert_eq!(min_watch_time(len), Duration::from_secs(60));
+        assert_eq!(min_watch_time(2 * 60 * 1_000_000), Duration::from_secs(30));
+        // No duration reported: fall back to a flat minute rather than 0.
+        assert_eq!(min_watch_time(0), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn below_threshold_or_already_done_does_not_push() {
+        let g = AutoGate { position_us: 24 * 60 * 1_000_000 / 2, ..watched() };
+        assert!(!g.should_push(), "50% is under the 80% threshold");
+        let g = AutoGate { incremented: true, ..watched() };
+        assert!(!g.should_push(), "already pushed for this track");
+        let g = AutoGate { episode: 4, progress: 4, ..watched() };
+        assert!(!g.should_push(), "never rewinds or rewrites the same episode");
+        let g = AutoGate { episode: 2, progress: 9, ..watched() };
+        assert!(!g.should_push(), "rewatching an earlier episode must not rewind");
+    }
+
+    #[test]
+    fn a_player_with_no_duration_never_auto_pushes() {
+        // pct() is 0 without a length, so the percentage gate can never open.
+        let g = AutoGate { length_us: 0, position_us: 0, ..watched() };
+        assert_eq!(g.pct(), 0.0);
+        assert!(!g.should_push());
+    }
+
+    #[test]
+    fn failed_pushes_back_off_and_then_give_up() {
+        // Backed off: the retry instant has not arrived yet.
+        let g = AutoGate { fail_count: 1, retry_due: false, ..watched() };
+        assert!(!g.should_push());
+        // Backoff elapsed: try again.
+        let g = AutoGate { fail_count: 1, retry_due: true, ..watched() };
+        assert!(g.should_push());
+        // Too many consecutive failures: stop hammering AniList for this track.
+        let g = AutoGate { fail_count: MAX_AUTO_PUSH_FAILURES, retry_due: true, ..watched() };
+        assert!(!g.should_push());
+        assert!(auto_push_backoff(1) < auto_push_backoff(2));
+        assert!(auto_push_backoff(2) < auto_push_backoff(3));
+    }
+
+    #[test]
+    fn browsers_are_excluded_but_known_players_are_not() {
+        assert!(is_browser_str("org.mpris.MediaPlayer2.firefox.instance_1 Firefox"));
+        assert!(is_browser_str("308046B0AF4A39CB"), "opaque Firefox AUMID");
+        assert!(is_browser_str("Chromium"));
+        assert!(!is_browser_str("org.mpris.MediaPlayer2.mpv mpv"));
+        assert!(!is_browser_str("io.github.celluloid_player.Celluloid"));
+        assert!(!is_browser_str("VLC media player"));
+        // A known player wins even when its path contains a denylisted word.
+        assert!(!is_browser_str(r"C:\Users\opera\AppData\mpv.net\mpvnet.exe"));
+    }
 
     /// Same drift guard as models.rs, for the event payloads the watcher emits
     /// (mirrored by hand as `NowPlaying` / `TrackingPrompt` in types.ts).

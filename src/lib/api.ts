@@ -9,6 +9,8 @@ import type {
   MediaDetail,
   Notification,
   TorrentItem,
+  TorrentFetch,
+  LibraryScan,
   TrackingConfig,
   UpdateInfo,
   User,
@@ -80,7 +82,7 @@ export const api = {
     invoke<string[]>("add_library_folder", { path }),
   removeLibraryFolder: (path: string) =>
     invoke<string[]>("remove_library_folder", { path }),
-  scanLibrary: () => invoke<LibraryFile[]>("scan_library"),
+  scanLibrary: () => invoke<LibraryScan>("scan_library"),
   bindLibraryPath: (path: string, mediaId: number) =>
     invoke<void>("bind_library_path", { path, mediaId }),
   unbindLibraryMedia: (mediaId: number) =>
@@ -89,7 +91,7 @@ export const api = {
   getRssFeeds: () => invoke<string[]>("get_rss_feeds"),
   addRssFeed: (url: string) => invoke<string[]>("add_rss_feed", { url }),
   removeRssFeed: (url: string) => invoke<string[]>("remove_rss_feed", { url }),
-  fetchTorrents: () => invoke<TorrentItem[]>("fetch_torrents"),
+  fetchTorrents: () => invoke<TorrentFetch>("fetch_torrents"),
   markTorrentsSeen: (guids: string[]) =>
     invoke<void>("mark_torrents_seen", { guids }),
 
@@ -97,4 +99,6 @@ export const api = {
 
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
   installUpdate: () => invoke<string>("install_update"),
+  takeUpdateFailed: () => invoke<string | null>("take_update_failed"),
+  takePendingUpdate: () => invoke<UpdateInfo | null>("take_pending_update"),
 };

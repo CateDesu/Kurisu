@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
+  import { installInFlight, runInstallUpdate } from "$lib/updater.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
 
@@ -16,7 +17,6 @@
   let autoUpdate = $state(true);
   let update = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
-  let updateInstalling = $state(false);
   let updateError = $state("");
   let updateStatus = $state("");
   let loadError = $state("");
@@ -58,11 +58,23 @@
     // Snapshot what's being saved: the inputs bind straight into `cfg`, so an edit
     // made while the request is in flight must not change what we send — and the
     // response must not clobber that newer edit when it lands.
+    // `bind:value` on a number input yields NaN when the field is cleared and a
+    // float when the user types "2.5". Both serialize to something the Rust u64
+    // parameters reject, so the whole save failed with a raw deserialize error.
+    // Normalize and clamp to the same ranges the inputs advertise.
+    const int = (v: unknown, fallback: number, lo: number, hi: number) => {
+      const n = Math.round(Number(v));
+      if (!Number.isFinite(n)) return fallback;
+      return Math.min(hi, Math.max(lo, n));
+    };
     const snap = {
       mode: cfg.mode,
-      prompt_seconds: cfg.prompt_seconds,
-      auto_percent: cfg.auto_percent,
+      prompt_seconds: int(cfg.prompt_seconds, 120, 10, 86_400),
+      auto_percent: int(cfg.auto_percent, 80, 1, 100),
     };
+    // Reflect the normalized values so the field shows what was actually saved.
+    cfg.prompt_seconds = snap.prompt_seconds;
+    cfg.auto_percent = snap.auto_percent;
     try {
       const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent);
       if (
@@ -99,17 +111,16 @@
     }
   }
   async function installUpdate() {
-    updateInstalling = true;
+    // The in-flight flag lives in the shared updater store, so an install
+    // started from the update modal (or vice versa) blocks a second one here.
     updateError = "";
     updateStatus = "";
     try {
-      const result = await api.installUpdate();
+      const result = await runInstallUpdate();
       // "restarting": the installer launched and the app quits itself.
       if (result === "installed") updateStatus = "Installed — restart Kurisu to finish.";
     } catch (e) {
       updateError = String(e);
-    } finally {
-      updateInstalling = false;
     }
   }
   load();
@@ -130,7 +141,7 @@
     {#if auth.user}
       <p class="text-sm mb-2">Signed in as <b>{auth.user.name}</b>.</p>
       <button
-        onclick={() => auth.logout()}
+        onclick={() => auth.logout().catch(() => {})}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
       >
         Log out
@@ -245,7 +256,7 @@
     <div class="flex items-center gap-2">
       <button
         onclick={checkForUpdate}
-        disabled={updateChecking || updateInstalling}
+        disabled={updateChecking || installInFlight()}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
       >
         {updateChecking ? "Checking…" : "Check for updates"}
@@ -253,10 +264,10 @@
       {#if update?.available && update.can_install && !updateStatus}
         <button
           onclick={installUpdate}
-          disabled={updateInstalling}
+          disabled={installInFlight()}
           class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
         >
-          {updateInstalling ? "Downloading…" : `Install ${update.version}`}
+          {installInFlight() ? "Downloading…" : `Install ${update.version}`}
         </button>
       {/if}
     </div>
@@ -264,7 +275,9 @@
       {#if update.available}
         <p class="text-xs text-accent mt-2">
           Version {update.version} is available (you're on {update.current}).
-          {#if !update.can_install}
+          {#if update.restart_pending}
+            — installed, restart Kurisu to finish.
+          {:else if !update.can_install}
             <button
               onclick={() => openUrl(update!.html_url)}
               class="underline hover:text-accent-2 cursor-pointer"

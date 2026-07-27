@@ -51,6 +51,12 @@
     editing = false;
     expanded = false;
     recs = [];
+    // Clear the PREVIOUS anime's data too. Leaving it in place kept the old
+    // title, cover and entry panel on screen under a new id, so the stepper and
+    // the status buttons acted on a show the user was no longer looking at (and
+    // the `loading && !detail` placeholder below could never fire).
+    detail = null;
+    entry = null;
     try {
       const [d, e] = await Promise.all([api.getMediaDetail(mediaId), api.getEntry(mediaId)]);
       if (reqId !== loadId) return;
@@ -75,8 +81,10 @@
   }
 
   async function reloadEntry() {
+    const reqId = loadId;
     try {
       const e = await api.getEntry(id);
+      if (reqId !== loadId) return;
       entry = e ? { ...e, media: e.media ?? detail?.media ?? null } : null;
     } catch {
       // keep whatever we had
@@ -84,14 +92,20 @@
   }
 
   async function add(status: string) {
+    // A full AniList round-trip. The relation and recommendation cards stay
+    // clickable throughout, so navigating mid-add must not land this entry on
+    // the next anime's page: same latest-wins guard `load` uses.
+    const reqId = loadId;
     adding = status;
     error = "";
     try {
-      entry = await api.updateEntry(id, status, 0, null, 0);
+      const e = await api.updateEntry(id, status, 0, null, 0);
+      if (reqId !== loadId) return;
+      entry = e;
     } catch (e) {
-      error = String(e);
+      if (reqId === loadId) error = String(e);
     } finally {
-      adding = null;
+      if (reqId === loadId) adding = null;
     }
   }
 

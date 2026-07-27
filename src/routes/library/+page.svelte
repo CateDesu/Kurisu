@@ -89,6 +89,24 @@
     }
   }
 
+  async function play(path: string) {
+    error = "";
+    try {
+      await openPath(path);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function reveal(path: string) {
+    error = "";
+    try {
+      await revealItemInDir(path);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   function basename(path: string): string {
     return path.split(/[\\/]/).pop() ?? path;
   }
@@ -147,6 +165,20 @@
     {#if error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
         {error}
+      </div>
+    {/if}
+
+    {#if library.unreadable.length > 0}
+      <div class="text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md p-2 mb-4">
+        {library.unreadable.length === 1
+          ? "1 folder could not be read"
+          : `${library.unreadable.length} folders could not be read`} — files under
+        {library.unreadable.length === 1 ? "it are" : "them are"} missing from this scan.
+        <ul class="mt-1 space-y-0.5">
+          {#each library.unreadable as u (u.path)}
+            <li class="truncate text-xs" title={u.error}>{u.path}: {u.error}</li>
+          {/each}
+        </ul>
       </div>
     {/if}
 
@@ -233,7 +265,7 @@
               {/if}
               {#if next}
                 <button
-                  onclick={() => openPath(next.path)}
+                  onclick={() => play(next.path)}
                   title={basename(next.path)}
                   class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm shrink-0 flex items-center gap-1.5"
                 >
@@ -254,14 +286,14 @@
                     <span class="text-accent shrink-0 grid place-items-center" title="Watched (per your list progress)"><Icon name="check" size={14} /></span>
                   {/if}
                   <button
-                    onclick={() => openPath(f.path)}
+                    onclick={() => play(f.path)}
                     title="Play"
                     class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
                     <Icon name="play" size={13} />
                   </button>
                   <button
-                    onclick={() => revealItemInDir(f.path)}
+                    onclick={() => reveal(f.path)}
                     title="Show in file manager"
                     class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
@@ -290,14 +322,14 @@
                     <Icon name="link" size={14} />
                   </button>
                   <button
-                    onclick={() => openPath(f.path)}
+                    onclick={() => play(f.path)}
                     title="Play"
                     class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >
                     <Icon name="play" size={13} />
                   </button>
                   <button
-                    onclick={() => revealItemInDir(f.path)}
+                    onclick={() => reveal(f.path)}
                     title="Show in file manager"
                     class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                   >

@@ -82,6 +82,28 @@ export interface TorrentItem {
   seen: boolean;
 }
 
+export interface UnreadableFolder {
+  path: string;
+  error: string;
+}
+
+/// One library scan: recognized files plus roots that could not be read.
+export interface LibraryScan {
+  files: LibraryFile[];
+  unreadable: UnreadableFolder[];
+}
+
+export interface FeedFailure {
+  url: string;
+  error: string;
+}
+
+/// A torrent refresh: merged items plus the feeds that did not answer.
+export interface TorrentFetch {
+  items: TorrentItem[];
+  failures: FeedFailure[];
+}
+
 /// AniList server-side profile statistics (Stats page).
 export interface UserStats {
   count: number;
@@ -280,6 +302,7 @@ export interface TrackingPrompt {
 export interface UpdateInfo {
   available: boolean; // a newer release exists on GitHub
   can_install: boolean; // this build can update in place (Windows + installer asset)
+  restart_pending: boolean; // an update was already applied this session; restart to finish
   version: string; // latest release version
   tag: string;
   html_url: string;

@@ -53,6 +53,12 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
             // future migration attempt). Sidecars ride along so writes sitting
             // in an un-checkpointed legacy WAL survive the move.
             let tmp = data_dir.join(".kurisu-migrate.tmp");
+            // Stage EVERYTHING first, then publish the main database LAST. The
+            // sidecars used to be renamed into place before it: a failure after
+            // that point (or a crash) left a -wal/-shm pair belonging to a
+            // database that was not there, and SQLite treats an orphaned WAL
+            // beside a fresh DB as corruption.
+            let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
             let result = (|| -> std::io::Result<()> {
                 std::fs::copy(&legacy, &tmp)?;
                 for suffix in ["-wal", "-shm"] {
@@ -64,20 +70,38 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
                         tmp_side.push(suffix);
                         let mut dst_side = db_path.as_os_str().to_os_string();
                         dst_side.push(suffix);
+                        let (tmp_side, dst_side) =
+                            (std::path::PathBuf::from(tmp_side), std::path::PathBuf::from(dst_side));
                         std::fs::copy(&side, &tmp_side)?;
-                        std::fs::rename(&tmp_side, dst_side)?;
+                        staged.push((tmp_side, dst_side));
                     }
                 }
-                std::fs::rename(&tmp, &db_path)
+                // Publish the database first, then its sidecars. If a sidecar
+                // rename fails now, the DB is still valid on its own: SQLite
+                // rebuilds a missing -shm and an absent -wal just means the
+                // un-checkpointed tail is lost, not that the file is unreadable.
+                std::fs::rename(&tmp, &db_path)?;
+                for (from, to) in &staged {
+                    std::fs::rename(from, to)?;
+                }
+                Ok(())
             })();
             if let Err(e) = result {
                 log::warn!("legacy DB migration failed: {e}");
                 let _ = std::fs::remove_file(&tmp);
+                for (from, _) in &staged {
+                    let _ = std::fs::remove_file(from);
+                }
             }
         }
     }
     db::Db::open(&db_path).map_err(|e| format!("cannot open {}: {e}", db_path.display()))
 }
+
+/// Loopback address the running instance holds for its whole lifetime. A second
+/// launch fails to bind it, which is how it learns it is the second launch.
+/// Adjacent to the OAuth callback port (39417) so the two stay together.
+const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:39418";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -95,6 +119,28 @@ pub fn run() {
     if std::env::var_os("KURISU_DMABUF").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
+
+    // Single instance. Two Kurisu processes share ONE SQLite file with separate
+    // in-memory state and separate playback watchers, so they overwrite each
+    // other's writes and can double-push progress to AniList. Close-to-tray makes
+    // a second launch easy: the first process is alive but has no window, so
+    // clicking the launcher again looks like the app "didn't start".
+    //
+    // The guard is a loopback bind rather than a lock file (no stale lock to
+    // clean up if the process is killed) and rather than a plugin (no new
+    // dependency). Same shape as the OAuth callback listener already here.
+    let instance_guard = match std::net::TcpListener::bind(SINGLE_INSTANCE_ADDR) {
+        Ok(l) => l,
+        Err(_) => {
+            // Someone already holds it: poke them so their window comes back,
+            // then exit quietly. A connect failure means the port belongs to an
+            // unrelated process, in which case carrying on is better than
+            // refusing to start at all.
+            let _ = std::net::TcpStream::connect(SINGLE_INSTANCE_ADDR);
+            eprintln!("kurisu: already running; raising the existing window");
+            return;
+        }
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -141,11 +187,21 @@ pub fn run() {
             commands::get_user_stats,
             commands::check_update,
             commands::install_update,
+            updater::take_update_failed,
+            updater::take_pending_update,
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             use tauri_plugin_dialog::DialogExt;
+
+            // Capture the exe path before anything can swap it: after a
+            // successful Linux in-place update, /proc/self/exe follows the
+            // renamed inode and a current_exe() at apply time would point at
+            // the .kurisu-old backup.
+            if let Err(e) = updater::init_install_path() {
+                log::warn!("updater: {e}");
+            }
 
             let db = match open_database(app) {
                 Ok(db) => db,
@@ -195,6 +251,11 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(w) = app.get_webview_window("main") {
+                            // unminimize FIRST: show() does not de-iconify, and
+                            // set_focus() is a no-op on a minimized window, so a
+                            // window minimized to the taskbar could not be
+                            // brought back from the tray at all.
+                            let _ = w.unminimize();
                             let _ = w.show();
                             let _ = w.set_focus();
                         }
@@ -212,9 +273,14 @@ pub fn run() {
                     {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("main") {
-                            if w.is_visible().unwrap_or(false) {
+                            // A minimized window is still "visible" to Tauri, so
+                            // toggling one used to HIDE it to the tray instead of
+                            // restoring it: the click appeared to do nothing.
+                            let minimized = w.is_minimized().unwrap_or(false);
+                            if w.is_visible().unwrap_or(false) && !minimized {
                                 let _ = w.hide();
                             } else {
+                                let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
                             }
@@ -246,6 +312,23 @@ pub fn run() {
                 });
             }
 
+            // Hold the single-instance listener for the process lifetime and
+            // answer later launches by raising this window. The OS drops the
+            // binding when the process dies, so there is no stale state to clear.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    for stream in instance_guard.incoming() {
+                        drop(stream); // the connection itself is the whole message
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                });
+            }
+
             // Background MPRIS2 playback watcher. Runs for the app's lifetime; every
             // tick swallows its own errors, so a flaky player can't crash detection.
             playback::spawn(app.handle().clone());
@@ -267,20 +350,12 @@ pub fn run() {
                         if let Ok(dir) = sweep_handle.path().app_local_data_dir() {
                             updater::sweep_update_leftovers(&dir);
                         }
-                        // A leftover failure marker means a previous update's swap
-                        // AND its rollback both failed; the user only gets here by
-                        // manually restoring the backup. Surface it once.
-                        if let Ok(exe) = std::env::current_exe() {
-                            if let Some(dir) = exe.parent() {
-                                updater::sweep_install_leftovers(dir);
-                                let marker = dir.join(updater::FAILED_MARKER);
-                                if marker.exists() {
-                                    let _ = std::fs::remove_file(&marker);
-                                    return true;
-                                }
-                            }
-                        }
-                        false
+                        // Sweep next to the exe and flag the doubly-failed-swap
+                        // marker if one exists. The marker file stays on disk
+                        // until the frontend acknowledges the notice via
+                        // take_update_failed — the emit below is only a fast
+                        // path and can fire before the webview listens.
+                        updater::sweep_install_dir()
                     })
                     .await
                     .unwrap_or(false);
@@ -290,7 +365,7 @@ pub fn run() {
                         let _ = handle.emit(
                             "kurisu://update-failed",
                             serde_json::json!({
-                                "message": "The last update failed to install cleanly, so the previous version was kept. Nothing was lost — you can retry the update from Settings."
+                                "message": updater::FAILED_MESSAGE
                             }),
                         );
                     }
@@ -309,18 +384,20 @@ pub fn run() {
                         if updater::platform_asset(&rel).is_some()
                             && updater::is_newer(&rel.version, updater::current_version())
                         {
-                            let _ = handle.emit(
-                                "kurisu://update-available",
-                                serde_json::json!({
-                                    "available": true,
-                                    "can_install": true,
-                                    "version": rel.version,
-                                    "tag": rel.tag,
-                                    "html_url": rel.html_url,
-                                    "body": rel.body,
-                                    "current": updater::current_version(),
-                                }),
-                            );
+                            let payload = serde_json::json!({
+                                "available": true,
+                                "can_install": true,
+                                "version": rel.version,
+                                "tag": rel.tag,
+                                "html_url": rel.html_url,
+                                "body": rel.body,
+                                "current": updater::current_version(),
+                            });
+                            // Stash it for the frontend's pull on mount
+                            // (take_pending_update): the emit is a one-shot
+                            // fast path a slow-booting webview can miss.
+                            updater::set_pending_update(payload.clone());
+                            let _ = handle.emit("kurisu://update-available", payload);
                         }
                     }
                 });

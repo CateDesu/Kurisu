@@ -1,34 +1,66 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
+  import { installInFlight, runInstallUpdate } from "$lib/updater.svelte";
   import type { UpdateInfo } from "$lib/types";
 
   // Shown when the backend's startup check finds a newer release (the
-  // `kurisu://update-available` event). `null` = hidden.
+  // `kurisu://update-available` event, or the stashed payload pulled on mount
+  // — see below). `null` = hidden.
   let update = $state<UpdateInfo | null>(null);
-  let busy = $state(false);
   let err = $state("");
   // Linux swaps the binary in place and needs a manual restart; Windows
   // quits by itself once the installer launches.
   let installed = $state(false);
   // One-shot notice after a doubly-failed swap (see the backend marker).
   let failedMsg = $state("");
+  // What the user already dismissed / was already shown this session: the
+  // emit and the pull-on-mount can deliver the same payload twice.
+  let dismissedTag = "";
+  let failedSeen = false;
 
   let updateDialog = $state<HTMLDivElement | null>(null);
   let failedDialog = $state<HTMLDivElement | null>(null);
+
+  function showUpdate(info: UpdateInfo) {
+    if (!info?.available || info.tag === dismissedTag) return;
+    update = info;
+    err = "";
+    installed = false;
+  }
+
+  function showFailed(message: string) {
+    if (failedSeen) return;
+    failedSeen = true;
+    failedMsg = message;
+  }
 
   $effect(() => {
     let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
-    listen<UpdateInfo>("kurisu://update-available", (e) => {
-      update = e.payload;
-      err = "";
-      installed = false;
-    }).then((u) => (alive ? (un1 = u) : u()));
-    listen<{ message: string }>("kurisu://update-failed", (e) => {
-      failedMsg = e.payload.message;
-    }).then((u) => (alive ? (un2 = u) : u()));
+    listen<UpdateInfo>("kurisu://update-available", (e) => showUpdate(e.payload)).then(
+      (u) => (alive ? (un1 = u) : u())
+    );
+    listen<{ message: string }>("kurisu://update-failed", (e) => showFailed(e.payload.message)).then(
+      (u) => (alive ? (un2 = u) : u())
+    );
+    // The emits above are one-shot and can fire before this listener exists
+    // on a slow cold boot, so the backend also stashes both payloads until
+    // the UI pulls them. This pull is the reliable path; the listeners are
+    // the fast one.
+    api
+      .takePendingUpdate()
+      .then((info) => {
+        if (alive && info) showUpdate(info);
+      })
+      .catch(() => {});
+    api
+      .takeUpdateFailed()
+      .then((msg) => {
+        if (alive && msg) showFailed(msg);
+      })
+      .catch(() => {});
     return () => {
       alive = false;
       un1?.();
@@ -37,21 +69,22 @@
   });
 
   async function install() {
-    if (!update || busy) return;
-    busy = true;
+    if (!update || installInFlight()) return;
     err = "";
     try {
-      const result = await api.installUpdate();
+      const result = await runInstallUpdate();
       if (result === "installed") installed = true;
       // "restarting": the installer launched and the app quits itself.
     } catch (e) {
       err = String(e);
-    } finally {
-      busy = false;
     }
   }
 
+  // Dismissal is refused while an install runs: hiding the modal would leave
+  // the outcome (success or failure) invisible.
   function later() {
+    if (installInFlight() || !update) return;
+    dismissedTag = update.tag;
     update = null;
   }
 
@@ -118,16 +151,17 @@
         <div class="flex justify-end items-center gap-2">
           <button
             onclick={later}
-            class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+            disabled={installInFlight()}
+            class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
           >
             Later
           </button>
           <button
             onclick={install}
-            disabled={busy}
+            disabled={installInFlight()}
             class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
           >
-            {busy ? "Downloading…" : "Download & install"}
+            {installInFlight() ? "Downloading…" : "Download & install"}
           </button>
         </div>
         <p class="text-xs text-ink-dim mt-3">

@@ -7,6 +7,10 @@
   // `null` = nothing playing / banner hidden.
   let nowPlaying = $state<NowPlaying | null>(null);
   let prompt = $state<TrackingPrompt | null>(null);
+  // Prompts that arrived while an earlier one was still open. Close-to-tray
+  // keeps the webview alive but invisible, so a night of playback used to
+  // deliver several prompts into one slot and only the last survived.
+  let queued = $state<TrackingPrompt[]>([]);
   let busy = $state(false);
   let err = $state("");
 
@@ -27,7 +31,18 @@
       nowPlaying = e.payload?.active ? e.payload : null;
     }).then((u) => (alive ? (un1 = u) : u()));
     listen<TrackingPrompt>("kurisu://tracking-prompt", (e) => {
-      prompt = e.payload;
+      const p = e.payload;
+      if (!p) return;
+      if (prompt) {
+        // Never drop a prompt on the floor; de-dupe so a repeat for the same
+        // episode doesn't stack up.
+        const dup =
+          (prompt.media_id === p.media_id && prompt.episode === p.episode) ||
+          queued.some((q) => q.media_id === p.media_id && q.episode === p.episode);
+        if (!dup) queued = [...queued, p];
+        return;
+      }
+      prompt = p;
       err = "";
     }).then((u) => (alive ? (un2 = u) : u()));
     return () => {
@@ -58,19 +73,27 @@
       // The modal can sit open for a while — progress may have moved past the
       // detected episode since the prompt was emitted. Don't rewind it.
       const fresh = await api.getEntry(p.media_id);
-      if (fresh && fresh.progress >= p.episode) {
-        if (prompt === p) prompt = null;
+      // No row means the user removed the show from their list while the prompt
+      // was open. Writing now would recreate it on AniList, so dismiss instead.
+      if (!fresh) {
+        if (prompt === p) dismiss();
+        return;
+      }
+      if (fresh.progress >= p.episode) {
+        if (prompt === p) dismiss();
         return;
       }
       // Set progress to the detected episode (not a blind +1), so mid-cour skips
       // land correctly. The modal only offers this when it's ahead of progress.
-      const entry = await api.setProgress(p.media_id, p.episode);
+      // `fresh.progress` is the compare-and-swap baseline: if something else
+      // moved the entry between the read and the write, the backend declines.
+      const entry = await api.setProgress(p.media_id, p.episode, fresh.progress);
       // Unify the list-refresh signal: auto-increment emits this from the
       // backend, the prompt path emits it here so one listener covers both.
       await emit("kurisu://episode-updated", entry);
       // A NEWER prompt may have replaced ours while the write was in flight —
       // only close the one we actually confirmed.
-      if (prompt === p) prompt = null;
+      if (prompt === p) dismiss();
     } catch (e) {
       // Keep the prompt open and say why — closing on failure reads as success.
       err = String(e);
@@ -79,8 +102,19 @@
     }
   }
 
+  /// Close the current prompt and present the next queued one, if any.
+  function dismiss() {
+    if (queued.length > 0) {
+      prompt = queued[0];
+      queued = queued.slice(1);
+      err = "";
+    } else {
+      prompt = null;
+    }
+  }
+
   function skip() {
-    prompt = null;
+    dismiss();
   }
 </script>
 

@@ -1,3 +1,18 @@
+<script module lang="ts">
+  // Which account the cached list was last reconciled against, kept at MODULE
+  // scope so it survives this route being destroyed and recreated. As component
+  // state it reset to null on every navigation, so the "the user changed under
+  // us" check below could only ever fire when the user logged out and back in
+  // without leaving this page: after a restart, or a trip to any other route,
+  // the previous account's cached rows rendered as if they were the new one's.
+  let syncedFor: number | null = null;
+
+  // One collator for the whole session. `localeCompare` with an options object
+  // builds a fresh Intl.Collator on every call, which the title sort makes
+  // O(n log n) times over a 1280-entry list on every keystroke.
+  const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+</script>
+
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
@@ -89,10 +104,7 @@
   }
 
   const titleCmp = (a: ListEntry, b: ListEntry) =>
-    displayTitle(a.media).localeCompare(displayTitle(b.media), undefined, {
-      sensitivity: "base",
-      numeric: true,
-    });
+    COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
 
   /// Sort value for the active key; null = "doesn't apply" → always sorts last.
   function keyVal(e: ListEntry): number | null {
@@ -137,7 +149,6 @@
   // The local cache isn't namespaced per account: if the user changes under us
   // (logout → different login), force a sync — it also purges rows the new
   // account doesn't have. Auto-sync on an empty list happens once per session.
-  let syncedFor = $state<number | null>(null);
   let autoSynced = false;
   async function load() {
     const id = ++loadId;
@@ -146,11 +157,14 @@
     try {
       const list = await api.localEntries();
       if (id !== loadId) return;
-      entries = list;
+      // Decide BEFORE rendering: on an account switch the cached rows belong to
+      // the previous user, so showing them (even for one frame) invites edits
+      // against the wrong list. Hold the old view until the sync reconciles.
       const uid = auth.user?.id ?? null;
-      const switched = syncedFor !== null && uid !== syncedFor;
-      if (syncedFor !== uid) syncedFor = uid;
-      if ((entries.length === 0 && !autoSynced) || switched) {
+      const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
+      if (!switched) entries = list;
+      syncedFor = uid;
+      if ((list.length === 0 && !autoSynced) || switched) {
         autoSynced = true;
         await sync(id);
       }
@@ -271,6 +285,13 @@
           <div
             onclick={() => (editing = e)}
             onkeydown={(ev) => {
+              // Only when the ROW itself is focused. The row contains real
+              // buttons (cover, stepper -/+); their click handlers stop
+              // propagation but nothing stopped the keydown, so keyboard users
+              // hitting Enter on the stepper both cancelled its activation
+              // (preventDefault suppresses the synthesized click) and opened
+              // this modal instead.
+              if (ev.currentTarget !== ev.target) return;
               if (ev.key === "Enter" || ev.key === " ") {
                 ev.preventDefault();
                 editing = e;

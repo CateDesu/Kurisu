@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::{ListEntry, Media};
 
@@ -45,7 +45,28 @@ impl Db {
     /// Schema ladder keyed off PRAGMA user_version: each `if version < N` rung
     /// upgrades N-1 → N. CREATE TABLEs stay IF NOT EXISTS so a fresh DB (version
     /// 0) and an old one converge on the same schema.
+    /// Runs the ladder under `BEGIN IMMEDIATE`, so user_version is read while
+    /// holding the write lock. Without that the ladder is a check-then-act: two
+    /// processes opening the same file (a second launch, since nothing stops
+    /// one) could both read version 3 and both run the version-4 rung, and the
+    /// loser died on "duplicate column name" from `ensure_column`. SQLite DDL is
+    /// transactional, so a failed rung rolls back whole instead of leaving a
+    /// half-migrated schema behind.
     fn migrate(conn: &Connection) -> Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match Self::migrate_locked(conn) {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate_locked(conn: &Connection) -> Result<()> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 1 {
             conn.execute_batch(
@@ -183,7 +204,7 @@ impl Db {
                     next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios
              FROM media WHERE id = ?",
         )?;
-        let row = stmt.query_row([id], row_to_media).ok();
+        let row = stmt.query_row([id], row_to_media).optional()?;
         Ok(row)
     }
 
@@ -236,11 +257,18 @@ impl Db {
     pub fn entries_with_media(&self) -> Result<Vec<ListEntry>> {
         let c = self.0.lock();
         let mut stmt = c.prepare(
+            // The detail-only columns are selected as NULL: no list view renders a
+            // synopsis, banner, genre list, duration, source or studio, but they
+            // were serialized for all ~1300 rows on every list refresh (AniList
+            // descriptions are multi-KB HTML, so this dominated the payload).
+            // The rows stay in the DB untouched; /anime/[id] re-reads them via
+            // get_media. Column ORDER is unchanged so row_to_media_offset still
+            // applies, and every one of these fields is Option, so NULL is None.
             "SELECT e.media_id,e.entry_id,e.status,e.progress,e.score,e.repeat,e.updated_at,
                     m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
                     m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,
-                    m.season_year,m.description,m.next_airing_episode,m.next_airing_at,
-                    m.banner_image,m.genres,m.duration,m.source,m.studios
+                    m.season_year,NULL,m.next_airing_episode,m.next_airing_at,
+                    NULL,NULL,NULL,NULL,NULL
              FROM list_entry e LEFT JOIN media m ON m.id = e.media_id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -276,6 +304,9 @@ impl Db {
 
     pub fn get_entry(&self, media_id: i64) -> Result<Option<ListEntry>> {
         let c = self.0.lock();
+        // .optional(): Ok(None) must mean ONLY "no such row" — a real read
+        // error propagates, because the write paths read None as "not on the
+        // list" and would build a fresh entry that overwrites the remote one.
         let row = c
             .query_row(
                 "SELECT media_id,entry_id,status,progress,score,repeat,updated_at
@@ -294,7 +325,7 @@ impl Db {
                     })
                 },
             )
-            .ok();
+            .optional()?;
         Ok(row)
     }
 
@@ -342,7 +373,23 @@ impl Db {
                 [key],
                 |r| r.get::<_, String>(0),
             )
-            .ok())
+            .optional()?)
+    }
+    /// Plain row delete (no VACUUM): the fallback when `scrub_setting`'s VACUUM
+    /// fails, and enough for non-secret rows like the cached username.
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.0
+            .lock()
+            .execute("DELETE FROM settings WHERE key = ?", [key])?;
+        Ok(())
+    }
+    /// Drop the whole cached list mirror. Used on logout: a different account
+    /// signing in afterwards must never see (or push writes through) the
+    /// previous account's rows. The media cache stays — it isn't
+    /// account-specific.
+    pub fn clear_entries(&self) -> Result<()> {
+        self.0.lock().execute("DELETE FROM list_entry", [])?;
+        Ok(())
     }
 
     // ---- torrent-feed seen state (M6) ----

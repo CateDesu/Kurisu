@@ -14,8 +14,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde_json::Value;
 
 const REPO: &str = "CateDesu/Kurisu";
@@ -23,8 +26,119 @@ const USER_AGENT: &str = "Kurisu";
 
 /// Dropped next to the exe when a swap fails so badly the rollback rename also
 /// failed (exe missing, only the `.kurisu-old` backup remains). The next
-/// launch — possible only after a manual restore — surfaces it and removes it.
+/// launch — possible only after a manual restore — surfaces it; the file is
+/// removed only once the frontend acknowledges the notice.
 pub const FAILED_MARKER: &str = ".kurisu-update-failed";
+
+/// Notice text for the doubly-failed-swap state the marker records. Shared by
+/// the emit fast path and the `take_update_failed` pull so both say the same
+/// thing.
+pub const FAILED_MESSAGE: &str = "The last update failed to install cleanly, so the previous version was kept. Nothing was lost — you can retry the update from Settings.";
+
+// ── Process-wide updater state ──────────────────────────────────────────────
+
+/// The exe path captured ONCE at process start (`init_install_path`, from app
+/// setup). After a successful Linux swap, `/proc/self/exe` follows the renamed
+/// inode, so a `current_exe()` at apply time would return the `.kurisu-old`
+/// backup and the install would target the wrong path.
+static EXE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set after a successful in-place swap: the on-disk binary is then newer than
+/// the still-running process (whose `current_version()` is a compile-time
+/// constant), so no further install may be offered or applied until restart.
+static UPDATE_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// Set when startup found the doubly-failed-swap marker; cleared (and the
+/// marker file removed) only when the frontend acknowledges the notice via
+/// `take_update_failed`.
+static UPDATE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The startup check's update-available payload, stashed so a webview that
+/// booted after the one-shot emit can still pull it on mount.
+static PENDING_UPDATE: Mutex<Option<Value>> = Mutex::new(None);
+
+/// Per-invocation counter for scratch paths: a bare pid is shared by every
+/// concurrent install in the same process.
+#[cfg(any(windows, target_os = "linux"))]
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Unique-per-invocation scratch suffix (see `SCRATCH_SEQ`).
+#[cfg(any(windows, target_os = "linux"))]
+fn scratch_suffix() -> u64 {
+    SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Capture the exe path at process start, before any update can have swapped
+/// it (see `EXE_PATH`). Repeat calls keep the first capture.
+pub fn init_install_path() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let _ = EXE_PATH.set(sane_exe_path(exe)?);
+    Ok(())
+}
+
+/// Backstop sanity check on an install target: never a `.kurisu-old` backup,
+/// never an unlinked-but-running inode (a ` (deleted)` suffix on Linux).
+fn sane_exe_path(exe: PathBuf) -> Result<PathBuf, String> {
+    let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".kurisu-old") || name.contains(" (deleted)") {
+        return Err(format!("refusing to update the install at {name}"));
+    }
+    Ok(exe)
+}
+
+/// The install dir: parent of the startup-captured exe path, falling back to a
+/// fresh `current_exe()` when `init_install_path` never ran (unit tests).
+fn install_dir() -> Option<PathBuf> {
+    let exe = EXE_PATH
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_exe().ok())?;
+    exe.parent().map(Path::to_path_buf)
+}
+
+/// Startup sweep next to the exe: leftovers, then the doubly-failed-swap
+/// marker. Returns true when a marker was found — meaning a previous update's
+/// swap AND its rollback both failed, and the user only got here by manually
+/// restoring the backup. The marker file is NOT removed here: it stays until
+/// the frontend acknowledges the notice via `take_update_failed`, because the
+/// one-shot emit can race a slow webview boot and drop, losing the warning.
+pub fn sweep_install_dir() -> bool {
+    let Some(dir) = install_dir() else {
+        return false;
+    };
+    sweep_install_leftovers(&dir);
+    if dir.join(FAILED_MARKER).exists() {
+        UPDATE_FAILED.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// The frontend's pull half of the failed-update notice: returns the notice
+/// text once per marker and removes the marker file only now.
+#[tauri::command]
+pub fn take_update_failed() -> Option<String> {
+    if !UPDATE_FAILED.swap(false, Ordering::SeqCst) {
+        return None;
+    }
+    if let Some(dir) = install_dir() {
+        let _ = std::fs::remove_file(dir.join(FAILED_MARKER));
+    }
+    Some(FAILED_MESSAGE.to_string())
+}
+
+/// Stash the startup update-available payload for the pull path.
+pub fn set_pending_update(payload: Value) {
+    *PENDING_UPDATE.lock() = Some(payload);
+}
+
+/// The stashed update-available payload, handed out once: the emit carrying
+/// the same payload can fire before a slow-booting webview has its listener
+/// registered, so pulling on mount is the reliable path.
+#[tauri::command]
+pub fn take_pending_update() -> Option<Value> {
+    PENDING_UPDATE.lock().take()
+}
 
 // ── Version comparison (same semantics as NyaaTriggers' parse_version) ──────
 
@@ -166,8 +280,22 @@ fn parse_release(data: &Value) -> Release {
 
 /// The updatable asset for THIS platform in `rel`: the NSIS installer
 /// (`…-setup.exe`) on Windows, the bare `kurisu` binary on Linux. `None`
-/// elsewhere. Never matches the `.sha256` sidecars.
+/// elsewhere — and `None` once an update was applied this session (the running
+/// process is then older than the on-disk binary, so the version comparison
+/// would keep re-offering the install until restart). Never matches the
+/// `.sha256` sidecars. Linux CI publishes x86-64 only, so other arches get
+/// `None` (can_install: false) rather than a binary their kernel cannot exec.
+/// Whether an update was already applied this session. The running process is
+/// then older than the on-disk binary, so no further install should be offered
+/// until a restart.
+pub fn update_applied() -> bool {
+    UPDATE_APPLIED.load(Ordering::SeqCst)
+}
+
 pub fn platform_asset(rel: &Release) -> Option<&str> {
+    if update_applied() {
+        return None;
+    }
     #[cfg(target_os = "windows")]
     {
         rel.assets
@@ -177,6 +305,9 @@ pub fn platform_asset(rel: &Release) -> Option<&str> {
     }
     #[cfg(target_os = "linux")]
     {
+        if std::env::consts::ARCH != "x86_64" {
+            return None;
+        }
         rel.assets
             .keys()
             .find(|n| n.as_str() == "kurisu")
@@ -190,14 +321,45 @@ pub fn platform_asset(rel: &Release) -> Option<&str> {
 }
 
 /// Fetch the `.sha256` sidecar text for an asset, if the release publishes one.
+/// Bounded like the module's other fetches (a sidecar is under 100 bytes): a
+/// 15 s deadline, HTTP error statuses don't count as sidecar text, and the
+/// body is capped rather than read unbounded.
 #[cfg(any(windows, target_os = "linux"))]
 pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
+    const MAX_SIDECAR_BYTES: usize = 4096;
     let url = rel.assets.get(&format!("{asset_name}.sha256"))?;
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(15))
         .build()
         .ok()?;
-    client.get(url).send().await.ok()?.text().await.ok()
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_SIDECAR_BYTES as u64)
+    {
+        return None;
+    }
+    let mut buf = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_SIDECAR_BYTES {
+                    return None;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    String::from_utf8(buf).ok()
 }
 
 // ── Download + integrity ────────────────────────────────────────────────────
@@ -209,17 +371,21 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
 #[cfg(any(windows, target_os = "linux"))]
 const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Stream `url` to `dest`, writing to a `.part` and renaming on success so a
-/// half-download is never mistaken for complete. Verifies Content-Length (a
-/// clean early close is a short read with no error) and refuses anything past
-/// `MAX_DOWNLOAD_BYTES`, header-claimed or streamed. `.part` removed on failure.
-/// File I/O goes through tokio::fs so the writes stay off the async workers.
+/// Stream `url` to `dest`, writing to a unique-per-invocation `.part-N`
+/// sibling (concurrent installs in one process must never share a scratch
+/// file) and renaming on success so a half-download is never mistaken for
+/// complete. Verifies Content-Length (a clean early close is a short read
+/// with no error) and refuses anything past `MAX_DOWNLOAD_BYTES`,
+/// header-claimed or streamed. `.part` removed on failure. The staged bytes
+/// and the directory entry are fsync'd before returning, so a crash in the
+/// writeback window can't leave an unflushed file at `dest`. File I/O goes
+/// through tokio::fs so the writes stay off the async workers.
 #[cfg(any(windows, target_os = "linux"))]
 pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
     let part = {
         let mut p = dest.as_os_str().to_os_string();
-        p.push(".part");
+        p.push(format!(".part-{}", scratch_suffix()));
         PathBuf::from(p)
     };
     if let Some(parent) = dest.parent() {
@@ -256,11 +422,20 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
             }
         }
         file.flush().await.map_err(|e| e.to_string())?;
+        file.sync_all().await.map_err(|e| e.to_string())?;
         drop(file);
         if total != 0 && got < total {
             return Err(format!("download incomplete: {got} of {total} bytes"));
         }
         tokio::fs::rename(&part, dest).await.map_err(|e| e.to_string())?;
+        // The caller verifies and then installs/executes these bytes: make the
+        // rename itself durable too (best effort — e.g. Windows can't fsync a
+        // directory handle opened this way).
+        if let Some(parent) = dest.parent() {
+            if let Ok(d) = tokio::fs::File::open(parent).await {
+                let _ = d.sync_all().await;
+            }
+        }
         Ok(())
     }
     .await;
@@ -317,28 +492,56 @@ pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std
 
 // ── Apply: Linux in-place binary swap ───────────────────────────────────────
 
-/// Replace the running exe with the verified download: copy FROM the verified
-/// handle (never re-open the download path — that keeps the verify→use chain on
-/// the same bytes), stage it next to the live exe (same filesystem), then two
-/// adjacent renames — live exe aside to `<name>.kurisu-old`, staged file in as
-/// the exe. Rolls back if the second rename fails; the backup is swept on the
-/// next launch. The caller prompts the user to restart.
+/// Replace the running exe with the verified download: refuse when an update
+/// already went in this session (the running process is older than the
+/// on-disk binary now — restart first), refuse bytes that are not an ELF for
+/// this architecture, then copy FROM the verified handle (never re-open the
+/// download path — that keeps the verify→use chain on the same bytes), fsync,
+/// stage next to the live exe (same filesystem) under a unique-per-invocation
+/// name, and do two adjacent renames — live exe aside to `<name>.kurisu-old`,
+/// staged file in as the exe — followed by an fsync of the install dir so the
+/// rename metadata is durable (ext4's rename-onto-existing flush heuristic
+/// can't fire here: the target is renamed away FIRST). Rolls back if the
+/// second rename fails; the backup is swept on the next launch. The install
+/// path is the one captured at process start, not a fresh `current_exe()` —
+/// after a swap the latter points at the `.kurisu-old` backup. The caller
+/// prompts the user to restart.
 #[cfg(target_os = "linux")]
 pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if UPDATE_APPLIED.load(Ordering::SeqCst) {
+        return Err("an update was already installed; restart Kurisu to finish it".to_string());
+    }
+    // CI ships exactly one Linux build (x86-64): never swap in bytes this
+    // kernel cannot exec.
+    if !elf_file_matches_arch(new_bin)
+        .map_err(|e| format!("could not read the downloaded update: {e}"))?
+    {
+        return Err("the downloaded update is not built for this machine's architecture".to_string());
+    }
+    let exe = match EXE_PATH.get() {
+        Some(p) => p.clone(),
+        None => sane_exe_path(std::env::current_exe().map_err(|e| e.to_string())?)?,
+    };
     let dir = exe.parent().ok_or("cannot locate install dir")?;
     let name = exe
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("cannot locate install dir")?;
-    let staging = dir.join(format!(".kurisu-new-{}", std::process::id()));
+    let staging = dir.join(format!(
+        ".kurisu-new-{}-{}",
+        std::process::id(),
+        scratch_suffix()
+    ));
     let backup = dir.join(format!("{name}.kurisu-old"));
     let result = (|| -> io::Result<()> {
         let mut staged = std::fs::File::create(&staging)?;
         io::copy(new_bin, &mut staged)?;
-        drop(staged);
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+        // Flush data AND metadata before the renames commit the path: without
+        // this a crash in the writeback window can leave a zero-length exe.
+        staged.sync_all()?;
+        drop(staged);
         std::fs::rename(&exe, &backup)?;
         if let Err(e) = std::fs::rename(&staging, &exe) {
             // Roll the exe swap back. If even that fails, the install is left
@@ -348,12 +551,67 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
             if std::fs::rename(&backup, &exe).is_err() {
                 let _ = std::fs::write(dir.join(FAILED_MARKER), "");
             }
+            sync_dir(dir);
             return Err(e);
         }
+        sync_dir(dir);
         Ok(())
     })();
     let _ = std::fs::remove_file(&staging);
+    if result.is_ok() {
+        UPDATE_APPLIED.store(true, Ordering::SeqCst);
+    }
     result.map_err(|e| format!("could not install the update: {e}"))
+}
+
+/// fsync a directory so rename metadata inside it survives a crash. Best
+/// effort: the swap itself already succeeded (or already failed).
+#[cfg(target_os = "linux")]
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// The e_machine value an ELF must carry for this process's architecture, when
+/// known (`None` = we cannot check, so we do not refuse).
+#[cfg(target_os = "linux")]
+fn expected_elf_machine() -> Option<u16> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(62),   // EM_X86_64
+        "aarch64" => Some(183), // EM_AARCH64
+        _ => None,
+    }
+}
+
+/// True when a 20-byte ELF prefix (e_ident + e_type + e_machine) matches the
+/// running architecture. e_machine sits at offset 18 for both ELF classes;
+/// EI_DATA (byte 5) picks its endianness. Anything unparseable is NOT a match.
+#[cfg(target_os = "linux")]
+fn elf_header_matches_arch(ident: &[u8; 20]) -> bool {
+    let Some(want) = expected_elf_machine() else {
+        return true;
+    };
+    if ident[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return false;
+    }
+    let machine = match ident[5] {
+        1 => u16::from_le_bytes([ident[18], ident[19]]),
+        2 => u16::from_be_bytes([ident[18], ident[19]]),
+        _ => return false,
+    };
+    machine == want
+}
+
+/// Read the ELF header from the verified handle, then rewind: the install
+/// copies from this same handle, so it must be left back at offset 0.
+#[cfg(target_os = "linux")]
+fn elf_file_matches_arch(file: &mut std::fs::File) -> io::Result<bool> {
+    use std::io::{Read, Seek};
+    let mut ident = [0u8; 20];
+    file.read_exact(&mut ident)?;
+    file.seek(io::SeekFrom::Start(0))?;
+    Ok(elf_header_matches_arch(&ident))
 }
 
 // ── Leftover sweeps ─────────────────────────────────────────────────────────
@@ -434,18 +692,56 @@ mod tests {
     #[test]
     fn platform_asset_picks_this_platforms_asset() {
         let mut rel = Release::default();
-        rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u1".into());
+        // A release carrying ONLY sidecars and near-miss names has nothing this
+        // platform can install. (The Windows installer is deliberately absent
+        // here: asserting None while it was present made this test impossible to
+        // pass on Windows, since platform_asset would rightly have found it.)
         rel.assets
             .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u2".into());
         rel.assets.insert("kurisu.exe".into(), "u3".into());
         rel.assets.insert("kurisu.sha256".into(), "u4".into());
-        // Sidecars and the other platform's assets never match.
         assert_eq!(platform_asset(&rel), None);
+        // Now publish both platforms' real assets.
+        rel.assets
+            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u1".into());
         rel.assets.insert("kurisu".into(), "u5".into());
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         assert_eq!(platform_asset(&rel), Some("kurisu"));
+        // CI publishes x86-64 only: other arches get no installable asset.
+        #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+        assert_eq!(platform_asset(&rel), None);
         #[cfg(target_os = "windows")]
         assert_eq!(platform_asset(&rel), Some("Kurisu_1.0.0_x64-setup.exe"));
+    }
+
+    #[test]
+    fn exe_path_backstop_rejects_backup_and_deleted_names() {
+        assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu")).is_ok());
+        assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu.kurisu-old")).is_err());
+        assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu (deleted)")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn elf_header_matches_running_arch() {
+        let Some(machine) = expected_elf_machine() else {
+            return; // an arch with no known e_machine: nothing to assert here
+        };
+        let mut ident = [0u8; 20];
+        ident[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        ident[5] = 1; // little-endian
+        ident[18..20].copy_from_slice(&machine.to_le_bytes());
+        assert!(elf_header_matches_arch(&ident));
+        // The other supported architecture's machine id is refused.
+        let other: u16 = if machine == 62 { 183 } else { 62 };
+        ident[18..20].copy_from_slice(&other.to_le_bytes());
+        assert!(!elf_header_matches_arch(&ident));
+        // Big-endian encoding of the right machine is honored.
+        ident[5] = 2;
+        ident[18..20].copy_from_slice(&machine.to_be_bytes());
+        assert!(elf_header_matches_arch(&ident));
+        // No ELF magic, no match.
+        ident[0] = 0;
+        assert!(!elf_header_matches_arch(&ident));
     }
 }

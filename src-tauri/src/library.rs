@@ -9,10 +9,10 @@
 //!
 //! Folder list lives in the `settings` table as a JSON array (`library_folders`).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::db::Db;
-use crate::models::LibraryFile;
+use crate::models::{LibraryFile, LibraryScan, UnreadableFolder};
 use crate::recognize::{basename, match_title, resolve_episode, Matcher};
 
 const FOLDERS_KEY: &str = "library_folders";
@@ -45,11 +45,26 @@ fn save_folders(db: &Db, folders: &[String]) -> Result<()> {
 pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     let _guard = FOLDERS_LOCK.lock();
     let mut folders = get_folders(db);
-    if !folders.iter().any(|f| f == path) {
-        folders.push(path.to_string());
-        save_folders(db, &folders)?;
+    if folders.iter().any(|f| f == path) {
+        return Ok(folders);
     }
+    // Overlapping folders would double-scan every shared file (and the Library
+    // page keys on path, so duplicates crash its render) — refuse them.
+    if let Some(existing) = folders.iter().find(|f| folders_overlap(f, path)) {
+        return Err(anyhow!("folder overlaps existing library folder: {existing}"));
+    }
+    folders.push(path.to_string());
+    save_folders(db, &folders)?;
     Ok(folders)
+}
+
+/// True when either path is the other or contains it, comparing normalized
+/// components: `/anime/` == `/anime`, `/anime/seasonal` nests under `/anime`,
+/// but `/anime2` is unrelated to `/anime`.
+fn folders_overlap(a: &str, b: &str) -> bool {
+    let a = std::path::Path::new(a);
+    let b = std::path::Path::new(b);
+    a.starts_with(b) || b.starts_with(a)
 }
 
 pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
@@ -118,14 +133,27 @@ pub fn scan_paths(
     folders: &[String],
     matchers: &[Matcher],
     bindings: &std::collections::HashMap<String, i64>,
-) -> Vec<LibraryFile> {
+) -> LibraryScan {
     let mut paths = Vec::new();
+    // Roots that could not be read at all. Deeper subdirectories stay
+    // best-effort, but a configured root vanishing (unmounted drive, dead
+    // network mount, permissions changed) silently produced an empty scan that
+    // looked exactly like "you have no files".
+    let mut unreadable = Vec::new();
     for folder in folders {
-        collect_videos(std::path::Path::new(folder), 0, &mut paths);
+        let root = std::path::Path::new(folder);
+        if let Err(e) = std::fs::read_dir(root) {
+            unreadable.push(UnreadableFolder { path: folder.clone(), error: e.to_string() });
+            continue;
+        }
+        collect_videos(root, 0, &mut paths);
     }
+    // Overlapping folders (added before the overlap check existed) can collect
+    // the same file twice — sort+dedup so each path appears exactly once.
     paths.sort();
+    paths.dedup();
 
-    paths
+    let files = paths
         .into_iter()
         .map(|path| {
             let base = basename(&path);
@@ -143,7 +171,8 @@ pub fn scan_paths(
                 bound: bound.is_some(),
             }
         })
-        .collect()
+        .collect();
+    LibraryScan { files, unreadable }
 }
 
 /// Recursively collect video files under `dir`, skipping hidden entries.
@@ -178,7 +207,8 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::binding_for;
+    use super::{add_folder, binding_for, folders_overlap, get_folders, scan_paths};
+    use crate::db::Db;
     use std::collections::HashMap;
 
     #[test]
@@ -198,5 +228,71 @@ mod tests {
         // Windows separators count as a boundary too
         assert_eq!(binding_for(&b, "/a/Show\\ep01.mkv"), Some(1));
         assert_eq!(binding_for(&b, "/other/x.mkv"), None);
+    }
+
+    #[test]
+    fn folder_overlap_detection() {
+        assert!(folders_overlap("/anime", "/anime"));
+        // trailing slash still the same folder
+        assert!(folders_overlap("/anime/", "/anime"));
+        assert!(folders_overlap("/anime", "/anime/seasonal"));
+        assert!(folders_overlap("/anime/seasonal", "/anime"));
+        // shared string prefix without a component boundary is NOT overlap
+        assert!(!folders_overlap("/anime", "/anime2"));
+        assert!(!folders_overlap("/anime", "/other"));
+    }
+
+    #[test]
+    fn add_folder_rejects_overlaps() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        add_folder(&db, "/anime").unwrap();
+        // exact duplicate stays a silent no-op
+        add_folder(&db, "/anime").unwrap();
+        // nested either way is rejected, trailing slash included
+        assert!(add_folder(&db, "/anime/seasonal").is_err());
+        assert!(add_folder(&db, "/anime/").is_err());
+        assert!(add_folder(&db, "/").is_err());
+        // a sibling that merely shares a string prefix is fine
+        add_folder(&db, "/anime2").unwrap();
+        assert_eq!(get_folders(&db), vec!["/anime", "/anime2"]);
+    }
+
+    #[test]
+    fn scan_dedups_overlapping_folders() {
+        let dir = std::env::temp_dir().join(format!("kurisu-scan-test-{}", std::process::id()));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("ep01.mkv"), []).unwrap();
+        let folders = vec![
+            dir.to_string_lossy().into_owned(),
+            nested.to_string_lossy().into_owned(),
+        ];
+        let scan = scan_paths(&folders, &[], &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+        // the file under the nested folder must appear exactly once
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].path.ends_with("ep01.mkv"));
+        assert!(scan.unreadable.is_empty());
+    }
+
+    /// A configured root that cannot be read is REPORTED, not silently skipped:
+    /// an unmounted drive used to look identical to an empty library.
+    #[test]
+    fn scan_reports_unreadable_roots() {
+        let dir = std::env::temp_dir().join(format!("kurisu-scan-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ep01.mkv"), []).unwrap();
+        let gone = dir.join("not-mounted");
+        let folders = vec![
+            dir.to_string_lossy().into_owned(),
+            gone.to_string_lossy().into_owned(),
+        ];
+        let scan = scan_paths(&folders, &[], &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+        // The readable root still scans; the missing one is named.
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.unreadable.len(), 1);
+        assert!(scan.unreadable[0].path.ends_with("not-mounted"));
+        assert!(!scan.unreadable[0].error.is_empty());
     }
 }

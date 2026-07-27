@@ -12,16 +12,21 @@
     progress,
     total = null,
     onchange,
+    onerror,
   }: {
     mediaId: number;
     progress: number;
     total?: number | null;
     onchange?: (e: ListEntry) => void;
+    onerror?: (message: string) => void;
   } = $props();
 
   let pending = $state(untrack(() => progress));
   let saved = $state(untrack(() => progress));
   let saving = $state(false);
+  // Last commit failure. Kept so the control can SHOW that the number snapped
+  // back rather than reverting silently and leaving the user believing it saved.
+  let failed = $state("");
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   const dirty = $derived(pending !== saved);
@@ -45,6 +50,7 @@
     if (pending === saved || saving) return;
     saving = true;
     const v = pending;
+    failed = "";
     try {
       // Compare-and-swap on `saved`: if the auto-tracker (or anything else) moved
       // progress while this commit was in flight, the backend skips our stale
@@ -62,7 +68,11 @@
     } catch (e) {
       // revert so the UI reflects what actually saved
       pending = saved;
+      failed = String(e);
       console.error("set progress failed", e);
+      // Tell the page too: a console line is invisible to the user, who just
+      // watched their episode count silently jump back.
+      onerror?.(failed);
     } finally {
       saving = false;
     }
@@ -128,5 +138,7 @@
     <span class="text-[10px] text-accent ml-0.5" title="Saves automatically in 3s">●</span>
   {:else if saving}
     <span class="text-[10px] text-ink-dim ml-0.5">…</span>
+  {:else if failed}
+    <span class="text-[10px] text-red-400 ml-0.5" title="Not saved: {failed}">!</span>
   {/if}
 </div>

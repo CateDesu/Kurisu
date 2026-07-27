@@ -3,7 +3,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import { timeAgo, type ListEntry, type TorrentItem } from "$lib/types";
+  import { timeAgo, type FeedFailure, type ListEntry, type TorrentItem } from "$lib/types";
   import Icon from "$lib/Icon.svelte";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
@@ -18,6 +18,9 @@
   }
 
   let items = $state<TorrentItem[]>([]);
+  // Feeds that failed this refresh. A refresh where SOME feeds worked still
+  // succeeds, so without this a dead feed reads as "nothing new".
+  let feedFailures = $state<FeedFailure[]>([]);
   let entries = $state<ListEntry[]>([]);
   let feeds = $state<string[]>([]);
   let feedInput = $state("");
@@ -50,7 +53,8 @@
         api.getRssFeeds(),
       ]);
       if (id !== loadId) return;
-      items = torrents;
+      items = torrents.items;
+      feedFailures = torrents.failures;
       entries = myEntries;
       feeds = myFeeds;
       loaded = true;
@@ -92,7 +96,7 @@
     try {
       await openUrl(url);
     } catch (e) {
-      error = String(e);
+      error = `Could not open ${url.startsWith("magnet:") ? "magnet link" : "link"}: ${String(e)}`;
       return;
     }
     // Opening a torrent counts as acting on it — clear its NEW state.
@@ -218,6 +222,17 @@
     {#if error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
         {error}
+      </div>
+    {/if}
+
+    {#if feedFailures.length > 0}
+      <div class="text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md p-2 mb-4">
+        {feedFailures.length === 1 ? "1 feed failed" : `${feedFailures.length} feeds failed`}:
+        <ul class="mt-1 space-y-0.5">
+          {#each feedFailures as f (f.url)}
+            <li class="truncate text-xs" title={f.error}>{f.error}</li>
+          {/each}
+        </ul>
       </div>
     {/if}
 
