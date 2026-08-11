@@ -20,6 +20,7 @@
     logout:
       '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/>',
     play: '<path d="M6 4l14 8-14 8z"/>',
+    chevron: '<path d="m9 18 6-6-6-6"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
     refresh: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
     x: '<path d="M18 6 6 18M6 6l12 12"/>',

@@ -14,7 +14,7 @@ use crate::db::Db;
 static RE_BRACKETS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\[\(【][^\]\)】]*[\]\)】]").unwrap());
 static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[45]|avc|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
+    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[456]|avc|av1|vp9|vp0|vvc|xvid|divx|mpeg-?2|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
 });
 // Trailing episode marker. The bare `E05` form needs a separator or a season
 // prefix before the `e` — otherwise the title's own final `e` is eaten
@@ -39,6 +39,21 @@ static RE_SEASON_N: LazyLock<Regex> =
 /// the layout is usually glued to its codec ("AAC2.0"); the trailing `\b`
 /// alone keeps dot-separated tags like "S01E01.1080p" intact.
 static RE_CHANNEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d\.\d\b").unwrap());
+/// Season-episode marker in a RAW release name: `S03E05`, `s1e12`. Used to
+/// extract the season ordinal BEFORE `clean_title` strips the marker entirely
+/// (leaving a bare franchise name that matches every season as a prefix).
+static RE_SEASON_EP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)[sS](\d{1,2})\s*[eE]\d{1,3}").unwrap());
+/// Season prefix before an episode marker: `S02E` → `E`. Applied in
+/// `parse_last_episode_number` so the season digits don't survive as a
+/// candidate episode number while the real episode after `E` is kept.
+static RE_SEASON_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)[sS]\d{1,2}\s*([eE])").unwrap());
+/// Bare season marker without a following episode: `S02` on a season pack.
+/// Stripped from the episode-parser remainder so "Show S02" doesn't parse as
+/// episode 2. Applied AFTER `RE_SEASON_PREFIX` so `S02E05` is safe.
+static RE_SEASON_BARE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)[sS]\d{1,2}\b").unwrap());
 
 /// Resolutions / common bitrates to discard when picking the episode number.
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
@@ -165,36 +180,123 @@ fn norm_match_tier(norm: &str, cand: &str) -> Option<u8> {
     }
 }
 
+/// Extract the season ordinal from a RAW release title or URL. `[G] Show -
+/// S03E05` → Some(3). Returns None when no `S\d{1,2}E\d` marker is present —
+/// we only trust the explicit season-episode pattern, not bare numbers, to
+/// avoid false confidence on non-seasonal releases and movies.
+fn parse_season_marker(raw: &str) -> Option<u32> {
+    RE_SEASON_EP
+        .captures(raw)
+        .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
+        .filter(|&n| (1..=50).contains(&n))
+}
+
+/// Extract the season ordinal from a NORMALIZED list-title norm. After
+/// `season_ordinals` collapse, "season 3" / "3rd season" is already a bare "3";
+/// we also check for roman-numeral sequels ("iii" → 3). Returns None when the
+/// title has no season marker.
+fn norm_season_ordinal(norm: &str) -> Option<u32> {
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    // Roman-numeral sequel markers (AniList romaji: "Mushoku Tensei III").
+    for w in &words {
+        if let Some(n) = roman_to_u32(w) {
+            return Some(n);
+        }
+    }
+    // Bare trailing number from the season_ordinals collapse: "...season 3" →
+    // "...3". Only the LAST token — a number mid-title ("No 6", "Mob Psycho
+    // 100") is part of the name, not a season ordinal.
+    words.last().and_then(|w| {
+        if w.len() <= 2 {
+            w.parse::<u32>().ok().filter(|&n| (1..=30).contains(&n))
+        } else {
+            None
+        }
+    })
+}
+
+/// Parse a lowercase roman numeral (ii–xxx) to its integer value. Requires at
+/// least 2 characters so the single letters "i", "v", "x" — common as
+/// standalone tokens in anime titles ("Hunter x Hunter", "K", "V") — don't
+/// false-positive into season ordinals they were never meant to be.
+fn roman_to_u32(s: &str) -> Option<u32> {
+    if s.len() < 2 {
+        return None;
+    }
+    let valid = ['i', 'v', 'x', 'l', 'c', 'd', 'm'];
+    if s.is_empty() || !s.bytes().all(|b| valid.contains(&(b as char))) {
+        return None;
+    }
+    let mut total = 0u32;
+    let mut prev = 0u32;
+    for c in s.chars().rev() {
+        let v = match c {
+            'i' => 1,
+            'v' => 5,
+            'x' => 10,
+            'l' => 50,
+            'c' => 100,
+            'd' => 500,
+            'm' => 1000,
+            _ => return None,
+        };
+        total = if v < prev { total - v } else { total + v };
+        prev = v;
+    }
+    (1..=30).contains(&total).then_some(total)
+}
+
 /// Match a now-playing string against the cached list. Tries the raw title first,
-/// then the file basename. Best (tier, norm length) wins, so an exact hit beats
-/// a prefix, a prefix beats an interior phrase, and a prefix pair ("Toradora"
-/// vs "Toradora SOS") resolves to the more specific show.
+/// then the file basename. Scores ALL candidates globally (not first-candidate-
+/// wins) so a weak interior-phrase hit on the player title doesn't hide a
+/// stronger prefix or exact match on the filename.
+///
+/// Tiebreak order: higher match tier wins first (exact > prefix > interior
+/// phrase). Among equal tiers, a season-ordinal match wins — the release says
+/// `S03E05` and the entry's norm encodes "3" / "III", so the correct season
+/// beats every franchise sibling regardless of status or title length. Then
+/// prefer what the user is watching (CURRENT/REPEATING before COMPLETED), then
+/// the longer norm (more specific title), then the lower media_id.
 pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -> Option<&'a Matcher> {
     let candidates = [clean_title(title), clean_title(&basename(url))];
+    // Season ordinal from the RAW inputs (before clean_title strips the marker).
+    let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
+    let mut best: Option<((bool, u8, std::cmp::Reverse<u8>, usize, std::cmp::Reverse<i64>), &Matcher)> =
+        None;
     for cand in candidates {
         if cand.is_empty() {
             continue;
         }
-        let best = matchers
-            .iter()
-            .filter_map(|m| {
-                m.norms
-                    .iter()
-                    .filter_map(|n| norm_match_tier(n, &cand).map(|t| (t, n.len())))
-                    .max()
-                    .map(|score| (score, m))
-            })
-            // On an exact tie prefer the better status, then the lower media_id.
-            // `max_by_key` keeps the LAST maximum, so the ranks are negated to
-            // turn "smaller is better" into "larger wins".
-            .max_by_key(|((tier, len), m)| {
-                (*tier, *len, std::cmp::Reverse(m.status_rank), std::cmp::Reverse(m.media_id))
-            });
-        if let Some((_, m)) = best {
-            return Some(m);
+        for m in matchers {
+            if let Some((tier, nlen)) = m
+                .norms
+                .iter()
+                .filter_map(|n| norm_match_tier(n, &cand).map(|t| (t, n.len())))
+                .max()
+            {
+                // Season match: the release says `S03E05` and at least one of
+                // this entry's norms encodes the same ordinal ("3" from a
+                // collapsed "season 3", or "iii" from the romaji title). This
+                // is the strongest franchise disambiguator — it picks the right
+                // season even when every sibling shares a prefix at the same
+                // tier and status.
+                let season_match = cand_season.map_or(false, |cs| {
+                    m.norms.iter().any(|n| norm_season_ordinal(n) == Some(cs))
+                });
+                let key = (
+                    season_match,
+                    tier,
+                    std::cmp::Reverse(m.status_rank),
+                    nlen,
+                    std::cmp::Reverse(m.media_id),
+                );
+                if best.as_ref().map_or(true, |(bk, _)| key > *bk) {
+                    best = Some((key, m));
+                }
+            }
         }
     }
-    None
+    best.map(|(_, m)| m)
 }
 
 // ─────────────────────────── parsing helpers ───────────────────────────
@@ -222,7 +324,10 @@ pub(crate) fn clean_title(s: &str) -> String {
 pub(crate) fn norm_title(s: &str) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
-    let s = RE_RES.replace_all(&s, " ");
+    let res_stripped = RE_RES.replace_all(&s, " ");
+    // Don't let codec-name stripping empty a real title (the film "Opus"
+    // would lose its only word to the `opus` codec alias).
+    let s = if normalize(&res_stripped).is_empty() { s } else { res_stripped };
     season_ordinals(&normalize(&s))
 }
 
@@ -390,6 +495,11 @@ fn parse_last_episode_number(s: &str) -> Option<i64> {
     let s = RE_BRACKETS.replace_all(s, " ");
     let s = RE_CHANNEL.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
+    // Strip season markers so a season pack "Show S02" doesn't parse its
+    // season number as episode 2. Two-step: first peel the season prefix off
+    // S02E05 (keeping E05), then strip any remaining bare S02.
+    let s = RE_SEASON_PREFIX.replace_all(&s, "$1");
+    let s = RE_SEASON_BARE.replace_all(&s, " ");
     RE_EP_NUM
         .find_iter(&s)
         .filter_map(|m| m.as_str().split('v').next()?.parse::<i64>().ok())
@@ -714,6 +824,149 @@ mod tests {
         let pair = vec![mk(1, "Toradora"), mk(2, "Toradora SOS")];
         assert_eq!(
             match_title(&pair, "[G] Toradora SOS - 02", "").map(|m| m.media_id),
+            Some(2)
+        );
+    }
+
+    /// A generic candidate (the season marker "S03E05" strips away, leaving just
+    /// the franchise name) matches EVERY entry of a multi-season franchise as a
+    /// prefix. The matcher must resolve to the season the user is CURRENTLY
+    /// watching — not the entry whose title string is longest. Regression for a
+    /// bug where Mushoku S3 updates were silently routed to a 1-episode COMPLETED
+    /// special ("...Eris the Goblin Slayer") purely because its title was longer,
+    /// so the detected episode got clamped to 1 and progress never moved.
+    #[test]
+    fn generic_match_prefers_current_over_longest_title() {
+        // All six real Mushoku entries; only Season 3 (178789) is CURRENT.
+        let titles: &[(i64, &str, &str)] = &[
+            (108465, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation"),
+            (127720, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Cour 2"),
+            (141534, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer"),
+            (146065, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 2"),
+            (166873, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 2 Part 2"),
+            (178789, "CURRENT", "Mushoku Tensei: Jobless Reincarnation Season 3"),
+        ];
+        let rom_by_id: std::collections::HashMap<i64, &str> = [
+            (108465, "Mushoku Tensei: Isekai Ittara Honki Dasu"),
+            (127720, "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2"),
+            (141534, "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2 - Eris no Goblin Toubatsu"),
+            (146065, "Mushoku Tensei II: Isekai Ittara Honki Dasu"),
+            (166873, "Mushoku Tensei II: Isekai Ittara Honki Dasu Part 2"),
+            (178789, "Mushoku Tensei III: Isekai Ittara Honki Dasu"),
+        ]
+        .into_iter()
+        .collect();
+        let matchers: Vec<Matcher> = titles
+            .iter()
+            .map(|(id, status, en)| Matcher {
+                media_id: *id,
+                display: (*en).into(),
+                variants: vec![(*en).into(), rom_by_id[id].into()],
+                norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                status_rank: status_rank(status),
+            })
+            .collect();
+        for raw in [
+            "[Judas] Mushoku Tensei - S03E04.mkv",
+            "[Judas] Mushoku Tensei - S03E05.mkv",
+        ] {
+            let url = format!("file:///home/cate/Videos/Torrents/{raw}");
+            let m = match_title(&matchers, raw, &url).expect("should match a franchise entry");
+            assert_eq!(m.media_id, 178789, "S03 release must resolve to Season 3 (CURRENT)");
+            let ep = resolve_episode(m, &[raw, basename(&url).as_str()]);
+            assert_eq!(ep, raw.contains("E04").then_some(4).or(Some(5)));
+        }
+    }
+
+    /// The season-ordinal fix: when ALL entries share the same status, the
+    /// season marker in the release (`S03E05`) must still disambiguate to the
+    /// correct season. This is the case the old status-based tiebreak couldn't
+    /// handle (status_rank ties, then longest-title wins, which picks the
+    /// special).
+    #[test]
+    fn season_ordinal_beats_same_status_siblings() {
+        // Every entry is COMPLETED. Without the season ordinal, the longest-
+        // title entry (141534, the special) would win.
+        let titles: &[(i64, &str, &str)] = &[
+            (108465, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation"),
+            (141534, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer"),
+            (146065, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 2"),
+            (178789, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 3"),
+        ];
+        let rom_by_id: std::collections::HashMap<i64, &str> = [
+            (108465, "Mushoku Tensei: Isekai Ittara Honki Dasu"),
+            (141534, "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2 - Eris no Goblin Toubatsu"),
+            (146065, "Mushoku Tensei II: Isekai Ittara Honki Dasu"),
+            (178789, "Mushoku Tensei III: Isekai Ittara Honki Dasu"),
+        ]
+        .into_iter()
+        .collect();
+        let matchers: Vec<Matcher> = titles
+            .iter()
+            .map(|(id, status, en)| Matcher {
+                media_id: *id,
+                display: (*en).into(),
+                variants: vec![(*en).into(), rom_by_id[id].into()],
+                norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                status_rank: status_rank(status),
+            })
+            .collect();
+        let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")
+            .expect("should match");
+        assert_eq!(m.media_id, 178789, "S03 must resolve to Season 3 even when all are COMPLETED");
+    }
+
+    /// The season ordinal wins over status: even if the user is CURRENTLY
+    /// watching Season 2 (not S3), an S03E05 release resolves to Season 3
+    /// because the season marker is the strongest signal.
+    #[test]
+    fn season_ordinal_beats_status_rank() {
+        let matchers = vec![
+            Matcher {
+                media_id: 146065,
+                display: "Mushoku Tensei: Jobless Reincarnation Season 2".into(),
+                variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 2".into()],
+                norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 2")],
+                status_rank: status_rank("CURRENT"),
+            },
+            Matcher {
+                media_id: 178789,
+                display: "Mushoku Tensei: Jobless Reincarnation Season 3".into(),
+                variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 3".into()],
+                norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 3")],
+                status_rank: status_rank("PAUSED"),
+            },
+        ];
+        let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")
+            .expect("should match");
+        assert_eq!(m.media_id, 178789, "S03 release must resolve to Season 3 (PAUSED) not S2 (CURRENT)");
+    }
+
+    /// A season pack (no episode number) must not have its season number parsed
+    /// as the episode. "Show S02" → Some(None) from parse_episode_after (batch),
+    /// not episode 2.
+    #[test]
+    fn season_pack_does_not_parse_season_as_episode() {
+        let variants = vec!["Some Show".to_string()];
+        // "Some Show S02" — the season marker should be stripped, leaving no
+        // episode number.
+        assert_eq!(parse_episode_after("Some Show S02 [1080p]", &variants), Some(None));
+        // "Some Show S02E05" — the episode number is still read correctly.
+        assert_eq!(parse_episode_after("Some Show S02E05 [1080p]", &variants), Some(Some(5)));
+    }
+
+    /// A non-seasonal release (no S\d{1,2}E marker) must not get a season
+    /// boost. The status tiebreak still applies as before.
+    #[test]
+    fn no_season_marker_falls_back_to_status() {
+        let matchers = vec![
+            mk_status(1, "Some Show", "COMPLETED"),
+            mk_status(2, "Some Show", "CURRENT"),
+        ];
+        // No S\d{1,2}E\d in the release → season_match is false for both →
+        // status_rank decides → CURRENT wins.
+        assert_eq!(
+            match_title(&matchers, "Some Show - 03", "").map(|m| m.media_id),
             Some(2)
         );
     }

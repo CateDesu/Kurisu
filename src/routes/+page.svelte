@@ -37,6 +37,7 @@
   let loading = $state(false);
   let syncing = $state(false);
   let error = $state("");
+  let stepError = $state("");
   let filter = $state<string>("CURRENT");
   let editing = $state<ListEntry | null>(null);
 
@@ -260,6 +261,15 @@
       </div>
     {/if}
 
+    {#if stepError}
+      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4 flex items-center justify-between gap-2">
+        <span>Episode update failed: {stepError}</span>
+        <button onclick={() => (stepError = "")} class="text-ink-dim hover:text-ink shrink-0">
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/if}
+
     <div class="flex gap-1 mb-5 border-b border-edge">
       {#each statuses as s}
         {@const count = entries.filter((e) => e.status === s).length}
@@ -330,7 +340,8 @@
                 mediaId={e.media_id}
                 progress={e.progress}
                 total={e.media?.episodes ?? null}
-                onchange={applyEntry}
+                onchange={(entry) => { stepError = ""; applyEntry(entry); }}
+                onerror={(msg) => { stepError = msg; }}
               />
             </div>
           </div>

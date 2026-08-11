@@ -27,12 +27,14 @@ export const api = {
   setTrackingConfig: (
     mode: string,
     promptSeconds: number,
-    autoPercent: number
+    autoPercent: number,
+    autoAsk: boolean
   ) =>
     invoke<TrackingConfig>("set_tracking_config", {
       mode,
       promptSeconds,
       autoPercent,
+      autoAsk,
     }),
 
   getAppSetting: (key: string) =>

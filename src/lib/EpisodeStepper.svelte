@@ -99,10 +99,12 @@
         pending = p;
         saved = p;
       } else if (p !== saved) {
+        // Only adopt a higher external value when the user was ALSO incrementing.
+        // A decrement (pending < saved) must not be silently reversed by a
+        // concurrent increment from elsewhere — CAS will arbitrate at commit.
+        const wasIncrementing = pending > saved;
         saved = p;
-        // External update jumped past the buffered edit — adopt it. Otherwise the
-        // 3s timer would commit the older, lower pending value and rewind progress.
-        if (p > pending) pending = p;
+        if (wasIncrementing && p > pending) pending = p;
       }
     });
   });
@@ -112,7 +114,19 @@
     "disabled:opacity-30 disabled:hover:bg-edge/50 disabled:hover:text-ink-dim text-sm leading-none transition-colors";
 </script>
 
-<div class="flex items-center gap-1 select-none">
+<!-- stopPropagation so clicking the status indicator (or anywhere in the
+stepper's bounding box) doesn't activate a parent row's click handler. -->
+<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+<div class="flex items-center gap-1 select-none" role="presentation" onclick={(e) => e.stopPropagation()}>
+  <span class="w-3 shrink-0 text-[10px] text-center leading-none">
+    {#if saving}
+      <span class="text-ink-dim">…</span>
+    {:else if failed}
+      <span class="text-red-400" title="Not saved: {failed}">!</span>
+    {:else if dirty}
+      <span class="text-accent" title="Saves automatically in 3s">●</span>
+    {/if}
+  </span>
   <button
     type="button"
     onclick={(e) => { e.stopPropagation(); step(-1); }}
@@ -134,11 +148,4 @@
     aria-label="One more episode"
     class={btnCls}>+</button
   >
-  {#if dirty}
-    <span class="text-[10px] text-accent ml-0.5" title="Saves automatically in 3s">●</span>
-  {:else if saving}
-    <span class="text-[10px] text-ink-dim ml-0.5">…</span>
-  {:else if failed}
-    <span class="text-[10px] text-red-400 ml-0.5" title="Not saved: {failed}">!</span>
-  {/if}
 </div>

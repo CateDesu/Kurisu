@@ -1,11 +1,13 @@
 <script lang="ts">
   import { listen, emit } from "@tauri-apps/api/event";
+  import { goto } from "$app/navigation";
   import { api } from "$lib/api";
+  import { nowPlaying } from "$lib/nowplaying.svelte";
   import Icon from "$lib/Icon.svelte";
-  import type { NowPlaying, TrackingPrompt } from "$lib/types";
+  import type { TrackingPrompt } from "$lib/types";
 
-  // `null` = nothing playing / banner hidden.
-  let nowPlaying = $state<NowPlaying | null>(null);
+  // The banner reads the shared now-playing store (bound once by the root layout)
+  // instead of attaching its own listener.
   let prompt = $state<TrackingPrompt | null>(null);
   // Prompts that arrived while an earlier one was still open. Close-to-tray
   // keeps the webview alive but invisible, so a night of playback used to
@@ -14,36 +16,48 @@
   let busy = $state(false);
   let err = $state("");
 
+  const np = $derived(nowPlaying());
   const pct = $derived(
-    nowPlaying && nowPlaying.length_us > 0
-      ? Math.min(100, Math.round((nowPlaying.position_us / nowPlaying.length_us) * 100))
+    np && np.length_us > 0
+      ? Math.min(100, Math.round((np.position_us / np.length_us) * 100))
       : 0
   );
 
   let promptDialog = $state<HTMLDivElement | null>(null);
 
+  function presentPrompt(p: TrackingPrompt) {
+    if (prompt) {
+      // Never drop a prompt on the floor; de-dupe so a repeat for the same
+      // episode doesn't stack up.
+      const dup =
+        (prompt.media_id === p.media_id && prompt.episode === p.episode) ||
+        queued.some((q) => q.media_id === p.media_id && q.episode === p.episode);
+      if (!dup) queued = [...queued, p];
+      return;
+    }
+    prompt = p;
+    err = "";
+  }
+
   $effect(() => {
     let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
-    listen<NowPlaying>("kurisu://now-playing", (e) => {
-      // `active: false` means playback stopped → hide the banner.
-      nowPlaying = e.payload?.active ? e.payload : null;
-    }).then((u) => (alive ? (un1 = u) : u()));
+    // 120s prompt-mode modal (no navigation): existing behavior.
     listen<TrackingPrompt>("kurisu://tracking-prompt", (e) => {
+      if (!alive) return;
       const p = e.payload;
       if (!p) return;
-      if (prompt) {
-        // Never drop a prompt on the floor; de-dupe so a repeat for the same
-        // episode doesn't stack up.
-        const dup =
-          (prompt.media_id === p.media_id && prompt.episode === p.episode) ||
-          queued.some((q) => q.media_id === p.media_id && q.episode === p.episode);
-        if (!dup) queued = [...queued, p];
-        return;
-      }
-      prompt = p;
-      err = "";
+      presentPrompt(p);
+    }).then((u) => (alive ? (un1 = u) : u()));
+    // 15s auto-ask: switch to the Currently Watching tab THEN prompt, so the
+    // detected show is front-and-center when the question appears.
+    listen<TrackingPrompt>("kurisu://tracking-ask", (e) => {
+      if (!alive) return;
+      const p = e.payload;
+      if (!p) return;
+      goto("/now");
+      presentPrompt(p);
     }).then((u) => (alive ? (un2 = u) : u()));
     return () => {
       alive = false;
@@ -95,8 +109,10 @@
       // only close the one we actually confirmed.
       if (prompt === p) dismiss();
     } catch (e) {
-      // Keep the prompt open and say why — closing on failure reads as success.
-      err = String(e);
+      // Only show the error on the prompt that was actually confirmed — a
+      // Skip may have already swapped in a different prompt while the write
+      // was in flight, and its UI must not inherit this error.
+      if (prompt === p) err = String(e);
     } finally {
       busy = false;
     }
@@ -120,20 +136,20 @@
 
 <svelte:window onkeydown={onWindowKeydown} />
 
-{#if nowPlaying}
+{#if np}
   <div class="flex items-center gap-3 px-4 py-1.5 border-b border-edge bg-panel text-xs shrink-0">
     <span class="text-accent leading-none grid place-items-center"><Icon name="play" size={12} /></span>
     <span class="truncate max-w-[40%]">
-      {#if nowPlaying.matched}
-        <span class="font-medium">{nowPlaying.matched}</span>
-        {#if nowPlaying.episode != null}
-          <span class="text-ink-dim"> · Ep {nowPlaying.episode}</span>
+      {#if np.matched}
+        <span class="font-medium">{np.matched}</span>
+        {#if np.episode != null}
+          <span class="text-ink-dim"> · Ep {np.episode}</span>
         {/if}
       {:else}
-        <span class="text-ink-dim italic">Detected: {nowPlaying.title || "unknown track"}</span>
+        <span class="text-ink-dim italic">Detected: {np.title || "unknown track"}</span>
       {/if}
     </span>
-    {#if nowPlaying.length_us > 0}
+    {#if np.length_us > 0}
       <div class="flex-1 h-1 bg-edge rounded overflow-hidden min-w-[40px]">
         <!-- scaleX keeps this animation on the compositor; a width transition
              forces layout every frame -->
@@ -143,7 +159,7 @@
     {:else}
       <div class="flex-1"></div>
     {/if}
-    <span class="text-ink-dim shrink-0">{nowPlaying.player}</span>
+    <span class="text-ink-dim shrink-0">{np.player}</span>
   </div>
 {/if}
 
@@ -178,7 +194,8 @@
         {/if}
         <button
           onclick={skip}
-          class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+          disabled={busy}
+          class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
         >
           Skip
         </button>

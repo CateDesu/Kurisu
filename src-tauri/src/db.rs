@@ -307,21 +307,31 @@ impl Db {
         // .optional(): Ok(None) must mean ONLY "no such row" — a real read
         // error propagates, because the write paths read None as "not on the
         // list" and would build a fresh entry that overwrites the remote one.
+        //
+        // LEFT JOINs media so callers (the Currently Watching tab, the tracking
+        // prompt) get the cover/episodes/title in one read. The CAS write paths
+        // only read `.progress`, so the join is free for them. Column layout
+        // matches `entries_with_media` (detail-only fields NULL).
         let row = c
             .query_row(
-                "SELECT media_id,entry_id,status,progress,score,repeat,updated_at
-                 FROM list_entry WHERE media_id = ?",
+                "SELECT e.media_id,e.entry_id,e.status,e.progress,e.score,e.repeat,e.updated_at,
+                        m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
+                        m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,
+                        m.season_year,NULL,m.next_airing_episode,m.next_airing_at,
+                        NULL,NULL,NULL,NULL,NULL
+                 FROM list_entry e LEFT JOIN media m ON m.id = e.media_id
+                 WHERE e.media_id = ?",
                 [media_id],
                 |r| {
                     Ok(ListEntry {
-                        id: r.get(1)?,
+                        id: r.get::<_, Option<i64>>(1)?,
                         media_id: r.get(0)?,
                         status: r.get(2)?,
                         progress: r.get(3)?,
                         score: r.get(4)?,
                         repeat: r.get(5)?,
                         updated_at: r.get(6)?,
-                        media: None,
+                        media: row_to_media_offset(r, 7).ok(),
                     })
                 },
             )
@@ -374,6 +384,22 @@ impl Db {
                 |r| r.get::<_, String>(0),
             )
             .optional()?)
+    }
+    /// Read multiple keys in ONE lock acquisition so a concurrent `set_settings`
+    /// can't interleave (a torn read where some keys are pre-write and some
+    /// post-write).
+    pub fn get_settings_batch(&self, keys: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+        let c = self.0.lock();
+        let mut out = std::collections::HashMap::new();
+        for k in keys {
+            if let Ok(Some(v)) = c
+                .query_row("SELECT value FROM settings WHERE key = ?", [*k], |r| r.get::<_, String>(0))
+                .optional()
+            {
+                out.insert((*k).to_string(), v);
+            }
+        }
+        Ok(out)
     }
     /// Plain row delete (no VACUUM): the fallback when `scrub_setting`'s VACUUM
     /// fails, and enough for non-secret rows like the cached username.

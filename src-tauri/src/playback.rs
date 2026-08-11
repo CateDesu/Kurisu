@@ -31,6 +31,10 @@ use crate::recognize::{match_title, resolve_episode};
 /// Poll interval. 5s is responsive enough for a 2-minute prompt threshold while
 /// keeping D-Bus chatter negligible.
 const TICK: Duration = Duration::from_secs(5);
+/// How long a matched track must actually PLAY before the auto-ask fires and
+/// switches the UI to the Currently Watching tab. Short enough to feel instant,
+/// long enough that skipping a file / a momentary MPRIS blip doesn't trip it.
+const AUTO_ASK_DELAY: Duration = Duration::from_secs(15);
 /// Bus-name / identity substrings of MPRIS players we never treat as anime
 /// players: web browsers (YouTube & co. in Firefox/Librewolf shouldn't drive the
 /// banner or tracking). Covers the Firefox and Chromium families. Matched against
@@ -99,6 +103,10 @@ struct ActiveTrack {
     was_playing: bool,
     prompted: bool,
     incremented: bool,
+    /// "Jump to Currently Watching + ask" has fired for this track. Separate
+    /// from `prompted` (the 120s prompt-mode modal) so the two never collide,
+    /// and from `incremented` (the auto-mode push).
+    asked: bool,
     /// Consecutive failed auto-pushes for this track, and the earliest instant
     /// the next attempt may run. Without these a failing push retries on every
     /// 5s tick for as long as the file plays.
@@ -115,6 +123,7 @@ impl ActiveTrack {
             was_playing: false,
             prompted: false,
             incremented: false,
+            asked: false,
             fail_count: 0,
             retry_at: None,
         }
@@ -309,6 +318,32 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         .unwrap_or(0);
 
     let cfg = read_config(app);
+
+    // Auto-ask: independent of `mode`. After a few seconds of ACTUAL playback of a
+    // matched episode that's ahead of progress, switch the UI to the Currently
+    // Watching tab and prompt. Uses the same accumulated-play gate as the other
+    // arms (resume-at-position alone must not trigger it). Marks `prompted` too,
+    // so a later prompt-mode cycle doesn't double-prompt for the same track.
+    if cfg.auto_ask
+        && info.playing
+        && episode > progress
+        && !track.asked
+        && track.accumulated >= AUTO_ASK_DELAY
+    {
+        track.asked = true;
+        track.prompted = true;
+        let _ = app.emit(
+            "kurisu://tracking-ask",
+            TrackingPrompt {
+                media_id,
+                episode,
+                title: info.matched_title.clone().unwrap_or_else(|| info.title.clone()),
+                raw_title: info.title.clone(),
+                progress,
+            },
+        );
+    }
+
     match cfg.mode.as_str() {
         "prompt" if info.playing => {
             if !track.prompted && track.accumulated >= Duration::from_secs(cfg.prompt_seconds) {

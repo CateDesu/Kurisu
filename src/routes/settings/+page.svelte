@@ -5,7 +5,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
 
-  let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80 });
+  let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80, auto_ask: true });
   let trackingLoaded = $state(false);
   let trackingSaving = $state(false);
   let trackingSavedAt = $state(0);
@@ -71,16 +71,18 @@
       mode: cfg.mode,
       prompt_seconds: int(cfg.prompt_seconds, 120, 10, 86_400),
       auto_percent: int(cfg.auto_percent, 80, 1, 100),
+      auto_ask: cfg.auto_ask,
     };
     // Reflect the normalized values so the field shows what was actually saved.
     cfg.prompt_seconds = snap.prompt_seconds;
     cfg.auto_percent = snap.auto_percent;
     try {
-      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent);
+      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent, snap.auto_ask);
       if (
         cfg.mode === snap.mode &&
         cfg.prompt_seconds === snap.prompt_seconds &&
-        cfg.auto_percent === snap.auto_percent
+        cfg.auto_percent === snap.auto_percent &&
+        cfg.auto_ask === snap.auto_ask
       ) {
         cfg = saved;
       }
@@ -205,6 +207,21 @@
         % watched
       </div>
     {/if}
+    <label class="flex items-start gap-2 text-sm cursor-pointer mb-4">
+      <input
+        type="checkbox"
+        bind:checked={cfg.auto_ask}
+        onchange={() => (trackingSavedAt = 0)}
+        class="accent-accent mt-0.5"
+      />
+      <span>
+        Jump to the <b>Currently Watching</b> tab and ask to update after ~15s of playback
+        <span class="block text-xs text-ink-dim mt-0.5">
+          On by default. When a show on your list is detected, Kurisu switches to the
+          detection tab and prompts you — harder to miss than the banner alone.
+        </span>
+      </span>
+    </label>
     <div>
       <button
         disabled={!trackingLoaded || trackingSaving}

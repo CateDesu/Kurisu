@@ -15,6 +15,17 @@
   let error = $state("");
   /// Path of the unmatched file being manually linked (LinkAnime modal).
   let linking = $state<string | null>(null);
+  /// Expanded show groups (by media id). Empty = all collapsed, so a show with
+  /// hundreds of episodes (Dragon Ball) doesn't bury the next series under a wall
+  /// of file rows. The next-episode Play button stays in the header either way.
+  let expanded = $state<Set<number>>(new Set());
+
+  function toggle(mediaId: number) {
+    const next = new Set(expanded);
+    if (next.has(mediaId)) next.delete(mediaId);
+    else next.add(mediaId);
+    expanded = next;
+  }
 
   interface Group {
     mediaId: number;
@@ -222,12 +233,36 @@
         {#each groups.matched as g (g.mediaId)}
           {@const next = nextFile(g)}
           {@const cov = cover(g)}
+          {@const isOpen = expanded.has(g.mediaId)}
           <section class="cv-card bg-panel border border-edge rounded-lg overflow-hidden">
-            <div class="flex items-center gap-3 p-2.5 border-b border-edge">
+            <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+            <div
+              class="flex items-center gap-3 p-2.5 border-b border-edge cursor-pointer select-none hover:bg-panel-2/40 transition-colors"
+              role="button"
+              tabindex="0"
+              aria-expanded={isOpen}
+              onclick={() => toggle(g.mediaId)}
+              onkeydown={(ev) => {
+                if (ev.currentTarget !== ev.target) return;
+                if (ev.key === "Enter" || ev.key === " ") {
+                  ev.preventDefault();
+                  toggle(g.mediaId);
+                }
+              }}
+            >
+              <span
+                class="w-4 shrink-0 text-ink-dim grid place-items-center transition-transform duration-150 {isOpen ? 'rotate-90' : ''}"
+                aria-hidden="true"
+              >
+                <Icon name="chevron" size={14} />
+              </span>
               {#if cov}
                 <button
                   type="button"
-                  onclick={() => goto(`/anime/${g.mediaId}`)}
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    goto(`/anime/${g.mediaId}`);
+                  }}
                   title="Open details"
                   class="shrink-0"
                 >
@@ -239,7 +274,10 @@
               <div class="flex-1 min-w-0">
                 <button
                   type="button"
-                  onclick={() => goto(`/anime/${g.mediaId}`)}
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    goto(`/anime/${g.mediaId}`);
+                  }}
                   title="Open details"
                   class="block max-w-full truncate font-medium text-left hover:text-accent transition-colors"
                 >
@@ -256,7 +294,10 @@
               </div>
               {#if hasBound(g)}
                 <button
-                  onclick={() => unlink(g)}
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    unlink(g);
+                  }}
                   title="Manually linked — click to remove the link"
                   class="text-ink-dim hover:text-red-400 px-1 grid place-items-center shrink-0"
                 >
@@ -265,7 +306,10 @@
               {/if}
               {#if next}
                 <button
-                  onclick={() => play(next.path)}
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    play(next.path);
+                  }}
                   title={basename(next.path)}
                   class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm shrink-0 flex items-center gap-1.5"
                 >
@@ -273,35 +317,47 @@
                 </button>
               {/if}
             </div>
-            <div class="divide-y divide-edge/60">
-              {#each g.files as f (f.path)}
-                <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
-                  <span class="w-14 shrink-0 text-ink-dim">
-                    {f.episode != null ? `Ep ${f.episode}` : "—"}
-                  </span>
-                  <span class="flex-1 min-w-0 truncate {isWatched(g, f) ? 'text-ink-dim' : ''}">
-                    {basename(f.path)}
-                  </span>
-                  {#if isWatched(g, f)}
-                    <span class="text-accent shrink-0 grid place-items-center" title="Watched (per your list progress)"><Icon name="check" size={14} /></span>
-                  {/if}
-                  <button
+            {#if isOpen}
+              <div class="divide-y divide-edge/60">
+                {#each g.files as f (f.path)}
+                  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+                  <div
+                    class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-panel-2/40 transition-colors"
+                    role="button"
+                    tabindex="0"
+                    title={`Play ${basename(f.path)}`}
                     onclick={() => play(f.path)}
-                    title="Play"
-                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
+                    onkeydown={(ev) => {
+                      if (ev.key === "Enter" || ev.key === " ") {
+                        ev.preventDefault();
+                        play(f.path);
+                      }
+                    }}
                   >
-                    <Icon name="play" size={13} />
-                  </button>
-                  <button
-                    onclick={() => reveal(f.path)}
-                    title="Show in file manager"
-                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
-                  >
-                    <Icon name="folder-open" size={14} />
-                  </button>
-                </div>
-              {/each}
-            </div>
+                    <span class="w-14 shrink-0 text-ink-dim">
+                      {f.episode != null ? `Ep ${f.episode}` : "—"}
+                    </span>
+                    <span class="flex-1 min-w-0 truncate {isWatched(g, f) ? 'text-ink-dim' : ''}">
+                      {basename(f.path)}
+                    </span>
+                    {#if isWatched(g, f)}
+                      <span class="text-accent shrink-0 grid place-items-center" title="Watched (per your list progress)"><Icon name="check" size={14} /></span>
+                    {/if}
+                    <span class="text-ink-dim shrink-0 grid place-items-center" title="Play"><Icon name="play" size={13} /></span>
+                    <button
+                      onclick={(ev) => {
+                        ev.stopPropagation();
+                        reveal(f.path);
+                      }}
+                      title="Show in file manager"
+                      class="text-ink-dim hover:text-ink px-1 grid place-items-center"
+                    >
+                      <Icon name="folder-open" size={14} />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </section>
         {/each}
 

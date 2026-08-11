@@ -62,49 +62,62 @@ impl AppState {
     }
 }
 
-/// Playback tracking configuration. All three are stored in the settings table and
-/// surfaced in the Settings tab. Mode defaults to `off` (opt-in) since tracking
-/// edits the user's live AniList list.
+/// Playback tracking configuration. Stored in the settings table and surfaced in
+/// the Settings tab. Mode defaults to `off` (opt-in) since tracking edits the
+/// user's live AniList list. `auto_ask` is independent of mode: when on, the
+/// watcher switches to the Currently Watching tab and asks to update after a few
+/// seconds of detected playback — the primary, hard-to-miss detection surface.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackingConfig {
     pub mode: String,            // "off" | "prompt" | "auto"
     pub prompt_seconds: u64,     // prompt mode: how long playback must run before asking
     pub auto_percent: u64,       // auto mode: watched percentage that triggers a +1
+    pub auto_ask: bool,          // jump to Currently Watching + ask after a short delay
 }
 
 impl Default for TrackingConfig {
     fn default() -> Self {
-        Self { mode: "off".into(), prompt_seconds: 120, auto_percent: 80 }
+        Self { mode: "off".into(), prompt_seconds: 120, auto_percent: 80, auto_ask: true }
     }
 }
 
 const TRACKING_MODE_KEY: &str = "tracking_mode";
 const TRACKING_PROMPT_KEY: &str = "tracking_prompt_seconds";
 const TRACKING_AUTO_KEY: &str = "tracking_auto_percent";
+const TRACKING_AUTO_ASK_KEY: &str = "tracking_auto_ask";
 
 impl TrackingConfig {
     pub fn load(db: &Db) -> Self {
-        let mode = db
-            .get_setting(TRACKING_MODE_KEY)
-            .ok()
-            .flatten()
+        // Batch read so a concurrent set_settings can't interleave (new mode
+        // paired with an old threshold, etc).
+        let kv = db.get_settings_batch(&[
+            TRACKING_MODE_KEY,
+            TRACKING_PROMPT_KEY,
+            TRACKING_AUTO_KEY,
+            TRACKING_AUTO_ASK_KEY,
+        ]).unwrap_or_default();
+        let mode = kv
+            .get(TRACKING_MODE_KEY)
             .filter(|s| !s.is_empty())
+            .cloned()
             .unwrap_or_else(|| "off".to_string());
-        let prompt_seconds = db
-            .get_setting(TRACKING_PROMPT_KEY)
-            .ok()
-            .flatten()
+        let prompt_seconds = kv
+            .get(TRACKING_PROMPT_KEY)
             .and_then(|s| s.parse().ok())
             .filter(|&s: &u64| s > 0)
             .unwrap_or(120);
-        let auto_percent = db
-            .get_setting(TRACKING_AUTO_KEY)
-            .ok()
-            .flatten()
+        let auto_percent = kv
+            .get(TRACKING_AUTO_KEY)
             .and_then(|s| s.parse().ok())
             .filter(|&p: &u64| (1..=100).contains(&p))
             .unwrap_or(80);
-        Self { mode, prompt_seconds, auto_percent }
+        // auto_ask defaults ON (the whole point of the feature). Only an explicit
+        // "0" turns it off, so existing installs pick it up without a migration.
+        let auto_ask = kv
+            .get(TRACKING_AUTO_ASK_KEY)
+            .map(|s| s != "0")
+            .unwrap_or(true);
+        Self { mode, prompt_seconds, auto_percent, auto_ask }
     }
 
     pub fn save(&self, db: &Db) -> Result<(), String> {
@@ -114,6 +127,7 @@ impl TrackingConfig {
             (TRACKING_MODE_KEY, &self.mode),
             (TRACKING_PROMPT_KEY, &self.prompt_seconds.to_string()),
             (TRACKING_AUTO_KEY, &self.auto_percent.to_string()),
+            (TRACKING_AUTO_ASK_KEY, if self.auto_ask { "1" } else { "0" }),
         ])
         .map_err(|e| e.to_string())
     }
@@ -183,6 +197,7 @@ pub fn set_tracking_config(
     mode: String,
     prompt_seconds: u64,
     auto_percent: u64,
+    auto_ask: bool,
     state: State<'_, AppState>,
 ) -> Result<TrackingConfig, String> {
     let normalized_mode = match mode.as_str() {
@@ -193,6 +208,7 @@ pub fn set_tracking_config(
         mode: normalized_mode,
         prompt_seconds: prompt_seconds.clamp(1, 3_600),
         auto_percent: auto_percent.clamp(1, 100),
+        auto_ask,
     };
     cfg.save(&state.db)?;
     Ok(cfg)
@@ -289,7 +305,11 @@ pub async fn login_oauth(app: tauri::AppHandle, state: State<'_, AppState>) -> R
 }
 
 #[tauri::command]
-pub fn logout(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    // Serialize with any in-flight list write: if a save / increment / sync
+    // holds the lock, logout waits for it to finish before clearing the table,
+    // so the write can't resurrect rows after clear_entries.
+    let _write = state.entry_lock.lock().await;
     state.anilist.lock().set_token(None);
     *state.user.lock() = None;
     // Scrub, don't overwrite: an emptied row can survive on a freed SQLite page.
@@ -725,6 +745,13 @@ pub async fn set_progress_inner(
             let mut entry = entry;
             entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
             return Ok(entry);
+        }
+    } else {
+        // Without a CAS baseline we still must not CREATE an entry: a missing
+        // row means the user deleted it, and writing now would resurrect it on
+        // AniList — the same guard the watcher and increment paths enforce.
+        if state.db.get_entry(media_id).map_err(|e| e.to_string())?.is_none() {
+            return Err("the entry is no longer on your list".to_string());
         }
     }
     let w = compute_set_progress(state, media_id, progress)?;

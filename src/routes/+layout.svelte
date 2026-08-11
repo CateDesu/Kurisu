@@ -6,6 +6,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { runClock } from "$lib/now.svelte";
+  import { bindNowPlaying } from "$lib/nowplaying.svelte";
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
   import Updater from "$lib/Updater.svelte";
@@ -16,9 +17,17 @@
   // Ticks the shared clock so relative labels (timeAgo, airingLabel) refresh.
   $effect(() => runClock());
 
+  // One now-playing listener for the whole app: the top banner and the
+  // Currently Watching tab both read the shared store instead of each attaching
+  // their own.
+  $effect(() => {
+    void bindNowPlaying();
+  });
+
   // Inline SVG icons (Icon.svelte) — stroke style, inherit text color.
   const nav = [
     { href: "/", label: "My List", icon: "list" },
+    { href: "/now", label: "Currently Watching", icon: "play" },
     { href: "/library", label: "Library", icon: "folder" },
     { href: "/torrents", label: "Torrents", icon: "download" },
     { href: "/seasons", label: "Seasons", icon: "sun" },

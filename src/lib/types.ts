@@ -273,6 +273,7 @@ export interface TrackingConfig {
   mode: "off" | "prompt" | "auto";
   prompt_seconds: number;
   auto_percent: number;
+  auto_ask: boolean;
 }
 
 /// "Now Playing" payload pushed from the MPRIS watcher every tick.

@@ -95,6 +95,13 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let http = reqwest::Client::builder()
         .user_agent("Kurisu")
         .timeout(std::time::Duration::from_secs(20))
+        // Limit (don't fully disable) redirects: HTTP→HTTPS upgrades and
+        // domain canonicalisation are common, and blocking them entirely breaks
+        // legitimate feeds. Capping at 3 hops bounds the attack surface — the
+        // SSRF vector (redirect to loopback/metadata) still exists per-hop, but
+        // feeds are user-added (not attacker-controlled) and the response is
+        // parsed as RSS, never executed.
+        .redirect(reqwest::redirect::Policy::limited(3))
         .build()?;
 
     // tokio::spawn rather than a futures combinator: no new dependency, and the

@@ -26,7 +26,19 @@
   let feedInput = $state("");
   let q = $state("");
   let newOnly = $state(readNewOnly());
+  /// Expanded show groups (by media id). Collapsed by default like the Library
+  /// tab: the header already shows the release count and a NEW badge, so the
+  /// list isn't buried, and feeds with dozens of items don't drown the next
+  /// group.
+  let expanded = $state<Set<number>>(new Set());
   let loading = $state(false);
+
+  function toggle(mediaId: number) {
+    const next = new Set(expanded);
+    if (next.has(mediaId)) next.delete(mediaId);
+    else next.add(mediaId);
+    expanded = next;
+  }
   let marking = $state(false);
   let error = $state("");
   let loaded = $state(false);
@@ -93,6 +105,13 @@
   }
 
   async function openItem(t: TorrentItem, url: string) {
+    // Only http(s) and magnet schemes reach the OS handler — a crafted feed
+    // could publish file://, data:, or a custom protocol in the <link> tag.
+    const scheme = url.split(":")[0]?.toLowerCase().trim();
+    if (scheme !== "http" && scheme !== "https" && scheme !== "magnet") {
+      error = `Refused to open link with scheme "${scheme}:"`;
+      return;
+    }
     try {
       await openUrl(url);
     } catch (e) {
@@ -109,7 +128,7 @@
   }
 
   async function markAllSeen() {
-    const guids = items.filter((t) => t.media_id != null && !t.seen).map((t) => t.guid);
+    const guids = groups.flatMap((g) => g.items).filter((t) => !t.seen).map((t) => t.guid);
     if (guids.length === 0) return;
     marking = true;
     error = "";
@@ -291,10 +310,39 @@
     {:else}
       <div class="space-y-4">
         {#each groups as g (g.mediaId)}
+          {@const isOpen = expanded.has(g.mediaId)}
           <section class="cv-card bg-panel border border-edge rounded-lg overflow-hidden">
-            <div class="flex items-center gap-3 p-2.5 border-b border-edge">
+            <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+            <div
+              class="flex items-center gap-3 p-2.5 border-b border-edge cursor-pointer select-none hover:bg-panel-2/40 transition-colors"
+              role="button"
+              tabindex="0"
+              aria-expanded={isOpen}
+              onclick={() => toggle(g.mediaId)}
+              onkeydown={(ev) => {
+                if (ev.currentTarget !== ev.target) return;
+                if (ev.key === "Enter" || ev.key === " ") {
+                  ev.preventDefault();
+                  toggle(g.mediaId);
+                }
+              }}
+            >
+              <span
+                class="w-4 shrink-0 text-ink-dim grid place-items-center transition-transform duration-150 {isOpen ? 'rotate-90' : ''}"
+                aria-hidden="true"
+              >
+                <Icon name="chevron" size={14} />
+              </span>
               {#if g.cover}
-                <button type="button" onclick={() => goto(`/anime/${g.mediaId}`)} title="Open details" class="shrink-0">
+                <button
+                  type="button"
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    goto(`/anime/${g.mediaId}`);
+                  }}
+                  title="Open details"
+                  class="shrink-0"
+                >
                   <Img src={g.cover} class="w-10 h-14 object-cover rounded" />
                 </button>
               {:else}
@@ -303,55 +351,64 @@
               <div class="flex-1 min-w-0">
                 <button
                   type="button"
-                  onclick={() => goto(`/anime/${g.mediaId}`)}
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    goto(`/anime/${g.mediaId}`);
+                  }}
                   title="Open details"
                   class="block max-w-full truncate font-medium text-left hover:text-accent transition-colors"
                 >
                   {g.title}
                 </button>
-                <div class="text-xs text-ink-dim">
-                  {g.items.length} release{g.items.length === 1 ? "" : "s"}
+                <div class="text-xs text-ink-dim flex items-center gap-1.5">
+                  <span>{g.items.length} release{g.items.length === 1 ? "" : "s"}</span>
+                  {#if g.hasNew}
+                    <span class="opacity-40">·</span>
+                    <span class="text-accent">new</span>
+                  {/if}
                 </div>
               </div>
             </div>
-            <div class="divide-y divide-edge/60">
-              {#each g.items as t (t.guid)}
-                <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm {t.seen ? 'opacity-60' : ''}">
-                  {#if t.is_new}
-                    <span class="shrink-0 text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent">New</span>
-                  {/if}
-                  <span class="w-12 shrink-0 text-ink-dim tabular-nums">
-                    {t.episode != null ? `Ep ${t.episode}` : "—"}
-                  </span>
-                  <span class="flex-1 min-w-0 truncate" title={t.title}>{t.title}</span>
-                  {#if t.size}
-                    <span class="shrink-0 text-xs text-ink-dim">{t.size}</span>
-                  {/if}
-                  {#if t.seeders != null}
-                    <span class="shrink-0 text-xs text-accent/80 tabular-nums" title="Seeders">↑{t.seeders}</span>
-                  {/if}
-                  {#if t.published}
-                    <span class="shrink-0 text-xs text-ink-dim/70 w-10 text-right">{timeAgo(t.published)}</span>
-                  {/if}
-                  {#if t.magnet}
+            {#if isOpen}
+              <div class="divide-y divide-edge/60">
+                {#each g.items as t (t.guid)}
+                  <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm {t.seen ? 'opacity-60' : ''}">
+                    {#if t.is_new}
+                      <span class="shrink-0 text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent">New</span>
+                    {/if}
+                    <span class="w-12 shrink-0 text-ink-dim tabular-nums">
+                      {t.episode != null ? `Ep ${t.episode}` : "—"}
+                    </span>
+                    <span class="flex-1 min-w-0 truncate" title={t.title}>{t.title}</span>
+                    {#if t.size}
+                      <span class="shrink-0 text-xs text-ink-dim">{t.size}</span>
+                    {/if}
+                    {#if t.seeders != null}
+                      <span class="shrink-0 text-xs text-accent/80 tabular-nums" title="Seeders">↑{t.seeders}</span>
+                    {/if}
+                    {#if t.published}
+                      <span class="shrink-0 text-xs text-ink-dim/70 w-10 text-right">{timeAgo(t.published)}</span>
+                    {/if}
+                    {#if t.magnet}
+                      <button
+                        onclick={() => openItem(t, t.magnet ?? t.link)}
+                        title="Open magnet link"
+                        class="text-ink-dim hover:text-accent px-1 grid place-items-center"
+                      >
+                        <Icon name="magnet" size={14} />
+                      </button>
+                    {/if}
                     <button
-                      onclick={() => openItem(t, t.magnet ?? t.link)}
-                      title="Open magnet link"
-                      class="text-ink-dim hover:text-accent px-1 grid place-items-center"
+                      onclick={() => openItem(t, t.link)}
+                      title="Download .torrent"
+                      class="text-ink-dim hover:text-ink px-1 grid place-items-center"
                     >
-                      <Icon name="magnet" size={14} />
+                      <Icon name="download" size={14} />
                     </button>
-                  {/if}
-                  <button
-                    onclick={() => openItem(t, t.link)}
-                    title="Download .torrent"
-                    class="text-ink-dim hover:text-ink px-1 grid place-items-center"
-                  >
-                    <Icon name="download" size={14} />
-                  </button>
-                </div>
-              {/each}
-            </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </section>
         {/each}
         {#if unmatchedCount > 0}
