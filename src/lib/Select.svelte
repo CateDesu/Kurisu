@@ -1,8 +1,8 @@
 <script lang="ts" generics="T extends string">
   // Custom dropdown. WebKit2GTK renders native <select> popups with the platform
-  // theme (white, ignores color-scheme), so we draw our own to keep everything
-  // dark and on-theme. Keyboard: Enter/Space/↓ open, Esc closes, ↑/↓ move,
-  // Home/End jump, Tab closes and moves on, Enter picks.
+  // theme, white and ignoring color scheme. So we draw our own to stay dark.
+  // Keyboard: Enter, Space, ArrowDown open. Esc closes. ArrowUp and ArrowDown
+  // move. Home and End jump. Tab closes and moves on. Enter picks.
   let {
     value = $bindable(),
     options,
@@ -41,11 +41,11 @@
     if (!open) return;
     if (e.key === "Escape") {
       e.preventDefault();
-      // Keep the key from bubbling to an enclosing modal's own Escape handler.
+      // Keep the key from bubbling to an enclosing modal's Escape handler.
       e.stopPropagation();
       open = false;
     } else if (e.key === "Tab") {
-      // Let focus leave naturally; just don't leave the menu dangling open.
+      // Let focus leave naturally. Just don't leave the menu dangling open.
       open = false;
     } else if (e.key === "Home") {
       e.preventDefault();

@@ -6,12 +6,11 @@
   import Icon from "$lib/Icon.svelte";
   import type { TrackingPrompt } from "$lib/types";
 
-  // The banner reads the shared now-playing store (bound once by the root layout)
-  // instead of attaching its own listener.
+  // Reads the shared now-playing store instead of attaching its own listener.
   let prompt = $state<TrackingPrompt | null>(null);
-  // Prompts that arrived while an earlier one was still open. Close-to-tray
-  // keeps the webview alive but invisible, so a night of playback used to
-  // deliver several prompts into one slot and only the last survived.
+  // Prompts queued while another was open. Close-to-tray keeps the webview
+  // alive but hidden, so a night of playback used to stack prompts and only
+  // the last survived.
   let queued = $state<TrackingPrompt[]>([]);
   let busy = $state(false);
   let err = $state("");
@@ -27,8 +26,7 @@
 
   function presentPrompt(p: TrackingPrompt) {
     if (prompt) {
-      // Never drop a prompt on the floor; de-dupe so a repeat for the same
-      // episode doesn't stack up.
+      // Don't drop a prompt. De-dupe so repeats don't stack.
       const dup =
         (prompt.media_id === p.media_id && prompt.episode === p.episode) ||
         queued.some((q) => q.media_id === p.media_id && q.episode === p.episode);
@@ -43,15 +41,15 @@
     let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
-    // 120s prompt-mode modal (no navigation): existing behavior.
+    // 120s prompt mode. No navigation.
     listen<TrackingPrompt>("kurisu://tracking-prompt", (e) => {
       if (!alive) return;
       const p = e.payload;
       if (!p) return;
       presentPrompt(p);
     }).then((u) => (alive ? (un1 = u) : u()));
-    // 15s auto-ask: switch to the Currently Watching tab THEN prompt, so the
-    // detected show is front-and-center when the question appears.
+    // 15s auto-ask. Switch to Currently Watching first so the show is
+    // visible when the prompt appears.
     listen<TrackingPrompt>("kurisu://tracking-ask", (e) => {
       if (!alive) return;
       const p = e.payload;
@@ -66,8 +64,8 @@
     };
   });
 
-  // Escape dismisses the prompt. The prompt renders above page modals (z-[60]),
-  // so it gets first claim on Escape and stops it reaching modals below.
+  // Escape dismisses. The prompt sits above page modals so it claims Escape
+  // first.
   function onWindowKeydown(e: KeyboardEvent) {
     if (e.key === "Escape" && prompt) {
       e.stopImmediatePropagation();
@@ -84,11 +82,11 @@
     busy = true;
     err = "";
     try {
-      // The modal can sit open for a while — progress may have moved past the
-      // detected episode since the prompt was emitted. Don't rewind it.
+      // The modal can sit open for a while. Progress may have moved past
+      // the detected episode. Don't rewind.
       const fresh = await api.getEntry(p.media_id);
-      // No row means the user removed the show from their list while the prompt
-      // was open. Writing now would recreate it on AniList, so dismiss instead.
+      // No row means the show was removed from the list while the prompt
+      // was open. Don't recreate it. Dismiss.
       if (!fresh) {
         if (prompt === p) dismiss();
         return;
@@ -97,28 +95,26 @@
         if (prompt === p) dismiss();
         return;
       }
-      // Set progress to the detected episode (not a blind +1), so mid-cour skips
-      // land correctly. The modal only offers this when it's ahead of progress.
-      // `fresh.progress` is the compare-and-swap baseline: if something else
-      // moved the entry between the read and the write, the backend declines.
+      // Set to the detected episode, not a blind +1, so skips land right.
+      // fresh.progress is the CAS baseline. Backend declines if something
+      // else moved it between read and write.
       const entry = await api.setProgress(p.media_id, p.episode, fresh.progress);
-      // Unify the list-refresh signal: auto-increment emits this from the
-      // backend, the prompt path emits it here so one listener covers both.
+      // Unify the refresh signal. Auto-increment emits from the backend,
+      // prompt emits here. One listener covers both.
       await emit("kurisu://episode-updated", entry);
-      // A NEWER prompt may have replaced ours while the write was in flight —
-      // only close the one we actually confirmed.
+      // A newer prompt may have replaced ours mid-write. Only close the
+      // one we confirmed.
       if (prompt === p) dismiss();
     } catch (e) {
-      // Only show the error on the prompt that was actually confirmed — a
-      // Skip may have already swapped in a different prompt while the write
-      // was in flight, and its UI must not inherit this error.
+      // Only show the error on the prompt we confirmed. A skip may have
+      // swapped in another prompt mid-write and it must not inherit this.
       if (prompt === p) err = String(e);
     } finally {
       busy = false;
     }
   }
 
-  /// Close the current prompt and present the next queued one, if any.
+  /// Close current prompt, show next queued if any.
   function dismiss() {
     if (queued.length > 0) {
       prompt = queued[0];
@@ -151,8 +147,7 @@
     </span>
     {#if np.length_us > 0}
       <div class="flex-1 h-1 bg-edge rounded overflow-hidden min-w-[40px]">
-        <!-- scaleX keeps this animation on the compositor; a width transition
-             forces layout every frame -->
+        <!-- scaleX stays on the compositor. Width transition would force layout per frame -->
         <div class="h-full bg-accent origin-left transition-transform duration-500" style="transform:scaleX({pct / 100})"></div>
       </div>
       <span class="text-ink-dim tabular-nums w-9 text-right">{pct}%</span>

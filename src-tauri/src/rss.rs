@@ -1,9 +1,10 @@
-//! M6: torrent-feed awareness — Taiga's other half. Fetches the user's RSS
-//! feeds (nyaa-style), parses the items, and hands them to the command layer,
-//! which matches titles against the list with the shared recognizer.
+//! M6 torrent feed awareness, the other half of the Taiga style flow. Fetches
+//! the user's RSS feeds, nyaa style, parses the items and hands them to the
+//! command layer which matches titles against the list with the shared
+//! recognizer.
 //!
-//! Feed list lives in the `settings` table as a JSON array (`rss_feeds`), same
-//! pattern as the library folders. Seen-state is the `rss_seen` table.
+//! Feed list lives in the settings table as a JSON array under rss_feeds, same
+//! pattern as the library folders. Seen state lives in the rss_seen table.
 
 use anyhow::{anyhow, Result};
 use quick_xml::events::Event;
@@ -12,10 +13,10 @@ use quick_xml::Reader;
 use crate::db::Db;
 
 const FEEDS_KEY: &str = "rss_feeds";
-/// nyaa.si "Anime - English-translated", trusted-or-normal filter. The Taiga
+/// nyaa.si Anime English translated, trusted or normal filter. The Taiga
 /// default, editable on the Torrents page.
 const DEFAULT_FEEDS: &[&str] = &["https://nyaa.si/?page=rss&c=1_2&f=0"];
-/// Read-modify-write JSON in the settings table — serialize mutations.
+/// Read modify write JSON in the settings table. Serialize mutations.
 static FEEDS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// One raw feed item, before any list matching.
@@ -33,7 +34,7 @@ pub struct RawItem {
 
 // ─────────────────────────── feed settings ───────────────────────────
 
-/// Configured feeds; the built-in default only applies while the setting has
+/// Configured feeds. The built in default only applies while the setting has
 /// never been written, so an emptied list stays empty.
 pub fn get_feeds(db: &Db) -> Vec<String> {
     match db.get_setting(FEEDS_KEY).ok().flatten() {
@@ -69,12 +70,12 @@ pub fn remove_feed(db: &Db, url: &str) -> Result<Vec<String>> {
 
 // ─────────────────────────── fetch + parse ───────────────────────────
 
-/// Hard ceiling on one feed body. Real feeds are tens of kilobytes; this
+/// Hard ceiling on one feed body. Real feeds are tens of kilobytes. This
 /// bounds how much memory a hostile or pathological endpoint can make us
-/// buffer (feed URLs are arbitrary user input over plaintext http).
+/// buffer. Feed URLs are arbitrary user input over plaintext http.
 const MAX_FEED_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Items from every feed plus a per-feed report, so the UI can say WHICH feed
+/// Items from every feed plus a per feed report. Lets the UI say WHICH feed
 /// failed instead of showing a silently short list.
 pub struct FeedFetch {
     pub items: Vec<RawItem>,
@@ -87,24 +88,24 @@ pub struct FeedFailure {
     pub error: String,
 }
 
-/// Fetch every feed and merge the items (deduped by guid). One dead feed doesn't
-/// fail the refresh; if ALL feeds fail, the first error is returned. Feeds are
-/// fetched CONCURRENTLY: run serially with a 20s timeout each, a few dead feeds
-/// stalled the Torrents page for a minute or more before showing anything.
+/// Fetch every feed and merge the items, deduped by guid. One dead feed doesn't
+/// fail the refresh. If ALL feeds fail the first error is returned. Feeds are
+/// fetched concurrently. Run serially with a 20s timeout each and a few dead
+/// feeds stalled the Torrents page for a minute or more before showing anything.
 pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let http = reqwest::Client::builder()
         .user_agent("Kurisu")
         .timeout(std::time::Duration::from_secs(20))
-        // Limit (don't fully disable) redirects: HTTP→HTTPS upgrades and
-        // domain canonicalisation are common, and blocking them entirely breaks
-        // legitimate feeds. Capping at 3 hops bounds the attack surface — the
-        // SSRF vector (redirect to loopback/metadata) still exists per-hop, but
-        // feeds are user-added (not attacker-controlled) and the response is
-        // parsed as RSS, never executed.
+        // Limit redirects rather than fully disabling them. HTTP to HTTPS
+        // upgrades and domain canonicalisation are common, and blocking them
+        // entirely breaks legitimate feeds. Capping at 3 hops bounds the attack
+        // surface. The SSRF vector via redirect to loopback or metadata still
+        // exists per hop, but feeds are user added not attacker controlled and
+        // the response is parsed as RSS, never executed.
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()?;
 
-    // tokio::spawn rather than a futures combinator: no new dependency, and the
+    // tokio::spawn rather than a futures combinator. No new dependency, and the
     // handles are awaited in order so the merged list stays deterministic.
     let mut tasks = Vec::with_capacity(feeds.len());
     for feed in feeds {
@@ -123,7 +124,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 let mut body: Vec<u8> = Vec::new();
                 while let Some(chunk) = resp.chunk().await? {
                     body.extend_from_slice(&chunk);
-                    // The header can lie (or be absent): cap the stream too.
+                    // The header can lie or be absent. Cap the stream too.
                     if body.len() as u64 > MAX_FEED_BYTES {
                         return Err(anyhow!("{feed}: response exceeded {MAX_FEED_BYTES} bytes"));
                     }
@@ -152,9 +153,9 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
         match fetched {
             Ok(xml) => {
                 let items = parse_rss(&xml);
-                // A 200 that isn't RSS (a captive portal, an error page, a
-                // moved feed) yields zero items and used to be indistinguishable
-                // from "nothing new".
+                // A 200 that isn't RSS, like a captive portal, an error page or
+                // a moved feed, yields zero items and used to be indistinguishable
+                // from nothing new.
                 if items.is_empty() && !xml.contains("<item") {
                     let msg = format!("{feed}: response was not an RSS feed");
                     log::warn!("{msg}");
@@ -185,15 +186,15 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     Ok(FeedFetch { items: out, failures })
 }
 
-/// Pull `<item>`s out of an RSS 2.0 document. Namespaced nyaa extras
-/// (`nyaa:seeders`, `nyaa:infoHash`, …) are matched on their qualified name;
-/// unknown elements are ignored, so non-nyaa feeds still yield the basics.
+/// Pull <item>s out of an RSS 2.0 document. Namespaced nyaa extras like
+/// nyaa:seeders and nyaa:infoHash are matched on their qualified name. Unknown
+/// elements are ignored so non nyaa feeds still yield the basics.
 pub fn parse_rss(xml: &str) -> Vec<RawItem> {
     let mut reader = Reader::from_str(xml);
     let mut out = Vec::new();
     let mut item: Option<RawItem> = None;
     // Field being accumulated plus the element depth at which it opened, so a
-    // nested child element can't clobber it: only the End that closes the
+    // nested child element can't clobber it. Only the End that closes the
     // element which opened the field commits the buffer.
     let mut field: Option<String> = None;
     let mut field_depth = 0usize;
@@ -259,9 +260,9 @@ pub fn parse_rss(xml: &str) -> Vec<RawItem> {
                 }
             }
             Ok(Event::Eof) => break,
-            // Ill-formed markup (e.g. a mismatched closing tag) stops the parse
-            // here. Keep what was accumulated, but say so: silent truncation
-            // looks identical to a clean, short feed otherwise.
+            // Ill formed markup like a mismatched closing tag stops the parse
+            // here. Keep what was accumulated but say so. Silent truncation
+            // looks identical to a clean short feed otherwise.
             Err(e) => {
                 log::warn!("RSS parse stopped early: {e}");
                 break;
@@ -273,9 +274,9 @@ pub fn parse_rss(xml: &str) -> Vec<RawItem> {
 }
 
 /// Decode a text node without letting one bad entity blank the whole run.
-/// quick-xml resolves only the five predefined XML entities, so map the
-/// common HTML ones too, and fall back to the raw text for anything unknown
-/// instead of dropping it (an emptied title/link silently deletes the item).
+/// quick-xml resolves only the five predefined XML entities, so map the common
+/// HTML ones too. Fall back to the raw text for anything unknown instead of
+/// dropping it. An emptied title or link silently deletes the item.
 fn decode_text(t: &quick_xml::events::BytesText) -> String {
     t.unescape_with(|name| {
         Some(match name {
@@ -303,9 +304,9 @@ fn decode_text(t: &quick_xml::events::BytesText) -> String {
     .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned())
 }
 
-/// RSS 2.0 dates are RFC 2822, but plenty of feeds ship ISO 8601 (RSS 1.0's
-/// `<dc:date>` is ISO by spec) and some carry no timezone at all. Try the
-/// strict parsers first, then a couple of naive layouts treated as UTC.
+/// RSS 2.0 dates are RFC 2822, but plenty of feeds ship ISO 8601. RSS 1.0's
+/// dc:date is ISO by spec, and some carry no timezone at all. Try the strict
+/// parsers first, then a couple of naive layouts treated as UTC.
 fn parse_date(s: &str) -> Option<i64> {
     if let Ok(d) = chrono::DateTime::parse_from_rfc2822(s) {
         return Some(d.timestamp());
@@ -332,7 +333,7 @@ fn finish_item(mut it: RawItem) -> RawItem {
     it
 }
 
-/// magnet: URI from an info hash (clients resolve peers over DHT/trackers).
+/// magnet URI from an info hash. Clients resolve peers over DHT or trackers.
 pub fn magnet_for(info_hash: &str, title: &str) -> String {
     format!(
         "magnet:?xt=urn:btih:{}&dn={}",
@@ -388,11 +389,11 @@ mod tests {
             a.info_hash.as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef01")
         );
-        // CDATA title with raw ampersand survives; bad pubDate → None.
+        // CDATA title with raw ampersand survives. Bad pubDate maps to None.
         let b = &items[1];
         assert_eq!(b.title, "[Group] R&D Show - 02 [720p]");
         assert_eq!(b.published, None);
-        // No guid → link is the identity. Escaped entity decoded.
+        // No guid means link is the identity. Escaped entity decoded.
         let c = &items[2];
         assert_eq!(c.title, "Entity & Escapes - 09");
         assert_eq!(c.guid, c.link);
@@ -424,8 +425,8 @@ mod tests {
 
     #[test]
     fn bad_entity_keeps_text() {
-        // One unknown entity must not blank the whole text node (an emptied
-        // title/link silently deletes the item).
+        // One unknown entity must not blank the whole text node. An emptied
+        // title or link silently deletes the item.
         let xml = r#"<rss version="2.0"><channel>
             <item>
               <title>Show&nbsp;Name &amp; Friends - 01</title>
@@ -439,14 +440,14 @@ mod tests {
         let items = parse_rss(xml);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "Show\u{a0}Name & Friends - 01");
-        // Unknown entity: the raw text is kept verbatim rather than dropped.
+        // Unknown entity. The raw text is kept verbatim rather than dropped.
         assert_eq!(items[1].title, "Odd &bogus; Entity - 02");
     }
 
     #[test]
     fn nested_element_inside_field() {
         // A child element inside <title> must not clobber the field state or
-        // drop the item; the text around the child is kept.
+        // drop the item. The text around the child is kept.
         let xml = r#"<rss version="2.0"><channel>
             <item>
               <title>Foo <b>Bar</b> Baz - 03</title>
@@ -462,7 +463,7 @@ mod tests {
     #[test]
     fn truncated_feed_keeps_items_and_warns() {
         install_logger();
-        // A mismatched closing tag mid-feed: keep the items parsed so far and
+        // A mismatched closing tag mid feed. Keep the items parsed so far and
         // log a warning instead of silently truncating.
         let xml = r#"<rss version="2.0"><channel>
             <item>
@@ -522,7 +523,7 @@ mod tests {
         assert_eq!(items[4].published, Some(ts - (21 * 3600 + 38 * 60)));
     }
 
-    /// Serve one canned HTTP response on a loopback port, then run `fetch_all`
+    /// Serve one canned HTTP response on a loopback port, then run fetch_all
     /// against it.
     async fn fetch_with_server(respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> Result<Vec<RawItem>> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -557,7 +558,7 @@ mod tests {
     #[tokio::test]
     async fn streamed_oversize_is_rejected() {
         use std::io::{Read, Write};
-        // No Content-Length: the running-total cap must catch it instead.
+        // No Content-Length. The running total cap must catch it instead.
         let err = fetch_with_server(move |stream| {
             let mut req = [0u8; 1024];
             let _ = stream.read(&mut req);

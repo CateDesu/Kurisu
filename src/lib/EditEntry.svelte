@@ -1,8 +1,8 @@
 <script module lang="ts">
   import type { Media as MediaType } from "$lib/types";
-  // Recommendations for a show never change within a session, but the modal
-  // re-fetched them from AniList on every single open — a network round trip
-  // (and a slice of the 30 req/min budget) just to reopen the same entry.
+  // Recommendations for a show never change in a session, but the modal
+  // refetched them on every open. Wasted a network call and part of the
+  // 30 req/min budget just to reopen the same entry.
   const RECS_CACHE = new Map<number, MediaType[]>();
 </script>
 
@@ -24,8 +24,8 @@
     scoreFormat = null,
   }: { entry: ListEntry; onclose: () => void; scoreFormat?: string | null } = $props();
 
-  // Snapshot the entry's current values once (untrack = read, don't subscribe).
-  // The modal edits a copy; the source list is reloaded on close.
+  // Snapshot the entry values once. untrack reads without subscribing.
+  // The modal edits a copy. The source list reloads on close.
   const snap = untrack(() => ({
     status: entry.status,
     progress: entry.progress,
@@ -40,7 +40,7 @@
   let removing = $state(false);
   let err = $state("");
 
-  // Community recommendations for this title; failures just hide the strip.
+  // Community recommendations for this title. Failures just hide the strip.
   let recs = $state<Media[]>([]);
   let addingRec = $state<number | null>(null);
   let addedRecs = $state<number[]>([]);
@@ -50,7 +50,7 @@
     label,
   }));
   const total = $derived(entry.media?.episodes ?? null);
-  // Next unwatched episode on disk (from the last library scan, if any).
+  // Next unwatched episode on disk from the last library scan, if any.
   const nextFile = $derived(library.fileFor(entry.media_id, entry.progress + 1));
   const scoreUnit = $derived(
     scoreFormat === "POINT_3"
@@ -74,10 +74,10 @@
     try {
       const r = await api.getRecommendations(id);
       RECS_CACHE.set(id, r);
-      // The modal may have been closed and reopened on another show meanwhile.
+      // Modal may have been closed and reopened on another show meanwhile.
       if (entry.media_id === id) recs = r;
     } catch {
-      // Don't cache a failure: a transient network error should retry next open.
+      // Don't cache a failure. A transient network error should retry next open.
       if (entry.media_id === id) recs = [];
     }
   }
@@ -86,8 +86,8 @@
   async function addRec(m: Media) {
     addingRec = m.id;
     try {
-      // updateEntry writes status/progress unconditionally — only push when the
-      // show isn't already on the list, or its entry would be reset.
+      // updateEntry writes status and progress unconditionally. Only push when
+      // the show isn't on the list yet, or its entry would be reset.
       if (!(await api.getEntry(m.id))) {
         await api.updateEntry(m.id, "PLANNING", 0, null, 0);
       }
@@ -104,9 +104,9 @@
     saving = true;
     err = "";
     try {
-      // Merge with a FRESH read: fields the user didn't touch in the modal follow
-      // the live entry, so saving can't rewind progress that advanced (the
-      // auto-tracker, the row stepper) while the modal was open.
+      // Merge with a fresh read. Fields the user didn't touch in the modal follow
+      // the live entry. Saving can't then rewind progress that advanced via
+      // the auto tracker or row stepper while the modal was open.
       const fresh = await api.getEntry(entry.media_id);
       await api.updateEntry(
         entry.media_id,
@@ -137,12 +137,12 @@
     }
   }
 
-  // Modal behavior: Escape closes (Select swallows it first when its dropdown is
-  // open), and the dialog takes focus so Tab stays inside the modal.
+  // Escape closes the modal. Select swallows it first when its dropdown is
+  // open. The dialog takes focus so Tab stays inside the modal.
   let dialog = $state<HTMLDivElement | null>(null);
-  /// Dismissal is refused while a write is in flight: closing mid-save threw
-  /// away the error banner, so a rejected save looked exactly like a successful
-  /// one and the list kept showing the value the server never accepted.
+  /// Dismissal is refused while a write is in flight. Closing mid-save threw
+  /// away the error banner, so a rejected save looked like a successful one.
+  /// The list kept showing the value the server never accepted.
   function tryClose() {
     if (saving || removing) return;
     onclose();

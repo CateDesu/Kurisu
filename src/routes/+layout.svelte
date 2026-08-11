@@ -14,17 +14,16 @@
   import Img from "$lib/Img.svelte";
   let { children } = $props();
 
-  // Ticks the shared clock so relative labels (timeAgo, airingLabel) refresh.
+  // Tick the shared clock so relative labels refresh.
   $effect(() => runClock());
 
-  // One now-playing listener for the whole app: the top banner and the
-  // Currently Watching tab both read the shared store instead of each attaching
-  // their own.
+  // One now-playing listener for the whole app. Banner and Currently
+  // Watching both read the shared store.
   $effect(() => {
     void bindNowPlaying();
   });
 
-  // Inline SVG icons (Icon.svelte) — stroke style, inherit text color.
+  // Inline SVG icons. Stroke style, inherit text color.
   const nav = [
     { href: "/", label: "My List", icon: "list" },
     { href: "/now", label: "Currently Watching", icon: "play" },
@@ -40,14 +39,13 @@
 
   const appWindow = getCurrentWindow();
 
-  /// Persistent back button: walks the in-app history. `history.length` counts the
-  /// whole tab session (forward entries included), so we track our own navigation
-  /// depth instead. At the root there's nothing to go back to → no-op (desired).
+  /// Persistent back button. Walks in-app history. history.length counts the
+  /// whole tab session so we track our own depth. No-op at the root.
   let navDepth = $state(0);
   afterNavigate(({ type, to, from }) => {
     if (type === "popstate") navDepth = Math.max(0, navDepth - 1);
-    // Clicking the current page's own link is a navigation that goes nowhere —
-    // counting it would make Back return to the identical URL (looks dead).
+    // Clicking the current page's own link goes nowhere. Counting it would
+    // make Back return to the same URL.
     else if (type !== "enter" && to?.url.pathname !== from?.url.pathname) navDepth += 1;
   });
   function back() {
@@ -58,8 +56,8 @@
     if (auth.user) void openUrl(`https://anilist.co/user/${encodeURIComponent(auth.user.name)}`);
   }
 
-  /// Begin a compositor resize gesture from a window edge/corner. Only works with
-  /// custom decorations (which we use) — native GTK borders would handle it.
+  /// Begin a compositor resize gesture from an edge or corner. Only works
+  /// with custom decorations.
   function resize(direction: "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West") {
     void appWindow.startResizeDragging(direction);
   }
@@ -82,7 +80,7 @@
             <span class="text-accent text-3xl leading-none">ク</span>
             <span class="text-xl font-semibold tracking-wide truncate">Kurisu</span>
           </div>
-          <!-- Persistent back; no-op when there's no history to return to. -->
+          <!-- Persistent back. No-op when there's no history. -->
           <button
             onclick={back}
             title="Back"
@@ -131,30 +129,29 @@
             </button>
           </div>
         {:else}
-          <!-- signed out: keep the bar, just empty -->
+          <!-- signed out. Keep the bar empty. -->
           <div class="px-4 py-5 border-t border-edge text-[13px] text-ink-dim/50">Not signed in</div>
         {/if}
       </aside>
       <main class="flex-1 overflow-auto">
         {@render children?.()}
       </main>
-      <!-- East resize grip, in-flow: as an absolute overlay it sat on top of
-           main's scrollbar (same 6px at the right edge) and won every hit test.
-           Taking layout space keeps both the grip and the scrollbar usable. -->
+      <!-- East resize grip in-flow. As an overlay it sat on main's scrollbar
+           and won every hit test. Taking layout space keeps both usable. -->
       <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
       <div class="w-1.5 shrink-0 cursor-e-resize" onpointerdown={() => resize("East")}></div>
     </div>
   {/if}
 
-  <!-- Edge/corner resize grips (CSD). Thin overlays that show a resize cursor and
-       hand the gesture to the compositor. -->
+  <!-- Edge and corner resize grips for CSD. Thin overlays that show a resize
+       cursor and hand the gesture to the compositor. -->
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute top-0 inset-x-0 h-1 cursor-n-resize z-50" onpointerdown={() => resize("North")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute bottom-0 inset-x-0 h-1.5 cursor-s-resize z-50" onpointerdown={() => resize("South")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute left-0 inset-y-0 w-1.5 cursor-w-resize z-50" onpointerdown={() => resize("West")}></div>
-  <!-- (East grip lives in-flow after <main> — see above.) -->
+  <!-- East grip lives in-flow after main. See above. -->
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute top-0 left-0 w-2 h-2 cursor-nw-resize z-50" onpointerdown={() => resize("NorthWest")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->

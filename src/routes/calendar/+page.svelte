@@ -29,11 +29,12 @@
     try {
       localStorage.setItem(MINE_KEY, v ? "1" : "0");
     } catch {
-      // storage unavailable — the toggle just won't persist
+      // Storage unavailable. The toggle just won't persist.
     }
   }
 
-  /// Rolling 7-day window: local midnight today (+ offset weeks) → +7 days.
+  /// Rolling 7 day window. From local midnight today plus offset weeks,
+  /// ending 7 days later.
   function range(offset: number): { start: Date; end: Date } {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
@@ -51,7 +52,7 @@
     return `${fmt(start)} – ${fmt(last)}`;
   });
 
-  // Rapid Prev/Next resolves latest-wins.
+  // Guard for rapid Prev/Next clicks. Latest result wins.
   let loadId = 0;
   async function load() {
     const id = ++loadId;

@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Inline SVG icons, 24x24 stroke style (lucide-like), drawn with currentColor so
-  // they inherit text color on the dark theme. Replaces the emoji glyphs — crisper,
-  // consistent weight, and they scale cleanly at any size.
+  // Inline SVG icons. 24x24 stroke style, lucide-like, drawn with currentColor
+  // so they inherit text color on the dark theme. Replaces the emoji glyphs.
+  // Crisper, consistent weight, scale cleanly at any size.
   let { name, size = 18 }: { name: string; size?: number } = $props();
 
   const icons: Record<string, string> = {

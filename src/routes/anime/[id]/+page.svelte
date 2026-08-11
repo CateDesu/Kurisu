@@ -42,7 +42,7 @@
     { v: "COMPLETED", label: "Completed" },
   ];
 
-  // Navigating relation → relation reuses this component; latest-wins per id.
+  // Navigating between relations reuses this component. Latest-wins per id.
   let loadId = 0;
   async function load(mediaId: number) {
     const reqId = ++loadId;
@@ -52,9 +52,9 @@
     expanded = false;
     recs = [];
     // Clear the PREVIOUS anime's data too. Leaving it in place kept the old
-    // title, cover and entry panel on screen under a new id, so the stepper and
-    // the status buttons acted on a show the user was no longer looking at (and
-    // the `loading && !detail` placeholder below could never fire).
+    // title, cover and entry panel on screen under a new id. The stepper and
+    // status buttons then acted on a show the user was no longer looking at,
+    // and the `loading && !detail` placeholder below could never fire.
     detail = null;
     entry = null;
     try {
@@ -71,7 +71,7 @@
     } finally {
       if (reqId === loadId) loading = false;
     }
-    // Recommendations load after the main content; failures just hide the strip.
+    // Recommendations load after the main content. Failures just hide the strip.
     try {
       const r = await api.getRecommendations(mediaId);
       if (reqId === loadId) recs = r;
@@ -92,9 +92,9 @@
   }
 
   async function add(status: string) {
-    // A full AniList round-trip. The relation and recommendation cards stay
-    // clickable throughout, so navigating mid-add must not land this entry on
-    // the next anime's page: same latest-wins guard `load` uses.
+    // A full AniList round trip. The relation and recommendation cards stay
+    // clickable throughout, so navigating mid add must not land this entry on
+    // the next anime's page. Same latest-wins guard `load` uses.
     const reqId = loadId;
     adding = status;
     error = "";
@@ -110,8 +110,9 @@
   }
 
   function applyEntry(e: ListEntry) {
-    // A stepper flushing its buffered edit during relation→relation navigation
-    // reports the PREVIOUS anime — don't let it clobber the new page's entry.
+    // A stepper flushing its buffered edit during relation to relation
+    // navigation reports the PREVIOUS anime. Don't let it clobber the new
+    // page's entry.
     if (e.media_id !== id) return;
     entry = { ...e, media: e.media ?? detail?.media ?? null };
   }
@@ -119,7 +120,7 @@
   const media = $derived(detail?.media ?? null);
   const desc = $derived(plainDescription(media?.description));
   const air = $derived(airingLabel(media));
-  // First on-disk file for the next unwatched episode (from the last scan).
+  // File for the next unwatched episode, from the last library scan.
   const nextFile = $derived(entry ? library.fileFor(id, entry.progress + 1) : undefined);
   const meta = $derived.by(() => {
     if (!media) return "";
@@ -213,8 +214,8 @@
       </div>
     {/if}
 
-    <!-- Your list entry (or quick-add). Keyed on the anime id: navigating
-         relation → relation must destroy the stepper so its buffered edit
+    <!-- Your list entry, or quick add. Keyed on the anime id. Navigating
+         between relations must destroy the stepper so its buffered edit
          flushes against the OLD media id instead of leaking onto the new one. -->
     {#key id}
     <div class="bg-panel border border-edge rounded-lg p-3 mb-5 flex items-center gap-3 flex-wrap">

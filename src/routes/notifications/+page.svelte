@@ -17,7 +17,7 @@
   let loading = $state(true);
   let error = $state("");
 
-  // Overlapping loads (login flip + manual refresh) resolve latest-wins.
+  // Overlapping loads like login flip plus manual refresh. Latest wins.
   let loadId = 0;
   async function load() {
     const id = ++loadId;
@@ -35,9 +35,9 @@
   }
 
   async function open(n: Notification) {
-    // Anime notifications stay in-app (native detail page); activity / thread /
-    // user pages need the browser's AniList session cookie, so those still
-    // open externally.
+    // Anime notifications stay in app on the native detail page. Activity,
+    // thread and user pages need the browser's AniList session cookie, so
+    // those still open externally.
     if (n.media_id) {
       goto(`/anime/${n.media_id}`);
       return;

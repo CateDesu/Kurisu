@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Custom dark title bar. The native title bar is disabled (decorations: false),
-  // so we draw this and make it draggable via `data-tauri-drag-region`. Window
-  // controls call into the Tauri window API.
+  // Custom dark title bar. The native title bar is disabled via decorations:
+  // false, so we draw this and make it draggable via data-tauri-drag-region.
+  // Window controls call into the Tauri window API.
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   const appWindow = getCurrentWindow();
@@ -11,11 +11,11 @@
     try {
       maximized = await appWindow.isMaximized();
     } catch {
-      // window API not ready yet (during loading) — leave default
+      // window API not ready yet during loading. Leave default.
     }
   }
   refresh();
-  // keep the maximize/restore icon in sync when the user resizes via the WM edges
+  // keep the maximize or restore icon in sync when the user resizes via the WM edges
   $effect(() => {
     let alive = true;
     let un: (() => void) | undefined;

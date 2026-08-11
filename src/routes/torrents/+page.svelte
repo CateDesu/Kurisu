@@ -18,18 +18,18 @@
   }
 
   let items = $state<TorrentItem[]>([]);
-  // Feeds that failed this refresh. A refresh where SOME feeds worked still
-  // succeeds, so without this a dead feed reads as "nothing new".
+  // Feeds that failed this refresh. A refresh where some feeds worked still
+  // succeeds. Without this a dead feed looks like nothing new.
   let feedFailures = $state<FeedFailure[]>([]);
   let entries = $state<ListEntry[]>([]);
   let feeds = $state<string[]>([]);
   let feedInput = $state("");
   let q = $state("");
   let newOnly = $state(readNewOnly());
-  /// Expanded show groups (by media id). Collapsed by default like the Library
-  /// tab: the header already shows the release count and a NEW badge, so the
-  /// list isn't buried, and feeds with dozens of items don't drown the next
-  /// group.
+  /// Expanded show groups by media id. Collapsed by default like the
+  /// Library tab. The header shows the release count and a NEW badge so
+  /// the list isn't buried. Feeds with dozens of items don't drown the
+  /// next group.
   let expanded = $state<Set<number>>(new Set());
   let loading = $state(false);
 
@@ -48,11 +48,11 @@
     try {
       localStorage.setItem(NEW_KEY, v ? "1" : "0");
     } catch {
-      // storage unavailable — the toggle just won't persist
+      // storage unavailable. Toggle won't persist.
     }
   }
 
-  // Overlapping refreshes (login flip + manual) resolve latest-wins.
+  // Overlapping refreshes resolve latest wins.
   let loadId = 0;
   async function load() {
     const id = ++loadId;
@@ -105,8 +105,8 @@
   }
 
   async function openItem(t: TorrentItem, url: string) {
-    // Only http(s) and magnet schemes reach the OS handler — a crafted feed
-    // could publish file://, data:, or a custom protocol in the <link> tag.
+    // Only http, https and magnet reach the OS handler. A crafted feed
+    // could publish file, data or a custom protocol in the link tag.
     const scheme = url.split(":")[0]?.toLowerCase().trim();
     if (scheme !== "http" && scheme !== "https" && scheme !== "magnet") {
       error = `Refused to open link with scheme "${scheme}:"`;
@@ -118,12 +118,12 @@
       error = `Could not open ${url.startsWith("magnet:") ? "magnet link" : "link"}: ${String(e)}`;
       return;
     }
-    // Opening a torrent counts as acting on it — clear its NEW state.
+    // Opening a torrent counts as acting on it. Clear NEW state.
     try {
       await api.markTorrentsSeen([t.guid]);
       markLocal(new Set([t.guid]));
     } catch {
-      // seen-state is best-effort
+      // seen state is best effort
     }
   }
 
@@ -178,7 +178,7 @@
       g.newest = Math.max(g.newest, t.published ?? 0);
       g.hasNew = g.hasNew || t.is_new;
     }
-    // Groups with something NEW float to the top, then most recently active.
+    // Groups with NEW float up first, then most recently active.
     return [...byMedia.values()].sort((a, b) => {
       if (a.hasNew !== b.hasNew) return a.hasNew ? -1 : 1;
       return b.newest - a.newest;
@@ -255,7 +255,7 @@
       </div>
     {/if}
 
-    <!-- Feeds being watched. -->
+    <!-- Feeds being watched -->
     <div class="mb-5">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Feeds</h2>
       {#if feeds.length === 0 && loaded}

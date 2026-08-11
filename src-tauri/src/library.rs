@@ -1,13 +1,14 @@
-//! M3: library scan. Walks the user's configured folders for video files and runs
-//! each basename through the recognizer (`recognize.rs`) against the cached list.
+//! M3 library scan. Walks the user's configured folders for video files and
+//! runs each basename through the recognizer in recognize.rs against the
+//! cached list.
 //!
-//! Scan results are NOT persisted — a full walk of a typical anime folder takes
-//! well under a second, so the Library page just re-scans on demand. Watched state
-//! is derived from list progress (`episode <= progress` ⇒ watched), which is
-//! retroactively correct for files watched before M3 existed; that's why the older
-//! `watched_file` table stays unused.
+//! Scan results are NOT persisted. A full walk of a typical anime folder
+//! takes well under a second, so the Library page just re-scans on demand.
+//! Watched state is derived from list progress where episode <= progress
+//! means watched. That is retroactively correct for files watched before
+//! M3 existed, which is why the older watched_file table stays unused.
 //!
-//! Folder list lives in the `settings` table as a JSON array (`library_folders`).
+//! Folder list lives in the settings table as a JSON array, library_folders.
 
 use anyhow::{anyhow, Result};
 
@@ -17,14 +18,15 @@ use crate::recognize::{basename, match_title, resolve_episode, Matcher};
 
 const FOLDERS_KEY: &str = "library_folders";
 const BINDINGS_KEY: &str = "library_bindings";
-/// Recursion cap — plenty for `Anime/Series/Season 2/file.mkv` layouts, and keeps
-/// a symlink-ish loop from running away.
+/// Recursion cap. Plenty for Anime/Series/Season 2/file.mkv layouts.
+/// Keeps a symlink loop from running away.
 const MAX_DEPTH: usize = 8;
 const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv",
 ];
-/// The folder list and the bindings map are read-modify-write JSON values in the
-/// settings table — serialize mutations so two concurrent calls can't lose one.
+/// The folder list and bindings map are JSON values in the settings table,
+/// read then modified then written back. Serialize mutations so two
+/// concurrent calls can not lose one.
 static FOLDERS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 static BINDINGS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -48,8 +50,8 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     if folders.iter().any(|f| f == path) {
         return Ok(folders);
     }
-    // Overlapping folders would double-scan every shared file (and the Library
-    // page keys on path, so duplicates crash its render) — refuse them.
+    // Overlapping folders would scan every shared file twice. The Library
+    // page keys on path, so duplicates crash its render. Refuse them.
     if let Some(existing) = folders.iter().find(|f| folders_overlap(f, path)) {
         return Err(anyhow!("folder overlaps existing library folder: {existing}"));
     }
@@ -59,8 +61,8 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
 }
 
 /// True when either path is the other or contains it, comparing normalized
-/// components: `/anime/` == `/anime`, `/anime/seasonal` nests under `/anime`,
-/// but `/anime2` is unrelated to `/anime`.
+/// components. /anime/ == /anime. /anime/seasonal nests under /anime.
+/// /anime2 is unrelated to /anime.
 fn folders_overlap(a: &str, b: &str) -> bool {
     let a = std::path::Path::new(a);
     let b = std::path::Path::new(b);
@@ -77,9 +79,10 @@ pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
 
 // ─────────────────────────── manual bindings ───────────────────────────
 //
-// A binding maps a file or directory path to a media_id — the user's explicit
-// "this IS that show" for files the recognizer can't name. Stored as a JSON
-// object (path → media_id) in the settings table, like the folder list.
+// A binding maps a file or directory path to a media_id. It is the user's
+// explicit "this IS that show" for files the recognizer can not name.
+// Stored as a JSON object, path to media_id, in the settings table, like
+// the folder list.
 
 pub fn get_bindings(db: &Db) -> std::collections::HashMap<String, i64> {
     db.get_setting(BINDINGS_KEY)
@@ -96,7 +99,7 @@ pub fn bind_path(db: &Db, path: &str, media_id: i64) -> Result<()> {
     db.set_setting(BINDINGS_KEY, &serde_json::to_string(&bindings)?)
 }
 
-/// Drop every binding pointing at `media_id` (the group-level "unlink" action).
+/// Drop every binding pointing at media_id. The group level unlink action.
 pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
     let _guard = BINDINGS_LOCK.lock();
     let mut bindings = get_bindings(db);
@@ -104,9 +107,9 @@ pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
     db.set_setting(BINDINGS_KEY, &serde_json::to_string(&bindings)?)
 }
 
-/// The media a path is manually bound to, if any: an exact file binding, else
-/// the DEEPEST directory binding containing the path (so a nested `Specials/`
-/// binding beats its parent's).
+/// The media a path is manually bound to, if any. An exact file binding,
+/// else the DEEPEST directory binding containing the path, so a nested
+/// Specials/ binding beats its parent's.
 fn binding_for(bindings: &std::collections::HashMap<String, i64>, path: &str) -> Option<i64> {
     if let Some(id) = bindings.get(path) {
         return Some(*id);
@@ -124,11 +127,11 @@ fn binding_for(bindings: &std::collections::HashMap<String, i64>, path: &str) ->
 
 // ─────────────────────────── scan ───────────────────────────
 
-/// Walk the given folders and recognize each video file against `matchers`
-/// (pre-built from the cached list by the caller). A manual binding wins over
-/// the recognizer — it's the user's explicit statement. Blocking — call from
-/// `spawn_blocking`. Missing/unreadable folders are skipped (a disconnected drive
-/// shouldn't fail the whole scan).
+/// Walk the given folders and recognize each video file against matchers,
+/// built from the cached list by the caller. A manual binding wins over
+/// the recognizer, it is the user's explicit statement. Blocking. Call
+/// from spawn_blocking. Missing or unreadable folders are skipped. A
+/// disconnected drive should not fail the whole scan.
 pub fn scan_paths(
     folders: &[String],
     matchers: &[Matcher],
@@ -136,9 +139,9 @@ pub fn scan_paths(
 ) -> LibraryScan {
     let mut paths = Vec::new();
     // Roots that could not be read at all. Deeper subdirectories stay
-    // best-effort, but a configured root vanishing (unmounted drive, dead
-    // network mount, permissions changed) silently produced an empty scan that
-    // looked exactly like "you have no files".
+    // best effort, but a configured root vanishing, unmounted drive, dead
+    // network mount, permissions changed, silently produced an empty scan
+    // that looked exactly like "you have no files".
     let mut unreadable = Vec::new();
     for folder in folders {
         let root = std::path::Path::new(folder);
@@ -148,8 +151,9 @@ pub fn scan_paths(
         }
         collect_videos(root, 0, &mut paths);
     }
-    // Overlapping folders (added before the overlap check existed) can collect
-    // the same file twice — sort+dedup so each path appears exactly once.
+    // Overlapping folders added before the overlap check existed can
+    // collect the same file twice. Sort and dedup so each path appears
+    // exactly once.
     paths.sort();
     paths.dedup();
 
@@ -157,8 +161,9 @@ pub fn scan_paths(
         .into_iter()
         .map(|path| {
             let base = basename(&path);
-            // A binding to a show no longer on the list has no matcher (no
-            // titles to show or parse against) — fall through to the recognizer.
+            // A binding to a show no longer on the list has no matcher,
+            // no titles to show or parse against. Fall through to the
+            // recognizer.
             let bound = binding_for(bindings, &path)
                 .and_then(|id| matchers.iter().find(|m| m.media_id == id));
             let matched = bound.or_else(|| match_title(matchers, "", &path));
@@ -175,7 +180,7 @@ pub fn scan_paths(
     LibraryScan { files, unreadable }
 }
 
-/// Recursively collect video files under `dir`, skipping hidden entries.
+/// Recursively collect video files under dir, skipping hidden entries.
 fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
     if depth > MAX_DEPTH {
         return;
@@ -188,8 +193,9 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
             continue;
         }
         let path = entry.path();
-        // metadata() (not DirEntry::metadata) follows symlinks, so symlinked
-        // folders/files get scanned; a symlink loop just bottoms out at MAX_DEPTH.
+        // metadata(), not DirEntry::metadata, follows symlinks, so symlinked
+        // folders and files get scanned. A symlink loop just bottoms out
+        // at MAX_DEPTH.
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         if meta.is_dir() {
             collect_videos(&path, depth + 1, out);
@@ -223,7 +229,7 @@ mod tests {
         assert_eq!(binding_for(&b, "/a/Show/ep01.mkv"), Some(1));
         // deepest dir wins
         assert_eq!(binding_for(&b, "/a/Show/Specials/sp1.mkv"), Some(2));
-        // "Show 2" is NOT under the "Show" binding (no separator boundary)
+        // "Show 2" is NOT under the "Show" binding, no separator boundary
         assert_eq!(binding_for(&b, "/a/Show 2/ep01.mkv"), None);
         // Windows separators count as a boundary too
         assert_eq!(binding_for(&b, "/a/Show\\ep01.mkv"), Some(1));
@@ -275,8 +281,9 @@ mod tests {
         assert!(scan.unreadable.is_empty());
     }
 
-    /// A configured root that cannot be read is REPORTED, not silently skipped:
-    /// an unmounted drive used to look identical to an empty library.
+    /// A configured root that cannot be read is REPORTED, not silently
+    /// skipped. An unmounted drive used to look identical to an empty
+    /// library.
     #[test]
     fn scan_reports_unreadable_roots() {
         let dir = std::env::temp_dir().join(format!("kurisu-scan-missing-{}", std::process::id()));
@@ -289,7 +296,7 @@ mod tests {
         ];
         let scan = scan_paths(&folders, &[], &HashMap::new());
         std::fs::remove_dir_all(&dir).ok();
-        // The readable root still scans; the missing one is named.
+        // The readable root still scans. The missing one is named.
         assert_eq!(scan.files.len(), 1);
         assert_eq!(scan.unreadable.len(), 1);
         assert!(scan.unreadable[0].path.ends_with("not-mounted"));

@@ -1,9 +1,9 @@
-//! Data types shared between the AniList client, the local DB, and the frontend
-//! (serde + Tauri serialize every command return).
+//! Data types shared between the AniList client, the local DB, and the frontend.
+//! serde and Tauri serialize every command return.
 
 use serde::{Deserialize, Serialize};
 
-/// AniList media list status. Matches the API enum values exactly (PascalCase).
+/// AniList media list status. Matches the API enum values exactly, in PascalCase.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum ListStatus {
@@ -39,7 +39,7 @@ impl ListStatus {
     }
 }
 
-/// A cached anime entry. Fields we actually show in the UI; AniList returns far
+/// A cached anime entry. Fields we actually show in the UI. AniList returns far
 /// more, we only deserialize what we need.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Media {
@@ -57,17 +57,17 @@ pub struct Media {
     pub season: Option<String>,
     pub season_year: Option<i64>,
     pub description: Option<String>,
-    /// Next episode that hasn't aired yet (AniList `nextAiringEpisode`).
+    /// Next episode that hasn't aired yet. AniList calls this nextAiringEpisode.
     pub next_airing_episode: Option<i64>,
-    /// When that next episode airs (Unix seconds). None = unknown / finished.
+    /// When that next episode airs, in Unix seconds. None means unknown or finished.
     pub next_airing_at: Option<i64>,
-    // Detail-only fields (fetched by `media_detail`, not the lean list queries).
+    // Detail-only fields. Fetched by media_detail, not the lean list queries.
     // The DB upsert COALESCEs them so a lean re-fetch never wipes cached values.
     pub banner_image: Option<String>,
     pub genres: Option<Vec<String>>,
     /// Episode length in minutes.
     pub duration: Option<i64>,
-    /// Adaptation source (MANGA / LIGHT_NOVEL / ORIGINAL / …).
+    /// Adaptation source. MANGA, LIGHT_NOVEL, ORIGINAL, and so on.
     pub source: Option<String>,
     /// Main studio names.
     pub studios: Option<Vec<String>>,
@@ -82,10 +82,10 @@ impl Media {
     }
 }
 
-/// One row of the user's AniList anime list (the bits we track locally).
+/// One row of the user's AniList anime list. Only the bits we track locally.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ListEntry {
-    pub id: Option<i64>,          // AniList list-entry id (the row, not the media)
+    pub id: Option<i64>,          // AniList list-entry id. The row, not the media.
     pub media_id: i64,            // the anime
     pub status: String,           // ListStatus as a string for the frontend
     pub progress: i64,
@@ -95,18 +95,18 @@ pub struct ListEntry {
     pub media: Option<Media>,     // joined when served to the UI
 }
 
-/// One anime related to another (AniList `relations` edge), shown on the detail
-/// page. `relation` is the raw edge type (SEQUEL / PREQUEL / SIDE_STORY / …).
+/// One anime related to another, an AniList relations edge, shown on the detail
+/// page. relation is the raw edge type. SEQUEL, PREQUEL, SIDE_STORY, and so on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaRelation {
     pub relation: String,
     pub media: Media,
 }
 
-/// One character on the detail page, with their (Japanese) voice actor.
+/// One character on the detail page, with their Japanese voice actor.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MediaCharacter {
-    /// MAIN / SUPPORTING / BACKGROUND.
+    /// MAIN, SUPPORTING, or BACKGROUND.
     pub role: Option<String>,
     pub name: String,
     pub image: Option<String>,
@@ -114,7 +114,7 @@ pub struct MediaCharacter {
     pub va_image: Option<String>,
 }
 
-/// One staff credit on the detail page (`role` is free text: "Director", …).
+/// One staff credit on the detail page. role is free text, like Director.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MediaStaff {
     pub role: Option<String>,
@@ -122,8 +122,8 @@ pub struct MediaStaff {
     pub image: Option<String>,
 }
 
-/// Full detail-page payload: the (rich) media plus its anime relations and
-/// credits. Characters/staff are not cached — offline fallback serves them empty.
+/// Full detail-page payload. The rich media plus its anime relations and
+/// credits. Characters and staff are not cached. Offline fallback serves them empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaDetail {
     pub media: Media,
@@ -134,7 +134,7 @@ pub struct MediaDetail {
     pub staff: Vec<MediaStaff>,
 }
 
-/// One scheduled episode airing (the calendar view).
+/// One scheduled episode airing, for the calendar view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiringItem {
     pub airing_at: i64,
@@ -142,22 +142,22 @@ pub struct AiringItem {
     pub media: Media,
 }
 
-/// One RSS feed entry, matched against the local list. `is_new` = matched, the
-/// parsed episode is past the entry's progress, and the item hasn't been marked
-/// seen. Unmatched items ride along with `media_id: None`.
+/// One RSS feed entry, matched against the local list. is_new means matched,
+/// the parsed episode is past the entry's progress, and the item hasn't been
+/// marked seen. Unmatched items ride along with media_id None.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TorrentItem {
     pub title: String,
-    /// The feed's `<link>` — for nyaa-style feeds, the .torrent download URL.
+    /// The feed link. For nyaa-style feeds this is the .torrent download URL.
     pub link: String,
-    /// Stable identity for seen-state (feed `<guid>`, falling back to the link).
+    /// Stable identity for seen-state. feed guid, falling back to the link.
     pub guid: String,
-    /// magnet: URI built from the feed's info hash, when it publishes one.
+    /// magnet URI built from the feed's info hash, when it publishes one.
     pub magnet: Option<String>,
     pub size: Option<String>,
     pub seeders: Option<i64>,
     pub leechers: Option<i64>,
-    /// Unix seconds from `<pubDate>`.
+    /// Unix seconds from pubDate.
     pub published: Option<i64>,
     pub media_id: Option<i64>,
     pub matched: Option<String>,
@@ -166,7 +166,7 @@ pub struct TorrentItem {
     pub seen: bool,
 }
 
-/// A torrent refresh: the merged items plus whichever feeds did not answer. A
+/// A torrent refresh. The merged items plus whichever feeds did not answer. A
 /// dead feed used to be invisible as long as one other feed worked, so a
 /// mistyped or moved feed URL looked like "nothing new today" forever.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -181,7 +181,7 @@ pub struct FeedFailure {
     pub error: String,
 }
 
-/// AniList-computed profile statistics (`User.statistics.anime`). Server-side
+/// AniList-computed profile statistics, from User.statistics.anime. Server-side
 /// aggregates, so they cover the whole list regardless of what's cached locally.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserStats {
@@ -261,14 +261,14 @@ pub struct User {
     pub id: i64,
     pub name: String,
     pub avatar: Option<String>,
-    /// The user's preferred score format: POINT_100 / POINT_10_DECIMAL /
-    /// POINT_10 / POINT_5 / POINT_3 (smiley). Drives the score UI.
+    /// The user's preferred score format. POINT_100, POINT_10_DECIMAL,
+    /// POINT_10, POINT_5, or POINT_3 smiley. Drives the score UI.
     pub score_format: Option<String>,
 }
 
-/// A flattened AniList notification. The API returns a union of ~14 concrete types;
-/// we capture the fields we care about and leave the rest None. `kind` is the
-/// `type` enum (AIRING / FOLLOWING / ACTIVITY_LIKE / …).
+/// A flattened AniList notification. The API returns a union of about 14 concrete
+/// types. We capture the fields we care about and leave the rest None. kind is
+/// the type enum. AIRING, FOLLOWING, ACTIVITY_LIKE, and so on.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Notification {
     pub id: i64,
@@ -276,8 +276,8 @@ pub struct Notification {
     pub context: Option<String>,
     pub created_at: Option<i64>,
     pub media_id: Option<i64>,
-    /// Media title (user-preferred language) + cover for media-type notifications,
-    /// so the row reads like the anilist.co/notifications entry.
+    /// Media title in user-preferred language, plus cover for media-type
+    /// notifications, so the row reads like the anilist.co/notifications entry.
     pub media_title: Option<String>,
     pub media_cover: Option<String>,
     pub episode: Option<i64>,
@@ -291,12 +291,12 @@ pub struct Notification {
     pub user_avatar: Option<String>,
 }
 
-/// Drift guard for the hand-maintained TS mirror: assert every field name
-/// `value` (a serialized command/event payload) carries is declared on the
-/// matching `interface <name>` in src/lib/types.ts, and that every field of
-/// that interface is still serialized — a Rust rename, addition, or removal
-/// that would land as `undefined` in the UI fails here instead. Shared with
-/// playback.rs for its event payload structs.
+/// Drift guard for the hand-maintained TS mirror. Assert every field name
+/// value, a serialized command or event payload, is declared on the matching
+/// interface in src/lib/types.ts, and that every field of that interface is
+/// still serialized. A Rust rename, addition, or removal that would land as
+/// undefined in the UI fails here instead. Shared with playback.rs for its
+/// event payload structs.
 #[cfg(test)]
 pub(crate) fn assert_ts_declares(name: &str, value: &serde_json::Value) {
     let ts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/lib/types.ts"))
@@ -311,8 +311,8 @@ fn assert_ts_declares_in(ts: &str, name: &str, value: &serde_json::Value) {
         .as_object()
         .unwrap_or_else(|| panic!("{name} must serialize to a JSON object"));
     let Some(body) = ts_interface_body(ts, name) else {
-        // No interface of that name — some structs are mirrored as inline
-        // object types (ScoreBucket & co. inside UserStats). File-wide check.
+        // No interface of that name. Some structs are mirrored as inline
+        // object types, like ScoreBucket inside UserStats. File-wide check.
         for key in obj.keys() {
             assert!(
                 ts.contains(&format!("{key}:")) || ts.contains(&format!("{key}?:")),
@@ -336,8 +336,8 @@ fn assert_ts_declares_in(ts: &str, name: &str, value: &serde_json::Value) {
     }
 }
 
-/// The body of `interface <name> { ... }`, brace-depth counted so an inline
-/// object type (`scores: { score: number }[]`) doesn't end it early. None when
+/// The body of `interface <name> { ... }`. Brace-depth counted so an inline
+/// object type like scores: { score: number }[] doesn't end it early. None when
 /// no such interface exists.
 #[cfg(test)]
 fn ts_interface_body(ts: &str, name: &str) -> Option<String> {
@@ -360,8 +360,8 @@ fn ts_interface_body(ts: &str, name: &str) -> Option<String> {
 }
 
 /// Field names declared at the top level of a TS interface body. The brace
-/// depth keeps fields of inline object types out; `//` comments are skipped so
-/// a `word:` inside one can't read as a field.
+/// depth keeps fields of inline object types out. // comments are skipped so
+/// a word: inside one can't read as a field.
 #[cfg(test)]
 fn ts_top_level_fields(body: &str) -> Vec<String> {
     let mut fields = Vec::new();
@@ -405,8 +405,8 @@ fn ts_top_level_fields(body: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// Every model a command returns, serialized with all keys present (serde
-    /// keeps `None` fields as null), checked against the TS mirror.
+    /// Every model a command returns, serialized with all keys present. serde
+    /// keeps None fields as null. Checked against the TS mirror.
     #[test]
     fn serialized_field_names_exist_in_types_ts() {
         let models: Vec<(&str, serde_json::Value)> = vec![
@@ -452,8 +452,8 @@ mod tests {
         }
     }
 
-    /// C28 regression: a renamed-away field still matches some other interface
-    /// file-wide — the interface-scoped check must fail anyway.
+    /// C28 regression. A renamed-away field still matches some other interface
+    /// file-wide. The interface-scoped check must fail anyway.
     #[test]
     #[should_panic(expected = "not declared on interface Widget")]
     fn drift_guard_catches_rename() {
@@ -461,7 +461,7 @@ mod tests {
         assert_ts_declares_in(ts, "Widget", &serde_json::json!({ "id": 1, "name": "x" }));
     }
 
-    /// The reverse direction: a field the Rust struct stopped serializing.
+    /// The reverse direction. A field the Rust struct stopped serializing.
     #[test]
     #[should_panic(expected = "no longer serialized")]
     fn drift_guard_catches_removal() {

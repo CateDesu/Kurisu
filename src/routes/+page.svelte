@@ -1,15 +1,15 @@
 <script module lang="ts">
-  // Which account the cached list was last reconciled against, kept at MODULE
-  // scope so it survives this route being destroyed and recreated. As component
-  // state it reset to null on every navigation, so the "the user changed under
-  // us" check below could only ever fire when the user logged out and back in
-  // without leaving this page: after a restart, or a trip to any other route,
-  // the previous account's cached rows rendered as if they were the new one's.
+  // Which account the cached list was last reconciled against. Kept at
+  // module scope so it survives the route being recreated. As component
+  // state it reset on every navigation, so the account-switch check only
+  // fired when the user logged out and back in without leaving this page.
+  // After a restart or any other route, the previous account's rows
+  // rendered as the new one's.
   let syncedFor: number | null = null;
 
-  // One collator for the whole session. `localeCompare` with an options object
-  // builds a fresh Intl.Collator on every call, which the title sort makes
-  // O(n log n) times over a 1280-entry list on every keystroke.
+  // One collator for the session. localeCompare with options builds a fresh
+  // Intl.Collator on every call. The title sort runs O(n log n) over a
+  // 1280-entry list on every keystroke.
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 </script>
 
@@ -43,7 +43,7 @@
 
   const statuses = ["CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"];
 
-  // ---- filter + sort (persisted UI state) ----
+  // filter and sort. Persisted UI state.
   type SortKey = "title" | "score" | "progress" | "updated" | "airing";
   const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
     { value: "title", label: "Title" },
@@ -52,7 +52,7 @@
     { value: "updated", label: "Last updated" },
     { value: "airing", label: "Next airing" },
   ];
-  /// Natural direction per key — picking a key resets to it; the arrow flips it.
+  /// Natural direction per key. Picking a key resets to it. The arrow flips it.
   const SORT_DEFAULT_DESC: Record<SortKey, boolean> = {
     title: false,
     score: true,
@@ -84,7 +84,7 @@
       localStorage.setItem("kurisu.list.sort", sortKey);
       localStorage.setItem("kurisu.list.dir", sortDesc ? "desc" : "asc");
     } catch {
-      // storage unavailable — the choice just won't persist
+      // storage unavailable. Choice won't persist.
     }
   }
   function pickSort(k: SortKey) {
@@ -107,7 +107,7 @@
   const titleCmp = (a: ListEntry, b: ListEntry) =>
     COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
 
-  /// Sort value for the active key; null = "doesn't apply" → always sorts last.
+  /// Sort value for the active key. Null sorts last.
   function keyVal(e: ListEntry): number | null {
     switch (sortKey) {
       case "score":
@@ -144,12 +144,11 @@
     });
   });
 
-  // Overlapping loads (initial + episode-updated + edit-close) resolve
-  // latest-wins; stale responses are dropped.
+  // Overlapping loads resolve latest wins. Stale responses are dropped.
   let loadId = 0;
-  // The local cache isn't namespaced per account: if the user changes under us
-  // (logout → different login), force a sync — it also purges rows the new
-  // account doesn't have. Auto-sync on an empty list happens once per session.
+  // Local cache isn't namespaced per account. If the user changes, force a
+  // sync. Also purges rows the new account doesn't have. Auto-sync on
+  // empty happens once per session.
   let autoSynced = false;
   async function load() {
     const id = ++loadId;
@@ -158,9 +157,9 @@
     try {
       const list = await api.localEntries();
       if (id !== loadId) return;
-      // Decide BEFORE rendering: on an account switch the cached rows belong to
-      // the previous user, so showing them (even for one frame) invites edits
-      // against the wrong list. Hold the old view until the sync reconciles.
+      // Decide before rendering. On account switch the cached rows belong
+      // to the previous user. Showing them invites edits against the wrong
+      // list. Hold the old view until sync reconciles.
       const uid = auth.user?.id ?? null;
       const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
       if (!switched) entries = list;
@@ -176,8 +175,8 @@
     }
   }
 
-  // `fromLoad` ties this sync to a load()'s request id: if a newer load started
-  // while the sync was in flight, the stale result is dropped like any other.
+  // fromLoad ties this sync to a load request id. If a newer load started
+  // mid-sync, the stale result is dropped.
   async function sync(fromLoad?: number) {
     syncing = true;
     error = "";
@@ -191,8 +190,7 @@
     }
   }
 
-  /// Merge a freshly-saved entry back into the local list (from the stepper or the
-  /// edit modal) without a full reload.
+  /// Merge a saved entry back into the local list without a full reload.
   function applyEntry(entry: ListEntry) {
     entries = entries.map((x) =>
       x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x
@@ -203,9 +201,9 @@
     if (auth.isLoggedIn) load();
   });
 
-  // Refresh when the watcher (auto mode) or the prompt modal updates an episode —
-  // those paths have no in-place row update here, unlike the stepper which calls
-  // applyEntry itself. Debounced so a burst of events collapses into one reload.
+  // Refresh when the watcher or prompt modal updates an episode. Those
+  // paths don't update the row in place, unlike the stepper. Debounced
+  // so a burst of events collapses into one reload.
   $effect(() => {
     let alive = true;
     let un: (() => void) | undefined;
@@ -295,12 +293,10 @@
           <div
             onclick={() => (editing = e)}
             onkeydown={(ev) => {
-              // Only when the ROW itself is focused. The row contains real
-              // buttons (cover, stepper -/+); their click handlers stop
-              // propagation but nothing stopped the keydown, so keyboard users
-              // hitting Enter on the stepper both cancelled its activation
-              // (preventDefault suppresses the synthesized click) and opened
-              // this modal instead.
+              // Only when the row itself is focused. The row has real buttons
+              // whose click handlers stop propagation, but keydown wasn't
+              // stopped. So Enter on the stepper both cancelled its click via
+              // preventDefault and opened this modal.
               if (ev.currentTarget !== ev.target) return;
               if (ev.key === "Enter" || ev.key === " ") {
                 ev.preventDefault();

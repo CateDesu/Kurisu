@@ -4,18 +4,18 @@
   import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
   import type { UpdateInfo } from "$lib/types";
 
-  // Shown when the backend's startup check finds a newer release (the
-  // `kurisu://update-available` event, or the stashed payload pulled on mount
-  // — see below). `null` = hidden.
+  // Shown when the backend's startup check finds a newer release. Comes from
+  // the `kurisu://update-available` event or the stashed payload pulled on
+  // mount below. null means hidden.
   let update = $state<UpdateInfo | null>(null);
   let err = $state("");
-  // Linux swaps the binary in place and needs a manual restart; Windows
+  // Linux swaps the binary in place and needs a manual restart. Windows
   // quits by itself once the installer launches.
   let installed = $state(false);
-  // One-shot notice after a doubly-failed swap (see the backend marker).
+  // One shot notice after a doubly failed swap. See the backend marker.
   let failedMsg = $state("");
-  // What the user already dismissed / was already shown this session: the
-  // emit and the pull-on-mount can deliver the same payload twice.
+  // What the user already dismissed or was already shown this session. The
+  // emit and the pull on mount can deliver the same payload twice.
   let dismissedTag = "";
   let failedSeen = false;
 
@@ -45,9 +45,9 @@
     listen<{ message: string }>("kurisu://update-failed", (e) => showFailed(e.payload.message)).then(
       (u) => (alive ? (un2 = u) : u())
     );
-    // The emits above are one-shot and can fire before this listener exists
-    // on a slow cold boot, so the backend also stashes both payloads until
-    // the UI pulls them. This pull is the reliable path; the listeners are
+    // The emits above are one shot and can fire before this listener exists
+    // on a slow cold boot. The backend also stashes both payloads until
+    // the UI pulls them. This pull is the reliable path. The listeners are
     // the fast one.
     api
       .takePendingUpdate()
@@ -74,21 +74,21 @@
     try {
       const result = await runInstallUpdate();
       if (result === "installed") installed = true;
-      // "restarting": the installer launched and the app quits itself.
+      // "restarting" means the installer launched and the app quits itself.
     } catch (e) {
       err = String(e);
     }
   }
 
-  // Dismissal is refused while an install runs: hiding the modal would leave
-  // the outcome (success or failure) invisible.
+  // Dismissal is refused while an install runs. Hiding the modal would leave
+  // the outcome, success or failure, invisible.
   function later() {
     if (installInFlight() || !update) return;
     dismissedTag = update.tag;
     update = null;
   }
 
-  // Modal behavior: Escape dismisses, dialog takes focus on open.
+  // Escape dismisses. Dialog takes focus on open.
   function onWindowKeydown(e: KeyboardEvent) {
     if (e.key !== "Escape") return;
     if (failedMsg) {

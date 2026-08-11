@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Modal for the Library's unmatched files: pick a show on your list and bind
-  // this file (or its whole folder) to it. The binding is stored backend-side
+  // Modal for the Library's unmatched files. Pick a show on your list and bind
+  // this file or its whole folder to it. The binding is stored on the backend
   // and wins over the recognizer on every future scan.
   import { api } from "$lib/api";
   import { displayTitle, STATUS_LABEL, type ListEntry } from "$lib/types";
@@ -15,8 +15,8 @@
   }: {
     path: string;
     entries: ListEntry[];
-    /// Configured library root folders — a root is never offered for folder
-    /// binding (it would swallow every unmatched file in the library).
+    /// Configured library root folders. A root is never offered for folder
+    /// binding. It would swallow every unmatched file in the library.
     roots: string[];
     onclose: () => void;
     onlinked: () => void;
@@ -31,7 +31,7 @@
     dir !== "" && !roots.some((r) => r.replace(/[\\/]+$/, "") === dir)
   );
 
-  // The user's radio pick, if any; until then follow what the path allows.
+  // The user's radio pick, if any. Until then follow what the path allows.
   let scopeChoice = $state<"folder" | "file" | null>(null);
   const scope = $derived(
     scopeChoice === "folder" && !folderAllowed
@@ -42,7 +42,7 @@
   let busy = $state<number | null>(null);
   let err = $state("");
 
-  // Watching first — those are the likely targets — then the rest, title order.
+  // Watching first since those are the likely targets. Then the rest in title order.
   const STATUS_ORDER: Record<string, number> = {
     CURRENT: 0,
     REPEATING: 1,
@@ -51,7 +51,7 @@
     DROPPED: 4,
     COMPLETED: 5,
   };
-  // One collator for the session; localeCompare with an options object builds a
+  // One collator for the session. localeCompare with an options object builds a
   // fresh Intl.Collator on every comparison.
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
   // This picker is meant to be searched, not scrolled. Rendering all 1280 rows

@@ -13,11 +13,11 @@
 
   let entries = $state<ListEntry[]>([]);
   let error = $state("");
-  /// Path of the unmatched file being manually linked (LinkAnime modal).
+  /// Path of the unmatched file being manually linked.
   let linking = $state<string | null>(null);
-  /// Expanded show groups (by media id). Empty = all collapsed, so a show with
-  /// hundreds of episodes (Dragon Ball) doesn't bury the next series under a wall
-  /// of file rows. The next-episode Play button stays in the header either way.
+  /// Expanded show groups by media id. Empty means all collapsed. Keeps a
+  /// show with hundreds of episodes from burying the next series. Play
+  /// button stays in the header either way.
   let expanded = $state<Set<number>>(new Set());
 
   function toggle(mediaId: number) {
@@ -122,7 +122,7 @@
     return path.split(/[\\/]/).pop() ?? path;
   }
 
-  /// First file exactly at the next unwatched episode (progress + 1).
+  /// First file at the next unwatched episode, progress plus one.
   function nextFile(g: Group): LibraryFile | undefined {
     const progress = g.entry?.progress ?? 0;
     return g.files.find((f) => f.episode === progress + 1);
@@ -136,7 +136,7 @@
     return g.entry?.media?.cover_medium ?? null;
   }
 
-  /// Whether any of the group's files got here via a manual link.
+  /// Whether any file got here via a manual link.
   function hasBound(g: Group): boolean {
     return g.files.some((f) => f.bound);
   }
@@ -193,7 +193,7 @@
       </div>
     {/if}
 
-    <!-- Folders being scanned. -->
+    <!-- Folders being scanned -->
     <div class="mb-5">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Folders</h2>
       {#if library.folders.length === 0}

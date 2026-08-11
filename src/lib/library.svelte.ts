@@ -1,17 +1,19 @@
-// Library scan state (M3). Holds the configured folders + last scan so the Library
-// page and the edit modal's "play next" share one scan instead of each re-walking
-// the disk. Scans are cheap (a full walk is sub-second), so nothing is persisted.
+// Library scan state for M3. Holds the configured folders and last scan so the
+// Library page and the edit modal's "play next" share one scan instead of each
+// walking the disk again. Scans are cheap, a full walk takes under a second,
+// so nothing is persisted.
 import { api } from "./api";
 import type { LibraryFile, UnreadableFolder } from "./types";
 
 let files = $state<LibraryFile[]>([]);
-// Configured roots the last scan could not read (unmounted drive, permissions).
+// Configured roots the last scan could not read. Unmounted drive, permissions.
 let unreadable = $state<UnreadableFolder[]>([]);
 let folders = $state<string[]>([]);
 let scanning = $state(false);
 let lastScanAt = $state(0);
-// Set when a scan is requested mid-scan (e.g. removeFolder's keep-it-honest
-// re-scan): run one follow-up with the current folders when the active scan ends.
+// Set when a scan is requested during another scan. For example, removeFolder's
+// rescan to stay honest. Runs one follow up with the current folders when the
+// active scan ends.
 let pendingScan = false;
 
 async function loadFolders() {
@@ -61,13 +63,13 @@ export const library = {
   get hasScan() {
     return lastScanAt > 0;
   },
-  /** First scanned file for `mediaId` at `episode` (used by "play next"). */
+  /** First scanned file for `mediaId` at `episode`. Used by "play next". */
   fileFor(mediaId: number, episode: number): LibraryFile | undefined {
     return files.find((f) => f.media_id === mediaId && f.episode === episode);
   },
   loadFolders,
   scan,
-  /** Drop everything cached for the signed-in account (called from logout). */
+  /** Drop everything cached for the current account. Called from logout. */
   reset() {
     files = [];
     folders = [];
@@ -80,7 +82,7 @@ export const library = {
   },
   async removeFolder(path: string) {
     folders = await api.removeLibraryFolder(path);
-    // The scan still holds files from the removed folder; re-scan to stay honest.
+    // The scan still holds files from the removed folder. Rescan to stay honest.
     if (lastScanAt > 0) await scan();
   },
 };

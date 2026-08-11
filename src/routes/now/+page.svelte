@@ -11,12 +11,12 @@
   import Img from "$lib/Img.svelte";
   import Login from "$lib/Login.svelte";
 
-  // The detected show's list entry (cover + progress come from the joined media).
+  // Detected show's list entry. Cover and progress come from the joined media.
   let entry = $state<ListEntry | null>(null);
   let updating = $state(false);
   let error = $state("");
 
-  // Idle-state "continue watching": the user's CURRENT entries.
+  // Idle state continue watching. The user's CURRENT entries.
   let current = $state<ListEntry[]>([]);
 
   const np = $derived(nowPlaying());
@@ -25,7 +25,7 @@
       ? Math.min(100, Math.round((np.position_us / np.length_us) * 100))
       : 0
   );
-  // Next unwatched episode file for the detected show (for the Play button).
+  // Next unwatched episode file for the detected show.
   const nextFile = $derived(
     np?.media_id != null && entry
       ? library.fileFor(np.media_id, (entry.progress ?? 0) + 1)
@@ -49,7 +49,7 @@
   $effect(() => {
     if (auth.isLoggedIn) {
       loadCurrent();
-      // Make sure library files are available for the Play buttons.
+      // Make sure library files are loaded for the Play buttons.
       library.loadFolders().then(() => {
         if (library.folders.length > 0 && !library.hasScan) library.scan();
       });
@@ -65,9 +65,9 @@
     }
   }
 
-  // Refresh when progress is written anywhere (auto mode / prompt / this page).
-  // A loadId guards against burst races: N events spawn N concurrent loads, and
-  // only the last one's result is applied.
+  // Refresh when progress is written anywhere. A loadId guards against
+  // burst races. N events spawn N concurrent loads, only the last
+  // result is applied.
   let entryLoadId = 0;
   $effect(() => {
     let alive = true;
@@ -112,8 +112,8 @@
       updating = false;
       return;
     }
-    // Optimistic: reflect the new progress immediately so the click feels
-    // instant while the (sometimes slow, first-hit) AniList round-trip runs.
+    // Optimistic. Reflect the new progress immediately so the click feels
+    // instant while the AniList round-trip runs.
     entry = { ...fresh, progress: episode };
     try {
       const saved = await api.setProgress(id, episode, fresh.progress);
@@ -122,9 +122,9 @@
       await loadCurrent();
     } catch (e) {
       error = String(e);
-      // Re-fetch rather than reverting to a stale snapshot: the listener may
-      // have already updated entry to something newer than the pre-click value.
-      // Guarded by entryLoadId so a concurrent listener load isn't clobbered.
+      // Re-fetch instead of reverting to a stale snapshot. The listener
+      // may have already updated entry past the pre-click value. Guarded
+      // by entryLoadId so a concurrent load isn't clobbered.
       const lid = ++entryLoadId;
       try { const e2 = await api.getEntry(id); if (lid === entryLoadId) entry = e2; } catch { /* keep what we have */ }
     } finally {

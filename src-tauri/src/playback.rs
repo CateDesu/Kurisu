@@ -1,19 +1,19 @@
-//! Playback detection. Polls the OS media sessions — MPRIS2 on Linux
-//! (MPV/VLC/Celluloid/…), GSMTC on Windows (mpv.net/VLC/…) — every few seconds,
-//! matches the playing title against the user's cached list, and — per the
-//! tracking mode — either prompts after N minutes of playback or auto-updates
-//! progress at X% watched. Other platforms get a no-op stub.
+//! Playback detection. Polls the OS media session every few seconds, matches
+//! the playing title against the cached list, and either prompts after N
+//! minutes of playback or auto updates progress at X% watched. MPRIS2 on
+//! Linux, GSMTC on Windows. Other platforms get a no-op stub.
 //!
-//! Title cleaning / episode parsing / list matching live in `recognize.rs` (shared
-//! with the library scanner). Only `read_now` is platform-specific; the payloads,
-//! tick state machine, and event flow are identical on every OS.
+//! Title cleaning, episode parsing, and list matching live in recognize.rs
+//! and are shared with the library scanner. Only read_now is platform
+//! specific. The payloads, tick state machine, and event flow are identical
+//! on every OS.
 //!
-//! Feedback is in-app only: we emit Tauri events for a "Now Playing" banner and a
-//! prompt modal. No desktop / tray notifications, by request.
+//! Feedback is in-app only. We emit Tauri events for a Now Playing banner
+//! and a prompt modal. No desktop or tray notifications, by request.
 //!
-//! Media-session calls are blocking round-trips (D-Bus / WinRT), so each tick's
-//! reads happen inside a `spawn_blocking` task; the accumulated-play state machine
-//! + the network push stay on the async runtime.
+//! Media session calls are blocking round trips on D-Bus and WinRT, so each
+//! tick's reads happen inside a spawn_blocking task. The accumulated play
+//! state machine and the network push stay on the async runtime.
 
 use std::time::{Duration, Instant};
 
@@ -28,47 +28,46 @@ use crate::recognize::basename;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
 use crate::recognize::{match_title, resolve_episode};
 
-/// Poll interval. 5s is responsive enough for a 2-minute prompt threshold while
-/// keeping D-Bus chatter negligible.
+/// Poll interval. 5s is responsive for a 2min prompt threshold and keeps
+/// D-Bus chatter low.
 const TICK: Duration = Duration::from_secs(5);
-/// How long a matched track must actually PLAY before the auto-ask fires and
-/// switches the UI to the Currently Watching tab. Short enough to feel instant,
-/// long enough that skipping a file / a momentary MPRIS blip doesn't trip it.
+/// How long a matched track must actually play before the auto ask fires
+/// and switches the UI to the Currently Watching tab. Short enough to feel
+/// instant, long enough that a quick skip or MPRIS blip doesn't trip it.
 const AUTO_ASK_DELAY: Duration = Duration::from_secs(15);
-/// Bus-name / identity substrings of MPRIS players we never treat as anime
-/// players: web browsers (YouTube & co. in Firefox/Librewolf shouldn't drive the
-/// banner or tracking). Covers the Firefox and Chromium families. Matched against
-/// the D-Bus bus name + identity on Linux, the source AppUserModelId on Windows.
+/// Substrings of MPRIS player bus names and identities we never treat as
+/// anime players. Mostly web browsers. YouTube in Firefox shouldn't drive
+/// the banner or tracking. Matched against the D-Bus bus name and identity
+/// on Linux, the source AppUserModelId on Windows.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 const BROWSER_PLAYERS: &[&str] = &[
     "firefox", "librewolf", "mozilla", "zen", "waterfox", "floorp", "chrome", "chromium", "brave",
     "vivaldi", "opera", "edge",
-    // Bridges that re-expose another device's or app's media on the bus under
-    // their own name, bypassing the browser check above: KDE's browser
-    // integration (Firefox/Chrome tabs appear as plasma.browser.integration),
-    // KDE Connect (the paired phone's media sessions), and playerctld (mirrors
-    // whatever player it last controlled, browsers included).
+    // Bridges that forward another device or app's media on the bus under
+    // their own name. KDE browser integration, KDE Connect for paired phones,
+    // and playerctld which mirrors whatever it last controlled. These bypass
+    // the browser check above.
     "browser", "kdeconnect", "playerctld",
-    // Opaque AppUserModelIDs. A name-substring denylist cannot catch a browser
-    // whose AUMID carries no name: the classic (non-Store) Firefox installer
-    // registers this hash, so YouTube in Firefox would otherwise drive tracking
-    // on Windows even though the Linux side catches it via the MPRIS bus name.
-    "308046b0af4a39cb", // Firefox, default install path
-    "e7cf176e110c211b", // Firefox, common alternate install hash
+    // Opaque AppUserModelIDs. A name substring denylist can't catch a browser
+    // whose AUMID carries no name. The classic non-Store Firefox installer
+    // registers this hash, so YouTube in Firefox would drive tracking on
+    // Windows even though Linux catches it via the MPRIS bus name.
+    "308046b0af4a39cb", // Firefox default install path
+    "e7cf176e110c211b", // Firefox alternate install hash
 ];
 
-/// Windows GSMTC exposes only an AppUserModelId, so a denylist can never be
-/// complete. Anything on this list is treated as a real video player even if a
-/// future denylist entry would otherwise match it.
+/// Windows GSMTC exposes only an AppUserModelId so the denylist can never
+/// be complete. Anything here is treated as a real video player even if a
+/// future denylist entry would match it.
 #[cfg_attr(not(windows), allow(dead_code))]
 const KNOWN_VIDEO_PLAYERS: &[&str] = &[
     "mpv", "vlc", "mpc-hc", "mpc-be", "potplayer", "celluloid", "haruna", "smplayer",
 ];
 
-// ─────────────────────────── event payloads ───────────────────────────
+// ─────────────────────────── payloads ───────────────────────────
 
-/// Emitted every tick while something is (or was) playing. `active=false` means
-/// playback stopped — the frontend hides the banner.
+/// Emitted every tick while something is or was playing. active=false means
+/// playback stopped and the frontend hides the banner.
 #[derive(Serialize, Clone)]
 struct NowPlaying {
     active: bool,
@@ -81,9 +80,9 @@ struct NowPlaying {
     position_us: i64,
 }
 
-/// Emitted in prompt mode once the threshold is reached for a given track.
-/// `progress` is the entry's current local progress, so the modal can offer
-/// "set to Ep N" only when that's actually ahead.
+/// Emitted in prompt mode once the threshold is reached for a track.
+/// progress is the entry's current local progress, so the modal can offer
+/// set to Ep N only when that's ahead.
 #[derive(Serialize, Clone)]
 struct TrackingPrompt {
     media_id: i64,
@@ -93,9 +92,9 @@ struct TrackingPrompt {
     progress: i64,
 }
 
-// ─────────────────────────── track state machine ───────────────────────────
+// ─────────────────────────── track state ───────────────────────────
 
-/// Per-playing-track state. Reset whenever the MPRIS trackid / title changes.
+/// Per track state. Reset when the MPRIS trackid or title changes.
 struct ActiveTrack {
     key: String,
     accumulated: Duration,
@@ -103,11 +102,11 @@ struct ActiveTrack {
     was_playing: bool,
     prompted: bool,
     incremented: bool,
-    /// "Jump to Currently Watching + ask" has fired for this track. Separate
-    /// from `prompted` (the 120s prompt-mode modal) so the two never collide,
-    /// and from `incremented` (the auto-mode push).
+    /// The jump to Currently Watching and ask has fired for this track.
+    /// Separate from prompted so the two never collide, and from incremented
+    /// which is the auto mode push.
     asked: bool,
-    /// Consecutive failed auto-pushes for this track, and the earliest instant
+    /// Consecutive failed auto pushes for this track and the earliest instant
     /// the next attempt may run. Without these a failing push retries on every
     /// 5s tick for as long as the file plays.
     fail_count: u32,
@@ -130,11 +129,11 @@ impl ActiveTrack {
     }
 }
 
-/// Give up on a track after this many consecutive failed auto-pushes. The user
-/// can still set progress by hand, and the next file starts a fresh track.
+/// Give up on a track after this many consecutive failed auto pushes. The
+/// user can still set progress by hand. The next file starts a fresh track.
 const MAX_AUTO_PUSH_FAILURES: u32 = 4;
 
-/// Backoff before retrying a failed auto-push: 30s, 2m, 10m.
+/// Backoff before retrying a failed auto push. 30s, 2m, 10m.
 fn auto_push_backoff(fail_count: u32) -> Duration {
     match fail_count {
         0 | 1 => Duration::from_secs(30),
@@ -143,9 +142,9 @@ fn auto_push_backoff(fail_count: u32) -> Duration {
     }
 }
 
-/// Everything the auto arm needs to decide whether to write progress, lifted out
-/// of `tick` so the ONE code path that mutates the user's AniList list without
-/// asking is testable without D-Bus, a database, or the network.
+/// Everything the auto arm needs to decide whether to write progress.
+/// Lifted out of tick so the one code path that mutates the user's AniList
+/// list without asking is testable without D-Bus, a database, or network.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 struct AutoGate {
     incremented: bool,
@@ -161,7 +160,7 @@ struct AutoGate {
 }
 
 impl AutoGate {
-    /// Fraction of the file played, 0.0 when the player reports no duration.
+    /// Fraction of the file played. 0.0 when the player reports no duration.
     fn pct(&self) -> f64 {
         if self.length_us > 0 {
             (self.position_us as f64 / self.length_us as f64) * 100.0
@@ -170,11 +169,11 @@ impl AutoGate {
         }
     }
 
-    /// Position alone is NOT evidence of watching. Require that the track was
+    /// Position alone is not evidence of watching. Require the track was
     /// already playing on the previous tick and has actually played for
-    /// `min_watch_time`, so a file that merely RESUMES past the threshold (mpv
-    /// watch_later, VLC continue-where-you-left-off) or is seeked straight to the
-    /// credits cannot write progress from a single 5s sample.
+    /// min_watch_time. A file that merely resumes past the threshold from mpv
+    /// watch_later or VLC continue mode, or is seeked to the credits, can't
+    /// write progress from a single 5s sample.
     fn should_push(&self) -> bool {
         !self.incremented
             && self.was_playing_before
@@ -186,11 +185,11 @@ impl AutoGate {
     }
 }
 
-/// Minimum time a track must have actually PLAYED before an auto-push may fire.
-/// Position alone is not evidence of watching: mpv's `watch_later` and VLC's
-/// "continue where you left off" both reopen a file at the position it was
-/// closed at, and a single seek to the credits reaches any percentage instantly.
-/// A quarter of the runtime, capped at a minute, so short specials still track.
+/// Minimum time a track must have actually played before an auto push may
+/// fire. Position alone is not evidence of watching. mpv watch_later and
+/// VLC continue mode both reopen a file at the saved position, and a single
+/// seek to the credits reaches any percentage instantly. A quarter of the
+/// runtime, capped at a minute, so short specials still track.
 fn min_watch_time(length_us: i64) -> Duration {
     if length_us <= 0 {
         return Duration::from_secs(60);
@@ -201,14 +200,15 @@ fn min_watch_time(length_us: i64) -> Duration {
 
 // ─────────────────────────── entrypoint ───────────────────────────
 
-/// Launch the background watcher. Runs for the app's lifetime. Each tick is
-/// supervised as its own task: a tick ERROR is logged and skipped, and even a
-/// PANIC is caught at the join boundary — it costs the per-track state, but the
-/// loop itself keeps running (a single bad tick must not end tracking silently).
+/// Launch the background watcher. Runs for the app's lifetime. Each tick
+/// is its own task. A tick error is logged and skipped. Even a panic is
+/// caught at the join boundary. It costs the per track state but the loop
+/// keeps running. A single bad tick must not end tracking silently.
 ///
-/// Spawned via `tauri::async_runtime` (not `tokio::spawn`) because the call site
-/// is Tauri's `setup()` closure, where no Tokio reactor is entered. The Tauri
-/// runtime is Tokio, so `tokio::time::sleep` / `spawn_blocking` work inside it.
+/// Spawned via tauri::async_runtime rather than tokio::spawn because the
+/// call site is Tauri's setup closure where no Tokio reactor is entered.
+/// The Tauri runtime is Tokio, so tokio::time::sleep and spawn_blocking
+/// work inside it.
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut active: Option<ActiveTrack> = None;
@@ -230,7 +230,7 @@ pub fn spawn(app: AppHandle) {
                     }
                 }
                 Err(e) => {
-                    active = None; // per-track state died with the panicked task
+                    active = None; // per track state died with the panicked task
                     log::warn!("playback tick panicked (watcher continues): {e}");
                 }
             }
@@ -240,7 +240,7 @@ pub fn spawn(app: AppHandle) {
 
 // ─────────────────────────── tick ───────────────────────────
 
-/// Snapshot of what a player is playing right now (read on a blocking thread).
+/// Snapshot of what a player is playing right now. Read on a blocking thread.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 struct TickInfo {
     playing: bool,
@@ -255,13 +255,13 @@ struct TickInfo {
 }
 
 async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Result<()> {
-    // Do all blocking D-Bus + DB reads off the async runtime.
+    // Do all blocking D-Bus and DB reads off the async runtime.
     let app_for_blocking = app.clone();
-    // `??`: first unwraps the JoinHandle's JoinError, then read_now's anyhow error.
+    // ??. First unwraps the JoinHandle JoinError, then read_now's anyhow error.
     let info = tokio::task::spawn_blocking(move || read_now(&app_for_blocking)).await??;
 
     let Some(info) = info else {
-        // Nothing playing (or paused-but-nothing): drop the banner, reset state.
+        // Nothing playing or paused with nothing. Drop the banner and reset state.
         if active.is_some() {
             let _ = app.emit("kurisu://now-playing", idle());
             *active = None;
@@ -269,7 +269,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         return Ok(());
     };
 
-    // Banner — emitted every tick so the progress bar stays live.
+    // Banner. Emitted every tick so the progress bar stays live.
     let _ = app.emit(
         "kurisu://now-playing",
         NowPlaying {
@@ -284,20 +284,19 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         },
     );
 
-    // Advance / reset the per-track state machine.
+    // Advance or reset the per track state machine.
     let key = if !info.trackid.is_empty() { info.trackid.clone() } else { info.title.clone() };
     if active.as_ref().map(|t| &t.key) != Some(&key) {
         *active = Some(ActiveTrack::new(key));
     }
-    // Provably Some (the branch above just set it if it wasn't), but spelled as
-    // a let-else so a future edit to that condition can't turn it into a panic.
+    // Provably Some since the branch above just set it. Spelled as a let else
+    // so a future edit to that condition can't turn it into a panic.
     let Some(track) = active.as_mut() else { return Ok(()) };
-    // Credit the interval only when playing at BOTH ticks: sampling every 5s
-    // can't see intra-interval pauses, so counting a pause→resume interval in
-    // full would reach the prompt threshold early. Under-counting (a slightly
-    // late prompt) is the safe direction.
-    // Capture the PREVIOUS tick's playing state before overwriting it: the auto
-    // arm needs "was already playing one tick ago", not "is playing right now".
+    // Only credit the interval when playing at both ticks. We sample every 5s
+    // so we can't see pauses within an interval. Under counting is the safe
+    // direction since it just means a slightly late prompt.
+    // Capture the previous tick's playing state before overwriting it. The auto
+    // arm needs was already playing one tick ago, not is playing right now.
     let was_playing_before = track.was_playing;
     if info.playing && track.was_playing {
         track.accumulated += track.last_tick.elapsed();
@@ -305,7 +304,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     track.was_playing = info.playing;
     track.last_tick = Instant::now();
 
-    // Tracking only applies once we've matched a list entry AND parsed an episode.
+    // Tracking only applies once we've matched a list entry and parsed an episode.
     let Some(media_id) = info.media_id else { return Ok(()) };
     let Some(episode) = info.episode else { return Ok(()) };
     let progress = app
@@ -319,11 +318,11 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
 
     let cfg = read_config(app);
 
-    // Auto-ask: independent of `mode`. After a few seconds of ACTUAL playback of a
-    // matched episode that's ahead of progress, switch the UI to the Currently
-    // Watching tab and prompt. Uses the same accumulated-play gate as the other
-    // arms (resume-at-position alone must not trigger it). Marks `prompted` too,
-    // so a later prompt-mode cycle doesn't double-prompt for the same track.
+    // Auto ask. Independent of mode. After a few seconds of actual playback of
+    // a matched episode that's ahead of progress, switch the UI to Currently
+    // Watching and prompt. Uses the same accumulated play gate as the other
+    // arms. Resume at position alone must not trigger it. Marks prompted too
+    // so a later prompt mode cycle doesn't double prompt for the same track.
     if cfg.auto_ask
         && info.playing
         && episode > progress
@@ -373,21 +372,22 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
                 episode,
                 progress,
             };
-            // Set progress to the detected episode (never rewind): identical to +1
-            // for sequential viewing, catches up on skips, and leaves rewatches alone.
+            // Set progress to the detected episode and never rewind. Identical
+            // to +1 for sequential viewing, catches up on skips, leaves
+            // rewatches alone.
             if gate.should_push() {
                 let st = app.state::<AppState>();
-                // watcher_set_progress re-checks "episode > progress" under the
-                // write lock: the user may have rewound while we were deciding.
-                // `incremented` is set only once the outcome is known, so a failed
-                // push (offline hiccup) retries on a later tick instead of never
+                // watcher_set_progress checks episode > progress again under
+                // the write lock. The user may have rewound while we were
+                // deciding. incremented is set only once the outcome is known,
+                // so a failed push retries on a later tick instead of never
                 // firing for this track.
                 match commands::watcher_set_progress(st.inner(), media_id, episode).await {
                     Ok(Some(entry)) => {
                         track.incremented = true;
                         let _ = app.emit("kurisu://episode-updated", entry);
                     }
-                    Ok(None) => track.incremented = true, // rewound past `episode` between check and write
+                        Ok(None) => track.incremented = true, // rewound past episode between check and write
                     Err(e) => {
                         track.fail_count += 1;
                         track.retry_at = Some(Instant::now() + auto_push_backoff(track.fail_count));
@@ -427,14 +427,14 @@ fn idle() -> NowPlaying {
 
 // ─────────────────────────── blocking reads ───────────────────────────
 
-/// Linux (MPRIS2): find the most relevant player (prefer Playing, fall back to
-/// Paused so we don't lose accumulated progress on a pause), read its current
-/// track, and match it against the cached list. All blocking.
+/// Linux MPRIS2. Find the most relevant player. Prefer Playing, fall back
+/// to Paused so we don't lose accumulated progress on a pause. Read its
+/// current track and match against the cached list. All blocking.
 #[cfg(target_os = "linux")]
 fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let finder = match PlayerFinder::new() {
         Ok(f) => f,
-        Err(_) => return Ok(None), // no session bus / D-Bus unavailable
+        Err(_) => return Ok(None), // no session bus or D-Bus unavailable
     };
     let players: Vec<_> = finder
         .find_all()
@@ -465,14 +465,14 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let length = md.length().unwrap_or(Duration::ZERO);
     let position = player.get_position().unwrap_or(Duration::ZERO);
     let identity = player.identity().to_string();
-    // mpris 2.x's Metadata has no `trackid` accessor, so synthesize a stable
-    // per-track key: the file URL is unique per file (which is exactly when we
-    // want to reset the tracker), falling back to the title.
+    // mpris 2.x Metadata has no trackid accessor, so synthesize a stable per
+    // track key. The file URL is unique per file which is exactly when we want
+    // to reset the tracker. Falls back to the title.
     let trackid = if !url.is_empty() { url.clone() } else { title.clone() };
 
     let state = app.state::<AppState>();
-    // Matchers come from the shared cache (rebuilt on every list mutation) —
-    // rebuilding them from the DB every 5s tick was the hot path's main cost.
+    // Matchers come from the shared cache rebuilt on every list mutation.
+    // Rebuilding them from the DB every 5s tick was the hot path's main cost.
     let matchers = state.matchers.lock().clone();
     let matched = match_title(&matchers, &title, &url);
     let base = basename(&url);
@@ -495,13 +495,13 @@ fn read_config(app: &AppHandle) -> TrackingConfig {
     TrackingConfig::load(&app.state::<AppState>().db)
 }
 
-/// True if a player identifier (D-Bus bus name + identity on Linux, source
-/// AppUserModelId on Windows) belongs to a web browser — YouTube/Twitch playback
-/// must not drive the banner or tracking.
+/// True if a player identifier belongs to a web browser. The D-Bus bus name
+/// and identity on Linux, the source AppUserModelId on Windows. YouTube and
+/// Twitch playback must not drive the banner or tracking.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 fn is_browser_str(id: &str) -> bool {
     let id = id.to_lowercase();
-    // A known player always wins: "mpv" must not be excluded by a substring that
+    // A known player always wins. mpv must not be excluded by a substring that
     // happens to appear in its install path or package family name.
     if KNOWN_VIDEO_PLAYERS.iter().any(|p| id.contains(p)) {
         return false;
@@ -514,11 +514,11 @@ fn is_browser(player: &mpris::Player) -> bool {
     is_browser_str(&format!("{} {}", player.bus_name(), player.identity()))
 }
 
-/// Windows: read the Global System Media Transport Controls (GSMTC) sessions —
-/// the OS-level "what's playing" API. Same pick policy as MPRIS (Playing first,
-/// else Paused). Bare MPV doesn't register with GSMTC; mpv.net and VLC do.
-/// GSMTC exposes no file URL, so the title is the only match input and doubles
-/// as the track key.
+/// Windows. Read the Global System Media Transport Controls sessions, the
+/// OS level what's playing API. Same pick policy as MPRIS. Playing first,
+/// else Paused. Bare MPV doesn't register with GSMTC. mpv.net and VLC do.
+/// GSMTC exposes no file URL so the title is the only match input and
+/// doubles as the track key.
 #[cfg(windows)]
 fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     use windows::Media::Control::{
@@ -559,7 +559,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
         .map(|h| h.to_string_lossy())
         .unwrap_or_default();
     let timeline = session.GetTimelineProperties()?;
-    // TimeSpan.Duration is in 100 ns units → microseconds.
+    // TimeSpan.Duration is in 100 ns units. Divide by 10 for microseconds.
     let length_us = timeline.EndTime().map(|t| t.Duration / 10).unwrap_or(0);
     let position_us = timeline.Position().map(|t| t.Duration / 10).unwrap_or(0);
 
@@ -571,7 +571,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     Ok(Some(TickInfo {
         playing,
         player,
-        trackid: String::new(), // no URL from GSMTC; tick keys the track by title
+        trackid: String::new(), // no URL from GSMTC. tick keys the track by title
         title,
         length_us,
         position_us,
@@ -581,8 +581,9 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     }))
 }
 
-/// Platforms without a media-session API we support (macOS, …): no playback
-/// detection. Everything else (AniList sync, library, seasons) works unchanged.
+/// Platforms without a media session API we support like macOS. No playback
+/// detection. Everything else like AniList sync, library, seasons works
+/// unchanged.
 #[cfg(not(any(target_os = "linux", windows)))]
 fn read_now(_app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     Ok(None)
@@ -592,8 +593,8 @@ fn read_now(_app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
 mod tests {
     use super::*;
 
-    /// A 24-minute episode, played to 90%, on a track that has been running long
-    /// enough to count. The baseline every case below perturbs by ONE field.
+    /// A 24 minute episode played to 90%, on a track that has been running long
+    /// enough to count. The baseline every case below perturbs by one field.
     fn watched() -> AutoGate {
         AutoGate {
             incremented: false,
@@ -616,11 +617,11 @@ mod tests {
 
     #[test]
     fn seeking_to_the_credits_does_not_push() {
-        // The whole point of the accumulated-time gate: a file opened and dragged
-        // straight to 90% has position but no playback behind it.
+        // The whole point of the accumulated time gate. A file opened and
+        // dragged straight to 90% has position but no playback behind it.
         let g = AutoGate { accumulated: Duration::from_secs(5), ..watched() };
         assert!(!g.should_push());
-        // ...and one 5s sample of a file that only just appeared cannot push
+        // And one 5s sample of a file that only just appeared can't push
         // either, however far into it the player resumed.
         let g = AutoGate {
             was_playing_before: false,
@@ -632,8 +633,8 @@ mod tests {
 
     #[test]
     fn resume_on_open_does_not_complete_a_show() {
-        // mpv watch_later / VLC continue-where-you-left-off reopen at the saved
-        // position. First tick: playing, already at 97%, nothing accumulated.
+        // mpv watch_later or VLC continue mode reopen at the saved position.
+        // First tick. Playing, already at 97%, nothing accumulated.
         let g = AutoGate {
             was_playing_before: false,
             accumulated: Duration::ZERO,
@@ -647,8 +648,8 @@ mod tests {
 
     #[test]
     fn short_specials_still_track() {
-        // min_watch_time caps at a quarter of the runtime, so a 4-minute short
-        // does not need a full minute of playback to count.
+        // min_watch_time caps at a quarter of the runtime, so a 4 minute short
+        // doesn't need a full minute of playback to count.
         let len = 4 * 60 * 1_000_000_i64;
         let g = AutoGate {
             length_us: len,
@@ -659,7 +660,7 @@ mod tests {
         assert!(g.should_push());
         assert_eq!(min_watch_time(len), Duration::from_secs(60));
         assert_eq!(min_watch_time(2 * 60 * 1_000_000), Duration::from_secs(30));
-        // No duration reported: fall back to a flat minute rather than 0.
+        // No duration reported. Fall back to a flat minute rather than 0.
         assert_eq!(min_watch_time(0), Duration::from_secs(60));
     }
 
@@ -685,13 +686,13 @@ mod tests {
 
     #[test]
     fn failed_pushes_back_off_and_then_give_up() {
-        // Backed off: the retry instant has not arrived yet.
+        // Backed off. The retry instant hasn't arrived yet.
         let g = AutoGate { fail_count: 1, retry_due: false, ..watched() };
         assert!(!g.should_push());
-        // Backoff elapsed: try again.
+        // Backoff elapsed. Try again.
         let g = AutoGate { fail_count: 1, retry_due: true, ..watched() };
         assert!(g.should_push());
-        // Too many consecutive failures: stop hammering AniList for this track.
+        // Too many consecutive failures. Stop hammering AniList for this track.
         let g = AutoGate { fail_count: MAX_AUTO_PUSH_FAILURES, retry_due: true, ..watched() };
         assert!(!g.should_push());
         assert!(auto_push_backoff(1) < auto_push_backoff(2));
@@ -703,7 +704,7 @@ mod tests {
         assert!(is_browser_str("org.mpris.MediaPlayer2.firefox.instance_1 Firefox"));
         assert!(is_browser_str("308046B0AF4A39CB"), "opaque Firefox AUMID");
         assert!(is_browser_str("Chromium"));
-        // Bridges re-exposing browser/phone media under their own name.
+        // Bridges that forward browser or phone media under their own name.
         assert!(is_browser_str("org.mpris.MediaPlayer2.plasma.browser.integration Plasma Browser Integration"));
         assert!(is_browser_str("org.mpris.MediaPlayer2.kdeconnect.pixel_7 KDE Connect"));
         assert!(is_browser_str("org.mpris.MediaPlayer2.playerctld playerctld"));
@@ -714,8 +715,8 @@ mod tests {
         assert!(!is_browser_str(r"C:\Users\opera\AppData\mpv.net\mpvnet.exe"));
     }
 
-    /// Same drift guard as models.rs, for the event payloads the watcher emits
-    /// (mirrored by hand as `NowPlaying` / `TrackingPrompt` in types.ts).
+    /// Same drift guard as models.rs, for the event payloads the watcher emits.
+    /// Mirrored by hand as NowPlaying and TrackingPrompt in types.ts.
     #[test]
     fn event_payload_field_names_exist_in_types_ts() {
         crate::models::assert_ts_declares("NowPlaying", &serde_json::to_value(idle()).unwrap());

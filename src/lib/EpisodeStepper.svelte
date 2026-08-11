@@ -1,7 +1,6 @@
 <script lang="ts">
-  // Compact −/+ episode stepper that replaces the old +1 button. Edits buffer for
-  // 3s then auto-commit ("locks in"); pending changes are flushed on unmount so a
-  // quick tweak isn't lost. Grey surfaces only — no white.
+  // Compact minus plus stepper. Edits buffer 3s then auto commit.
+  // Pending changes flush on unmount. Grey only, no white.
   import { untrack } from "svelte";
   import { emit } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
@@ -24,14 +23,13 @@
   let pending = $state(untrack(() => progress));
   let saved = $state(untrack(() => progress));
   let saving = $state(false);
-  // Last commit failure. Kept so the control can SHOW that the number snapped
-  // back rather than reverting silently and leaving the user believing it saved.
+  // Last commit failure. Show the snapback instead of silently reverting.
   let failed = $state("");
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   const dirty = $derived(pending !== saved);
   const atMin = $derived(pending <= 0);
-  // No known episode count → cap at a sane ceiling instead of spinning forever.
+  // No episode count known. Cap at a sane ceiling.
   const atMax = $derived(pending >= (total ?? 9999));
 
   function step(delta: number) {
@@ -52,9 +50,8 @@
     const v = pending;
     failed = "";
     try {
-      // Compare-and-swap on `saved`: if the auto-tracker (or anything else) moved
-      // progress while this commit was in flight, the backend skips our stale
-      // absolute write and returns the live entry — adopt it instead of rewinding.
+      // CAS on saved. If something else moved progress while this was in
+      // flight, the backend skips our stale write and returns the live entry.
       const entry = await api.setProgress(mediaId, v, saved);
       if (entry.progress === v) {
         saved = v;
@@ -66,19 +63,18 @@
         onchange?.(entry);
       }
     } catch (e) {
-      // revert so the UI reflects what actually saved
+      // revert to what actually saved
       pending = saved;
       failed = String(e);
       console.error("set progress failed", e);
-      // Tell the page too: a console line is invisible to the user, who just
-      // watched their episode count silently jump back.
+      // Surface to the page. A console log alone is invisible to the user.
       onerror?.(failed);
     } finally {
       saving = false;
     }
   }
 
-  // Flush a pending edit if the row scrolls away / the app re-renders.
+  // Flush a pending edit if the row scrolls off or re-renders.
   $effect(() => {
     return () => {
       if (timer) {
@@ -89,9 +85,8 @@
     };
   });
 
-  // Follow external progress changes (sync / episode-updated reload). When we're
-  // not mid-edit, mirror the prop; if a reload lands while we ARE editing, just
-  // adopt the new saved baseline without clobbering the user's pending value.
+  // Follow external progress changes. When idle, mirror the prop. When
+  // editing, adopt the new baseline but don't clobber the pending value.
   $effect(() => {
     const p = progress;
     untrack(() => {
@@ -99,9 +94,8 @@
         pending = p;
         saved = p;
       } else if (p !== saved) {
-        // Only adopt a higher external value when the user was ALSO incrementing.
-        // A decrement (pending < saved) must not be silently reversed by a
-        // concurrent increment from elsewhere — CAS will arbitrate at commit.
+        // Only adopt a higher value when the user was also incrementing.
+        // Don't reverse a decrement silently. CAS sorts it out at commit.
         const wasIncrementing = pending > saved;
         saved = p;
         if (wasIncrementing && p > pending) pending = p;
@@ -114,8 +108,7 @@
     "disabled:opacity-30 disabled:hover:bg-edge/50 disabled:hover:text-ink-dim text-sm leading-none transition-colors";
 </script>
 
-<!-- stopPropagation so clicking the status indicator (or anywhere in the
-stepper's bounding box) doesn't activate a parent row's click handler. -->
+<!-- stopPropagation so clicking anywhere in the stepper doesn't fire the parent row's click handler -->
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="flex items-center gap-1 select-none" role="presentation" onclick={(e) => e.stopPropagation()}>
   <span class="w-3 shrink-0 text-[10px] text-center leading-none">

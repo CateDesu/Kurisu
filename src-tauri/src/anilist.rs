@@ -1,8 +1,7 @@
-//! AniList v2 GraphQL client + desktop OAuth2 (implicit flow via a localhost
-//! callback server). The browser gets the token in a URL fragment (#access_token),
-//! which it never sends to a server, so the callback page runs a few lines of JS
-//! that move the fragment into the query string and re-request — at which point our
-//! listener captures it. Avoids shipping a client_secret.
+//! AniList v2 GraphQL client with desktop OAuth2 implicit flow.
+//! Browser gets the token in a URL fragment it never sends to a server.
+//! Callback page runs JS that moves the fragment into the query string and
+//! re-requests. Then our listener picks it up. No client_secret needed.
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -16,10 +15,10 @@ use crate::models::{
 
 const GRAPHQL: &str = "https://graphql.anilist.co";
 const AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
-/// Fixed port so the user registers ONE redirect_uri in their AniList client once.
+/// Fixed port. User registers ONE redirect_uri in their AniList client.
 pub const OAUTH_PORT: u16 = 39417;
 
-/// `nextAiringEpisode { episode airingAt }` — shared by the search + list queries.
+/// `nextAiringEpisode { episode airingAt }`. Shared by search and list queries.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NextAiring {
@@ -27,10 +26,9 @@ struct NextAiring {
     airing_at: Option<i64>,
 }
 
-/// The media field set every list-ish query fetches (search / user_list / season /
-/// recommendations) — one deserializer + conversion shared by all of them. The
-/// detail-only fields (banner/genres/duration/source/studios) are Options the lean
-/// queries simply never populate.
+/// Media fields every list-ish query fetches. search, user_list, season,
+/// recommendations all share one deserializer and conversion. Detail fields
+/// are Options the lean queries never populate.
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct AniMedia {
@@ -47,7 +45,7 @@ struct AniMedia {
     description: Option<String>,
     next_airing_episode: Option<NextAiring>,
     banner_image: Option<String>,
-    // AniList types the list's ITEMS as nullable too — a stray null must not
+    // AniList types the list items as nullable. A stray null must not
     // fail the whole query.
     genres: Option<Vec<Option<String>>>,
     duration: Option<i64>,
@@ -109,10 +107,10 @@ impl From<AniMedia> for Media {
     }
 }
 
-/// The entry fields a SaveMediaListEntry mutation / MediaList query returns.
-/// This is AniList's true post-write state — the local cache mirrors THESE
-/// values, never the values that were sent (arguments Kurisu omits keep
-/// their remote values, and only the response knows them).
+/// Entry fields a SaveMediaListEntry mutation or MediaList query returns.
+/// AniList's true post-write state. The local cache mirrors THESE values,
+/// not what we sent. Arguments Kurisu omits keep their remote values, and
+/// only the response knows them.
 #[derive(Deserialize)]
 pub struct SavedEntry {
     pub id: i64,
@@ -122,8 +120,8 @@ pub struct SavedEntry {
     pub repeat: Option<i64>,
 }
 
-/// reqwest::Client is cheap to clone (Arc-backed), so cloning AniList lets us drop
-/// the DB-style lock before any `.await` (Tauri futures must be Send).
+/// reqwest::Client is cheap to clone, Arc backed. Cloning AniList lets us
+/// drop the lock before any .await. Tauri futures must be Send.
 #[derive(Clone)]
 pub struct AniList {
     http: reqwest::Client,
@@ -169,8 +167,8 @@ impl AniList {
                 .send()
                 .await?;
             let status = resp.status();
-            // Rate-limited: honor Retry-After and retry (bounded) instead of
-            // failing the whole operation on a transient 429.
+            // Rate limited. Honor Retry-After and retry, bounded. Do not
+            // fail the whole operation on a transient 429.
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS && retries < 2 {
                 retries += 1;
                 let wait = resp
@@ -202,7 +200,7 @@ impl AniList {
                 .unwrap_or("unknown AniList error");
             return Err(anyhow!("AniList ({}): {}", status, msg));
         }
-        // unwrap the "data" object before deserializing into T
+        // unwrap the data object before deserializing into T
         let data = body
             .get("data")
             .ok_or_else(|| anyhow!("AniList: no data field"))?
@@ -210,7 +208,7 @@ impl AniList {
         Ok(serde_json::from_value(data)?)
     }
 
-    /// `Viewer` = the authenticated user. Used to verify the token + fetch the name.
+    /// Viewer is the authenticated user. Used to verify the token and fetch the name.
     pub async fn viewer(&self) -> Result<User> {
         #[derive(Deserialize)]
         struct R {
@@ -277,7 +275,7 @@ impl AniList {
         Ok(r.page.media.into_iter().map(Media::from).collect())
     }
 
-    /// One anime season (WINTER/SPRING/SUMMER/FALL + year), most popular first.
+    /// One anime season. WINTER, SPRING, SUMMER, or FALL plus year. Most popular first.
     pub async fn season(&self, season: &str, year: i64, page: i64) -> Result<Vec<Media>> {
         #[derive(Deserialize)]
         struct R {
@@ -307,7 +305,7 @@ impl AniList {
         Ok(r.page.media.into_iter().map(Media::from).collect())
     }
 
-    /// AniList's community recommendations for one title, best-rated first.
+    /// Community recommendations for one title. Best rated first.
     pub async fn recommendations(&self, media_id: i64) -> Result<Vec<Media>> {
         #[derive(Deserialize)]
         struct R {
@@ -345,8 +343,8 @@ impl AniList {
             .collect())
     }
 
-    /// One anime by AniList id (the `get_media` cache-miss fallback — full-text
-    /// `search` can't look up by id).
+    /// One anime by AniList id. Cache miss fallback for get_media, since
+    /// search can not look up by id.
     pub async fn media_by_id(&self, id: i64) -> Result<Media> {
         #[derive(Deserialize)]
         struct R {
@@ -365,10 +363,9 @@ impl AniList {
         Ok(Media::from(r.media))
     }
 
-    /// One anime with the full detail-page field set plus its anime relations
-    /// (sequels/prequels/side stories — manga nodes are dropped, the app is
-    /// anime-only and can't open them), main characters (with their Japanese
-    /// voice actors), and key staff credits.
+    /// One anime with full detail fields plus anime relations, main
+    /// characters with Japanese voice actors, and key staff. Manga
+    /// relations dropped, app is anime only and can not open them.
     pub async fn media_detail(
         &self,
         id: i64,
@@ -523,9 +520,9 @@ impl AniList {
         Ok((r.media.media.into(), relations, characters, staff))
     }
 
-    /// AniList's server-side profile statistics for a user. Whole-list
-    /// aggregates (counts, time watched, score/status/format/genre/year
-    /// breakdowns) — nothing to compute locally.
+    /// Profile statistics for a user, computed on the server. Whole list
+    /// aggregates like counts, time watched, score, status, format, genre,
+    /// year breakdowns. Nothing to compute locally.
     pub async fn user_statistics(&self, user_name: &str) -> Result<UserStats> {
         #[derive(Deserialize)]
         struct R {
@@ -649,10 +646,10 @@ impl AniList {
         })
     }
 
-    /// Every episode airing in [start, end) (Unix seconds), in airing order.
-    /// Pages through AniList's 50-per-page chunks; capped at 12 pages (600
-    /// entries — more than any real week) so a bad range can't loop forever.
-    /// Adult titles are dropped.
+    /// Every episode airing in [start, end), Unix seconds, in airing order.
+    /// Pages through 50-per-page chunks. Capped at 12 pages so 600 entries,
+    /// more than any real week. A bad range can not loop forever.
+    /// Adult titles dropped.
     pub async fn airing_schedule(&self, start: i64, end: i64) -> Result<Vec<AiringItem>> {
         #[derive(Deserialize)]
         struct R {
@@ -684,11 +681,12 @@ impl AniList {
             #[serde(flatten)]
             media: AniMedia,
         }
-        // `airingAt_greater` is EXCLUSIVE, so passing the window start dropped an
-        // episode airing exactly on the boundary — and the calendar tiles a week
-        // as [start, end), so that episode fell through the crack between two
-        // adjacent weeks and appeared in neither. Shift the lower bound by one
-        // second to make it inclusive; `airingAt_lesser: end` stays exclusive.
+        // airingAt_greater is EXCLUSIVE, so passing the window start dropped
+        // an episode airing exactly on the boundary. The calendar tiles a
+        // week as [start, end), so that episode fell through the crack
+        // between two adjacent weeks and appeared in neither. Shift the
+        // lower bound by one second to make it inclusive. airingAt_lesser
+        // with end stays exclusive.
         let start_exclusive = start.saturating_sub(1);
         let q = "query ($startExclusive: Int!, $end: Int!, $page: Int!) {
             Page(page: $page, perPage: 50) {
@@ -708,9 +706,9 @@ impl AniList {
         let mut out = Vec::new();
         for page in 1..=12 {
             if page > 1 {
-                // Pace the page walk: one calendar view can cost a dozen
-                // requests and AniList's rate budget is tight — don't burn it
-                // in a single burst.
+                // Pace the page walk. One calendar view can cost a dozen
+                // requests and AniList's rate budget is tight. Do not burn
+                // it in a single burst.
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
             let r: R = self
@@ -743,13 +741,14 @@ impl AniList {
         Ok(out)
     }
 
-    /// Pull the full list (every status group) for a user and flatten to entries.
-    /// AniList chunks big lists at 500 entries per status group — walk the chunks
-    /// via `hasNextChunk` or large accounts sync an incomplete list. Ok is only
-    /// ever returned after a COMPLETE walk (`hasNextChunk == false`); any error
-    /// aborts the whole fetch, because the sync caller reconcile-deletes local
-    /// rows the remote did not return. AniList types every entry field nullable,
-    /// so they are Options here: one malformed row costs that row, not the sync.
+    /// Pull the full list, every status group, for a user and flatten to entries.
+    /// AniList chunks big lists at 500 entries per status group. Walk the
+    /// chunks via hasNextChunk or large accounts sync an incomplete list. Ok
+    /// is only ever returned after a COMPLETE walk where hasNextChunk is false.
+    /// Any error aborts the whole fetch, because the sync caller reconcile
+    /// deletes local rows the remote did not return. AniList types every entry
+    /// field nullable, so they are Options here. One malformed row costs that
+    /// row, not the sync.
     pub async fn user_list(&self, user_name: &str) -> Result<Vec<ListEntry>> {
         #[derive(Deserialize)]
         struct R {
@@ -805,8 +804,8 @@ impl AniList {
                 .await?;
             for list in r.collection.lists.unwrap_or_default() {
                 for e in list.entries {
-                    // A null media object can't be mapped to a cache row at all
-                    // (no media_id) — drop just this entry.
+                    // A null media object can not be mapped to a cache row
+                    // since it has no media_id. Drop just this entry.
                     let Some(media) = e.media else { continue };
                     out.push(ListEntry {
                         id: Some(e.id),
@@ -828,8 +827,8 @@ impl AniList {
         Ok(out)
     }
 
-    /// The viewer's list entry for one media (None = not on their list). Used
-    /// to tell a genuine add-to-list apart from a local-cache miss on an entry
+    /// The viewer's list entry for one media. None means not on their list.
+    /// Used to tell a real add apart from a local cache miss on an entry
     /// that already exists remotely.
     pub async fn entry_by_media_id(&self, media_id: i64) -> Result<Option<SavedEntry>> {
         #[derive(Deserialize)]
@@ -844,10 +843,10 @@ impl AniList {
         Ok(r.entry)
     }
 
-    /// Create or update an entry. Only the `Some(..)` fields are sent — AniList
-    /// treats omitted arguments as unchanged, so a write that isn't meant to
-    /// touch score/repeat can't clobber values set elsewhere. Returns the entry
-    /// as AniList stored it.
+    /// Create or update an entry. Only the Some fields are sent. AniList
+    /// treats omitted arguments as unchanged, so a write that is not meant
+    /// to touch score or repeat can not clobber values set elsewhere.
+    /// Returns the entry as AniList stored it.
     pub async fn save_entry(
         &self,
         media_id: i64,
@@ -882,10 +881,10 @@ impl AniList {
         Ok(r.entry)
     }
 
-    /// Delete a list entry. Ok(true) = deleted; Ok(false) = the entry was
-    /// already absent remotely (deleted on anilist.co / another client), which
-    /// IS the desired end state — the caller should drop the local row too
-    /// instead of hard-failing and stranding it.
+    /// Delete a list entry. Ok(true) means deleted. Ok(false) means the
+    /// entry was already absent remotely, deleted on anilist.co or another
+    /// client. That is the desired end state. The caller should drop the
+    /// local row too instead of hard failing and stranding it.
     pub async fn delete_entry(&self, entry_id: i64) -> Result<bool> {
         #[derive(Deserialize)]
         struct R {
@@ -894,8 +893,8 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct Entry {
-            // Nullable in the schema: a null maps to the friendly decline below,
-            // not a serde type error.
+            // Nullable in the schema. A null maps to the friendly decline
+            // below, not a serde type error.
             deleted: Option<bool>,
         }
         let q = "mutation ($id: Int!) { DeleteMediaListEntry(id: $id) { deleted } }";
@@ -910,10 +909,10 @@ impl AniList {
         Ok(true)
     }
 
-    /// The user's recent notifications (union of Airing / Following / Activity /
-    /// Thread / Media… types). Flattened into one struct per type with the rest
-    /// left None. `reset_notification_count=false` so opening the inbox here
-    /// doesn't silently clear AniList's own unread badge.
+    /// The user's recent notifications. Union of Airing, Following, Activity,
+    /// Thread, Media, and other types. Flattened into one struct per type
+    /// with the rest left None. resetNotificationCount is false so opening
+    /// the inbox here does not silently clear AniList's own unread badge.
     pub async fn notifications(&self) -> Result<Vec<Notification>> {
         #[derive(Deserialize)]
         struct R {
@@ -932,10 +931,10 @@ impl AniList {
             #[serde(rename = "type")]
             kind: String,
             context: Option<String>,
-            // AiringNotification has `contexts: [String]` (plural) instead of `context`.
+            // AiringNotification has contexts, a Vec, instead of context.
             contexts: Option<Vec<String>>,
             created_at: Option<i64>,
-            // AniList notifications expose the anime as `media { id }`, not `mediaId`.
+            // AniList notifications expose the anime as media { id }, not mediaId.
             media: Option<MediaRef>,
             episode: Option<i64>,
             activity_id: Option<i64>,
@@ -1001,9 +1000,9 @@ impl AniList {
             .notifications
             .unwrap_or_default()
             .into_iter()
-            // A notification type this query has no fragment for comes back as
-            // `{}` → kind "" and id 0. Drop it: rendering a ghost row (with a
-            // duplicate `id` for the frontend's keyed each) is worse than
+            // A notification type with no fragment in this query comes back
+            // as {} so kind "" and id 0. Drop it. Rendering a ghost row
+            // with a duplicate id for the frontend keyed each is worse than
             // hiding it until the type is added.
             .filter(|n| !n.kind.is_empty())
             .map(|n| Notification {
@@ -1038,26 +1037,27 @@ impl AniList {
     }
 }
 
-// ───────────────────────── OAuth2 desktop flow (implicit) ─────────────────────────
+// ───────────────────────── OAuth2 flow ─────────────────────────
 
-/// AniList answers a mutation against an already-gone entry with
-/// `{"data":{"DeleteMediaListEntry":null},"errors":[{"message":"Not Found"}]}`
-/// (HTTP 200) or, more rarely, a real 404. Both spell "no such entry".
+/// AniList answers a mutation against an already gone entry with
+/// {"data":{"DeleteMediaListEntry":null},"errors":[{"message":"Not Found"}]}
+/// over HTTP 200, or more rarely a real 404. Both mean no such entry.
 fn is_not_found(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("Not Found") || s.contains("404")
 }
 //
-// Implicit grant: no client_secret is needed (a desktop app can't keep one
-// private anyway). The token arrives in the redirect URL *fragment*
-// (#access_token=…), which the browser never sends to a server — so the callback
-// serves a tiny HTML page whose JS lifts the fragment into a query string the
-// server can read on a second request.
+// Implicit grant. No client_secret needed, a desktop app can not keep one
+// private anyway. The token arrives in the redirect URL fragment,
+// #access_token=..., which the browser never sends to a server. The
+// callback serves a tiny HTML page whose JS lifts the fragment into a
+// query string the server can read on a second request.
 
-/// 32 random bytes from the OS CSPRNG, hex-encoded. Used as the OAuth `state` so
-/// the callback can reject a token AniList didn't actually issue for THIS login
-/// attempt (CSRF / token-injection via a malicious site hitting 127.0.0.1:39417).
-/// No software fallback: an OAuth flow that can't randomize its state must not start.
+/// 32 random bytes from the OS CSPRNG, hex encoded. Used as OAuth state so
+/// the callback can reject a token AniList did not issue for THIS login
+/// attempt. Blocks CSRF and token injection via a malicious site hitting
+/// 127.0.0.1:39417. No software fallback. An OAuth flow that can not
+/// randomize its state must not start.
 fn random_state() -> Result<String> {
     use ring::rand::SecureRandom;
     use std::fmt::Write as _;
@@ -1072,8 +1072,8 @@ fn random_state() -> Result<String> {
     Ok(out)
 }
 
-/// Build the authorize URL the user's browser should visit (response_type=token).
-/// `state` is echoed back by AniList and checked by the callback server.
+/// Build the authorize URL the user's browser should visit. response_type=token.
+/// state is echoed back by AniList and checked by the callback server.
 pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
     format!(
         "{AUTHORIZE}?client_id={cid}&response_type=token&redirect_uri={redir}&state={state}",
@@ -1083,18 +1083,19 @@ pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String
     )
 }
 
-/// The HTML shim served on the first callback hit. It moves the URL fragment
-/// (which the server can't see) into a `/__capture__?<fragment>` request that the
-/// server CAN read. On a bare probe (no fragment) it just shows a "connecting" page.
+/// HTML shim served on the first callback hit. Moves the URL fragment,
+/// which the server can not see, into a /__capture__?<fragment> request
+/// the server CAN read. On a bare probe with no fragment, just shows a
+/// connecting page.
 const SHIM_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>body{font-family:sans-serif;text-align:center;padding:3em;color:#9aa3b2;background:#0f1115;margin:0}h2{color:#3ba55d;font-weight:600}</style></head><body><h2>Connecting to Kurisu…</h2><p>You can close this tab once the app opens.</p><script>(function(){var h=location.hash.charCodeAt(0)===35?location.hash.slice(1):location.hash;if(h.indexOf('access_token=')!==-1){location.replace('/__capture__?'+h);}})();</script></body></html>";
 
 const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#3ba55d'>Connected to Kurisu.</h2><p>You can close this tab and return to the app.</p></body>";
 const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#e74c3c'>Authorization failed.</h2><p>Return to Kurisu for details.</p></body>";
 
-/// Minimal query-value decoder: %XX escapes plus '+' as space. Today's values
-/// (base64url token, hex state) contain neither, so this is a no-op — it only
-/// starts mattering if AniList ever changes the token alphabet. Malformed
-/// escapes pass through literally.
+/// Minimal query value decoder. %XX escapes plus + as space. Today's
+/// values, base64url token and hex state, contain neither, so this is a
+/// no-op. Only matters if AniList ever changes the token alphabet.
+/// Malformed escapes pass through literally.
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -1127,23 +1128,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Start a localhost HTTP listener that captures the access token AniList sends
-/// back in the implicit flow. Returns `(state, receiver)`: the caller embeds
-/// `state` in the authorize URL, and the receiver resolves with the token once a
-/// request passes the CSRF `state` check. AniList errors, state mismatches, and
-/// stray probes are answered and LOGGED but never resolve the receiver or stop
-/// the listener — any web page can fire `http://127.0.0.1:39417/?error=x`, and
-/// that must not kill a login in flight. The listener shuts down when the caller
-/// drops the receiver (timeout / cancel), freeing the port for a retry.
+/// Start a localhost HTTP listener that captures the access token AniList
+/// sends back in the implicit flow. Returns (state, receiver). The caller
+/// embeds state in the authorize URL. The receiver resolves with the
+/// token once a request passes the CSRF state check. AniList errors,
+/// state mismatches, and stray probes are answered and LOGGED but never
+/// resolve the receiver or stop the listener. Any web page can fire
+/// http://127.0.0.1:39417/?error=x and that must not kill a login in
+/// flight. The listener shuts down when the caller drops the receiver,
+/// timeout or cancel, freeing the port for a retry.
 pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
     let (state, _port, rx) = start_callback_server_on(OAUTH_PORT)?;
     Ok((state, rx))
 }
 
-/// `start_callback_server`, with the port injectable. Production always uses
-/// `OAUTH_PORT` (it has to match the registered redirect URI); tests pass 0 so
-/// the OS assigns a free port, which keeps them off the real singleton and lets
-/// them run concurrently with each other and with a running Kurisu.
+/// start_callback_server, with the port injectable. Production always uses
+/// OAUTH_PORT, it has to match the registered redirect URI. Tests pass 0
+/// so the OS assigns a free port, keeping them off the real singleton and
+/// letting them run concurrently with each other and a running Kurisu.
 pub fn start_callback_server_on(
     port: u16,
 ) -> Result<(String, u16, oneshot::Receiver<String>)> {
@@ -1153,8 +1155,9 @@ pub fn start_callback_server_on(
     let addr = format!("127.0.0.1:{port}");
     let listener = std::net::TcpListener::bind(&addr).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
-            // Without this the user just saw "Address already in use". The usual
-            // cause is their own abandoned sign-in still holding the port.
+            // Without this the user just saw "Address already in use".
+            // The usual cause is their own abandoned sign in still holding
+            // the port.
             anyhow::anyhow!(
                 "a sign-in is already in progress (port {port} is busy) — finish it in your \
                  browser, or wait a moment and try again"
@@ -1163,7 +1166,7 @@ pub fn start_callback_server_on(
             anyhow::anyhow!(e)
         }
     })?;
-    // Read back what the OS actually gave us, so port 0 resolves to the real one.
+    // Read back what the OS actually gave us. Port 0 resolves to the real one.
     let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     listener.set_nonblocking(true)?;
     std::thread::spawn(move || {
@@ -1175,15 +1178,15 @@ pub fn start_callback_server_on(
             Err(_) => return,
         };
         rt.block_on(async move {
-            // `closed()` takes &mut self; rebind so the select can poll it.
+            // closed() takes &mut self. Rebind so the select can poll it.
             let mut tx = tx;
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             loop {
-                // Stop waiting when the caller dropped the receiver (login
-                // timed out or was abandoned): the listener drops with this
-                // task, freeing the port so a retry can bind it. Without this
-                // the port stayed bound for the process's lifetime and a
-                // second "Sign in" click always failed.
+                // Stop waiting when the caller dropped the receiver. Login
+                // timed out or was abandoned. The listener drops with this
+                // task, freeing the port so a retry can bind it. Without
+                // this the port stayed bound for the process lifetime and
+                // a second Sign in click always failed.
                 let (mut sock, _) = match tokio::select! {
                     _ = tx.closed() => return,
                     acc = listener.accept() => acc,
@@ -1192,12 +1195,12 @@ pub fn start_callback_server_on(
                     Err(_) => continue,
                 };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // Read until the request headers are complete (or the buffer
-                // fills, the peer closes, or 10s passes). One read usually
-                // delivers the whole GET over loopback, but that's a TCP
-                // accident, not a guarantee — and a speculative browser
-                // preconnect that never sends a byte must not park the accept
-                // loop until the browser gives up on the socket.
+                // Read until the request headers are complete, or the buffer
+                // fills, the peer closes, or 10s passes. One read usually
+                // delivers the whole GET over loopback, but that is a TCP
+                // accident, not a guarantee. A speculative browser preconnect
+                // that never sends a byte must not park the accept loop until
+                // the browser gives up on the socket.
                 let mut buf = [0u8; 8192];
                 let mut n = 0;
                 let read_headers = async {
@@ -1230,26 +1233,28 @@ pub fn start_callback_server_on(
                     })
                 };
 
-                // 1) AniList denied → error comes in the query (?error=…).
-                // 2) The shim re-requested with the fragment as a query
-                //    (?access_token=…). The flow is response_type=token, so
-                //    that's the ONLY parameter that can carry credentials — a
-                //    `code` would need an exchange step this app doesn't have.
-                // 3) Otherwise (initial implicit redirect with the token still in the
-                //    fragment, or a probe) → serve the shim, don't resolve yet.
-                // Failures (error param, state mismatch) answer the browser but do
-                // NOT resolve the login or stop the listener: any web page can hit
-                // 127.0.0.1:39417 with ?error=…, and that must not kill a login in
-                // flight before the real AniList redirect arrives.
+                // 1) AniList denied. The error comes in the query, ?error=...
+                // 2) The shim re-requested with the fragment as a query,
+                //    ?access_token=.... The flow is response_type=token, so
+                //    that is the ONLY parameter that can carry credentials.
+                //    A code would need an exchange step this app does not have.
+                // 3) Otherwise, initial implicit redirect with the token still
+                //    in the fragment, or a probe. Serve the shim, do not
+                //    resolve yet.
+                // Failures, error param or state mismatch, answer the browser
+                // but do NOT resolve the login or stop the listener. Any web
+                // page can hit 127.0.0.1:39417 with ?error=... and that must
+                // not kill a login in flight before the real AniList redirect
+                // arrives.
                 let (token, body): (Option<String>, &str) =
                     if let Some(err) = param("error") {
                         let msg = param("error_description").unwrap_or(err);
                         log::warn!("OAuth callback: AniList denied access: {msg}");
                         (None, ERR_HTML)
                     } else if let Some(token) = param("access_token") {
-                        // CSRF check: the state AniList echoes back must equal the one
-                        // we sent. A mismatch / missing state means this token wasn't
-                        // for our request — reject it and keep listening.
+                        // CSRF check. The state AniList echoes back must equal the
+                        // one we sent. A mismatch or missing state means this token
+                        // was not for our request. Reject it and keep listening.
                         match param("state") {
                             Some(s) if s == expected => (Some(token), OK_HTML),
                             _ => {
@@ -1274,7 +1279,7 @@ pub fn start_callback_server_on(
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
-                // Only a state-verified token resolves the login and frees the port.
+                // Only a token that passed the state check resolves the login and frees the port.
                 if let Some(token) = token {
                     let _ = tx.send(token);
                     break;
@@ -1285,8 +1290,8 @@ pub fn start_callback_server_on(
     Ok((state, bound_port, rx))
 }
 
-// minimal URL-encode helper (avoids pulling urlencoding as a dep); also used by
-// rss.rs to build magnet display names
+// minimal URL encode helper. Avoids pulling urlencoding as a dep.
+// Also used by rss.rs to build magnet display names.
 pub(crate) mod urlencoding {
     pub fn encode(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -1308,19 +1313,21 @@ mod tests {
         assert_eq!(super::percent_decode("abc-123_x.y~z"), "abc-123_x.y~z");
         assert_eq!(super::percent_decode("a%20b+c"), "a b c");
         assert_eq!(super::percent_decode("%41%6eiList"), "AniList");
-        // Malformed / truncated escapes pass through literally.
+        // Malformed or truncated escapes pass through literally.
         assert_eq!(super::percent_decode("100%"), "100%");
         assert_eq!(super::percent_decode("%zz%4"), "%zz%4");
     }
 
-    /// C3 regression: a hostile probe (`?error=…`), a token with the WRONG
-    /// state, and a bare hit must all be answered WITHOUT resolving the login
-    /// or killing the listener — only a state-verified token resolves it.
+    /// C3 regression. A hostile probe with ?error=..., a token with the
+    /// WRONG state, and a bare hit must all be answered WITHOUT resolving
+    /// the login or killing the listener. Only a token that passes the
+    /// state check resolves it.
     #[test]
     fn oauth_callback_survives_probes_and_accepts_verified_token() {
-        // Port 0: the OS picks a free one. Binding the real OAUTH_PORT made this
-        // test fail whenever Kurisu was running (or another copy of the test
-        // was), and it could steal the port from a sign-in in progress.
+        // Port 0. The OS picks a free one. Binding the real OAUTH_PORT
+        // made this test fail whenever Kurisu was running or another copy
+        // of the test was, and it could steal the port from a sign in
+        // in progress.
         let (state, port, rx) =
             super::start_callback_server_on(0).expect("bind callback listener");
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1330,24 +1337,24 @@ mod tests {
         rt.block_on(async move {
             let base = format!("http://127.0.0.1:{port}");
             let http = reqwest::Client::new();
-            // Bare probe → shim, still listening.
+            // Bare probe. Shim, still listening.
             let r = http.get(&base).send().await.unwrap();
             assert!(r.status().is_success());
-            // The one-shot DoS from the review: ?error= from any web page.
+            // One shot DoS from the review. ?error= from any web page.
             let r = http
                 .get(format!("{base}/?error=access_denied"))
                 .send()
                 .await
                 .unwrap();
             assert!(r.status().is_success());
-            // Token with a wrong state → rejected, still listening.
+            // Token with a wrong state. Rejected, still listening.
             let r = http
                 .get(format!("{base}/__capture__?access_token=bad&state=nope"))
                 .send()
                 .await
                 .unwrap();
             assert!(r.status().is_success());
-            // Token with the RIGHT state → the receiver resolves.
+            // Token with the RIGHT state. The receiver resolves.
             let r = http
                 .get(format!("{base}/__capture__?access_token=good-token&state={state}"))
                 .send()

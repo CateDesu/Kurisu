@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Format-aware score editor. Adapts to the user's AniList scoreFormat
-  // (POINT_100 / POINT_10_DECIMAL / POINT_10 / POINT_5 stars / POINT_3 smileys).
-  // `value` is null when unrated; AniList stores it as a number.
+  // Format aware score editor. Adapts to the user's AniList scoreFormat:
+  // POINT_100, POINT_10_DECIMAL, POINT_10, POINT_5 stars, POINT_3 smileys.
+  // value is null when unrated. AniList stores it as a number.
   let {
     value = $bindable(),
     format,

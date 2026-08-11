@@ -36,8 +36,8 @@
     adding = m.id;
     error = "";
     try {
-      // Adding writes status/progress unconditionally — refuse to clobber an
-      // entry that's already on the list.
+      // Adding writes status and progress unconditionally. Refuse to clobber
+      // an entry that's already on the list.
       if (await api.getEntry(m.id)) {
         error = `${displayTitle(m)} is already on your list.`;
         return;

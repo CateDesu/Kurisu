@@ -13,7 +13,7 @@
 
   let closeToTray = $state(false);
 
-  // Auto-update defaults ON: only an explicit "0" turns it off.
+  // Auto-update defaults on. Only an explicit 0 turns it off.
   let autoUpdate = $state(true);
   let update = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
@@ -55,13 +55,12 @@
     if (trackingSaving) return;
     trackingSaving = true;
     trackingError = "";
-    // Snapshot what's being saved: the inputs bind straight into `cfg`, so an edit
-    // made while the request is in flight must not change what we send — and the
-    // response must not clobber that newer edit when it lands.
-    // `bind:value` on a number input yields NaN when the field is cleared and a
-    // float when the user types "2.5". Both serialize to something the Rust u64
-    // parameters reject, so the whole save failed with a raw deserialize error.
-    // Normalize and clamp to the same ranges the inputs advertise.
+    // Snapshot what's being saved. Inputs bind straight into cfg so an edit
+    // mid-request must not change what we send. The response must not
+    // clobber a newer edit when it lands.
+    // bind:value on a number input yields NaN when cleared and a float when
+    // the user types 2.5. Both make the Rust u64 params fail to deserialize
+    // and the whole save failed. Normalize and clamp to the input ranges.
     const int = (v: unknown, fallback: number, lo: number, hi: number) => {
       const n = Math.round(Number(v));
       if (!Number.isFinite(n)) return fallback;
@@ -73,7 +72,7 @@
       auto_percent: int(cfg.auto_percent, 80, 1, 100),
       auto_ask: cfg.auto_ask,
     };
-    // Reflect the normalized values so the field shows what was actually saved.
+    // Reflect the normalized values so the field shows what was saved.
     cfg.prompt_seconds = snap.prompt_seconds;
     cfg.auto_percent = snap.auto_percent;
     try {
@@ -113,13 +112,13 @@
     }
   }
   async function installUpdate() {
-    // The in-flight flag lives in the shared updater store, so an install
-    // started from the update modal (or vice versa) blocks a second one here.
+    // The in-flight flag lives in the shared updater store. An install
+    // started from the update modal blocks a second one here and vice versa.
     updateError = "";
     updateStatus = "";
     try {
       const result = await runInstallUpdate();
-      // "restarting": the installer launched and the app quits itself.
+      // installed. The installer launched and the app quits itself.
       if (result === "installed") updateStatus = "Installed — restart Kurisu to finish.";
     } catch (e) {
       updateError = String(e);
