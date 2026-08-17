@@ -230,6 +230,15 @@ fn roman_to_u32(s: &str) -> Option<u32> {
     (1..=30).contains(&total).then_some(total)
 }
 
+/// Sort key behind the tiebreak order documented on match_title.
+type TiebreakKey = (
+    bool,
+    u8,
+    std::cmp::Reverse<u8>,
+    usize,
+    std::cmp::Reverse<i64>,
+);
+
 /// Match a now-playing string against the cached list. Tries the raw title first,
 /// then the file basename. Scores all candidates globally so a weak hit on the
 /// player title doesn't hide a stronger match on the filename.
@@ -240,8 +249,7 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
     let candidates = [clean_title(title), clean_title(&basename(url))];
     // Season ordinal from the raw inputs before clean_title strips the marker.
     let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
-    let mut best: Option<((bool, u8, std::cmp::Reverse<u8>, usize, std::cmp::Reverse<i64>), &Matcher)> =
-        None;
+    let mut best: Option<(TiebreakKey, &Matcher)> = None;
     for cand in candidates {
         if cand.is_empty() {
             continue;
@@ -257,7 +265,7 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
                 // this entry's norms encodes the same ordinal. Strongest
                 // franchise disambiguator. Picks the right season even when
                 // every sibling shares a prefix at the same tier and status.
-                let season_match = cand_season.map_or(false, |cs| {
+                let season_match = cand_season.is_some_and(|cs| {
                     m.norms.iter().any(|n| norm_season_ordinal(n) == Some(cs))
                 });
                 let key = (
@@ -267,7 +275,7 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
                     nlen,
                     std::cmp::Reverse(m.media_id),
                 );
-                if best.as_ref().map_or(true, |(bk, _)| key > *bk) {
+                if best.as_ref().is_none_or(|(bk, _)| key > *bk) {
                     best = Some((key, m));
                 }
             }
