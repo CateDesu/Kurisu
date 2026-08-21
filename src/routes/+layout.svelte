@@ -23,6 +23,18 @@
     void bindNowPlaying();
   });
 
+  // A session that starts offline never recovers on its own. When the
+  // network comes back, refresh the login so the sidebar and score
+  // format pick the user up.
+  $effect(() => {
+    const onOnline = () => void auth.refresh();
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  });
+
+  // Set when the backend side of a logout fails. Shown in the sidebar.
+  let logoutErr = $state("");
+
   // Inline SVG icons. Stroke style, inherit text color.
   const nav = [
     { href: "/", label: "My List", icon: "list" },
@@ -121,7 +133,10 @@
               <div class="text-xs text-ink-dim truncate">View AniList</div>
             </button>
             <button
-              onclick={() => auth.logout().catch(() => {})}
+              onclick={() => {
+                logoutErr = "";
+                auth.logout().catch((e) => (logoutErr = String(e)));
+              }}
               title="Log out"
               class="text-ink-dim hover:text-ink px-1 grid place-items-center"
             >
@@ -129,8 +144,13 @@
             </button>
           </div>
         {:else}
-          <!-- signed out. Keep the bar empty. -->
-          <div class="px-4 py-5 border-t border-edge text-[13px] text-ink-dim/50">Not signed in</div>
+          <!-- signed out. Quiet unless a logout just failed. -->
+          <div class="px-4 py-5 border-t border-edge text-[13px] text-ink-dim/50">
+            Not signed in
+            {#if logoutErr}
+              <p class="text-red-400 mt-1">Log out failed: {logoutErr}</p>
+            {/if}
+          </div>
         {/if}
       </aside>
       <main class="flex-1 overflow-auto">

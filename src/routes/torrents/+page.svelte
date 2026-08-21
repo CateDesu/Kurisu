@@ -128,7 +128,9 @@
   }
 
   async function markAllSeen() {
-    const guids = groups.flatMap((g) => g.items).filter((t) => !t.seen).map((t) => t.guid);
+    // The badge counts every item, so collect from items. groups skips
+    // whatever the filter hid, and those would keep the badge stuck.
+    const guids = items.filter((t) => !t.seen).map((t) => t.guid);
     if (guids.length === 0) return;
     marking = true;
     error = "";

@@ -184,7 +184,7 @@ impl AniList {
             let body: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| anyhow!("AniList ({}): {}", status, e))?;
+                .map_err(|e| ApiError { status, message: e.to_string() })?;
             break (status, body);
         };
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -198,7 +198,7 @@ impl AniList {
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown AniList error");
-            return Err(anyhow!("AniList ({}): {}", status, msg));
+            return Err(ApiError { status, message: msg.to_string() }.into());
         }
         // unwrap the data object before deserializing into T
         let data = body
@@ -254,7 +254,9 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct Page {
-            media: Vec<AniMedia>,
+            // The list and its items are both nullable in the schema. A
+            // stray null must not fail the whole query.
+            media: Option<Vec<Option<AniMedia>>>,
         }
         let q = "query ($search: String!, $perPage: Int!) {
             Page(perPage: $perPage) {
@@ -272,7 +274,13 @@ impl AniList {
                 serde_json::json!({ "search": query, "perPage": per_page }),
             )
             .await?;
-        Ok(r.page.media.into_iter().map(Media::from).collect())
+        Ok(r.page
+            .media
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .map(Media::from)
+            .collect())
     }
 
     /// One anime season. WINTER, SPRING, SUMMER, or FALL plus year. Most popular first.
@@ -284,7 +292,9 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct Page {
-            media: Vec<AniMedia>,
+            // The list and its items are both nullable in the schema. A
+            // stray null must not fail the whole query.
+            media: Option<Vec<Option<AniMedia>>>,
         }
         let q = "query ($season: MediaSeason!, $year: Int!, $page: Int!) {
             Page(page: $page, perPage: 50) {
@@ -302,7 +312,13 @@ impl AniList {
                 serde_json::json!({ "season": season, "year": year, "page": page }),
             )
             .await?;
-        Ok(r.page.media.into_iter().map(Media::from).collect())
+        Ok(r.page
+            .media
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .map(Media::from)
+            .collect())
     }
 
     /// Community recommendations for one title. Best rated first.
@@ -729,12 +745,15 @@ impl AniList {
                     media: m.media.into(),
                 });
             }
-            if !r
+            // A null hasNextPage is not "walk done". Breaking here would
+            // hand back a truncated calendar as if it were complete. Abort
+            // instead so the caller surfaces the failure.
+            let has_next = r
                 .page
                 .page_info
                 .and_then(|p| p.has_next_page)
-                .unwrap_or(false)
-            {
+                .ok_or_else(|| anyhow!("AniList returned a null pageInfo.hasNextPage"))?;
+            if !has_next {
                 break;
             }
         }
@@ -766,7 +785,9 @@ impl AniList {
         struct AniList {
             #[allow(dead_code)]
             status: Option<String>,
-            entries: Vec<Entry>,
+            // The list and its items are both nullable in the schema. A
+            // stray null must not fail the whole query.
+            entries: Option<Vec<Option<Entry>>>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -777,6 +798,10 @@ impl AniList {
             score: Option<f64>,
             repeat: Option<i64>,
             updated_at: Option<i64>,
+            // Non null in the schema, unlike media. Still identifies the
+            // entry while AniList merges or removes a title and media
+            // comes back null.
+            media_id: i64,
             media: Option<AniMedia>,
         }
         let q = "query ($userName: String!, $chunk: Int!) {
@@ -785,7 +810,7 @@ impl AniList {
                 lists {
                     status
                     entries {
-                        id status progress score repeat updatedAt
+                        id status progress score repeat updatedAt mediaId
                         media {
                             id idMal title { romaji english native }
                             coverImage { medium large }
@@ -797,34 +822,47 @@ impl AniList {
             }
         }";
         let mut out = Vec::new();
-        let mut chunk = 1;
-        loop {
+        // Chunks are 500 entries. Cap the walk at 200 chunks, 100k entries,
+        // well past any real list. A hasNextChunk stuck true must not spin
+        // requests until hard 429s burn the rate budget to stop it.
+        for chunk in 1..=200 {
             let r: R = self
                 .gql(q, serde_json::json!({ "userName": user_name, "chunk": chunk }))
                 .await?;
             for list in r.collection.lists.unwrap_or_default() {
-                for e in list.entries {
-                    // A null media object can not be mapped to a cache row
-                    // since it has no media_id. Drop just this entry.
-                    let Some(media) = e.media else { continue };
+                for e in list.entries.unwrap_or_default().into_iter().flatten() {
+                    // media comes back null while AniList merges or removes
+                    // a title, but the entry still exists remotely. Keep it
+                    // with media None so sync marks it seen instead of
+                    // reconcile deleting the local row. media_id equals
+                    // media.id whenever media is present.
                     out.push(ListEntry {
                         id: Some(e.id),
-                        media_id: media.id,
+                        media_id: e.media_id,
                         status: e.status.unwrap_or_else(|| "CURRENT".into()),
                         progress: e.progress.unwrap_or(0),
                         score: e.score,
                         repeat: e.repeat.unwrap_or(0),
                         updated_at: e.updated_at,
-                        media: Some(media.into()),
+                        media: e.media.map(Media::from),
                     });
                 }
             }
-            if !r.collection.has_next_chunk.unwrap_or(false) {
-                break;
+            // A null hasNextChunk is not "walk done". Sync reconcile deletes
+            // every local row the walk did not return, so a partial list
+            // must abort here and never pass for complete.
+            let Some(has_next) = r.collection.has_next_chunk else {
+                return Err(anyhow!(
+                    "AniList returned a null hasNextChunk, refusing to sync a partial list"
+                ));
+            };
+            if !has_next {
+                return Ok(out);
             }
-            chunk += 1;
         }
-        Ok(out)
+        Err(anyhow!(
+            "AniList list walk ran past 200 chunks without hasNextChunk clearing"
+        ))
     }
 
     /// The viewer's list entry for one media. None means not on their list.
@@ -1039,12 +1077,31 @@ impl AniList {
 
 // ───────────────────────── OAuth2 flow ─────────────────────────
 
+/// An AniList API failure with the HTTP status and the error message kept as
+/// data, so a caller can match on them instead of substring searching a
+/// formatted string. Displays in the same shape the old formatted error did.
+#[derive(Debug)]
+struct ApiError {
+    status: reqwest::StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AniList ({}): {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 /// AniList answers a mutation against an already gone entry with
 /// {"data":{"DeleteMediaListEntry":null},"errors":[{"message":"Not Found"}]}
 /// over HTTP 200, or more rarely a real 404. Both mean no such entry.
 fn is_not_found(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("Not Found") || s.contains("404")
+    let Some(api) = e.downcast_ref::<ApiError>() else {
+        return false;
+    };
+    api.status == reqwest::StatusCode::NOT_FOUND || api.message == "Not Found"
 }
 //
 // Implicit grant. No client_secret needed, a desktop app can not keep one
@@ -1180,7 +1237,16 @@ pub fn start_callback_server_on(
         rt.block_on(async move {
             // closed() takes &mut self. Rebind so the select can poll it.
             let mut tx = tx;
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(l) => l,
+                // Reactor registration failed, fd exhaustion is the usual
+                // cause. Returning drops tx, closing the channel, so the
+                // login fails fast instead of hanging until the timeout.
+                Err(e) => {
+                    log::warn!("OAuth callback: could not register the listener with the runtime: {e}");
+                    return;
+                }
+            };
             loop {
                 // Stop waiting when the caller dropped the receiver. Login
                 // timed out or was abandoned. The listener drops with this
@@ -1316,6 +1382,40 @@ mod tests {
         // Malformed or truncated escapes pass through literally.
         assert_eq!(super::percent_decode("100%"), "100%");
         assert_eq!(super::percent_decode("%zz%4"), "%zz%4");
+    }
+
+    /// A4 regression. Only the real HTTP status or the exact Not Found
+    /// message mark an entry as already gone. A validation error whose
+    /// message happens to carry the digits 404, say a quoted entry id,
+    /// must not read as gone or the local row dies while the remote lives.
+    #[test]
+    fn is_not_found_matches_status_and_exact_message_only() {
+        let real_404: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            message: "whatever".into(),
+        }
+        .into();
+        assert!(super::is_not_found(&real_404));
+        let gql_not_found: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::OK,
+            message: "Not Found".into(),
+        }
+        .into();
+        assert!(super::is_not_found(&gql_not_found));
+        let quoted_id: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "validation failed for entry 40413".into(),
+        }
+        .into();
+        assert!(!super::is_not_found(&quoted_id));
+        let near_miss: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::OK,
+            message: "Not Found.".into(),
+        }
+        .into();
+        assert!(!super::is_not_found(&near_miss));
+        let plain = anyhow::anyhow!("AniList (404): boom");
+        assert!(!super::is_not_found(&plain));
     }
 
     /// C3 regression. A hostile probe with ?error=..., a token with the

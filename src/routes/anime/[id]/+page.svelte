@@ -49,6 +49,10 @@
     loading = true;
     error = "";
     editing = false;
+    // An add still in flight from the previous id never clears `adding`.
+    // Its finally fails the reqId check once loadId bumps, and the add
+    // buttons would stay disabled on this page.
+    adding = null;
     expanded = false;
     recs = [];
     // Clear the PREVIOUS anime's data too. Leaving it in place kept the old
@@ -143,7 +147,17 @@
 
   $effect(() => {
     const mediaId = id;
-    if (auth.isLoggedIn && Number.isFinite(mediaId)) untrack(() => load(mediaId));
+    if (!auth.isLoggedIn) return;
+    if (!Number.isFinite(mediaId)) {
+      // A non-numeric id can never load. Show an error instead of
+      // spinning on Loading forever.
+      detail = null;
+      entry = null;
+      loading = false;
+      error = "Invalid anime id.";
+      return;
+    }
+    untrack(() => load(mediaId));
   });
 </script>
 

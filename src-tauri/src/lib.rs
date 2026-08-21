@@ -50,56 +50,92 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
         let target_free = std::fs::metadata(&db_path).map(|m| m.len() == 0).unwrap_or(true);
         let legacy_has_data = std::fs::metadata(&legacy).map(|m| m.len() > 0).unwrap_or(false);
         if target_free && legacy_has_data {
-            // Copy to a temp name and rename into place. A crash mid copy
-            // must not leave a truncated "real" DB. Its presence would
-            // block every future migration attempt. Sidecars ride along
-            // so writes sitting in a legacy WAL not yet checkpointed
-            // survive the move.
-            let tmp = data_dir.join(".kurisu-migrate.tmp");
-            // Stage EVERYTHING first, then publish the main database LAST.
-            // The sidecars used to be renamed into place before it. A
-            // failure after that point, or a crash, left a -wal/-shm pair
-            // belonging to a database that was not there. SQLite treats
-            // an orphaned WAL beside a fresh DB as corruption.
-            let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-            let result = (|| -> std::io::Result<()> {
-                std::fs::copy(&legacy, &tmp)?;
-                for suffix in ["-wal", "-shm"] {
-                    let mut side = legacy.as_os_str().to_os_string();
-                    side.push(suffix);
-                    let side = std::path::PathBuf::from(side);
-                    if side.exists() {
-                        let mut tmp_side = tmp.as_os_str().to_os_string();
-                        tmp_side.push(suffix);
-                        let mut dst_side = db_path.as_os_str().to_os_string();
-                        dst_side.push(suffix);
-                        let (tmp_side, dst_side) =
-                            (std::path::PathBuf::from(tmp_side), std::path::PathBuf::from(dst_side));
-                        std::fs::copy(&side, &tmp_side)?;
-                        staged.push((tmp_side, dst_side));
-                    }
-                }
-                // Publish the database first, then its sidecars. If a
-                // sidecar rename fails now, the DB is still valid on its
-                // own. SQLite rebuilds a missing -shm and an absent -wal
-                // just means the tail not yet checkpointed is lost, not
-                // that the file is unreadable.
-                std::fs::rename(&tmp, &db_path)?;
-                for (from, to) in &staged {
-                    std::fs::rename(from, to)?;
-                }
-                Ok(())
-            })();
-            if let Err(e) = result {
-                log::warn!("legacy DB migration failed: {e}");
-                let _ = std::fs::remove_file(&tmp);
-                for (from, _) in &staged {
-                    let _ = std::fs::remove_file(from);
-                }
-            }
+            migrate_legacy_db(&legacy, &db_path);
         }
     }
     db::Db::open(&db_path).map_err(|e| format!("cannot open {}: {e}", db_path.display()))
+}
+
+/// Copy a pre 1.0 ProjectDirs database into place at db_path. Only
+/// called when the target is free, meaning missing or zero bytes, and
+/// the legacy file has data. A failed attempt cleans up everything it
+/// touched, destination included, so the next launch sees a free
+/// target and retries instead of trusting a half published state.
+fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) {
+    // Copy to a temp name and rename into place. A crash mid copy
+    // must not leave a truncated "real" DB. Its presence would
+    // block every future migration attempt. Sidecars ride along
+    // so writes sitting in a legacy WAL not yet checkpointed
+    // survive the move.
+    let tmp = db_path.with_file_name(".kurisu-migrate.tmp");
+    // Stage EVERYTHING first, then publish the main database LAST.
+    // The sidecars used to be renamed into place before it. A
+    // failure after that point, or a crash, left a -wal/-shm pair
+    // belonging to a database that was not there. SQLite treats
+    // an orphaned WAL beside a fresh DB as corruption.
+    let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let result = (|| -> std::io::Result<()> {
+        std::fs::copy(legacy, &tmp)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut side = legacy.as_os_str().to_os_string();
+            side.push(suffix);
+            let side = std::path::PathBuf::from(side);
+            if side.exists() {
+                let mut tmp_side = tmp.as_os_str().to_os_string();
+                tmp_side.push(suffix);
+                let mut dst_side = db_path.as_os_str().to_os_string();
+                dst_side.push(suffix);
+                let (tmp_side, dst_side) =
+                    (std::path::PathBuf::from(tmp_side), std::path::PathBuf::from(dst_side));
+                std::fs::copy(&side, &tmp_side)?;
+                staged.push((tmp_side, dst_side));
+            }
+        }
+        // Drop sidecars already sitting at the destination. Their
+        // content is abandoned either way since the rename below
+        // discards the database they belong to. Left in place, a
+        // self consistent foreign WAL gets REPLAYED over the migrated
+        // copy. SQLite validates frames by WAL internal salt and
+        // checksum only, nothing binds a WAL to its main file, so
+        // the replay reads as disk corruption on open.
+        for suffix in ["-wal", "-shm"] {
+            let mut dst_side = db_path.as_os_str().to_os_string();
+            dst_side.push(suffix);
+            match std::fs::remove_file(std::path::PathBuf::from(dst_side)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Publish the database first, then its sidecars. If a
+        // sidecar rename fails now, the DB is still valid on its
+        // own. SQLite rebuilds a missing -shm and an absent -wal
+        // just means the tail not yet checkpointed is lost, not
+        // that the file is unreadable.
+        std::fs::rename(&tmp, db_path)?;
+        for (from, to) in &staged {
+            std::fs::rename(from, to)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        log::warn!("legacy DB migration failed: {e}");
+        let _ = std::fs::remove_file(&tmp);
+        for (from, _) in &staged {
+            let _ = std::fs::remove_file(from);
+        }
+        // Also drop whatever reached the destination, the published
+        // main file included. Leaving it behind makes the next launch
+        // see a non empty target, so the migration would never retry
+        // and the half published state would be permanent. The target
+        // was free when we started, nothing real is lost here.
+        let _ = std::fs::remove_file(db_path);
+        for suffix in ["-wal", "-shm"] {
+            let mut dst_side = db_path.as_os_str().to_os_string();
+            dst_side.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(dst_side));
+        }
+    }
 }
 
 /// Loopback address the running instance holds for its whole lifetime. A
@@ -107,6 +143,25 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
 /// second launch. Adjacent to the OAuth callback port 39417 so the two
 /// stay together.
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:39418";
+
+/// Byte the instance listener answers a poke with. Only that reply
+/// proves the port holder is another Kurisu and not some unrelated
+/// local service.
+const SINGLE_INSTANCE_ACK: u8 = b'k';
+
+/// Ask the holder of the single instance port whether it is Kurisu.
+/// True only when it answers with the ack byte. A connect failure, a
+/// garbage reply, or a holder that accepts but never answers within two
+/// seconds all mean "not ours", carry on without the guard.
+fn poke_running_instance() -> bool {
+    use std::io::Read;
+    let Ok(mut stream) = std::net::TcpStream::connect(SINGLE_INSTANCE_ADDR) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut ack = [0_u8; 1];
+    stream.read_exact(&mut ack).is_ok() && ack[0] == SINGLE_INSTANCE_ACK
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -138,15 +193,24 @@ pub fn run() {
     // plugin, no new dependency. Same shape as the OAuth callback
     // listener already here.
     let instance_guard = match std::net::TcpListener::bind(SINGLE_INSTANCE_ADDR) {
-        Ok(l) => l,
+        Ok(l) => Some(l),
         Err(_) => {
             // Someone already holds it. Poke them so their window comes
-            // back, then exit quietly. A connect failure means the port
-            // belongs to an unrelated process, in which case carrying on
-            // is better than refusing to start at all.
-            let _ = std::net::TcpStream::connect(SINGLE_INSTANCE_ADDR);
-            eprintln!("kurisu: already running; raising the existing window");
-            return;
+            // back, then exit quietly, but only when the holder answers
+            // with the ack byte. A missing or garbage reply means the
+            // port belongs to an unrelated process, in which case
+            // carrying on is better than refusing to start at all.
+            // Mixed version window: an old listener never sends an ack,
+            // so a new poker proceeds and two instances can coexist
+            // during a version transition.
+            if poke_running_instance() {
+                eprintln!("kurisu: already running; raising the existing window");
+                return;
+            }
+            log::warn!(
+                "single instance port {SINGLE_INSTANCE_ADDR} held by a process that is not Kurisu; starting without the guard"
+            );
+            None
         }
     };
 
@@ -326,12 +390,20 @@ pub fn run() {
             // Hold the single instance listener for the process lifetime
             // and answer later launches by raising this window. The OS
             // drops the binding when the process dies, so there is no
-            // stale state to clear.
-            {
+            // stale state to clear. When the port was held by something
+            // that is not Kurisu there is no guard to hold and no
+            // thread to spawn.
+            if let Some(guard) = instance_guard {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    for stream in instance_guard.incoming() {
-                        drop(stream); // the connection itself is the whole message
+                    use std::io::Write;
+                    for stream in guard.incoming() {
+                        // The ack tells the other launch that a Kurisu
+                        // holds this port. The connection itself is
+                        // still the whole message.
+                        if let Ok(mut stream) = stream {
+                            let _ = stream.write_all(&[SINGLE_INSTANCE_ACK]);
+                        }
                         if let Some(w) = handle.get_webview_window("main") {
                             let _ = w.unminimize();
                             let _ = w.show();
@@ -346,14 +418,18 @@ pub fn run() {
             // player can not crash detection.
             playback::spawn(app.handle().clone());
 
-            // Startup update check. CI builds only. Locally compiled
-            // builds skip it. They report the base version and would nag
-            // about every newer rolling build during development.
-            // Settings then Updates can turn it off, default on. A
-            // manual check there works on any build. Emits
-            // kurisu://update-available when a newer release ships an
-            // asset this platform can install.
-            if updater::is_ci_build() {
+            // Startup update housekeeping runs on EVERY build. Manual
+            // installs work on non CI builds too, so a dev build that
+            // installed an update leaves the same leftover download and
+            // the same doubly failed swap marker behind. Only the
+            // automatic version CHECK stays CI gated. Locally compiled
+            // builds report the base version and would nag about every
+            // newer rolling build during development. Settings then
+            // Updates can turn the check off, default on. A manual check
+            // there works on any build. Emits kurisu://update-available
+            // when a newer release ships an asset this platform can
+            // install.
+            {
                 use tauri::Emitter;
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -383,6 +459,9 @@ pub fn run() {
                                 "message": updater::FAILED_MESSAGE
                             }),
                         );
+                    }
+                    if !updater::is_ci_build() {
+                        return;
                     }
                     let enabled = handle
                         .state::<AppState>()
@@ -421,4 +500,83 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running kurisu");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_legacy_db;
+
+    fn test_dirs(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("kurisu-migrate-{name}-{}", std::process::id()));
+        let legacy_dir = base.join("legacy");
+        let dest_dir = base.join("dest");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        (base, legacy_dir, dest_dir)
+    }
+
+    /// Legacy sidecars ride along, and foreign sidecars already sitting
+    /// at the destination are replaced, never replayed onto the
+    /// migrated copy.
+    #[test]
+    fn migration_replaces_foreign_sidecars() {
+        let (base, legacy_dir, dest_dir) = test_dirs("foreign");
+        let legacy = legacy_dir.join("kurisu.db");
+        std::fs::write(&legacy, b"legacy data").unwrap();
+        std::fs::write(legacy_dir.join("kurisu.db-wal"), b"legacy wal").unwrap();
+        std::fs::write(legacy_dir.join("kurisu.db-shm"), b"legacy shm").unwrap();
+        let db_path = dest_dir.join("kurisu.db");
+        // Zero byte placeholder with sidecars from a dead database.
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::write(dest_dir.join("kurisu.db-wal"), b"foreign wal").unwrap();
+        std::fs::write(dest_dir.join("kurisu.db-shm"), b"foreign shm").unwrap();
+
+        migrate_legacy_db(&legacy, &db_path);
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"legacy data");
+        assert_eq!(std::fs::read(dest_dir.join("kurisu.db-wal")).unwrap(), b"legacy wal");
+        assert_eq!(std::fs::read(dest_dir.join("kurisu.db-shm")).unwrap(), b"legacy shm");
+        assert!(!dest_dir.join(".kurisu-migrate.tmp").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A foreign WAL the legacy DB has no counterpart for is deleted,
+    /// not left to be replayed over the migrated copy.
+    #[test]
+    fn migration_drops_destination_sidecars_the_legacy_db_lacks() {
+        let (base, legacy_dir, dest_dir) = test_dirs("orphan");
+        let legacy = legacy_dir.join("kurisu.db");
+        std::fs::write(&legacy, b"legacy data").unwrap();
+        let db_path = dest_dir.join("kurisu.db");
+        std::fs::write(dest_dir.join("kurisu.db-wal"), b"foreign wal").unwrap();
+        std::fs::write(dest_dir.join("kurisu.db-shm"), b"foreign shm").unwrap();
+
+        migrate_legacy_db(&legacy, &db_path);
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"legacy data");
+        assert!(!dest_dir.join("kurisu.db-wal").exists());
+        assert!(!dest_dir.join("kurisu.db-shm").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A failure mid migration removes whatever reached the destination,
+    /// so the next launch sees a free target and retries.
+    #[test]
+    fn failed_migration_leaves_a_free_target() {
+        let (base, legacy_dir, dest_dir) = test_dirs("failure");
+        let legacy = legacy_dir.join("kurisu.db");
+        std::fs::write(&legacy, b"legacy data").unwrap();
+        std::fs::write(legacy_dir.join("kurisu.db-wal"), b"legacy wal").unwrap();
+        let db_path = dest_dir.join("kurisu.db");
+        // A directory where the destination WAL belongs makes the
+        // pre-publish sidecar cleanup fail.
+        std::fs::create_dir(dest_dir.join("kurisu.db-wal")).unwrap();
+
+        migrate_legacy_db(&legacy, &db_path);
+
+        assert!(!db_path.exists());
+        assert!(!dest_dir.join(".kurisu-migrate.tmp").exists());
+        assert!(!dest_dir.join(".kurisu-migrate.tmp-wal").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

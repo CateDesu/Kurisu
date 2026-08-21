@@ -32,11 +32,17 @@
       : undefined
   );
 
+  // Tracks can skip faster than getEntry resolves. Shared latest-wins
+  // guard with the event listener and updateTo below, so an older read
+  // never overwrites a newer one.
+  let entryLoadId = 0;
   async function loadEntry(mediaId: number) {
+    const lid = ++entryLoadId;
     try {
-      entry = await api.getEntry(mediaId);
+      const e = await api.getEntry(mediaId);
+      if (lid === entryLoadId) entry = e;
     } catch {
-      entry = null;
+      if (lid === entryLoadId) entry = null;
     }
   }
 
@@ -65,10 +71,9 @@
     }
   }
 
-  // Refresh when progress is written anywhere. A loadId guards against
-  // burst races. N events spawn N concurrent loads, only the last
-  // result is applied.
-  let entryLoadId = 0;
+  // Refresh when progress is written anywhere. entryLoadId guards
+  // against burst races. N events spawn N concurrent loads, only the
+  // last result is applied.
   $effect(() => {
     let alive = true;
     let un: (() => void) | undefined;

@@ -58,10 +58,13 @@
     // Snapshot what's being saved. Inputs bind straight into cfg so an edit
     // mid-request must not change what we send. The response must not
     // clobber a newer edit when it lands.
-    // bind:value on a number input yields NaN when cleared and a float when
-    // the user types 2.5. Both make the Rust u64 params fail to deserialize
-    // and the whole save failed. Normalize and clamp to the input ranges.
+    // bind:value on a number input binds null when the field is cleared
+    // and a float when the user types 2.5. Number(null) is 0, which is
+    // finite, so without the empty check a cleared field clamped to the
+    // minimum instead of the fallback. Floats make the Rust u64 params
+    // fail to deserialize. Normalize and clamp to the input ranges.
     const int = (v: unknown, fallback: number, lo: number, hi: number) => {
+      if (v == null || v === "") return fallback;
       const n = Math.round(Number(v));
       if (!Number.isFinite(n)) return fallback;
       return Math.min(hi, Math.max(lo, n));
@@ -142,7 +145,7 @@
     {#if auth.user}
       <p class="text-sm mb-2">Signed in as <b>{auth.user.name}</b>.</p>
       <button
-        onclick={() => auth.logout().catch(() => {})}
+        onclick={() => auth.logout().catch((e) => (signInErr = String(e)))}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
       >
         Log out

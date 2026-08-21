@@ -112,7 +112,10 @@
         entry.media_id,
         status !== snap.status ? status : (fresh?.status ?? status),
         progress !== snap.progress ? (progress ?? snap.progress) : (fresh?.progress ?? progress),
-        score !== snap.score ? score : (fresh?.score ?? null),
+        // A cleared score binds null, but the backend omits null variables,
+        // so AniList would keep the old score. Send 0. AniList treats 0 as
+        // unrated and scoreLabel renders it as no score.
+        score !== snap.score ? (score ?? 0) : (fresh?.score ?? null),
         repeat !== snap.repeat ? (repeat ?? snap.repeat) : (fresh?.repeat ?? snap.repeat)
       );
       onclose();

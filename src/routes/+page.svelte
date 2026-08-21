@@ -7,6 +7,11 @@
   // rendered as the new one's.
   let syncedFor: number | null = null;
 
+  // Auto-sync on empty fires once per session. Kept at module scope for
+  // the same reason. As component state it reset on every mount, so an
+  // empty list triggered a full sync on every visit to this tab.
+  let autoSynced = false;
+
   // One collator for the session. localeCompare with options builds a fresh
   // Intl.Collator on every call. The title sort runs O(n log n) over a
   // 1280-entry list on every keystroke.
@@ -147,9 +152,7 @@
   // Overlapping loads resolve latest wins. Stale responses are dropped.
   let loadId = 0;
   // Local cache isn't namespaced per account. If the user changes, force a
-  // sync. Also purges rows the new account doesn't have. Auto-sync on
-  // empty happens once per session.
-  let autoSynced = false;
+  // sync. Also purges rows the new account doesn't have.
   async function load() {
     const id = ++loadId;
     loading = true;

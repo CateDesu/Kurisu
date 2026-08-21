@@ -336,11 +336,65 @@ fn assert_ts_declares_in(ts: &str, name: &str, value: &serde_json::Value) {
     }
 }
 
+/// `src` with every // and /* */ comment blanked out. Newlines survive so
+/// positions barely move. String literals are tracked first so a // or /*
+/// inside one can not start a comment. The scanners below run on stripped
+/// text, so a } inside a comment no longer ends an interface early and a
+/// word: inside one no longer reads as a field.
+#[cfg(test)]
+fn strip_ts_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'/') => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                    }
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            q @ ('"' | '\'' | '`') => {
+                out.push(q);
+                let mut escaped = false;
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == q {
+                        break;
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The body of `interface <name> { ... }`. Brace-depth counted so an inline
-/// object type like scores: { score: number }[] doesn't end it early. None when
-/// no such interface exists.
+/// object type like scores: { score: number }[] doesn't end it early.
+/// Comments are stripped before counting so a brace inside one can not end
+/// it early either. None when no such interface exists.
 #[cfg(test)]
 fn ts_interface_body(ts: &str, name: &str) -> Option<String> {
+    let ts = strip_ts_comments(ts);
     let marker = format!("interface {name} {{");
     let open = ts.find(&marker)? + marker.len() - 1; // byte index of the opening brace
     let mut depth = 0;
@@ -360,10 +414,11 @@ fn ts_interface_body(ts: &str, name: &str) -> Option<String> {
 }
 
 /// Field names declared at the top level of a TS interface body. The brace
-/// depth keeps fields of inline object types out. // comments are skipped so
-/// a word: inside one can't read as a field.
+/// depth keeps fields of inline object types out. Comments are stripped
+/// before the scan so a word: inside one can't read as a field.
 #[cfg(test)]
 fn ts_top_level_fields(body: &str) -> Vec<String> {
+    let body = strip_ts_comments(body);
     let mut fields = Vec::new();
     let mut depth = 0;
     let mut chars = body.chars().peekable();
@@ -475,5 +530,23 @@ mod tests {
     fn drift_guard_handles_inline_object_types() {
         let ts = "export interface Widget {\n  id: number;\n  buckets: { score: number; count: number }[];\n}\n";
         assert_ts_declares_in(ts, "Widget", &serde_json::json!({ "id": 1, "buckets": [] }));
+    }
+
+    /// A9. A block comment must not contribute phantom fields, and a brace
+    /// inside one must not end the interface early.
+    #[test]
+    fn drift_guard_ignores_block_comments() {
+        let ts = "export interface Widget {\n  /* gone: string; */\n  id: number;\n  /* a } hiding in a comment */\n  name: string;\n}\n";
+        assert_ts_declares_in(ts, "Widget", &serde_json::json!({ "id": 1, "name": "x" }));
+    }
+
+    /// A9. A comment opener inside a string literal is not a comment, and a
+    /// multi-line block comment still disappears whole.
+    #[test]
+    fn strip_ts_comments_leaves_strings_alone() {
+        let stripped = strip_ts_comments("let x = \"/* nope */\"; /* real\ncomment */ let y = 1;");
+        assert!(stripped.contains("\"/* nope */\""));
+        assert!(!stripped.contains("real"));
+        assert!(stripped.contains("let y = 1;"));
     }
 }

@@ -552,16 +552,33 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     }
     let Some((session, playing)) = picked.or(paused) else { return Ok(None) };
 
-    let props = session.TryGetMediaPropertiesAsync()?.join()?;
-    let title = props.Title().map(|h| h.to_string_lossy()).unwrap_or_default();
+    // One failed property call must not sink the tick. A player that answers
+    // playback status but has no media properties or timeline would disable
+    // the banner and both tracking modes for as long as its session lives.
+    // Degrade to an empty title and zeroed times like the Linux path does.
+    // Prompt and auto ask modes need no position data.
+    let title = session
+        .TryGetMediaPropertiesAsync()
+        .and_then(|op| op.join())
+        .and_then(|props| props.Title())
+        .map(|h| h.to_string_lossy())
+        .unwrap_or_default();
     let player = session
         .SourceAppUserModelId()
         .map(|h| h.to_string_lossy())
         .unwrap_or_default();
-    let timeline = session.GetTimelineProperties()?;
+    let timeline = session.GetTimelineProperties().ok();
     // TimeSpan.Duration is in 100 ns units. Divide by 10 for microseconds.
-    let length_us = timeline.EndTime().map(|t| t.Duration / 10).unwrap_or(0);
-    let position_us = timeline.Position().map(|t| t.Duration / 10).unwrap_or(0);
+    let length_us = timeline
+        .as_ref()
+        .and_then(|t| t.EndTime().ok())
+        .map(|t| t.Duration / 10)
+        .unwrap_or(0);
+    let position_us = timeline
+        .as_ref()
+        .and_then(|t| t.Position().ok())
+        .map(|t| t.Duration / 10)
+        .unwrap_or(0);
 
     let state = app.state::<AppState>();
     let matchers = state.matchers.lock().clone();

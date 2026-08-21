@@ -153,10 +153,12 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
         match fetched {
             Ok(xml) => {
                 let items = parse_rss(&xml);
-                // A 200 that isn't RSS, like a captive portal, an error page or
-                // a moved feed, yields zero items and used to be indistinguishable
-                // from nothing new.
-                if items.is_empty() && !xml.contains("<item") {
+                // A 200 that isn't RSS, like a captive portal, an error page
+                // or a moved feed, yields zero items and used to be
+                // indistinguishable from nothing new. An empty but valid
+                // feed like a nyaa search with zero hits still has the rss
+                // and channel elements, so only their absence is a failure.
+                if items.is_empty() && !xml.contains("<rss") && !xml.contains("<channel") {
                     let msg = format!("{feed}: response was not an RSS feed");
                     log::warn!("{msg}");
                     failures.push(FeedFailure { url: feed, error: msg });
@@ -535,6 +537,56 @@ mod tests {
         fetch_all(&[format!("http://127.0.0.1:{port}/rss")])
             .await
             .map(|f| f.items)
+    }
+
+    /// Same loopback server, but the whole FeedFetch so the per feed failure
+    /// list can be asserted on.
+    async fn fetch_full(respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> FeedFetch {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            respond(&mut stream);
+        });
+        fetch_all(&[format!("http://127.0.0.1:{port}/rss")])
+            .await
+            .expect("one feed failure must not fail the whole fetch")
+    }
+
+    fn serve_body(body: &'static str) -> impl FnOnce(&mut std::net::TcpStream) + Send + 'static {
+        move |stream| {
+            use std::io::{Read, Write};
+            let mut req = [0u8; 1024];
+            let _ = stream.read(&mut req);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+    }
+
+    /// A nyaa search with zero hits returns a well formed rss document with
+    /// no items. That is a healthy feed, not a failure.
+    #[tokio::test]
+    async fn empty_but_valid_feed_is_not_a_failure() {
+        let f = fetch_full(serve_body(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rss version=\"2.0\"><channel><title>Nyaa - Search</title></channel></rss>",
+        ))
+        .await;
+        assert!(f.items.is_empty());
+        assert!(f.failures.is_empty(), "an empty valid feed must not be reported failed");
+    }
+
+    /// A 200 that is not RSS at all still counts as a feed failure.
+    #[tokio::test]
+    async fn non_rss_response_is_still_a_failure() {
+        let f = fetch_full(serve_body("<html><body>moved</body></html>")).await;
+        assert!(f.items.is_empty());
+        assert_eq!(f.failures.len(), 1);
+        assert!(f.failures[0].error.contains("not an RSS feed"));
     }
 
     #[tokio::test]

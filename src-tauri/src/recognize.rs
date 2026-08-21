@@ -3,6 +3,7 @@
 //! library.rs. Both clean a raw title or filename, match it against the cached
 //! list, and pull an episode number from what is left.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -14,7 +15,7 @@ use crate::db::Db;
 static RE_BRACKETS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\[\(【][^\]\)】]*[\]\)】]").unwrap());
 static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[456]|avc|av1|vp9|vp0|vvc|xvid|divx|mpeg-?2|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
+    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b\d{3,4}p\d{2,3}\b|\b[48]k\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[456]|avc|av1|vp9|vp0|vvc|xvid|divx|mpeg-?2|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
 });
 // Trailing episode marker. Bare E05 needs a separator or season prefix before
 // the e, else the title's own final e gets eaten. Steins;Gate 01 would become
@@ -51,6 +52,11 @@ static RE_SEASON_PREFIX: LazyLock<Regex> =
 /// after RE_SEASON_PREFIX so S02E05 is safe.
 static RE_SEASON_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)[sS]\d{1,2}\b").unwrap());
+/// Bare trailing revision token like the v2 in Show - 05 v2. Only stripped
+/// when it stands alone. Glued to the episode like 04v2 it belongs to the
+/// number and RE_EP_NUM reads them as one token.
+static RE_REV_TAIL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s+v\d+\s*$").unwrap());
 
 /// Resolutions to discard when picking the episode number.
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
@@ -293,13 +299,33 @@ pub(crate) fn clean_title(s: &str) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
-    let stripped = RE_EP_TAIL.replace(&s, "");
+    let stripped = strip_episode_tail(&s);
     // The tail strip must never eat the whole title. A bare-number show is all
     // episode-tail to the regex. Keep the unstripped form when stripping leaves
     // nothing to match on.
     let normed = normalize(&stripped);
     let out = if normed.is_empty() { normalize(&s) } else { normed };
     season_ordinals(&out)
+}
+
+/// RE_EP_TAIL with one exception. A digit right after the word season is the
+/// season ordinal, not an episode. Stripping it turned a Season 2 pack into
+/// show season, which never matches the entry norm show 2 that the collapse
+/// below produces. The regex crate has no lookbehind, so the guard checks
+/// the text before the match instead.
+fn strip_episode_tail(s: &str) -> Cow<'_, str> {
+    match RE_EP_TAIL.find(s) {
+        Some(m) if preceded_by_season(s, m.start()) => Cow::Borrowed(s),
+        _ => RE_EP_TAIL.replace(s, ""),
+    }
+}
+
+/// True when the text before byte `start` ends in the word season.
+fn preceded_by_season(s: &str, start: usize) -> bool {
+    s[..start]
+        .split_whitespace()
+        .next_back()
+        .is_some_and(|w| w.eq_ignore_ascii_case("season"))
 }
 
 /// Normalize a list title for comparison. Same as clean_title without the
@@ -464,22 +490,41 @@ fn looks_like_year(n: i64) -> bool {
 /// layouts, and resolution and codec noise are stripped first or their digits
 /// would beat the real episode number. Excludes resolutions, 4-digit years,
 /// and anything outside 1 to 9999. A vN revision suffix belongs to the number
-/// it follows.
+/// it follows. One exemption from the resolution filter. The number right
+/// after the title is the episode even when it looks like a resolution.
+/// One Piece has real episodes 360, 480, 720 and 1080.
 fn parse_last_episode_number(s: &str) -> Option<i64> {
     let s = RE_BRACKETS.replace_all(s, " ");
     let s = RE_CHANNEL.replace_all(&s, " ");
-    let s = RE_RES.replace_all(&s, " ");
     // Strip season markers so a season pack Show S02 doesn't parse its season
     // number as episode 2. Two-step. First peel the season prefix off S02E05,
     // then strip any remaining bare S02.
     let s = RE_SEASON_PREFIX.replace_all(&s, "$1");
     let s = RE_SEASON_BARE.replace_all(&s, " ");
+    let s = RE_REV_TAIL.replace(&s, " ");
+    // The number right after the title is the episode. Capture it before the
+    // resolution strip below eats episode numbers like 1080, and keep it
+    // past the noise filter. It must stand alone. Glued to a letter it is
+    // part of a tag, like the 264 in x264 or a resolution with its p.
+    let after_title = RE_EP_NUM.find(&s).and_then(|m| {
+        let lone = s[..m.start()].chars().next_back().is_none_or(|c| !c.is_alphanumeric())
+            && s[m.end()..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if lone {
+            m.as_str().split('v').next()?.parse::<i64>().ok()
+        } else {
+            None
+        }
+    });
+    let s = RE_RES.replace_all(&s, " ");
     RE_EP_NUM
         .find_iter(&s)
         .filter_map(|m| m.as_str().split('v').next()?.parse::<i64>().ok())
         .filter(|n| !NOISE_NUMBERS.contains(n) && !looks_like_year(*n))
         .filter(|n| *n >= 1 && *n <= 9999)
         .last()
+        // The after-title number skips the noise filter but not the rest.
+        // A year right after the title is still a year.
+        .or(after_title.filter(|n| !looks_like_year(*n) && *n >= 1 && *n <= 9999))
 }
 
 #[cfg(test)]
@@ -561,6 +606,67 @@ mod tests {
         assert_eq!(
             parse_episode_guess("[SubsPlease] Frieren - 28 (1080p) [AB12CD34]"),
             Some(28)
+        );
+    }
+
+    /// Aired episodes numbered like resolutions. One Piece has real episodes
+    /// 360, 480, 720 and 1080. The number right after the title is the
+    /// episode even when a resolution tag would eat it.
+    #[test]
+    fn resolution_valued_episode_numbers_parse() {
+        assert_eq!(parse_episode_guess("One Piece - 1080 (1080p) [ABC123]"), Some(1080));
+        assert_eq!(parse_episode_guess("One Piece - 360 [1080p]"), Some(360));
+        assert_eq!(parse_episode_guess("One Piece - 480 (720p)"), Some(480));
+        assert_eq!(parse_episode_guess("One Piece - 720"), Some(720));
+        // A resolution later in the name stays noise. Only the number right
+        // after the title gets the exemption.
+        assert_eq!(parse_episode_guess("Show - 05 1080"), Some(5));
+        // Glued to its p a resolution is a tag, never the episode.
+        assert_eq!(parse_episode_guess("Show 1080p"), None);
+        // The exemption must not turn first number wins. 86 is the title
+        // here and 11 is the episode.
+        assert_eq!(parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"), Some(11));
+        // A year right after the title is still a year, not an episode.
+        assert_eq!(parse_episode_guess("Movie 2016 [BD]"), None);
+    }
+
+    /// More trailing tag forms. The fps suffix on a resolution, a bare 4K,
+    /// and a detached revision token all used to beat the episode number.
+    #[test]
+    fn episode_guess_ignores_fps_4k_and_detached_revisions() {
+        assert_eq!(parse_episode_guess("Show.S02E05.1080p60.WEB-DL.H.264-GROUP"), Some(5));
+        assert_eq!(parse_episode_guess("Show - 05 4K"), Some(5));
+        assert_eq!(parse_episode_guess("Show - 05 (1080p) v2"), Some(5));
+    }
+
+    /// A trailing Season N survives the episode tail strip so the season
+    /// collapse can turn it into the ordinal the entry norm carries. Judas
+    /// season packs name batches this way.
+    #[test]
+    fn trailing_season_n_survives_the_tail_strip() {
+        assert_eq!(
+            clean_title("[Judas] Kusuriya no Hitorigoto Season 2 [1080p]"),
+            "kusuriya no hitorigoto 2"
+        );
+        // The Nth Season form already worked and must keep working.
+        assert_eq!(
+            clean_title("[Judas] Kusuriya no Hitorigoto 2nd Season [1080p]"),
+            "kusuriya no hitorigoto 2"
+        );
+        // An episode after the season marker still strips.
+        assert_eq!(
+            clean_title("Kusuriya no Hitorigoto Season 2 - 05 [1080p]"),
+            "kusuriya no hitorigoto 2"
+        );
+        // End to end the batch form matches the sequel entry.
+        let matchers = vec![
+            mk(1, "Kusuriya no Hitorigoto"),
+            mk(2, "Kusuriya no Hitorigoto 2nd Season"),
+        ];
+        assert_eq!(
+            match_title(&matchers, "[Judas] Kusuriya no Hitorigoto Season 2 [1080p]", "")
+                .map(|m| m.media_id),
+            Some(2)
         );
     }
 

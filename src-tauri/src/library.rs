@@ -60,13 +60,15 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     Ok(folders)
 }
 
-/// True when either path is the other or contains it, comparing normalized
-/// components. /anime/ == /anime. /anime/seasonal nests under /anime.
-/// /anime2 is unrelated to /anime.
+/// True when either path is the other or contains it, comparing
+/// canonicalized components so symlinks and .. segments naming the same
+/// directory still count as overlap. Paths that do not resolve fall back
+/// to the raw configured string. /anime/ == /anime. /anime/seasonal
+/// nests under /anime. /anime2 is unrelated to /anime.
 fn folders_overlap(a: &str, b: &str) -> bool {
-    let a = std::path::Path::new(a);
-    let b = std::path::Path::new(b);
-    a.starts_with(b) || b.starts_with(a)
+    let a = std::fs::canonicalize(a).unwrap_or_else(|_| std::path::PathBuf::from(a));
+    let b = std::fs::canonicalize(b).unwrap_or_else(|_| std::path::PathBuf::from(b));
+    a.starts_with(&b) || b.starts_with(&a)
 }
 
 pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
@@ -151,11 +153,17 @@ pub fn scan_paths(
         }
         collect_videos(root, 0, &mut paths);
     }
-    // Overlapping folders added before the overlap check existed can
-    // collect the same file twice. Sort and dedup so each path appears
-    // exactly once.
+    // Overlapping folders added before the overlap check existed, and
+    // aliased roots that slipped past it, symlinks or .. segments naming
+    // one directory twice, can collect the same file under different
+    // strings. Dedup on the canonical path so each real file appears
+    // exactly once, then sort for a stable order.
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| {
+        let key = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        seen.insert(key)
+    });
     paths.sort();
-    paths.dedup();
 
     let files = paths
         .into_iter()
@@ -206,7 +214,16 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
                 .map(|e| VIDEO_EXTS.contains(&e.to_lowercase().as_str()))
                 .unwrap_or(false)
         {
-            out.push(path.to_string_lossy().into_owned());
+            // A name that is not valid UTF-8 would be stored mangled by
+            // to_string_lossy. Open and reveal would target a path that
+            // does not exist, and two files differing only in the
+            // invalid bytes would collapse into one at dedup. Skip the
+            // file instead of corrupting the key the rest of the
+            // pipeline uses.
+            match path.to_str() {
+                Some(p) => out.push(p.to_owned()),
+                None => log::warn!("library scan skipping non UTF-8 file: {}", path.to_string_lossy()),
+            }
         }
     }
 }
@@ -301,5 +318,69 @@ mod tests {
         assert_eq!(scan.unreadable.len(), 1);
         assert!(scan.unreadable[0].path.ends_with("not-mounted"));
         assert!(!scan.unreadable[0].error.is_empty());
+    }
+
+    /// Two roots naming one directory, here a real path and a symlink to
+    /// it, must not duplicate every shared file.
+    #[cfg(unix)]
+    #[test]
+    fn scan_dedups_aliased_roots() {
+        let dir = std::env::temp_dir().join(format!("kurisu-scan-alias-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("ep01.mkv"), []).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let folders = vec![
+            real.to_string_lossy().into_owned(),
+            link.to_string_lossy().into_owned(),
+        ];
+        let scan = scan_paths(&folders, &[], &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].path.ends_with("ep01.mkv"));
+        assert!(scan.unreadable.is_empty());
+    }
+
+    /// The overlap check must see through a symlink alias, not just
+    /// compare configured strings.
+    #[cfg(unix)]
+    #[test]
+    fn add_folder_rejects_symlink_alias() {
+        let dir = std::env::temp_dir().join(format!("kurisu-add-alias-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        add_folder(&db, &real.to_string_lossy()).unwrap();
+        assert!(add_folder(&db, &link.to_string_lossy()).is_err());
+        // A .. segment naming the same directory is rejected too. The
+        // intermediate directory must exist for canonicalize to resolve
+        // through it.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dotted = dir.join("sub").join("..").join("real");
+        assert!(add_folder(&db, &dotted.to_string_lossy()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file whose name is not valid UTF-8 is skipped with a log line,
+    /// not stored as a mangled lossy path that open and reveal can
+    /// never find.
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("kurisu-scan-nonutf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join(std::ffi::OsStr::from_bytes(b"ep01-\xff.mkv"));
+        std::fs::write(&bad, []).unwrap();
+        std::fs::write(dir.join("ep02.mkv"), []).unwrap();
+        let folders = vec![dir.to_string_lossy().into_owned()];
+        let scan = scan_paths(&folders, &[], &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].path.ends_with("ep02.mkv"));
+        assert!(scan.unreadable.is_empty());
     }
 }

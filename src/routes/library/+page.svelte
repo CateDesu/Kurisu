@@ -12,6 +12,7 @@
   import Img from "$lib/Img.svelte";
 
   let entries = $state<ListEntry[]>([]);
+  let entriesLoaded = $state(false);
   let error = $state("");
   /// Path of the unmatched file being manually linked.
   let linking = $state<string | null>(null);
@@ -63,6 +64,7 @@
     error = "";
     try {
       entries = await api.localEntries();
+      entriesLoaded = true;
       await library.loadFolders();
       if (library.folders.length > 0 && !library.hasScan) await library.scan();
     } catch (e) {
@@ -284,12 +286,14 @@
                   {g.entry ? displayTitle(g.entry.media) : g.title}
                 </button>
                 <div class="text-xs text-ink-dim">
+                  <!-- entries land after the groups paint. Until then show
+                       no label, else every mount flashes Not on your list. -->
                   {#if g.entry}
-                    Ep {g.entry.progress}{g.entry.media?.episodes ? `/${g.entry.media.episodes}` : ""} watched
-                  {:else}
-                    On your list
+                    Ep {g.entry.progress}{g.entry.media?.episodes ? `/${g.entry.media.episodes}` : ""} watched ·
+                  {:else if entriesLoaded}
+                    Not on your list ·
                   {/if}
-                  · {g.files.length} file{g.files.length === 1 ? "" : "s"}
+                  {g.files.length} file{g.files.length === 1 ? "" : "s"}
                 </div>
               </div>
               {#if hasBound(g)}

@@ -86,7 +86,7 @@
   });
 
   // Follow external progress changes. When idle, mirror the prop. When
-  // editing, adopt the new baseline but don't clobber the pending value.
+  // editing, hold the baseline and don't clobber the pending value.
   $effect(() => {
     const p = progress;
     untrack(() => {
@@ -94,10 +94,12 @@
         pending = p;
         saved = p;
       } else if (p !== saved) {
+        // Dirty. Keep saved on the baseline commit CASes against. Moving
+        // it to the fresh value here would let our stale write pass the
+        // backend check and rewind progress something else just set.
         // Only adopt a higher value when the user was also incrementing.
-        // Don't reverse a decrement silently. CAS sorts it out at commit.
+        // Don't reverse a decrement silently.
         const wasIncrementing = pending > saved;
-        saved = p;
         if (wasIncrementing && p > pending) pending = p;
       }
     });

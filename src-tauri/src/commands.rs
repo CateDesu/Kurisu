@@ -339,6 +339,13 @@ pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, St
     }
     let u = match al.viewer().await {
         Ok(u) => {
+            // A logout that raced the await has already cleared the shared
+            // client. The clone still holds the old token, so re-read the
+            // shared client before writing anything back. Caching the user
+            // or the username now would resurrect the signed out account.
+            if !state.anilist.lock().has_token() {
+                return Ok(None);
+            }
             // Refresh the stored username on every successful viewer() call. It
             // was only written at login, so renaming the AniList account left a
             // stale name behind and list queries keyed off it failed with
@@ -680,7 +687,7 @@ pub async fn increment_inner(state: &AppState, media_id: i64) -> Result<ListEntr
     };
     // Auto-complete at the last episode. Finishing while REPEATING also bumps
     // the rewatch count per AniList's convention, instead of silently losing it.
-    let (final_status, repeat) = if media.as_ref().and_then(|m| m.episodes) == Some(progress) {
+    let (final_status, repeat) = if at_last_episode(media.as_ref().and_then(|m| m.episodes), progress) {
         let repeat = if status == ListStatus::Repeating.as_str() { cur.repeat + 1 } else { cur.repeat };
         (ListStatus::Completed.as_str().to_string(), repeat)
     } else {
@@ -801,6 +808,14 @@ struct ProgressWrite {
     send_repeat: bool,
 }
 
+/// True when progress has landed exactly on the finale. The progress > 0
+/// half keeps a show cached with episodes 0, an announced title, from
+/// completing on a bare +1. Shared by the +1 path and the stepper so the
+/// two auto-complete rules can not drift apart.
+fn at_last_episode(total: Option<i64>, progress: i64) -> bool {
+    total == Some(progress) && progress > 0
+}
+
 /// Compute status, progress and repeat for an absolute progress set. Caller
 /// must hold `entry_lock` so reads are consistent against other writers.
 /// Clamps to the known episode count, auto-completes at the last episode, and
@@ -824,7 +839,7 @@ fn compute_set_progress(
     }
     let prev_status = cur.as_ref().map(|e| e.status.as_str()).unwrap_or("");
     let prev_repeat = cur.as_ref().map(|e| e.repeat).unwrap_or(0);
-    let at_end = total == Some(progress) && progress > 0;
+    let at_end = at_last_episode(total, progress);
     // Auto-complete at the last episode. Bump the rewatch count when a
     // REPEATING entry finishes, per AniList's convention, instead of silently
     // dropping the rewatch. Starting progress on a PLANNING entry or rewinding
@@ -1306,5 +1321,16 @@ mod tests {
         let w = compute_set_progress(&state, 1, 6).unwrap();
         assert_eq!((w.status.as_str(), w.progress, w.repeat), ("CURRENT", 6, 1));
         assert!(!w.send_status && !w.send_repeat);
+    }
+
+    /// A3. The +1 path shares the stepper's finale check. A show cached with
+    /// episodes 0, an announced title, must not auto-complete when +1 clamps
+    /// progress back to 0.
+    #[test]
+    fn zero_episode_show_does_not_auto_complete() {
+        assert!(!at_last_episode(Some(0), 0));
+        assert!(at_last_episode(Some(12), 12));
+        assert!(!at_last_episode(Some(12), 11));
+        assert!(!at_last_episode(None, 3));
     }
 }

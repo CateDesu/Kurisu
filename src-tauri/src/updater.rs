@@ -278,8 +278,8 @@ fn parse_release(data: &Value) -> Release {
     }
 }
 
-/// The updatable asset for THIS platform in `rel`. The NSIS installer,
-/// name ending in -setup.exe, on Windows. The bare `kurisu` binary on Linux.
+/// The updatable asset for THIS platform in `rel`. The NSIS installer for
+/// this arch on Windows. The bare `kurisu` binary on Linux.
 /// None elsewhere, and None once an update was applied this session. The
 /// running process is then older than the on-disk binary, so the version
 /// comparison would keep re-offering the install until restart. Never matches
@@ -292,16 +292,32 @@ pub fn update_applied() -> bool {
     UPDATE_APPLIED.load(Ordering::SeqCst)
 }
 
+/// The NSIS installer for `arch` out of a release's asset names. CI names it
+/// like Kurisu_1.0.0_x64-setup.exe. The arch marker is required so a second
+/// installer for another arch can never be picked at random out of the
+/// HashMap. Zero or more than one candidate means None. Better no update
+/// than the wrong arch installer. CI ships x64 only, so other arches get
+/// None like the Linux arm below.
+#[cfg(any(windows, test))]
+fn windows_installer<'a>(names: impl Iterator<Item = &'a String>, arch: &str) -> Option<&'a str> {
+    let marker = match arch {
+        "x86_64" => "_x64-",
+        _ => return None,
+    };
+    let mut hits = names.filter(|n| n.ends_with("-setup.exe") && n.contains(marker));
+    match (hits.next(), hits.next()) {
+        (Some(only), None) => Some(only.as_str()),
+        _ => None,
+    }
+}
+
 pub fn platform_asset(rel: &Release) -> Option<&str> {
     if update_applied() {
         return None;
     }
     #[cfg(target_os = "windows")]
     {
-        rel.assets
-            .keys()
-            .find(|n| n.ends_with("-setup.exe"))
-            .map(String::as_str)
+        windows_installer(rel.assets.keys(), std::env::consts::ARCH)
     }
     #[cfg(target_os = "linux")]
     {
@@ -689,6 +705,36 @@ mod tests {
         assert!(!is_newer("1.0.0-rc1", "1.0.0"));
         assert!(is_newer("1.0.0-rc2", "1.0.0-rc1"));
         assert!(is_newer("1.0.0.1", "1.0.0-rc9"));
+    }
+
+    #[test]
+    fn windows_installer_requires_arch_marker_and_a_unique_match() {
+        let mut rel = Release::default();
+        // No arch marker on the one installer present. It must not be picked.
+        rel.assets
+            .insert("Kurisu_1.0.0_arm64-setup.exe".into(), "u1".into());
+        assert_eq!(windows_installer(rel.assets.keys(), "x86_64"), None);
+        // The CI name shape picks fine.
+        rel.assets
+            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u2".into());
+        assert_eq!(
+            windows_installer(rel.assets.keys(), "x86_64"),
+            Some("Kurisu_1.0.0_x64-setup.exe")
+        );
+        // The sidecar is never a candidate.
+        rel.assets
+            .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u3".into());
+        assert_eq!(
+            windows_installer(rel.assets.keys(), "x86_64"),
+            Some("Kurisu_1.0.0_x64-setup.exe")
+        );
+        // Two x64 installers is ambiguous. Fail closed rather than let
+        // HashMap order choose.
+        rel.assets
+            .insert("Kurisu_1.0.0_x64-debug-setup.exe".into(), "u4".into());
+        assert_eq!(windows_installer(rel.assets.keys(), "x86_64"), None);
+        // Arches CI never ships get nothing.
+        assert_eq!(windows_installer(rel.assets.keys(), "aarch64"), None);
     }
 
     #[test]
