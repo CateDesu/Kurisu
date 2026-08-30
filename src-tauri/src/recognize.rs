@@ -186,6 +186,20 @@ fn parse_season_marker(raw: &str) -> Option<u32> {
         .filter(|&n| (1..=50).contains(&n))
 }
 
+/// Word-form season markers in a raw release name, "Season 7" or "7th
+/// Season", either case. When the episode-tail strip is blocked because the
+/// text before it ends in the word season, the episode number stays in the
+/// cleaned candidate, so a trailing-number read there would mistake the
+/// episode for a season. The raw word form is unambiguous.
+fn parse_season_word(raw: &str) -> Option<u32> {
+    let lower = raw.to_lowercase();
+    let n = RE_SEASON_N
+        .captures(&lower)
+        .or_else(|| RE_NTH_SEASON.captures(&lower))?
+        .name("n")?;
+    n.as_str().parse::<u32>().ok().filter(|&v| (1..=30).contains(&v))
+}
+
 /// Extract the season ordinal from a normalized list-title norm. After
 /// season_ordinals collapses, the bare number is already there. Also check for
 /// roman-numeral sequels. Returns None when the title has no season marker.
@@ -253,16 +267,34 @@ type TiebreakKey = (
 ///
 /// Tiebreak order: a season-ordinal match wins first, then higher tier,
 /// then status, then longer norm, then lower media_id.
+///
+/// A release carrying an explicit season ordinal may only match an entry whose
+/// norms encode that same ordinal. A Season 4 release with no Season 4 on the
+/// list stays unmatched instead of landing on a sibling. The old tiebreak let
+/// every sibling tie on the shared franchise prefix and picked the longest
+/// title, so a Re:ZERO Season 4 file wrote progress to a one episode OVA.
 pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -> Option<&'a Matcher> {
     let candidates = [clean_title(title), clean_title(&basename(url))];
     // Season ordinal from the raw inputs before clean_title strips the marker.
     let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
     let mut best: Option<(TiebreakKey, &Matcher)> = None;
+    // Explicit season ordinal for the veto below. Markers first, then word
+    // forms, both read from the raw inputs before clean_title touches them.
+    let season_ord = cand_season
+        .or_else(|| parse_season_word(title))
+        .or_else(|| parse_season_word(&basename(url)));
     for cand in candidates {
         if cand.is_empty() {
             continue;
         }
+        // A bare "Title 7 - 05" release carries no season word. There the
+        // candidate's own trailing ordinal, left behind after the episode
+        // tail strip, is the season.
+        let cand_ord = season_ord.or_else(|| norm_season_ordinal(&cand));
         for m in matchers {
+            if cand_ord.is_some_and(|n| !m.norms.iter().any(|x| norm_season_ordinal(x) == Some(n))) {
+                continue;
+            }
             if let Some((tier, nlen)) = m
                 .norms
                 .iter()
@@ -818,6 +850,50 @@ mod tests {
         );
     }
 
+    /// A release for a season that is not on the list must stay unmatched.
+    /// The old tiebreak let every Re:ZERO sibling tie on the shared franchise
+    /// prefix and picked the longest title, so a Season 4 file wrote progress
+    /// to a one episode OVA and marked it COMPLETED on AniList.
+    #[test]
+    fn season_ordinal_absent_from_list_stays_unmatched() {
+        let matchers = vec![
+            mk_status(101, "Re:Zero kara Hajimeru Isekai Seikatsu", "COMPLETED"),
+            mk_status(102, "Re:Zero kara Hajimeru Isekai Seikatsu -Memory Snow-", "COMPLETED"),
+            mk_status(103, "Re:Zero kara Hajimeru Isekai Seikatsu -Hyouketsu no Kizuna-", "COMPLETED"),
+            mk_status(104, "Re:Zero kara Hajimeru Isekai Seikatsu 2nd Season", "COMPLETED"),
+        ];
+        for release in [
+            "[SubsPlease] Re:Zero kara Hajimeru Isekai Seikatsu Season 4 - 01 [1080p].mkv",
+            "[SubsPlease] Re:Zero kara Hajimeru Isekai Seikatsu 4 - 01 [1080p].mkv",
+        ] {
+            assert_eq!(
+                match_title(&matchers, release, "").map(|m| m.media_id),
+                None,
+                "{release} names a season that is not on the list, no sibling may take it"
+            );
+        }
+    }
+
+    /// The same ordinal forms must resolve to the on-list season whatever
+    /// spelling each side uses.
+    #[test]
+    fn season_ordinal_present_on_list_resolves() {
+        let matchers = vec![
+            mk_status(101, "Re:Zero kara Hajimeru Isekai Seikatsu", "COMPLETED"),
+            mk_status(105, "Re:Zero kara Hajimeru Isekai Seikatsu 4th Season", "CURRENT"),
+        ];
+        for release in [
+            "[SubsPlease] Re:Zero kara Hajimeru Isekai Seikatsu Season 4 - 01 [1080p].mkv",
+            "[SubsPlease] Re:Zero kara Hajimeru Isekai Seikatsu 4 - 01 [1080p].mkv",
+        ] {
+            assert_eq!(
+                match_title(&matchers, release, "").map(|m| m.media_id),
+                Some(105),
+                "{release} must resolve to the on-list season 4"
+            );
+        }
+    }
+
     /// The episode-tail strip must never consume the entire title. A bare-number
     /// show is all episode tail to the regex, and an empty candidate matches
     /// nothing.
@@ -1088,3 +1164,4 @@ mod tests {
         );
     }
 }
+

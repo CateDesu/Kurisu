@@ -469,7 +469,11 @@ pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, Str
         return Ok(m);
     }
     let al = state.anilist.lock().clone();
-    let v = al.media_by_id(id).await.map_err(|e| e.to_string())?;
+    let v = match al.media_by_id(id).await {
+        Ok(v) => v,
+        Err(e) if anilist::media_not_found(&e) => return Err(MEDIA_GONE.to_string()),
+        Err(e) => return Err(e.to_string()),
+    };
     state.db.upsert_media(&v).map_err(|e| e.to_string())?;
     Ok(v)
 }
@@ -487,6 +491,13 @@ pub async fn get_media_detail(id: i64, state: State<'_, AppState>) -> Result<Med
                 let _ = state.db.upsert_media(&r.media);
             }
             Ok(MediaDetail { media, relations, characters, staff })
+        }
+        // A Not Found here is not an outage. AniList merged or deleted the
+        // entry. The cached row is dead and must not keep rendering a normal
+        // looking page whose every add and save then fails with a raw 404.
+        Err(e) if anilist::media_not_found(&e) => {
+            let _ = state.db.delete_media(id);
+            Err(MEDIA_GONE.to_string())
         }
         Err(e) => match state.db.get_media(id).map_err(|e| e.to_string())? {
             Some(media) => Ok(MediaDetail {
@@ -587,16 +598,24 @@ pub fn get_entry(media_id: i64, state: State<'_, AppState>) -> Result<Option<Lis
     state.db.get_entry(media_id).map_err(|e| e.to_string())
 }
 
+/// AniList no longer resolves this media id. It was merged into another entry
+/// or deleted upstream. Callers drop the dead cached row and report this
+/// instead of surfacing a raw 404 that can never be resolved from the app.
+const MEDIA_GONE: &str =
+    "AniList no longer has this anime. It was likely merged into another entry. Search for it to re-add the correct one.";
+
 /// Add or update an entry. Pushes to AniList and mirrors the returned entry to
-/// the local cache. Progress is clamped into range. Marking COMPLETED with a
-/// known episode count fills progress to that count.
+/// the local cache. Null fields are left untouched on AniList, so an edit only
+/// sends what the user changed and can not republish stale cached values over
+/// edits made elsewhere since the last sync. Progress is clamped into range.
+/// Marking COMPLETED with a known episode count fills progress to that count.
 #[tauri::command]
 pub async fn update_entry(
     media_id: i64,
-    status: String,
-    progress: i64,
+    status: Option<String>,
+    progress: Option<i64>,
     score: Option<f64>,
-    repeat: i64,
+    repeat: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<ListEntry, String> {
     save_entry_inner(state.inner(), media_id, status, progress, score, repeat).await
@@ -608,26 +627,32 @@ pub async fn update_entry(
 pub async fn save_entry_inner(
     state: &AppState,
     media_id: i64,
-    status: String,
-    progress: i64,
+    status: Option<String>,
+    progress: Option<i64>,
     score: Option<f64>,
-    repeat: i64,
+    repeat: Option<i64>,
 ) -> Result<ListEntry, String> {
     let _write = state.entry_lock.lock().await;
-    let st = parse_status(&status)?;
+    let st = status.as_deref().map(parse_status).transpose()?;
+    if status.is_none() && progress.is_none() && score.is_none() && repeat.is_none() {
+        return Err("nothing to update".to_string());
+    }
     let media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
     let total = media.as_ref().and_then(|m| m.episodes);
     // Clamp into range. The command accepts any i64 from any caller.
-    let mut progress = progress.max(0);
-    if let Some(t) = total {
-        progress = progress.min(t);
+    let mut progress = progress.map(|p| p.max(0));
+    if let (Some(t), Some(p)) = (total, progress.as_mut()) {
+        *p = (*p).min(t);
     }
     // Marking COMPLETED fills progress to the episode count when known. This
     // mirrors the auto-complete rule where progress reaching the finale flips
     // status, so a quick-add "Completed" never lands as "finished, 0 of 24".
-    let filled_to_total = st == ListStatus::Completed && total.is_some();
-    if let Some(t) = total.filter(|_| st == ListStatus::Completed) {
-        progress = progress.max(t);
+    let mut filled_to_total = false;
+    if st == Some(ListStatus::Completed) {
+        if let Some(t) = total {
+            progress = Some(progress.map_or(t, |p| p.max(t)));
+            filled_to_total = true;
+        }
     }
     let al = state.anilist.lock().clone();
     // Adding from a cold or partial cache. The show may already be on AniList
@@ -636,24 +661,32 @@ pub async fn save_entry_inner(
     // remotely and if it's there, send only the status plus the completion-fill
     // when it fired. Everything else keeps its remote values and comes back in
     // the response, which gets cached.
-    if state.db.get_entry(media_id).map_err(|e| e.to_string())?.is_none()
-        && al
-            .entry_by_media_id(media_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_some()
-    {
-        return save_entry_unlocked(
-            state,
-            media_id,
-            Some(status),
-            filled_to_total.then_some(progress),
-            None,
-            None,
-        )
-        .await;
+    if state.db.get_entry(media_id).map_err(|e| e.to_string())?.is_none() {
+        match al.entry_by_media_id(media_id).await {
+            Ok(Some(_)) => {
+                return save_entry_unlocked(
+                    state,
+                    media_id,
+                    status,
+                    filled_to_total.then_some(progress).flatten(),
+                    None,
+                    None,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) if anilist::media_not_found(&e) => {
+                // The media id itself no longer resolves. Drop the dead cached
+                // row so every surface refetches instead of serving an entry
+                // whose every write fails forever.
+                let _ = state.db.delete_media(media_id);
+                state.refresh_matchers();
+                return Err(MEDIA_GONE.to_string());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     }
-    save_entry_unlocked(state, media_id, Some(status), Some(progress), score, Some(repeat)).await
+    save_entry_unlocked(state, media_id, status, progress, score, repeat).await
 }
 
 /// The body shared by every AniList entry write, for callers already holding
@@ -673,10 +706,18 @@ async fn save_entry_unlocked(
 ) -> Result<ListEntry, String> {
     let st = status.as_deref().map(parse_status).transpose()?;
     let al = state.anilist.lock().clone();
-    let saved = al
-        .save_entry(media_id, st, progress, score, repeat)
-        .await
-        .map_err(|e| e.to_string())?;
+    let saved = match al.save_entry(media_id, st, progress, score, repeat).await {
+        Ok(s) => s,
+        // The media id is dead upstream. Same recovery as the add path: drop
+        // the cached row so the failure is not permanent, and say what
+        // happened instead of the raw status.
+        Err(e) if anilist::media_not_found(&e) => {
+            let _ = state.db.delete_media(media_id);
+            state.refresh_matchers();
+            return Err(MEDIA_GONE.to_string());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let entry = ListEntry {
         id: Some(saved.id),
         media_id,

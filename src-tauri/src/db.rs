@@ -222,6 +222,14 @@ impl Db {
         Ok(())
     }
 
+    /// Drop a cached media row. Used when AniList answers Not Found for an id
+    /// that was merged or deleted upstream, so every surface refetches instead
+    /// of serving a dead entry that can never be added or updated again.
+    pub fn delete_media(&self, media_id: i64) -> Result<()> {
+        self.0.lock().execute("DELETE FROM media WHERE id = ?", [media_id])?;
+        Ok(())
+    }
+
     /// Delete every local entry whose media_id is NOT in `keep`. Used after a
     /// full list sync. Rows the remote no longer has were deleted elsewhere or
     /// belong to a previous account, and must not linger or the recognizer

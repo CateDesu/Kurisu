@@ -104,19 +104,20 @@
     saving = true;
     err = "";
     try {
-      // Merge with a fresh read. Fields the user didn't touch in the modal follow
-      // the live entry. Saving can't then rewind progress that advanced via
-      // the auto tracker or row stepper while the modal was open.
-      const fresh = await api.getEntry(entry.media_id);
+      // Send only what the user touched. Null fields stay untouched on
+      // AniList, so a save can not republish stale cached progress, score or
+      // rewatch count over edits made on anilist.co or another device since
+      // the last sync. A field the tracker advanced while the modal was open
+      // is likewise left alone unless the user changed it here.
       await api.updateEntry(
         entry.media_id,
-        status !== snap.status ? status : (fresh?.status ?? status),
-        progress !== snap.progress ? (progress ?? snap.progress) : (fresh?.progress ?? progress),
+        status !== snap.status ? status : null,
+        progress !== snap.progress ? (progress ?? snap.progress) : null,
         // A cleared score binds null, but the backend omits null variables,
         // so AniList would keep the old score. Send 0. AniList treats 0 as
         // unrated and scoreLabel renders it as no score.
-        score !== snap.score ? (score ?? 0) : (fresh?.score ?? null),
-        repeat !== snap.repeat ? (repeat ?? snap.repeat) : (fresh?.repeat ?? snap.repeat)
+        score !== snap.score ? (score ?? 0) : null,
+        repeat !== snap.repeat ? (repeat ?? snap.repeat) : null
       );
       onclose();
     } catch (e) {

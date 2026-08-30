@@ -1145,6 +1145,13 @@ fn is_not_found(e: &anyhow::Error) -> bool {
     api.status == reqwest::StatusCode::NOT_FOUND || api.message == "Not Found"
 }
 
+/// Same test, public for the command layer. A media id that answers Not Found
+/// was merged or deleted upstream, callers use this to drop the dead cached
+/// row and report the merge instead of surfacing the raw status forever.
+pub fn media_not_found(e: &anyhow::Error) -> bool {
+    is_not_found(e)
+}
+
 /// AniList rejected the token itself. Revoked or expired tokens answer
 /// 400 "Invalid Token" rather than 401. A transport failure must not be
 /// confused with this: offline is not logged out. Only a definitive

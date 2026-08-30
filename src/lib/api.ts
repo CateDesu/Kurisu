@@ -66,10 +66,10 @@ export const api = {
   localEntries: () => invoke<ListEntry[]>("local_entries"),
   updateEntry: (
     mediaId: number,
-    status: string,
-    progress: number,
+    status: string | null,
+    progress: number | null,
     score: number | null,
-    repeat: number
+    repeat: number | null
   ) =>
     invoke<ListEntry>("update_entry", { mediaId, status, progress, score, repeat }),
   incrementEpisode: (mediaId: number) =>
