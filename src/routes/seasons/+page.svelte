@@ -43,7 +43,9 @@
     loading = true;
     error = "";
     try {
-      const seasonMedia = await api.getSeason(season, year, 1);
+      // Walks every page on the backend. A season carries several hundred
+      // entries and the old single page of 50 hid all but the popular head.
+      const seasonMedia = await api.getSeason(season, year);
       const myEntries = await api.localEntries();
       if (id !== loadId) return;
       media = seasonMedia;

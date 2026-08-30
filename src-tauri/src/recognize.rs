@@ -19,9 +19,11 @@ static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
 });
 // Trailing episode marker. Bare E05 needs a separator or season prefix before
 // the e, else the title's own final e gets eaten. Steins;Gate 01 would become
-// "steins gat". d{1,4} covers 1000+ episode runs.
+// "steins gat". d{1,4} covers 1000+ episode runs. The number must be nonzero
+// so a trailing 00 survives as episode 0. Prologues and specials are numbered
+// 0 on AniList and stripping the tail turned them into batch files.
 static RE_EP_TAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*[-_·]?\s*(?:[sS]\d{1,2}[eE]|ep(?:isode)?\.?|[-_·\s][eE]|#)?\s*0*\d{1,4}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
+    Regex::new(r"(?i)\s*[-_·]?\s*(?:[sS]\d{1,2}[eE]|ep(?:isode)?\.?|[-_·\s][eE]|#)?\s*0*[1-9]\d{0,3}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
 });
 /// Episode number candidate. Optional vN revision suffix. 04v2 is episode 4,
 /// not episodes 4 and 2.
@@ -249,7 +251,7 @@ type TiebreakKey = (
 /// then the file basename. Scores all candidates globally so a weak hit on the
 /// player title doesn't hide a stronger match on the filename.
 ///
-/// Tiebreak order: higher tier wins first, then a season-ordinal match wins,
+/// Tiebreak order: a season-ordinal match wins first, then higher tier,
 /// then status, then longer norm, then lower media_id.
 pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -> Option<&'a Matcher> {
     let candidates = [clean_title(title), clean_title(&basename(url))];
@@ -293,11 +295,15 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
 // ─────────────────────────── parsing ───────────────────────────
 
 /// Normalize a release name or now-playing string for comparison. Lowercase,
-/// split on non-alphanumeric, drop bracket groups and resolution noise, strip
-/// the trailing episode marker.
+/// split on non-alphanumeric, drop bracket groups, audio channel layouts and
+/// resolution noise, strip the trailing episode marker.
 pub(crate) fn clean_title(s: &str) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
+    // Channel layouts before the tail strip. AAC2.0 normalizes to the tokens
+    // aac2 0 and the trailing 0 used to be eaten by the episode tail, which
+    // the nonzero tail rule now refuses since episode 0 is real.
+    let s = RE_CHANNEL.replace_all(&s, " ");
     let s = RE_RES.replace_all(&s, " ");
     let stripped = strip_episode_tail(&s);
     // The tail strip must never eat the whole title. A bare-number show is all
@@ -489,7 +495,8 @@ fn looks_like_year(n: i64) -> bool {
 /// Last integer that looks like an episode. Bracketed groups, audio channel
 /// layouts, and resolution and codec noise are stripped first or their digits
 /// would beat the real episode number. Excludes resolutions, 4-digit years,
-/// and anything outside 1 to 9999. A vN revision suffix belongs to the number
+/// and anything outside 0 to 9999. Episode 0 is real, AniList numbers
+/// prologues and specials as 0. A vN revision suffix belongs to the number
 /// it follows. One exemption from the resolution filter. The number right
 /// after the title is the episode even when it looks like a resolution.
 /// One Piece has real episodes 360, 480, 720 and 1080.
@@ -518,13 +525,25 @@ fn parse_last_episode_number(s: &str) -> Option<i64> {
     let s = RE_RES.replace_all(&s, " ");
     RE_EP_NUM
         .find_iter(&s)
-        .filter_map(|m| m.as_str().split('v').next()?.parse::<i64>().ok())
+        .filter_map(|m| {
+            // A digit glued to a v is a revision token, not an episode. A
+            // detached "05 v2" leaves the 2 standing alone after the
+            // resolution strip, and .last() below would crown it over the
+            // real episode. The after title number already rejects it via
+            // the alphanumeric edge check.
+            if m.start() > 0
+                && matches!(s[..m.start()].chars().next_back(), Some('v' | 'V'))
+            {
+                return None;
+            }
+            m.as_str().split('v').next()?.parse::<i64>().ok()
+        })
         .filter(|n| !NOISE_NUMBERS.contains(n) && !looks_like_year(*n))
-        .filter(|n| *n >= 1 && *n <= 9999)
+        .filter(|n| *n >= 0 && *n <= 9999)
         .last()
         // The after-title number skips the noise filter but not the rest.
         // A year right after the title is still a year.
-        .or(after_title.filter(|n| !looks_like_year(*n) && *n >= 1 && *n <= 9999))
+        .or(after_title.filter(|n| !looks_like_year(*n) && *n >= 0 && *n <= 9999))
 }
 
 #[cfg(test)]
@@ -576,6 +595,27 @@ mod tests {
         assert_eq!(parse_episode_guess("Show - 07 [1080p]"), Some(7));
         assert_eq!(parse_episode_guess("Movie 2016 [BD]"), None);
         assert_eq!(parse_episode_guess("no numbers here"), None);
+    }
+
+    /// A detached v2 revision must not outrank the real episode number.
+    /// "05 v2 1080p" used to parse as episode 2 and auto tracking wrote
+    /// progress 2 for episode 5.
+    #[test]
+    fn episode_guess_takes_real_episode_over_detached_revision() {
+        assert_eq!(parse_episode_guess("Show - 05 v2 1080p"), Some(5));
+        assert_eq!(parse_episode_guess("[Group] Show - 05 v2 x264"), Some(5));
+        assert_eq!(parse_episode_guess("Show - 05 v2"), Some(5));
+        // glued revision still belongs to its number
+        assert_eq!(parse_episode_guess("Show - 05v2"), Some(5));
+    }
+
+    /// Episode 0 is real. Prologues and specials are numbered 0 on AniList
+    /// and used to parse as batch files with no episode at all.
+    #[test]
+    fn episode_zero_parses() {
+        assert_eq!(parse_episode_guess("Show - 00"), Some(0));
+        assert_eq!(parse_episode_guess("Show 0"), Some(0));
+        assert_eq!(parse_episode_guess("Show - 00 (Prologue) [1080p]"), Some(0));
     }
 
     #[test]
@@ -842,10 +882,12 @@ mod tests {
         assert_eq!(clean_title("Show Name - 03.mkv"), "show name");
         assert_eq!(clean_title("Show Name - 03.MKV"), "show name");
         // a torrent title that is not a filename is no longer truncated at the
-        // last dot. Only the codec and episode noise goes.
+        // last dot. Only the codec, channel layout and episode noise goes.
+        // The channel strip also frees the bare aac for the codec strip,
+        // which the glued 2 in AAC2.0 used to shield.
         assert_eq!(
             clean_title("Clevatess S02E03 CR WEB-DL DUAL AAC2.0 H.264 (Clevatess: Majuu no Ou)"),
-            "clevatess s02e03 cr dual aac2"
+            "clevatess s02e03 cr dual"
         );
     }
 

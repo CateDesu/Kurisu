@@ -284,7 +284,11 @@ impl AniList {
     }
 
     /// One anime season. WINTER, SPRING, SUMMER, or FALL plus year. Most popular first.
-    pub async fn season(&self, season: &str, year: i64, page: i64) -> Result<Vec<Media>> {
+    /// Walks every page. A single page of 50 on a season carrying several
+    /// hundred entries silently hid everything past the popular head, which
+    /// looked exactly like a complete listing. Paced like the calendar walk
+    /// so the rate budget survives it.
+    pub async fn season_all(&self, season: &str, year: i64) -> Result<Vec<Media>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Page")]
@@ -295,9 +299,15 @@ impl AniList {
             // The list and its items are both nullable in the schema. A
             // stray null must not fail the whole query.
             media: Option<Vec<Option<AniMedia>>>,
+            page_info: Option<PageInfo>,
+        }
+        #[derive(Deserialize)]
+        struct PageInfo {
+            has_next_page: Option<bool>,
         }
         let q = "query ($season: MediaSeason!, $year: Int!, $page: Int!) {
             Page(page: $page, perPage: 50) {
+                pageInfo { hasNextPage }
                 media(season: $season, seasonYear: $year, type: ANIME, isAdult: false, sort: POPULARITY_DESC) {
                     id idMal title { romaji english native }
                     coverImage { medium large }
@@ -306,19 +316,43 @@ impl AniList {
                 }
             }
         }";
-        let r: R = self
-            .gql(
-                q,
-                serde_json::json!({ "season": season, "year": year, "page": page }),
-            )
-            .await?;
-        Ok(r.page
-            .media
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .map(Media::from)
-            .collect())
+        let mut out = Vec::new();
+        let mut has_next = true;
+        for page in 1..=10 {
+            if page > 1 {
+                // Pace the page walk. AniList's rate budget is tight. Do not
+                // burn it in a single burst.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let r: R = self
+                .gql(
+                    q,
+                    serde_json::json!({ "season": season, "year": year, "page": page }),
+                )
+                .await?;
+            let media = r.page.media.unwrap_or_default();
+            for m in media.into_iter().flatten() {
+                out.push(Media::from(m));
+            }
+            // A null hasNextPage is not "walk done". Breaking here would
+            // hand back a truncated season as if it were complete. Abort
+            // instead so the caller surfaces the failure.
+            has_next = r
+                .page
+                .page_info
+                .and_then(|p| p.has_next_page)
+                .ok_or_else(|| anyhow!("AniList returned a null pageInfo.hasNextPage"))?;
+            if !has_next {
+                break;
+            }
+        }
+        // 10 pages of 50 covers every real season with room to spare. Still
+        // reporting more means something is wrong, and a partial season must
+        // not pass as complete.
+        if has_next {
+            anyhow::bail!("AniList season walk ran past 10 pages without hasNextPage clearing");
+        }
+        Ok(out)
     }
 
     /// Community recommendations for one title. Best rated first.
@@ -720,6 +754,7 @@ impl AniList {
             }
         }";
         let mut out = Vec::new();
+        let mut has_next = true;
         for page in 1..=12 {
             if page > 1 {
                 // Pace the page walk. One calendar view can cost a dozen
@@ -748,7 +783,7 @@ impl AniList {
             // A null hasNextPage is not "walk done". Breaking here would
             // hand back a truncated calendar as if it were complete. Abort
             // instead so the caller surfaces the failure.
-            let has_next = r
+            has_next = r
                 .page
                 .page_info
                 .and_then(|p| p.has_next_page)
@@ -756,6 +791,12 @@ impl AniList {
             if !has_next {
                 break;
             }
+        }
+        // Falling out of the loop while pages remain would hand back a
+        // partial week as if it were complete, the exact thing the null
+        // check above guards against.
+        if has_next {
+            anyhow::bail!("AniList calendar walk ran past 12 pages without hasNextPage clearing");
         }
         Ok(out)
     }
@@ -1103,6 +1144,19 @@ fn is_not_found(e: &anyhow::Error) -> bool {
     };
     api.status == reqwest::StatusCode::NOT_FOUND || api.message == "Not Found"
 }
+
+/// AniList rejected the token itself. Revoked or expired tokens answer
+/// 400 "Invalid Token" rather than 401. A transport failure must not be
+/// confused with this: offline is not logged out. Only a definitive
+/// rejection may clear the session.
+pub fn is_auth_rejection(e: &anyhow::Error) -> bool {
+    let Some(api) = e.downcast_ref::<ApiError>() else {
+        return false;
+    };
+    api.status == reqwest::StatusCode::UNAUTHORIZED
+        || api.status == reqwest::StatusCode::FORBIDDEN
+        || api.message.eq_ignore_ascii_case("Invalid Token")
+}
 //
 // Implicit grant. No client_secret needed, a desktop app can not keep one
 // private anyway. The token arrives in the redirect URL fragment,
@@ -1416,6 +1470,32 @@ mod tests {
         assert!(!super::is_not_found(&near_miss));
         let plain = anyhow::anyhow!("AniList (404): boom");
         assert!(!super::is_not_found(&plain));
+    }
+
+    /// Only a definitive rejection counts. Transport noise and unrelated
+    /// 400s must not log the user out.
+    #[test]
+    fn is_auth_rejection_matches_invalid_token_and_auth_statuses_only() {
+        let invalid_token: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "Invalid Token".into(),
+        }
+        .into();
+        assert!(super::is_auth_rejection(&invalid_token));
+        let unauthorized: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            message: "anything".into(),
+        }
+        .into();
+        assert!(super::is_auth_rejection(&unauthorized));
+        let validation: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "validation failed".into(),
+        }
+        .into();
+        assert!(!super::is_auth_rejection(&validation));
+        let transport = anyhow::anyhow!("dns error");
+        assert!(!super::is_auth_rejection(&transport));
     }
 
     /// C3 regression. A hostile probe with ?error=..., a token with the

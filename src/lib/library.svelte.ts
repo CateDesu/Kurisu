@@ -15,6 +15,9 @@ let lastScanAt = $state(0);
 // rescan to stay honest. Runs one follow up with the current folders when the
 // active scan ends.
 let pendingScan = false;
+// Bumped by reset(). A scan in flight when the account changed must not write
+// its results back, they belong to the previous account's recognizer state.
+let scanGen = 0;
 
 async function loadFolders() {
   try {
@@ -30,8 +33,10 @@ async function scan() {
     return;
   }
   scanning = true;
+  const gen = scanGen;
   try {
     const result = await api.scanLibrary();
+    if (gen !== scanGen) return;
     files = result.files;
     unreadable = result.unreadable;
     lastScanAt = Date.now();
@@ -71,6 +76,9 @@ export const library = {
   scan,
   /** Drop everything cached for the current account. Called from logout. */
   reset() {
+    // Invalidate any scan still in flight so its results are not written
+    // back over the reset.
+    scanGen++;
     files = [];
     folders = [];
     unreadable = [];

@@ -71,7 +71,10 @@
     };
     const snap = {
       mode: cfg.mode,
-      prompt_seconds: int(cfg.prompt_seconds, 120, 10, 86_400),
+      // Must match the backend clamp of 1..3600 in set_tracking_config and
+      // the input's min/max. The old 10..86400 range silently stored 3600
+      // when a user asked for more.
+      prompt_seconds: int(cfg.prompt_seconds, 120, 1, 3_600),
       auto_percent: int(cfg.auto_percent, 80, 1, 100),
       auto_ask: cfg.auto_ask,
       mpv_ipc_socket: cfg.mpv_ipc_socket.trim(),
@@ -98,10 +101,24 @@
     }
   }
   async function toggleCloseToTray() {
-    await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
+    const prev = closeToTray;
+    try {
+      await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
+    } catch (e) {
+      // bind:checked already flipped the checkbox. Without the revert it
+      // kept showing a state that was never persisted.
+      closeToTray = prev;
+      console.error("failed to save close_to_tray", e);
+    }
   }
   async function toggleAutoUpdate() {
-    await api.setAppSetting("auto_update", autoUpdate ? "1" : "0");
+    const prev = autoUpdate;
+    try {
+      await api.setAppSetting("auto_update", autoUpdate ? "1" : "0");
+    } catch (e) {
+      autoUpdate = prev;
+      console.error("failed to save auto_update", e);
+    }
   }
   async function checkForUpdate() {
     updateChecking = true;

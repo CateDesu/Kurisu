@@ -16,13 +16,20 @@ export function nowPlaying(): NowPlaying | null {
 /** Bind the single listener from the root layout $effect. Idempotent. */
 export async function bindNowPlaying(): Promise<void> {
   if (bound) return;
+  // Only claim bound once the listener exists. A listen() rejection on a slow
+  // cold boot used to leave bound stuck true, killing now playing for the
+  // whole session with no retry.
   bound = true;
-  const u: UnlistenFn = await listen<NowPlaying>("kurisu://now-playing", (e) => {
-    // active false means playback stopped. Clear.
-    np = e.payload?.active ? e.payload : null;
-  });
-  // Listener lives for the whole session. Keep the unlisten handle so dev
-  // hot-reload can't leak a second one. The bound guard already prevents
-  // dupes. Belt and suspenders.
-  void u;
+  try {
+    const u: UnlistenFn = await listen<NowPlaying>("kurisu://now-playing", (e) => {
+      // active false means playback stopped. Clear.
+      np = e.payload?.active ? e.payload : null;
+    });
+    // Listener lives for the whole session. Kept so a future teardown or dev
+    // hot reload path has the handle. The bound guard prevents duplicates.
+    void u;
+  } catch (e) {
+    bound = false;
+    console.error("now-playing listener failed, will retry on next bind", e);
+  }
 }

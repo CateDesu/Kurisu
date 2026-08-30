@@ -383,9 +383,12 @@ impl Db {
         let c = self.0.lock();
         let mut out = std::collections::HashMap::new();
         for k in keys {
-            if let Ok(Some(v)) = c
+            // Propagate read errors. Swallowing them made a transient DB
+            // error look exactly like every key being unset, which silently
+            // reset tracking to its defaults while the rows were intact.
+            if let Some(v) = c
                 .query_row("SELECT value FROM settings WHERE key = ?", [*k], |r| r.get::<_, String>(0))
-                .optional()
+                .optional()?
             {
                 out.insert((*k).to_string(), v);
             }

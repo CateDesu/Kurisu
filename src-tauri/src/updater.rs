@@ -652,7 +652,11 @@ pub fn sweep_update_leftovers(dir: &Path) {
             let stale = entry
                 .metadata()
                 .and_then(|m| m.modified())
-                .map(|t| t.elapsed().map(|age| age > Duration::from_secs(3600)).unwrap_or(true))
+                // A future mtime means the clock jumped, not that the file is
+                // ancient. Treat it as fresh. Deleting on the error path could
+                // unlink a live download mid write, the exact thing the hour
+                // long grace exists to prevent.
+                .map(|t| t.elapsed().map(|age| age > Duration::from_secs(3600)).unwrap_or(false))
                 .unwrap_or(true);
             if stale {
                 let _ = std::fs::remove_file(entry.path());

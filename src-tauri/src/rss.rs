@@ -38,7 +38,13 @@ pub struct RawItem {
 /// never been written, so an emptied list stays empty.
 pub fn get_feeds(db: &Db) -> Vec<String> {
     match db.get_setting(FEEDS_KEY).ok().flatten() {
-        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            // A corrupt row used to look exactly like "no feeds configured",
+            // silently erasing the user's list. Log it so the real state is
+            // at least discoverable.
+            log::warn!("corrupt rss_feeds setting, starting from empty: {e}");
+            Vec::new()
+        }),
         None => DEFAULT_FEEDS.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -50,6 +56,24 @@ fn save_feeds(db: &Db, feeds: &[String]) -> Result<()> {
 pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(anyhow!("feed URL must start with http:// or https://"));
+    }
+    // Plain http can be tampered with in transit. Feed items carry magnet
+    // links, so a tampered feed hands the user attacker chosen torrents
+    // dressed up as new episodes of shows they watch. A reader self hosted
+    // on this machine is the one legitimate plain http case.
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host = if let Some(inner) = authority.strip_prefix('[') {
+            inner.split(']').next().unwrap_or(inner)
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        let loopback = host == "localhost" || host.starts_with("127.") || host == "::1";
+        if !loopback {
+            return Err(anyhow!(
+                "plain http feeds are only allowed for addresses on this machine, use https"
+            ));
+        }
     }
     let _guard = FEEDS_LOCK.lock();
     let mut feeds = get_feeds(db);
@@ -136,11 +160,14 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
         }));
     }
     let mut results = Vec::with_capacity(tasks.len());
-    for task in tasks {
+    for (i, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok(pair) => results.push(pair),
-            // A panic in one feed's task must not lose the others.
-            Err(e) => log::warn!("RSS fetch task failed: {e}"),
+            // A panic in one feed's task must not lose the others. Report
+            // the feed as failed too. Dropping the pair hid it from the
+            // failure list, and a run where every task died reported
+            // success with an empty item list.
+            Err(e) => results.push((feeds[i].clone(), Err(anyhow!("feed task failed: {e}")))),
         }
     }
 
@@ -158,7 +185,10 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 // indistinguishable from nothing new. An empty but valid
                 // feed like a nyaa search with zero hits still has the rss
                 // and channel elements, so only their absence is a failure.
-                if items.is_empty() && !xml.contains("<rss") && !xml.contains("<channel") {
+                // Case insensitive. XML is case sensitive in general but
+                // real world generators have emitted <RSS>.
+                let lower = xml.to_lowercase();
+                if items.is_empty() && !lower.contains("<rss") && !lower.contains("<channel") {
                     let msg = format!("{feed}: response was not an RSS feed");
                     log::warn!("{msg}");
                     failures.push(FeedFailure { url: feed, error: msg });
@@ -336,12 +366,23 @@ fn finish_item(mut it: RawItem) -> RawItem {
 }
 
 /// magnet URI from an info hash. Clients resolve peers over DHT or trackers.
+/// The hash is feed text. Validate the shape, a 40 char hex or 32 char base32
+/// value, so a crafted "hash" can not smuggle extra magnet parameters into
+/// xt. A bad value degrades to a hashless magnet. The item's torrent page
+/// link still works for those.
 pub fn magnet_for(info_hash: &str, title: &str) -> String {
-    format!(
-        "magnet:?xt=urn:btih:{}&dn={}",
-        info_hash,
-        crate::anilist::urlencoding::encode(title)
-    )
+    let h = info_hash.trim();
+    let valid = (h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        || (h.len() == 32 && h.chars().all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')));
+    if valid {
+        format!(
+            "magnet:?xt=urn:btih:{h}&dn={}",
+            crate::anilist::urlencoding::encode(title)
+        )
+    } else {
+        log::warn!("feed item carried a malformed info hash: {h:?}");
+        format!("magnet:?dn={}", crate::anilist::urlencoding::encode(title))
+    }
 }
 
 #[cfg(test)]
@@ -403,8 +444,20 @@ mod tests {
 
     #[test]
     fn magnet_builds() {
-        let m = magnet_for("abc123", "My Show - 05");
-        assert_eq!(m, "magnet:?xt=urn:btih:abc123&dn=My%20Show%20-%2005");
+        let hash = "abcdef0123456789abcdef0123456789abcdef01";
+        let m = magnet_for(hash, "My Show - 05");
+        assert_eq!(m, format!("magnet:?xt=urn:btih:{hash}&dn=My%20Show%20-%2005"));
+        // base32 hashes are valid too
+        assert!(magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t").starts_with("magnet:?xt=urn:btih:"));
+    }
+
+    /// A crafted "hash" must not smuggle extra magnet parameters into xt.
+    #[test]
+    fn magnet_rejects_malformed_info_hash() {
+        let m = magnet_for("abc&tr=http://evil/announce", "My Show");
+        assert!(!m.contains("urn:btih"), "malformed hash must not reach xt: {m}");
+        assert!(!m.contains("evil"), "no injected parameters may survive: {m}");
+        assert!(m.starts_with("magnet:?dn="));
     }
 
     // Captures log output so the truncation warning can be asserted on.

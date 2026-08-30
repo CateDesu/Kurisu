@@ -33,11 +33,16 @@ static BINDINGS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 // ─────────────────────────── folder settings ───────────────────────────
 
 pub fn get_folders(db: &Db) -> Vec<String> {
-    db.get_setting(FOLDERS_KEY)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match db.get_setting(FOLDERS_KEY).ok().flatten() {
+        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            // A corrupt row used to look exactly like "no folders configured".
+            // The next add_folder then persisted the empty list, destroying
+            // the previous configuration for good. Log so it is discoverable.
+            log::warn!("corrupt library_folders setting, starting from empty: {e}");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    }
 }
 
 fn save_folders(db: &Db, folders: &[String]) -> Result<()> {
@@ -87,11 +92,13 @@ pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
 // the folder list.
 
 pub fn get_bindings(db: &Db) -> std::collections::HashMap<String, i64> {
-    db.get_setting(BINDINGS_KEY)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match db.get_setting(BINDINGS_KEY).ok().flatten() {
+        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            log::warn!("corrupt library_bindings setting, starting from empty: {e}");
+            std::collections::HashMap::new()
+        }),
+        None => std::collections::HashMap::new(),
+    }
 }
 
 pub fn bind_path(db: &Db, path: &str, media_id: i64) -> Result<()> {

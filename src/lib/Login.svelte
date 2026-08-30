@@ -61,7 +61,9 @@
         placeholder="AniList access token"
         class="flex-1 bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
       />
-      <button class="px-3 py-2 rounded-md bg-panel-2 hover:bg-edge text-sm">Use</button>
+      <button disabled={busy} class="px-3 py-2 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50">
+        Use
+      </button>
     </form>
     <p class="text-xs text-ink-dim mt-2">
       An AniList access token — only needed if the browser sign-in above doesn't

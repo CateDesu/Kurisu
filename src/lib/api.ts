@@ -51,8 +51,8 @@ export const api = {
   logout: () => invoke<void>("logout"),
 
   searchAnime: (query: string) => invoke<Media[]>("search_anime", { query }),
-  getSeason: (season: string, year: number, page: number) =>
-    invoke<Media[]>("get_season", { season, year, page }),
+  getSeason: (season: string, year: number) =>
+    invoke<Media[]>("get_season", { season, year }),
   getRecommendations: (mediaId: number) =>
     invoke<Media[]>("get_recommendations", { mediaId }),
   getMedia: (id: number) => invoke<Media>("get_media", { id }),

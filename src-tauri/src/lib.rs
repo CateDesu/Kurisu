@@ -487,6 +487,10 @@ pub fn run() {
                                 "html_url": rel.html_url,
                                 "body": rel.body,
                                 "current": updater::current_version(),
+                                // The TS type declares this non optional.
+                                // commands.rs includes it on the pull path,
+                                // this emit and the stash did not.
+                                "restart_pending": crate::updater::update_applied(),
                             });
                             // Stash it for the frontend's pull on mount,
                             // take_pending_update. The emit is a one shot

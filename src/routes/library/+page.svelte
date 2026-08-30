@@ -332,6 +332,10 @@
                     title={`Play ${basename(f.path)}`}
                     onclick={() => play(f.path)}
                     onkeydown={(ev) => {
+                      // Inner buttons, like reveal in file manager, must keep
+                      // their own keyboard activation. Without the target
+                      // check Enter on the reveal button played the file.
+                      if (ev.currentTarget !== ev.target) return;
                       if (ev.key === "Enter" || ev.key === " ") {
                         ev.preventDefault();
                         play(f.path);

@@ -55,9 +55,12 @@
   $effect(() => {
     if (auth.isLoggedIn) {
       loadCurrent();
-      // Make sure library files are loaded for the Play buttons.
+      // Make sure library files are loaded for the Play buttons. scan()
+      // rejects on backend failure; without the catch every revisit of this
+      // page logged another unhandled rejection.
       library.loadFolders().then(() => {
-        if (library.folders.length > 0 && !library.hasScan) library.scan();
+        if (library.folders.length > 0 && !library.hasScan)
+          library.scan().catch((e) => console.error("library scan failed", e));
       });
     }
   });

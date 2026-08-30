@@ -501,6 +501,16 @@ mod tests {
                 "TrackingConfig",
                 serde_json::to_value(crate::commands::TrackingConfig::default()).unwrap(),
             ),
+            (
+                "TorrentFetch",
+                serde_json::to_value(TorrentFetch::default()).unwrap(),
+            ),
+            ("FeedFailure", serde_json::to_value(FeedFailure::default()).unwrap()),
+            ("LibraryScan", serde_json::to_value(LibraryScan::default()).unwrap()),
+            (
+                "UnreadableFolder",
+                serde_json::to_value(UnreadableFolder::default()).unwrap(),
+            ),
         ];
         for (name, value) in &models {
             assert_ts_declares(name, value);

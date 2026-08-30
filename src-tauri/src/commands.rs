@@ -98,13 +98,22 @@ impl TrackingConfig {
     pub fn load(db: &Db) -> Self {
         // Batch read so a concurrent set_settings can't interleave a new mode
         // with an old threshold.
-        let kv = db.get_settings_batch(&[
+        let kv = match db.get_settings_batch(&[
             TRACKING_MODE_KEY,
             TRACKING_PROMPT_KEY,
             TRACKING_AUTO_KEY,
             TRACKING_AUTO_ASK_KEY,
             TRACKING_MPV_SOCKET_KEY,
-        ]).unwrap_or_default();
+        ]) {
+            Ok(kv) => kv,
+            // Surface the failure instead of silently degrading to defaults.
+            // A transient read error used to look exactly like unset keys,
+            // which quietly turned tracking off until the next good read.
+            Err(e) => {
+                log::warn!("tracking config read failed, using defaults: {e}");
+                return Self::default();
+            }
+        };
         let mode = kv
             .get(TRACKING_MODE_KEY)
             .filter(|s| !s.is_empty())
@@ -385,6 +394,21 @@ pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, St
         // local list, library, cached detail pages stay reachable instead of
         // hiding behind the login card.
         Err(e) => {
+            // A rejected token is a different thing entirely. Serving the
+            // placeholder here kept a dead session alive forever: every
+            // mutation failed while the app insisted the user was signed
+            // in. Clear the session so the login card comes back.
+            if anilist::is_auth_rejection(&e) {
+                state.anilist.lock().set_token(None);
+                *state.user.lock() = None;
+                // The token is dead, so plain deletes are enough. No need
+                // for the VACUUM scrub logout uses on a live secret.
+                if let Err(e) = state.db.delete_setting(TOKEN_KEY) {
+                    log::warn!("failed to drop rejected token from db: {e}");
+                }
+                let _ = state.db.delete_setting(USERNAME_KEY);
+                return Ok(None);
+            }
             let name = state
                 .db
                 .get_setting(USERNAME_KEY)
@@ -413,16 +437,16 @@ pub async fn search_anime(query: String, state: State<'_, AppState>) -> Result<V
     Ok(media)
 }
 
-/// One anime season for the `/seasons` browser. Results cached like search hits.
+/// One anime season for the `/seasons` browser. Walks every page so nothing
+/// past the popular head is missing. Results cached like search hits.
 #[tauri::command]
 pub async fn get_season(
     season: String,
     year: i64,
-    page: i64,
     state: State<'_, AppState>,
 ) -> Result<Vec<Media>, String> {
     let al = state.anilist.lock().clone();
-    let media = al.season(&season, year, page).await.map_err(|e| e.to_string())?;
+    let media = al.season_all(&season, year).await.map_err(|e| e.to_string())?;
     for m in &media {
         let _ = state.db.upsert_media(m);
     }
@@ -866,14 +890,19 @@ fn compute_set_progress(
     // Auto-complete at the last episode. Bump the rewatch count when a
     // REPEATING entry finishes, per AniList's convention, instead of silently
     // dropping the rewatch. Starting progress on a PLANNING entry or rewinding
-    // a COMPLETED one moves it to CURRENT.
+    // a COMPLETED one moves it to CURRENT. A completed entry reopens at any
+    // rewind, including straight to zero. PLANNING only flips once progress
+    // actually starts, so a stray zero write can't turn a plan into current.
     let (status, repeat) = if overshot {
         (prev_status, prev_repeat)
     } else if at_end && prev_status == "REPEATING" {
         (ListStatus::Completed.as_str(), prev_repeat + 1)
     } else if at_end {
         (ListStatus::Completed.as_str(), prev_repeat)
-    } else if prev_status.is_empty() || (progress > 0 && matches!(prev_status, "COMPLETED" | "PLANNING")) {
+    } else if prev_status.is_empty()
+        || prev_status == "COMPLETED"
+        || (progress > 0 && prev_status == "PLANNING")
+    {
         (ListStatus::Current.as_str(), prev_repeat)
     } else {
         (prev_status, prev_repeat)
@@ -1297,6 +1326,17 @@ mod tests {
         seed(&state, Some(12), "REPEATING", 6, 2);
         let w = compute_set_progress(&state, 1, 4).unwrap();
         assert_eq!((w.status.as_str(), w.repeat), ("REPEATING", 2));
+    }
+
+    /// Rewinding a completed entry to exactly zero still reopens it. The old
+    /// progress > 0 guard left a finished show marked COMPLETED at 0 of 12.
+    #[test]
+    fn rewinding_completed_to_zero_reopens() {
+        let state = test_state();
+        seed(&state, Some(12), "COMPLETED", 12, 0);
+        let w = compute_set_progress(&state, 1, 0).unwrap();
+        assert_eq!((w.status.as_str(), w.progress), ("CURRENT", 0));
+        assert!(w.send_status);
     }
 
     /// C7. Advancing progress on a PLANNING entry starts it, moves it to

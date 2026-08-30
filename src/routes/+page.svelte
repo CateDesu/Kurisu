@@ -162,10 +162,12 @@
       if (id !== loadId) return;
       // Decide before rendering. On account switch the cached rows belong
       // to the previous user. Showing them invites edits against the wrong
-      // list. Hold the old view until sync reconciles.
+      // list, so drop them and let sync fill the view. If the reconcile
+      // sync then fails, an empty list under an error banner beats the
+      // previous account's rows with live steppers.
       const uid = auth.user?.id ?? null;
       const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
-      if (!switched) entries = list;
+      entries = switched ? [] : list;
       syncedFor = uid;
       if ((list.length === 0 && !autoSynced) || switched) {
         autoSynced = true;

@@ -125,7 +125,11 @@
     }
   }
 
+  /// Skip the current prompt. Refused while a write is in flight, mirroring
+  /// the disabled Skip button. Dismissing mid save threw away the error
+  /// banner, so a rejected save looked like a successful one.
   function skip() {
+    if (busy) return;
     dismiss();
   }
 </script>
