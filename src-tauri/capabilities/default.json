@@ -12,7 +12,9 @@
     },
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "**" }]
+      "allow": [
+        { "path": "**/*.{mkv,mp4,avi,webm,mov,m4v,ts,m2ts,ogm,ogv,flv,wmv,mpg,mpeg,vob,3gp,rmvb,asf,divx}" }
+      ]
     },
     "opener:allow-reveal-item-in-dir",
     "dialog:allow-open",

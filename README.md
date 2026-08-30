@@ -16,14 +16,24 @@ Kurisu is an anime tracker inspired by [Taiga](https://taiga.moe), built in Rust
 - **Stats** - your AniList profile statistics: time watched, score distribution, genres, formats, release years.
 - **Library scan** - point it at your anime folders; files are matched against your list, watched state follows your progress, play the next episode directly. Unmatched files can be linked to a show by hand (per file or whole folder).
 - **Seasons + recommendations** - browse any AniList season; the edit dialog shows community recommendations.
-- **Playback tracking** - detects playback, matches the title against your list, and prompts or auto-updates progress to the detected episode.
+- **Playback tracking** - detects playback, matches the title against your list, and prompts or auto-updates progress to the detected episode. Any MPRIS2 player on Linux, GSMTC on Windows, and bare MPV through its IPC socket.
 - **Notifications** - your AniList inbox, mirroring anilist.co/notifications.
 - **Desktop integration** - custom dark title bar, system tray, borderless window with edge/corner resize.
 - **Self-update** - CI builds check the rolling GitHub release on startup (Settings → Updates, on by default) and install in place on Linux and Windows. Builds are verified against a SHA-256 sidecar before anything is run. Locally compiled builds don't auto-check, so developing never nags.
 
+## MPV
+
+Bare MPV doesn't register with the OS media APIs on either platform. Linux MPRIS needs the `mpv-mpris` script and Windows GSMTC only sees mpv.net. Kurisu reads MPV's JSON IPC socket instead. Turn it on once in `~/.config/mpv/mpv.conf`:
+
+```ini
+input-ipc-server=/tmp/mpvsocket
+```
+
+Detection, matching, and progress updates then work exactly like with any other player. A different socket path can be set in Settings → Playback tracking; leaving it blank tries the common defaults.
+
 ## Windows
 
-Playback detection uses GSMTC (Windows media controls). Any player that registers with it works - mpv.net and VLC do; **bare MPV does not**.
+Playback detection uses GSMTC (Windows media controls). Any player that registers with it works - mpv.net and VLC do. Bare MPV is detected through its IPC socket as described above, with `input-ipc-server=\\.\pipe\mpvsocket` in `mpv.conf`.
 
 Getting a build:
 

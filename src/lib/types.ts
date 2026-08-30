@@ -274,6 +274,7 @@ export interface TrackingConfig {
   prompt_seconds: number;
   auto_percent: number;
   auto_ask: boolean;
+  mpv_ipc_socket: string;
 }
 
 /// "Now Playing" payload pushed from the MPRIS watcher every tick.

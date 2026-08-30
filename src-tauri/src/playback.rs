@@ -1,7 +1,8 @@
 //! Playback detection. Polls the OS media session every few seconds, matches
 //! the playing title against the cached list, and either prompts after N
 //! minutes of playback or auto updates progress at X% watched. MPRIS2 on
-//! Linux, GSMTC on Windows. Other platforms get a no-op stub.
+//! Linux, GSMTC on Windows, plus the MPV IPC socket as a fallback for bare
+//! mpv which registers with neither. Other platforms get a no-op stub.
 //!
 //! Title cleaning, episode parsing, and list matching live in recognize.rs
 //! and are shared with the library scanner. Only read_now is platform
@@ -23,7 +24,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::{self, AppState, TrackingConfig};
-#[cfg(target_os = "linux")]
+use crate::mpvipc;
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
 use crate::recognize::basename;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
 use crate::recognize::{match_title, resolve_episode};
@@ -54,6 +56,10 @@ const BROWSER_PLAYERS: &[&str] = &[
     // Windows even though Linux catches it via the MPRIS bus name.
     "308046b0af4a39cb", // Firefox default install path
     "e7cf176e110c211b", // Firefox alternate install hash
+    // Music streaming. A song is not an episode and must not drive the
+    // banner or tracking. Bus name org.mpris.MediaPlayer2.spotify on Linux,
+    // SpotifyAB.SpotifyMusic AUMID on Windows.
+    "spotify",
 ];
 
 /// Windows GSMTC exposes only an AppUserModelId so the denylist can never
@@ -427,6 +433,57 @@ fn idle() -> NowPlaying {
 
 // ─────────────────────────── blocking reads ───────────────────────────
 
+/// Ask the MPV IPC socket what is playing. The socket paths tried are
+/// the one configured in Settings plus the well known defaults. Only
+/// called when the OS media session has nothing playing, since bare mpv
+/// registers with MPRIS and GSMTC on neither platform. Blocking, like
+/// the media session reads it complements.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn probe_mpv(app: &AppHandle) -> Option<TickInfo> {
+    let cfg = read_config(app);
+    let mut paths: Vec<String> = Vec::new();
+    let custom = cfg.mpv_ipc_socket.trim().to_string();
+    if !custom.is_empty() {
+        paths.push(custom);
+    }
+    for p in mpvipc::default_socket_paths() {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    mpvipc::probe(&paths).map(|s| mpv_tick_info(app, &s))
+}
+
+/// Shape an mpv IPC snapshot into the same TickInfo the media session
+/// paths produce. The recognizer and the tick state machine cannot tell
+/// the sources apart. The file path is the track key, exactly what the
+/// MPRIS path uses the file URL for, and it also feeds the matcher as
+/// the basename candidate.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn mpv_tick_info(app: &AppHandle, snap: &mpvipc::MpvSnapshot) -> TickInfo {
+    let state = app.state::<AppState>();
+    let matchers = state.matchers.lock().clone();
+    let title = if snap.media_title.is_empty() {
+        snap.filename.clone()
+    } else {
+        snap.media_title.clone()
+    };
+    let matched = match_title(&matchers, &title, &snap.path);
+    let base = basename(&snap.path);
+    let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
+    TickInfo {
+        playing: snap.playing,
+        player: "mpv".into(),
+        trackid: snap.path.clone(),
+        title,
+        length_us: snap.duration_us,
+        position_us: snap.position_us,
+        media_id: matched.map(|m| m.media_id),
+        matched_title: matched.map(|m| m.display.clone()),
+        episode,
+    }
+}
+
 /// Linux MPRIS2. Find the most relevant player. Prefer Playing, fall back
 /// to Paused so we don't lose accumulated progress on a pause. Read its
 /// current track and match against the cached list. All blocking.
@@ -453,42 +510,72 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
                 .find(|p| matches!(p.get_playback_status(), Ok(PlaybackStatus::Paused)))
                 .map(|p| (p, false))
         });
-    let Some((player, playing)) = picked else { return Ok(None) };
 
-    let md = match player.get_metadata() {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
+    // Bare mpv without the mpris script is invisible above. Ask its IPC
+    // socket. A playing mpv outranks a paused MPRIS player, same policy
+    // as Playing-before-Paused inside MPRIS. When the MPRIS pick IS an
+    // mpv the mpris script is loaded and the socket would be the same
+    // instance read twice, so IPC is skipped.
+    let mpris_playing = picked.as_ref().map(|(_, playing)| *playing).unwrap_or(false);
+    let mpris_is_mpv = picked.as_ref().map(|(p, _)| is_mpris_mpv(p)).unwrap_or(false);
+    let mut ipc: Option<TickInfo> = None;
+    if !mpris_playing && !mpris_is_mpv {
+        ipc = probe_mpv(app);
+        if ipc.as_ref().is_some_and(|i| i.playing) {
+            return Ok(ipc);
+        }
+    }
 
-    let title = md.title().map(|t| t.to_string()).unwrap_or_default();
-    let url = md.url().map(|u| u.to_string()).unwrap_or_default();
-    let length = md.length().unwrap_or(Duration::ZERO);
-    let position = player.get_position().unwrap_or(Duration::ZERO);
-    let identity = player.identity().to_string();
-    // mpris 2.x Metadata has no trackid accessor, so synthesize a stable per
-    // track key. The file URL is unique per file which is exactly when we want
-    // to reset the tracker. Falls back to the title.
-    let trackid = if !url.is_empty() { url.clone() } else { title.clone() };
+    if let Some((player, playing)) = picked {
+        let md = match player.get_metadata() {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
 
-    let state = app.state::<AppState>();
-    // Matchers come from the shared cache rebuilt on every list mutation.
-    // Rebuilding them from the DB every 5s tick was the hot path's main cost.
-    let matchers = state.matchers.lock().clone();
-    let matched = match_title(&matchers, &title, &url);
-    let base = basename(&url);
-    let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
+        let title = md.title().map(|t| t.to_string()).unwrap_or_default();
+        let url = md.url().map(|u| u.to_string()).unwrap_or_default();
+        let length = md.length().unwrap_or(Duration::ZERO);
+        let position = player.get_position().unwrap_or(Duration::ZERO);
+        let identity = player.identity().to_string();
+        // mpris 2.x Metadata has no trackid accessor, so synthesize a stable per
+        // track key. The file URL is unique per file which is exactly when we want
+        // to reset the tracker. Falls back to the title.
+        let trackid = if !url.is_empty() { url.clone() } else { title.clone() };
 
-    Ok(Some(TickInfo {
-        playing,
-        player: identity,
-        trackid,
-        title,
-        length_us: length.as_micros() as i64,
-        position_us: position.as_micros() as i64,
-        media_id: matched.map(|m| m.media_id),
-        matched_title: matched.map(|m| m.display.clone()),
-        episode,
-    }))
+        let state = app.state::<AppState>();
+        // Matchers come from the shared cache rebuilt on every list mutation.
+        // Rebuilding them from the DB every 5s tick was the hot path's main cost.
+        let matchers = state.matchers.lock().clone();
+        let matched = match_title(&matchers, &title, &url);
+        let base = basename(&url);
+        let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
+
+        Ok(Some(TickInfo {
+            playing,
+            player: identity,
+            trackid,
+            title,
+            length_us: length.as_micros() as i64,
+            position_us: position.as_micros() as i64,
+            media_id: matched.map(|m| m.media_id),
+            matched_title: matched.map(|m| m.display.clone()),
+            episode,
+        }))
+    } else if let Some(info) = ipc {
+        // Nothing in MPRIS at all, mpv paused over IPC. Keep the banner
+        // and the accumulated progress, same as a paused MPRIS player.
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
+}
+
+/// True if an MPRIS player is an mpv instance. Means the mpris script is
+/// loaded, the IPC fallback would read the same player twice, and the
+/// MPRIS data is richer anyway.
+#[cfg(target_os = "linux")]
+fn is_mpris_mpv(player: &mpris::Player) -> bool {
+    format!("{} {}", player.bus_name(), player.identity()).to_lowercase().contains("mpv")
 }
 
 fn read_config(app: &AppHandle) -> TrackingConfig {
@@ -516,9 +603,10 @@ fn is_browser(player: &mpris::Player) -> bool {
 
 /// Windows. Read the Global System Media Transport Controls sessions, the
 /// OS level what's playing API. Same pick policy as MPRIS. Playing first,
-/// else Paused. Bare MPV doesn't register with GSMTC. mpv.net and VLC do.
-/// GSMTC exposes no file URL so the title is the only match input and
-/// doubles as the track key.
+/// else Paused. Bare MPV doesn't register with GSMTC, mpv.net and VLC do,
+/// so bare mpv is read through its IPC socket instead, below. GSMTC
+/// exposes no file URL so the title is the only match input and doubles
+/// as the track key.
 #[cfg(windows)]
 fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     use windows::Media::Control::{
@@ -550,52 +638,68 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
             _ => {}
         }
     }
-    let Some((session, playing)) = picked.or(paused) else { return Ok(None) };
+    // Bare mpv never registers with GSMTC, mpv.net and VLC do. Before
+    // settling for a paused session, ask the mpv IPC socket. A playing
+    // mpv there outranks a paused GSMTC session, and with no GSMTC pick
+    // at all a paused mpv still keeps the banner alive.
+    let mut ipc: Option<TickInfo> = None;
+    if picked.is_none() {
+        ipc = probe_mpv(app);
+        if ipc.as_ref().is_some_and(|i| i.playing) {
+            return Ok(ipc);
+        }
+    }
 
-    // One failed property call must not sink the tick. A player that answers
-    // playback status but has no media properties or timeline would disable
-    // the banner and both tracking modes for as long as its session lives.
-    // Degrade to an empty title and zeroed times like the Linux path does.
-    // Prompt and auto ask modes need no position data.
-    let title = session
-        .TryGetMediaPropertiesAsync()
-        .and_then(|op| op.join())
-        .and_then(|props| props.Title())
-        .map(|h| h.to_string_lossy())
-        .unwrap_or_default();
-    let player = session
-        .SourceAppUserModelId()
-        .map(|h| h.to_string_lossy())
-        .unwrap_or_default();
-    let timeline = session.GetTimelineProperties().ok();
-    // TimeSpan.Duration is in 100 ns units. Divide by 10 for microseconds.
-    let length_us = timeline
-        .as_ref()
-        .and_then(|t| t.EndTime().ok())
-        .map(|t| t.Duration / 10)
-        .unwrap_or(0);
-    let position_us = timeline
-        .as_ref()
-        .and_then(|t| t.Position().ok())
-        .map(|t| t.Duration / 10)
-        .unwrap_or(0);
+    if let Some((session, playing)) = picked.or(paused) {
+        // One failed property call must not sink the tick. A player that answers
+        // playback status but has no media properties or timeline would disable
+        // the banner and both tracking modes for as long as its session lives.
+        // Degrade to an empty title and zeroed times like the Linux path does.
+        // Prompt and auto ask modes need no position data.
+        let title = session
+            .TryGetMediaPropertiesAsync()
+            .and_then(|op| op.join())
+            .and_then(|props| props.Title())
+            .map(|h| h.to_string_lossy())
+            .unwrap_or_default();
+        let player = session
+            .SourceAppUserModelId()
+            .map(|h| h.to_string_lossy())
+            .unwrap_or_default();
+        let timeline = session.GetTimelineProperties().ok();
+        // TimeSpan.Duration is in 100 ns units. Divide by 10 for microseconds.
+        let length_us = timeline
+            .as_ref()
+            .and_then(|t| t.EndTime().ok())
+            .map(|t| t.Duration / 10)
+            .unwrap_or(0);
+        let position_us = timeline
+            .as_ref()
+            .and_then(|t| t.Position().ok())
+            .map(|t| t.Duration / 10)
+            .unwrap_or(0);
 
-    let state = app.state::<AppState>();
-    let matchers = state.matchers.lock().clone();
-    let matched = match_title(&matchers, &title, "");
-    let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str()]));
+        let state = app.state::<AppState>();
+        let matchers = state.matchers.lock().clone();
+        let matched = match_title(&matchers, &title, "");
+        let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str()]));
 
-    Ok(Some(TickInfo {
-        playing,
-        player,
-        trackid: String::new(), // no URL from GSMTC. tick keys the track by title
-        title,
-        length_us,
-        position_us,
-        media_id: matched.map(|m| m.media_id),
-        matched_title: matched.map(|m| m.display.clone()),
-        episode,
-    }))
+        Ok(Some(TickInfo {
+            playing,
+            player,
+            trackid: String::new(), // no URL from GSMTC. tick keys the track by title
+            title,
+            length_us,
+            position_us,
+            media_id: matched.map(|m| m.media_id),
+            matched_title: matched.map(|m| m.display.clone()),
+            episode,
+        }))
+    } else if let Some(info) = ipc {
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Platforms without a media session API we support like macOS. No playback
@@ -730,6 +834,22 @@ mod tests {
         assert!(!is_browser_str("VLC media player"));
         // A known player wins even when its path contains a denylisted word.
         assert!(!is_browser_str(r"C:\Users\opera\AppData\mpv.net\mpvnet.exe"));
+    }
+
+    /// A playing song is not an episode. Spotify must never drive the
+    /// banner or tracking, whatever surface its name leaks through. Linux
+    /// joins the D-Bus bus name and identity, Windows exposes an
+    /// AppUserModelId, and third party clients like spotifyd carry the
+    /// name in their bus name too. Mixed case must not dodge the match.
+    #[test]
+    fn spotify_never_drives_the_banner_or_tracking() {
+        // Linux, exactly the string is_browser joins for the official client.
+        assert!(is_browser_str("org.mpris.MediaPlayer2.spotify Spotify"));
+        // Windows Store AUMID. CamelCase proves the match is case blind.
+        assert!(is_browser_str("SpotifyAB.SpotifyMusic-hz89res2p8targ!App"));
+        // Third party clients and daemons expose the same name on the bus.
+        assert!(is_browser_str("org.mpris.MediaPlayer2.spotifyd spotifyd"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.spotify-qt spotify-qt"));
     }
 
     /// Same drift guard as models.rs, for the event payloads the watcher emits.

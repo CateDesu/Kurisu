@@ -5,7 +5,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
 
-  let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80, auto_ask: true });
+  let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80, auto_ask: true, mpv_ipc_socket: "" });
   let trackingLoaded = $state(false);
   let trackingSaving = $state(false);
   let trackingSavedAt = $state(0);
@@ -74,17 +74,19 @@
       prompt_seconds: int(cfg.prompt_seconds, 120, 10, 86_400),
       auto_percent: int(cfg.auto_percent, 80, 1, 100),
       auto_ask: cfg.auto_ask,
+      mpv_ipc_socket: cfg.mpv_ipc_socket.trim(),
     };
     // Reflect the normalized values so the field shows what was saved.
     cfg.prompt_seconds = snap.prompt_seconds;
     cfg.auto_percent = snap.auto_percent;
     try {
-      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent, snap.auto_ask);
+      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent, snap.auto_ask, snap.mpv_ipc_socket);
       if (
         cfg.mode === snap.mode &&
         cfg.prompt_seconds === snap.prompt_seconds &&
         cfg.auto_percent === snap.auto_percent &&
-        cfg.auto_ask === snap.auto_ask
+        cfg.auto_ask === snap.auto_ask &&
+        cfg.mpv_ipc_socket.trim() === snap.mpv_ipc_socket
       ) {
         cfg = saved;
       }
@@ -171,6 +173,7 @@
     <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Playback tracking</h2>
     <p class="text-sm text-ink-dim mb-3">
       Detect playback in MPV/VLC/Celluloid (any MPRIS2 player) and update your list.
+      Bare MPV is detected through its IPC socket.
     </p>
     <div class="space-y-2 mb-4">
       {#each modes as [val, label]}
@@ -224,6 +227,22 @@
         </span>
       </span>
     </label>
+    <div class="mb-4">
+      <label class="block text-sm mb-1" for="mpv-sock">MPV socket path <span class="text-ink-dim">(optional)</span></label>
+      <input
+        id="mpv-sock"
+        type="text"
+        placeholder="/tmp/mpvsocket"
+        bind:value={cfg.mpv_ipc_socket}
+        oninput={() => (trackingSavedAt = 0)}
+        class="w-full bg-panel border border-edge rounded-md px-2 py-1 text-sm font-mono focus:outline-none focus:border-accent"
+      />
+      <p class="text-xs text-ink-dim mt-1">
+        Bare MPV doesn't report playback to the OS, so Kurisu reads mpv's IPC socket
+        directly. Turn it on with <code>input-ipc-server=/tmp/mpvsocket</code> in your
+        mpv.conf. Leave this blank to try the common default paths.
+      </p>
+    </div>
     <div>
       <button
         disabled={!trackingLoaded || trackingSaving}

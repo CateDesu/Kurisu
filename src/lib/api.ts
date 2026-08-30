@@ -28,13 +28,15 @@ export const api = {
     mode: string,
     promptSeconds: number,
     autoPercent: number,
-    autoAsk: boolean
+    autoAsk: boolean,
+    mpvIpcSocket: string
   ) =>
     invoke<TrackingConfig>("set_tracking_config", {
       mode,
       promptSeconds,
       autoPercent,
       autoAsk,
+      mpvIpcSocket,
     }),
 
   getAppSetting: (key: string) =>

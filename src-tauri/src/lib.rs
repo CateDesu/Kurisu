@@ -7,6 +7,7 @@ mod commands;
 mod db;
 mod library;
 mod models;
+mod mpvipc;
 mod playback;
 mod recognize;
 mod rss;

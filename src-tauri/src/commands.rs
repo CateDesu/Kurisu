@@ -70,11 +70,21 @@ pub struct TrackingConfig {
     pub prompt_seconds: u64,     // prompt mode: seconds of playback before asking
     pub auto_percent: u64,       // auto mode: watched percent that triggers a +1
     pub auto_ask: bool,          // jump to Currently Watching and ask after a delay
+    /// Optional mpv --input-ipc-server socket path. Empty tries the well
+    /// known defaults. Bare mpv never registers with the OS media session
+    /// so the watcher reads the socket directly.
+    pub mpv_ipc_socket: String,
 }
 
 impl Default for TrackingConfig {
     fn default() -> Self {
-        Self { mode: "off".into(), prompt_seconds: 120, auto_percent: 80, auto_ask: true }
+        Self {
+            mode: "off".into(),
+            prompt_seconds: 120,
+            auto_percent: 80,
+            auto_ask: true,
+            mpv_ipc_socket: String::new(),
+        }
     }
 }
 
@@ -82,6 +92,7 @@ const TRACKING_MODE_KEY: &str = "tracking_mode";
 const TRACKING_PROMPT_KEY: &str = "tracking_prompt_seconds";
 const TRACKING_AUTO_KEY: &str = "tracking_auto_percent";
 const TRACKING_AUTO_ASK_KEY: &str = "tracking_auto_ask";
+const TRACKING_MPV_SOCKET_KEY: &str = "tracking_mpv_socket";
 
 impl TrackingConfig {
     pub fn load(db: &Db) -> Self {
@@ -92,6 +103,7 @@ impl TrackingConfig {
             TRACKING_PROMPT_KEY,
             TRACKING_AUTO_KEY,
             TRACKING_AUTO_ASK_KEY,
+            TRACKING_MPV_SOCKET_KEY,
         ]).unwrap_or_default();
         let mode = kv
             .get(TRACKING_MODE_KEY)
@@ -114,7 +126,11 @@ impl TrackingConfig {
             .get(TRACKING_AUTO_ASK_KEY)
             .map(|s| s != "0")
             .unwrap_or(true);
-        Self { mode, prompt_seconds, auto_percent, auto_ask }
+        let mpv_ipc_socket = kv
+            .get(TRACKING_MPV_SOCKET_KEY)
+            .cloned()
+            .unwrap_or_default();
+        Self { mode, prompt_seconds, auto_percent, auto_ask, mpv_ipc_socket }
     }
 
     pub fn save(&self, db: &Db) -> Result<(), String> {
@@ -125,6 +141,7 @@ impl TrackingConfig {
             (TRACKING_PROMPT_KEY, &self.prompt_seconds.to_string()),
             (TRACKING_AUTO_KEY, &self.auto_percent.to_string()),
             (TRACKING_AUTO_ASK_KEY, if self.auto_ask { "1" } else { "0" }),
+            (TRACKING_MPV_SOCKET_KEY, self.mpv_ipc_socket.trim()),
         ])
         .map_err(|e| e.to_string())
     }
@@ -195,17 +212,23 @@ pub fn set_tracking_config(
     prompt_seconds: u64,
     auto_percent: u64,
     auto_ask: bool,
+    mpv_ipc_socket: String,
     state: State<'_, AppState>,
 ) -> Result<TrackingConfig, String> {
     let normalized_mode = match mode.as_str() {
         "prompt" | "auto" => mode,
         _ => "off".to_string(),
     };
+    // A path with a newline could never be a socket, and it would round
+    // trip through the settings row badly. Trim and cap instead of
+    // rejecting, the field is optional so garbage degrades to defaults.
+    let mpv_ipc_socket = mpv_ipc_socket.trim().chars().take(512).collect::<String>();
     let cfg = TrackingConfig {
         mode: normalized_mode,
         prompt_seconds: prompt_seconds.clamp(1, 3_600),
         auto_percent: auto_percent.clamp(1, 100),
         auto_ask,
+        mpv_ipc_socket,
     };
     cfg.save(&state.db)?;
     Ok(cfg)
