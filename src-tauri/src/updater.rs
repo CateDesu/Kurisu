@@ -200,13 +200,22 @@ pub fn current_version() -> &'static str {
     }
 }
 
-/// True only when this binary was stamped by CI. Unstamped, locally compiled,
-/// builds never auto-check on startup. They report the X.Y.Z base version, so
-/// the dev loop would get nagged by every newer rolling build, and an
-/// accidental install would overwrite the working tree's binary. A manual
-/// check from Settings still works on any build.
+/// True only when this binary was stamped by CI via KURISU_BUILD_VERSION.
+/// Stamped builds know their exact rolling version, X.Y.Z plus run number.
 pub fn is_ci_build() -> bool {
     matches!(option_env!("KURISU_BUILD_VERSION"), Some(v) if !v.is_empty())
+}
+
+/// True when this build participates in the startup auto check. CI builds
+/// always do. A release build compiled from source does too: someone who
+/// built the app themselves wants update notices just like an installed CI
+/// build, and the swap lands in their own target dir harmlessly. Debug
+/// builds are the dev loop and stay quiet, a modal every `tauri dev` boot
+/// helps nobody. The auto_update setting turns the check off entirely, the
+/// right escape hatch for anyone tracking main at the same X.Y.Z base as
+/// the rolling release. Manual check from Settings works on every build.
+pub fn auto_check_eligible() -> bool {
+    is_ci_build() || !cfg!(debug_assertions)
 }
 
 // ── Release lookup ──────────────────────────────────────────────────────────
@@ -709,6 +718,21 @@ mod tests {
         assert!(!is_newer("1.0.0-rc1", "1.0.0"));
         assert!(is_newer("1.0.0-rc2", "1.0.0-rc1"));
         assert!(is_newer("1.0.0.1", "1.0.0-rc9"));
+    }
+
+    /// A stamped build is always auto check eligible. In the test profile
+    /// there is no stamp and debug assertions are on, so eligibility here is
+    /// the source debug answer, the dev loop staying quiet.
+    #[test]
+    fn auto_check_eligibility_covers_every_build_kind() {
+        if is_ci_build() {
+            assert!(auto_check_eligible());
+        } else if cfg!(debug_assertions) {
+            assert!(!auto_check_eligible());
+        }
+        // A source release build, the case this guards, has no stamp and no
+        // debug assertions. It cannot be asserted from inside a single
+        // profile, the compile time flags are what decide it.
     }
 
     #[test]

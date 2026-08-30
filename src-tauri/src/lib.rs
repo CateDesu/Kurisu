@@ -461,7 +461,9 @@ pub fn run() {
                             }),
                         );
                     }
-                    if !updater::is_ci_build() {
+                    // Source release builds auto check too, only the debug
+                    // dev loop stays quiet. See auto_check_eligible.
+                    if !updater::auto_check_eligible() {
                         return;
                     }
                     let enabled = handle
