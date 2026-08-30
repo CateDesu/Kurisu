@@ -77,7 +77,9 @@
       prompt_seconds: int(cfg.prompt_seconds, 120, 1, 3_600),
       auto_percent: int(cfg.auto_percent, 80, 1, 100),
       auto_ask: cfg.auto_ask,
-      mpv_ipc_socket: cfg.mpv_ipc_socket.trim(),
+      // Same 512 char cap as set_tracking_config, so the guard below compares
+      // against what the backend will actually persist.
+      mpv_ipc_socket: cfg.mpv_ipc_socket.trim().slice(0, 512),
     };
     // Reflect the normalized values so the field shows what was saved.
     cfg.prompt_seconds = snap.prompt_seconds;

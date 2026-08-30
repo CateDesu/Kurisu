@@ -228,9 +228,8 @@ pub fn set_tracking_config(
         "prompt" | "auto" => mode,
         _ => "off".to_string(),
     };
-    // A path with a newline could never be a socket, and it would round
-    // trip through the settings row badly. Trim and cap instead of
-    // rejecting, the field is optional so garbage degrades to defaults.
+    // Trim and cap instead of rejecting. The field is optional, so
+    // garbage just fails to resolve and the defaults take over.
     let mpv_ipc_socket = mpv_ipc_socket.trim().chars().take(512).collect::<String>();
     let cfg = TrackingConfig {
         mode: normalized_mode,

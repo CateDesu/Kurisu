@@ -13,7 +13,25 @@
     {
       "identifier": "opener:allow-open-path",
       "allow": [
-        { "path": "**/*.{mkv,mp4,avi,webm,mov,m4v,ts,m2ts,ogm,ogv,flv,wmv,mpg,mpeg,vob,3gp,rmvb,asf,divx}" }
+        { "path": "**/*.mkv" },
+        { "path": "**/*.mp4" },
+        { "path": "**/*.avi" },
+        { "path": "**/*.webm" },
+        { "path": "**/*.mov" },
+        { "path": "**/*.m4v" },
+        { "path": "**/*.ts" },
+        { "path": "**/*.m2ts" },
+        { "path": "**/*.ogm" },
+        { "path": "**/*.ogv" },
+        { "path": "**/*.flv" },
+        { "path": "**/*.wmv" },
+        { "path": "**/*.mpg" },
+        { "path": "**/*.mpeg" },
+        { "path": "**/*.vob" },
+        { "path": "**/*.3gp" },
+        { "path": "**/*.rmvb" },
+        { "path": "**/*.asf" },
+        { "path": "**/*.divx" }
       ]
     },
     "opener:allow-reveal-item-in-dir",

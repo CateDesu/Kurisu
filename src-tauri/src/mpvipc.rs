@@ -69,7 +69,10 @@ pub(crate) fn probe(paths: &[String]) -> Option<MpvSnapshot> {
     None
 }
 
-#[cfg(target_os = "linux")]
+/// Unix domain socket. Not linux-only: every unix mpv supports
+/// --input-ipc-server the same way, and probe_mpv is simply never
+/// called on platforms whose read_now is the no-op stub.
+#[cfg(unix)]
 fn probe_one(path: &str) -> Option<MpvSnapshot> {
     use std::os::unix::net::UnixStream;
     let stream = UnixStream::connect(path).ok()?;
@@ -121,7 +124,9 @@ fn query<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Option<MpvSnapsh
             continue;
         }
         let Some(rid) = v.get("request_id").and_then(|x| x.as_u64()) else { continue };
-        if rid as usize >= vals.len() || vals[rid as usize].is_some() {
+        // Every command went out with an id from PROPS, so a 0 or unknown
+        // id is a foreign peer talking and must not consume a slot.
+        if rid == 0 || rid as usize >= vals.len() || vals[rid as usize].is_some() {
             continue;
         }
         let ok = v.get("error").and_then(|e| e.as_str()) == Some("success");
@@ -189,6 +194,9 @@ pub(crate) fn default_socket_paths() -> Vec<String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    // The top level Duration import is cfg(unix), the live mpv test needs
+    // it on Windows too.
+    use std::time::Duration;
 
     /// Run a query against canned socket lines. The sink stands in for
     /// the write half and captures the command burst.
@@ -280,10 +288,11 @@ mod tests {
     #[test]
     fn out_of_order_and_foreign_answers_are_ignored() {
         // A duplicate or unknown request id must not consume a slot or
-        // count toward completion.
+        // count toward completion. Id 0 included, we never send it.
         let mut lines = String::new();
         lines.push_str(&ok(IDX_FILENAME, "\"f.mkv\""));
         lines.push_str(&ok(99, "\"junk\""));
+        lines.push_str(&ok(0, "\"junk\""));
         lines.push_str(&ok(IDX_PAUSE, "false"));
         lines.push_str(&ok(IDX_PATH, "\"/f.mkv\""));
         lines.push_str(&ok(IDX_PATH, "\"/f.mkv\"")); // duplicate, ignored
