@@ -101,6 +101,18 @@
 
   async function save() {
     if (saving || removing) return; // form still submits on Enter mid-save
+    // An untouched form has nothing to send. The backend answers an all null
+    // update with an error, which would show up as a failure banner on what
+    // the user meant as a plain close.
+    if (
+      status === snap.status &&
+      progress === snap.progress &&
+      score === snap.score &&
+      repeat === snap.repeat
+    ) {
+      onclose();
+      return;
+    }
     saving = true;
     err = "";
     try {

@@ -493,10 +493,15 @@ pub async fn get_media_detail(id: i64, state: State<'_, AppState>) -> Result<Med
             Ok(MediaDetail { media, relations, characters, staff })
         }
         // A Not Found here is not an outage. AniList merged or deleted the
-        // entry. The cached row is dead and must not keep rendering a normal
-        // looking page whose every add and save then fails with a raw 404.
+        // entry. The cached rows are dead and must not keep rendering a
+        // normal looking page whose every add and save then fails with a raw
+        // 404. The entry row goes too: it is keyed on the dead id, and if the
+        // remote entry was moved to a merge target the next sync caches it
+        // under the new id.
         Err(e) if anilist::media_not_found(&e) => {
+            let _ = state.db.delete_entry(id);
             let _ = state.db.delete_media(id);
+            state.refresh_matchers();
             Err(MEDIA_GONE.to_string())
         }
         Err(e) => match state.db.get_media(id).map_err(|e| e.to_string())? {
@@ -599,7 +604,7 @@ pub fn get_entry(media_id: i64, state: State<'_, AppState>) -> Result<Option<Lis
 }
 
 /// AniList no longer resolves this media id. It was merged into another entry
-/// or deleted upstream. Callers drop the dead cached row and report this
+/// or deleted upstream. Callers drop the dead cached rows and report this
 /// instead of surfacing a raw 404 that can never be resolved from the app.
 const MEDIA_GONE: &str =
     "AniList no longer has this anime. It was likely merged into another entry. Search for it to re-add the correct one.";
@@ -709,9 +714,12 @@ async fn save_entry_unlocked(
     let saved = match al.save_entry(media_id, st, progress, score, repeat).await {
         Ok(s) => s,
         // The media id is dead upstream. Same recovery as the add path: drop
-        // the cached row so the failure is not permanent, and say what
-        // happened instead of the raw status.
+        // the cached rows so the failure is not permanent, and say what
+        // happened instead of the raw status. The entry row is keyed on the
+        // dead id, so keeping it would render a blank list card whose every
+        // write fails this same way.
         Err(e) if anilist::media_not_found(&e) => {
+            let _ = state.db.delete_entry(media_id);
             let _ = state.db.delete_media(media_id);
             state.refresh_matchers();
             return Err(MEDIA_GONE.to_string());

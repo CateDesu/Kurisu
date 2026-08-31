@@ -54,6 +54,13 @@ static RE_SEASON_PREFIX: LazyLock<Regex> =
 /// after RE_SEASON_PREFIX so S02E05 is safe.
 static RE_SEASON_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)[sS]\d{1,2}\b").unwrap());
+/// Standalone season token in a raw release name, the S3 in a Show S3
+/// release. Groups that tag the season with neither an episode marker nor
+/// the word season used to slip past every extractor and land on the base
+/// series. Word boundaries on both edges keep an S2 glued inside a word
+/// like this2 from firing.
+static RE_SEASON_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bs(\d{1,2})\b").unwrap());
 /// Bare trailing revision token like the v2 in Show - 05 v2. Only stripped
 /// when it stands alone. Glued to the episode like 04v2 it belongs to the
 /// number and RE_EP_NUM reads them as one token.
@@ -62,6 +69,12 @@ static RE_REV_TAIL: LazyLock<Regex> =
 
 /// Resolutions to discard when picking the episode number.
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
+
+/// Highest season ordinal the extractors may report. The marker, word, token
+/// and bare number reads must share one cap or the match veto can demand an
+/// ordinal no entry norm is allowed to produce. Roman numerals keep their
+/// own lower cap since real titles never count that high.
+const MAX_SEASON: u32 = 50;
 
 // ─────────────────────────── matchers ───────────────────────────
 
@@ -183,7 +196,7 @@ fn parse_season_marker(raw: &str) -> Option<u32> {
     RE_SEASON_EP
         .captures(raw)
         .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
-        .filter(|&n| (1..=50).contains(&n))
+        .filter(|&n| (1..=MAX_SEASON).contains(&n))
 }
 
 /// Word-form season markers in a raw release name, "Season 7" or "7th
@@ -197,7 +210,16 @@ fn parse_season_word(raw: &str) -> Option<u32> {
         .captures(&lower)
         .or_else(|| RE_NTH_SEASON.captures(&lower))?
         .name("n")?;
-    n.as_str().parse::<u32>().ok().filter(|&v| (1..=30).contains(&v))
+    n.as_str().parse::<u32>().ok().filter(|&v| (1..=MAX_SEASON).contains(&v))
+}
+
+/// Standalone S3 token form. Third season read behind the marker and word
+/// forms, for groups that tag the season with neither.
+fn parse_season_token(raw: &str) -> Option<u32> {
+    RE_SEASON_TOKEN
+        .captures(raw)
+        .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
+        .filter(|&n| (1..=MAX_SEASON).contains(&n))
 }
 
 /// Extract the season ordinal from a normalized list-title norm. After
@@ -215,7 +237,7 @@ fn norm_season_ordinal(norm: &str) -> Option<u32> {
     // token. A number mid-title is part of the name, not a season ordinal.
     words.last().and_then(|w| {
         if w.len() <= 2 {
-            w.parse::<u32>().ok().filter(|&n| (1..=30).contains(&n))
+            w.parse::<u32>().ok().filter(|&n| (1..=MAX_SEASON).contains(&n))
         } else {
             None
         }
@@ -273,16 +295,21 @@ type TiebreakKey = (
 /// list stays unmatched instead of landing on a sibling. The old tiebreak let
 /// every sibling tie on the shared franchise prefix and picked the longest
 /// title, so a Re:ZERO Season 4 file wrote progress to a one episode OVA.
+/// Ordinal 1 is special: AniList never numbers a first season, so an
+/// ordinal-less norm counts as season 1.
 pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -> Option<&'a Matcher> {
     let candidates = [clean_title(title), clean_title(&basename(url))];
     // Season ordinal from the raw inputs before clean_title strips the marker.
     let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
     let mut best: Option<(TiebreakKey, &Matcher)> = None;
     // Explicit season ordinal for the veto below. Markers first, then word
-    // forms, both read from the raw inputs before clean_title touches them.
+    // forms, then bare tokens, all read from the raw inputs before
+    // clean_title touches them.
     let season_ord = cand_season
         .or_else(|| parse_season_word(title))
-        .or_else(|| parse_season_word(&basename(url)));
+        .or_else(|| parse_season_word(&basename(url)))
+        .or_else(|| parse_season_token(title))
+        .or_else(|| parse_season_token(&basename(url)));
     for cand in candidates {
         if cand.is_empty() {
             continue;
@@ -292,7 +319,16 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
         // tail strip, is the season.
         let cand_ord = season_ord.or_else(|| norm_season_ordinal(&cand));
         for m in matchers {
-            if cand_ord.is_some_and(|n| !m.norms.iter().any(|x| norm_season_ordinal(x) == Some(n))) {
+            if cand_ord.is_some_and(|n| {
+                !m.norms.iter().any(|x| {
+                    let ord = norm_season_ordinal(x);
+                    // An entry with no ordinal in any norm is the first
+                    // season of its franchise. AniList never numbers a first
+                    // season, so without this allowance every S01 or Season 1
+                    // release would match nothing at all.
+                    ord == Some(n) || (n == 1 && ord.is_none())
+                })
+            }) {
                 continue;
             }
             if let Some((tier, nlen)) = m
@@ -379,13 +415,28 @@ pub(crate) fn norm_title(s: &str) -> String {
     season_ordinals(&normalize(&s))
 }
 
+/// Canonical digits for a captured ordinal. Leading zeros would survive a
+/// plain regex collapse and then miss the entry norm textually, S03 against
+/// a norm carrying 3.
+fn canon_ordinal(s: &str) -> &str {
+    let d = s.trim_start_matches('0');
+    if d.is_empty() { "0" } else { d }
+}
+
 /// Collapse season markers to a bare ordinal so both sides of a comparison agree.
 /// Without this a MAL-style release lost its sequel entry to the base series
 /// because the sequel norm failed the token check while the base matched as a
 /// prefix. Applied to list titles and release names.
 fn season_ordinals(normed: &str) -> String {
-    let out = RE_NTH_SEASON.replace_all(normed, "$n");
-    RE_SEASON_N.replace_all(&out, "$n").into_owned()
+    // Marker form first. S02E03 collapses to 2 and takes its episode digits
+    // along, so a dot separated scene name whose trailing dot blocked the
+    // episode tail strip still lands on its season norm.
+    let out = RE_SEASON_EP.replace_all(normed, |c: &regex::Captures| canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string());
+    let out = RE_NTH_SEASON.replace_all(&out, |c: &regex::Captures| canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string());
+    let out = RE_SEASON_N.replace_all(&out, |c: &regex::Captures| canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string());
+    // The S3 token form last. Its trailing word boundary keeps a marker
+    // glued to its episode like S02E03 intact.
+    RE_SEASON_TOKEN.replace_all(&out, |c: &regex::Captures| canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string()).into_owned()
 }
 
 fn normalize(s: &str) -> String {
@@ -894,6 +945,68 @@ mod tests {
         }
     }
 
+    /// Season 1 markers must still find the base entry. AniList never numbers
+    /// a first season, so the ordinal has nothing to match against and the
+    /// veto counts an ordinal-less norm as season 1. Regression coverage for
+    /// S01E05 scene naming, which the veto used to reject entirely.
+    #[test]
+    fn season_one_markers_match_the_base_entry() {
+        let matchers = vec![
+            mk(1, "Boku no Hero Academia"),
+            mk(2, "Boku no Hero Academia 7"),
+        ];
+        for release in [
+            "[Judas] Boku no Hero Academia - S01E05.mkv",
+            "[G] Boku no Hero Academia Season 1 - 05.mkv",
+            "[G] Boku no Hero Academia S1 - 05.mkv",
+            "[G] Boku no Hero Academia 1 - 05.mkv",
+        ] {
+            assert_eq!(
+                match_title(&matchers, release, "").map(|m| m.media_id),
+                Some(1),
+                "{release} names season 1, which only the ordinal-less base entry can be"
+            );
+        }
+        // The allowance must not leak across ordinals. With only season 2 on
+        // the list an S01 release still matches nothing.
+        let s2_only = vec![mk(2, "Boku no Hero Academia 2nd Season")];
+        assert_eq!(
+            match_title(&s2_only, "[Judas] Boku no Hero Academia - S01E05.mkv", "").map(|m| m.media_id),
+            None
+        );
+    }
+
+    /// A bare S3 token joins the veto and the collapse routes the release to
+    /// the season 3 entry. Before, the token slipped past every extractor and
+    /// the release landed on the base series as a prefix match.
+    #[test]
+    fn bare_season_token_routes_to_the_matching_season() {
+        let matchers = vec![mk(1, "Show"), mk(2, "Show 3rd Season")];
+        assert_eq!(
+            match_title(&matchers, "[G] Show S3 - 05.mkv", "").map(|m| m.media_id),
+            Some(2)
+        );
+        // Season 3 not on the list. The base entry may not take it.
+        let base_only = vec![mk(1, "Show")];
+        assert_eq!(match_title(&base_only, "[G] Show S3 - 05.mkv", "").map(|m| m.media_id), None);
+        // A token glued inside a bracket tag is not a season marker.
+        assert_eq!(
+            match_title(&base_only, "[G] Show - 05 [AB12S2].mkv", "").map(|m| m.media_id),
+            Some(1)
+        );
+    }
+
+    /// Every extractor shares one ordinal cap. A marker past the old word and
+    /// norm cap of 30 used to veto even the correct entry.
+    #[test]
+    fn ordinal_cap_agrees_across_extractors() {
+        let matchers = vec![mk(1, "Show"), mk(2, "Show Season 40")];
+        assert_eq!(
+            match_title(&matchers, "[G] Show - S40E05.mkv", "").map(|m| m.media_id),
+            Some(2)
+        );
+    }
+
     /// The episode-tail strip must never consume the entire title. A bare-number
     /// show is all episode tail to the regex, and an empty candidate matches
     /// nothing.
@@ -960,10 +1073,11 @@ mod tests {
         // a torrent title that is not a filename is no longer truncated at the
         // last dot. Only the codec, channel layout and episode noise goes.
         // The channel strip also frees the bare aac for the codec strip,
-        // which the glued 2 in AAC2.0 used to shield.
+        // which the glued 2 in AAC2.0 used to shield. The S02E03 marker
+        // collapses to its season ordinal.
         assert_eq!(
             clean_title("Clevatess S02E03 CR WEB-DL DUAL AAC2.0 H.264 (Clevatess: Majuu no Ou)"),
-            "clevatess s02e03 cr dual"
+            "clevatess 2 cr dual"
         );
     }
 
@@ -989,7 +1103,9 @@ mod tests {
         // the real shows still match
         assert_eq!(match_title(&matchers, "[SubsPlease] Another - 05 (1080p)", "").map(|m| m.media_id), Some(1));
         assert_eq!(match_title(&matchers, "[SubsPlease] 86 - 11 (1080p)", "").map(|m| m.media_id), Some(2));
-        assert_eq!(match_title(&matchers, "[SubsPlease] Dr. Stone S3 - 05 (1080p)", "").map(|m| m.media_id), Some(3));
+        // No season 3 on the list, so the bare S3 token vetoes the base
+        // entry rather than writing season 3 progress to season 1.
+        assert!(match_title(&matchers, "[SubsPlease] Dr. Stone S3 - 05 (1080p)", "").is_none());
         assert_eq!(match_title(&matchers, "[G] No.6 - 03 [720p]", "").map(|m| m.media_id), Some(4));
     }
 
@@ -1163,5 +1279,20 @@ mod tests {
             Some(2)
         );
     }
-}
 
+    /// Dot separated scene naming leaves the marker mid-string when the
+    /// trailing dot blocks the episode tail strip. The marker collapse still
+    /// routes the release to the on-list season, and the episode read comes
+    /// from the raw name.
+    #[test]
+    fn dotted_scene_marker_routes_to_the_matching_season() {
+        let matchers = vec![
+            mk_status(21355, "Re:Zero kara Hajimeru Isekai Seikatsu", "COMPLETED"),
+            mk_status(189046, "Re:Zero kara Hajimeru Isekai Seikatsu 4th Season", "CURRENT"),
+        ];
+        let release = "Re.Zero.kara.Hajimeru.Isekai.Seikatsu.S04E05.1080p.WEB-DL.mkv";
+        let m = match_title(&matchers, release, "").expect("dot scene form must match season 4");
+        assert_eq!(m.media_id, 189046);
+        assert_eq!(resolve_episode(m, &[release]), Some(5));
+    }
+}
