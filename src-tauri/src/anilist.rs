@@ -35,7 +35,12 @@ struct AniMedia {
     id: i64,
     id_mal: Option<i64>,
     title: AniTitle,
-    cover_image: AniCover,
+    // Nullable in the AniList schema, and real responses do carry null on
+    // merged or stub entries. serde default only covers an ABSENT field,
+    // an explicit null used to fail the whole query, so one stray null
+    // poisoned an entire 500 entry sync chunk. Modeled as Option like the
+    // notifications query already does.
+    cover_image: Option<AniCover>,
     episodes: Option<i64>,
     format: Option<String>,
     status: Option<String>,
@@ -80,8 +85,8 @@ impl From<AniMedia> for Media {
             title_romaji: m.title.romaji,
             title_english: m.title.english,
             title_native: m.title.native,
-            cover_medium: m.cover_image.medium,
-            cover_large: m.cover_image.large,
+            cover_medium: m.cover_image.as_ref().and_then(|c| c.medium.clone()),
+            cover_large: m.cover_image.and_then(|c| c.large),
             episodes: m.episodes,
             format: m.format,
             status: m.status,
@@ -143,6 +148,11 @@ impl AniList {
     pub fn has_token(&self) -> bool {
         self.token.is_some()
     }
+    /// The current token, for identity checks around awaits. A logout or an
+    /// account switch can replace it while a slow query is in flight.
+    pub fn token(&self) -> Option<String> {
+        self.token.clone()
+    }
 
     async fn gql<T: for<'de> serde::Deserialize<'de>>(
         &self,
@@ -168,37 +178,45 @@ impl AniList {
                 .await?;
             let status = resp.status();
             // Rate limited. Honor Retry-After and retry, bounded. Do not
-            // fail the whole operation on a transient 429.
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && retries < 2 {
-                retries += 1;
+            // fail the whole operation on a transient 429. A wait longer
+            // than 30s means both bounded retries would burn themselves on
+            // a doomed schedule, so fail fast with the friendly message
+            // instead. The header is read before the body is consumed.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let wait = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(1)
-                    .min(30);
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                continue;
+                    .unwrap_or(1);
+                if retries < 2 && wait <= 30 {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(anyhow!(
+                    "AniList is rate-limiting this app (429, retry after {wait}s); wait a minute and try again"
+                ));
             }
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| ApiError { status, message: e.to_string() })?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| ApiError {
+                status,
+                from_json: false,
+                message: e.to_string(),
+            })?;
             break (status, body);
         };
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(anyhow!(
-                "AniList is rate-limiting this app (429, still limited after {retries} retries); wait a minute and try again"
-            ));
-        }
         if let Some(errs) = body.get("errors") {
             let msg = errs
                 .get(0)
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown AniList error");
-            return Err(ApiError { status, message: msg.to_string() }.into());
+            return Err(ApiError {
+                status,
+                from_json: true,
+                message: msg.to_string(),
+            }
+            .into());
         }
         // unwrap the data object before deserializing into T
         let data = body
@@ -318,7 +336,12 @@ impl AniList {
         }";
         let mut out = Vec::new();
         let mut has_next = true;
-        for page in 1..=10 {
+        // 20 pages of 50, 1000 entries. Current seasons counting ONAs,
+        // specials and music have passed 500 entries, and one more page
+        // walk costs one paced request. Still reporting more means
+        // something is wrong, and a partial season must not pass as
+        // complete.
+        for page in 1..=20 {
             if page > 1 {
                 // Pace the page walk. AniList's rate budget is tight. Do not
                 // burn it in a single burst.
@@ -346,11 +369,11 @@ impl AniList {
                 break;
             }
         }
-        // 10 pages of 50 covers every real season with room to spare. Still
+        // 20 pages of 50 covers every real season with room to spare. Still
         // reporting more means something is wrong, and a partial season must
         // not pass as complete.
         if has_next {
-            anyhow::bail!("AniList season walk ran past 10 pages without hasNextPage clearing");
+            anyhow::bail!("AniList season walk ran past 20 pages without hasNextPage clearing");
         }
         Ok(out)
     }
@@ -383,7 +406,9 @@ impl AniList {
                 }
             }
         }";
-        let r: R = self.gql(q, serde_json::json!({ "mediaId": media_id })).await?;
+        let r: R = self
+            .gql(q, serde_json::json!({ "mediaId": media_id }))
+            .await?;
         Ok(r.page
             .recommendations
             .unwrap_or_default()
@@ -419,7 +444,12 @@ impl AniList {
     pub async fn media_detail(
         &self,
         id: i64,
-    ) -> Result<(Media, Vec<MediaRelation>, Vec<MediaCharacter>, Vec<MediaStaff>)> {
+    ) -> Result<(
+        Media,
+        Vec<MediaRelation>,
+        Vec<MediaCharacter>,
+        Vec<MediaStaff>,
+    )> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Media")]
@@ -490,7 +520,7 @@ impl AniList {
                 episodes duration format status source averageScore season seasonYear description
                 genres studios(isMain: true) { nodes { name } }
                 nextAiringEpisode { episode airingAt }
-                relations {
+                relations(perPage: 50) {
                     edges {
                         relationType
                         node {
@@ -546,7 +576,10 @@ impl AniList {
                     role: e.role,
                     name,
                     image: node.image.and_then(|i| i.medium),
-                    va_name: va.as_ref().and_then(|v| v.name.as_ref()).and_then(|n| n.full.clone()),
+                    va_name: va
+                        .as_ref()
+                        .and_then(|v| v.name.as_ref())
+                        .and_then(|n| n.full.clone()),
                     va_image: va.and_then(|v| v.image).and_then(|i| i.medium),
                 })
             })
@@ -643,17 +676,20 @@ impl AniList {
                 }
             }
         }";
-        let r: R = self.gql(q, serde_json::json!({ "name": user_name })).await?;
-        let a = r
-            .user
-            .statistics
-            .and_then(|s| s.anime)
-            .unwrap_or_default();
+        let r: R = self
+            .gql(q, serde_json::json!({ "name": user_name }))
+            .await?;
+        let a = r.user.statistics.and_then(|s| s.anime).unwrap_or_default();
         let mut release_years: Vec<YearCount> = a
             .release_years
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|y| Some(YearCount { year: y.release_year?, count: y.count }))
+            .filter_map(|y| {
+                Some(YearCount {
+                    year: y.release_year?,
+                    count: y.count,
+                })
+            })
             .collect();
         release_years.sort_by_key(|y| y.year);
         Ok(UserStats {
@@ -666,19 +702,32 @@ impl AniList {
                 .scores
                 .unwrap_or_default()
                 .into_iter()
-                .map(|s| ScoreBucket { score: s.score, count: s.count })
+                .map(|s| ScoreBucket {
+                    score: s.score,
+                    count: s.count,
+                })
                 .collect(),
             statuses: a
                 .statuses
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|s| Some(StatusCount { status: s.status?, count: s.count }))
+                .filter_map(|s| {
+                    Some(StatusCount {
+                        status: s.status?,
+                        count: s.count,
+                    })
+                })
                 .collect(),
             formats: a
                 .formats
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|f| Some(FormatCount { format: f.format?, count: f.count }))
+                .filter_map(|f| {
+                    Some(FormatCount {
+                        format: f.format?,
+                        count: f.count,
+                    })
+                })
                 .collect(),
             genres: a
                 .genres
@@ -868,7 +917,10 @@ impl AniList {
         // requests until hard 429s burn the rate budget to stop it.
         for chunk in 1..=200 {
             let r: R = self
-                .gql(q, serde_json::json!({ "userName": user_name, "chunk": chunk }))
+                .gql(
+                    q,
+                    serde_json::json!({ "userName": user_name, "chunk": chunk }),
+                )
                 .await?;
             for list in r.collection.lists.unwrap_or_default() {
                 for e in list.entries.unwrap_or_default().into_iter().flatten() {
@@ -918,7 +970,9 @@ impl AniList {
         let q = "query ($mediaId: Int!) {
             MediaList(mediaId: $mediaId) { id status progress score repeat }
         }";
-        let r: R = self.gql(q, serde_json::json!({ "mediaId": media_id })).await?;
+        let r: R = self
+            .gql(q, serde_json::json!({ "mediaId": media_id }))
+            .await?;
         Ok(r.entry)
     }
 
@@ -1087,9 +1141,12 @@ impl AniList {
             .map(|n| Notification {
                 id: n.id,
                 kind: n.kind,
-                context: n
-                    .context
-                    .or_else(|| n.contexts.as_ref().filter(|v| !v.is_empty()).map(|v| v.join(" "))),
+                context: n.context.or_else(|| {
+                    n.contexts
+                        .as_ref()
+                        .filter(|v| !v.is_empty())
+                        .map(|v| v.join(" "))
+                }),
                 created_at: n.created_at,
                 media_id: n.media.as_ref().map(|m| m.id),
                 media_title: n
@@ -1110,7 +1167,10 @@ impl AniList {
                 reason: n.reason,
                 deleted_media_title: n.deleted_media_title,
                 user_name: n.user.as_ref().map(|u| u.name.clone()),
-                user_avatar: n.user.as_ref().and_then(|u| u.avatar.as_ref().and_then(|a| a.large.clone())),
+                user_avatar: n
+                    .user
+                    .as_ref()
+                    .and_then(|u| u.avatar.as_ref().and_then(|a| a.large.clone())),
             })
             .collect())
     }
@@ -1121,9 +1181,15 @@ impl AniList {
 /// An AniList API failure with the HTTP status and the error message kept as
 /// data, so a caller can match on them instead of substring searching a
 /// formatted string. Displays in the same shape the old formatted error did.
+/// `from_json` records whether the message came out of an AniList JSON body.
+/// A Cloudflare challenge or an IP ban page answers 403 with HTML, which
+/// fails json decoding. Treating that as a token rejection deleted the
+/// session of a perfectly valid token, so 403 only counts when the body
+/// parsed as AniList JSON.
 #[derive(Debug)]
 struct ApiError {
     status: reqwest::StatusCode,
+    from_json: bool,
     message: String,
 }
 
@@ -1161,7 +1227,7 @@ pub fn is_auth_rejection(e: &anyhow::Error) -> bool {
         return false;
     };
     api.status == reqwest::StatusCode::UNAUTHORIZED
-        || api.status == reqwest::StatusCode::FORBIDDEN
+        || (api.status == reqwest::StatusCode::FORBIDDEN && api.from_json)
         || api.message.eq_ignore_ascii_case("Invalid Token")
 }
 //
@@ -1209,6 +1275,13 @@ const SHIM_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><sty
 
 const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#3ba55d'>Connected to Kurisu.</h2><p>You can close this tab and return to the app.</p></body>";
 const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#e74c3c'>Authorization failed.</h2><p>Return to Kurisu for details.</p></body>";
+
+/// Any web page can hit the callback with an attacker chosen error text.
+/// Clip it before it reaches the log: bounded length, no control characters,
+/// so a crafted value can neither flood the journal nor forge log lines.
+fn clip_for_log(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(200).collect()
+}
 
 /// Minimal query value decoder. %XX escapes plus + as space. Today's
 /// values, base64url token and hex state, contain neither, so this is a
@@ -1264,9 +1337,7 @@ pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
 /// OAUTH_PORT, it has to match the registered redirect URI. Tests pass 0
 /// so the OS assigns a free port, keeping them off the real singleton and
 /// letting them run concurrently with each other and a running Kurisu.
-pub fn start_callback_server_on(
-    port: u16,
-) -> Result<(String, u16, oneshot::Receiver<String>)> {
+pub fn start_callback_server_on(port: u16) -> Result<(String, u16, oneshot::Receiver<String>)> {
     let state = random_state()?;
     let expected = state.clone();
     let (tx, rx) = oneshot::channel::<String>();
@@ -1376,7 +1447,7 @@ pub fn start_callback_server_on(
                 let (token, body): (Option<String>, &str) =
                     if let Some(err) = param("error") {
                         let msg = param("error_description").unwrap_or(err);
-                        log::warn!("OAuth callback: AniList denied access: {msg}");
+                        log::warn!("OAuth callback: AniList denied access: {}", clip_for_log(&msg));
                         (None, ERR_HTML)
                     } else if let Some(token) = param("access_token") {
                         // CSRF check. The state AniList echoes back must equal the
@@ -1424,14 +1495,15 @@ pub(crate) mod urlencoding {
         let mut out = String::with_capacity(s.len());
         for b in s.bytes() {
             match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
                 _ => out.push_str(&format!("%{:02X}", b)),
             }
         }
         out
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1453,24 +1525,28 @@ mod tests {
     fn is_not_found_matches_status_and_exact_message_only() {
         let real_404: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::NOT_FOUND,
+            from_json: true,
             message: "whatever".into(),
         }
         .into();
         assert!(super::is_not_found(&real_404));
         let gql_not_found: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::OK,
+            from_json: true,
             message: "Not Found".into(),
         }
         .into();
         assert!(super::is_not_found(&gql_not_found));
         let quoted_id: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::BAD_REQUEST,
+            from_json: true,
             message: "validation failed for entry 40413".into(),
         }
         .into();
         assert!(!super::is_not_found(&quoted_id));
         let near_miss: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::OK,
+            from_json: true,
             message: "Not Found.".into(),
         }
         .into();
@@ -1485,24 +1561,48 @@ mod tests {
     fn is_auth_rejection_matches_invalid_token_and_auth_statuses_only() {
         let invalid_token: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::BAD_REQUEST,
+            from_json: true,
             message: "Invalid Token".into(),
         }
         .into();
         assert!(super::is_auth_rejection(&invalid_token));
         let unauthorized: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::UNAUTHORIZED,
+            from_json: true,
             message: "anything".into(),
         }
         .into();
         assert!(super::is_auth_rejection(&unauthorized));
         let validation: anyhow::Error = super::ApiError {
             status: reqwest::StatusCode::BAD_REQUEST,
+            from_json: true,
             message: "validation failed".into(),
         }
         .into();
         assert!(!super::is_auth_rejection(&validation));
         let transport = anyhow::anyhow!("dns error");
         assert!(!super::is_auth_rejection(&transport));
+    }
+
+    /// A 403 whose body did not decode as AniList JSON is a Cloudflare
+    /// challenge or a temporary IP ban page. It must not be read as a token
+    /// rejection, or the session of a valid token gets deleted.
+    #[test]
+    fn forbidden_with_a_non_json_body_is_not_an_auth_rejection() {
+        let html_403: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::FORBIDDEN,
+            from_json: false,
+            message: "error decoding response body: expected value at line 1 column 1".into(),
+        }
+        .into();
+        assert!(!super::is_auth_rejection(&html_403));
+        let json_403: anyhow::Error = super::ApiError {
+            status: reqwest::StatusCode::FORBIDDEN,
+            from_json: true,
+            message: "Forbidden".into(),
+        }
+        .into();
+        assert!(super::is_auth_rejection(&json_403));
     }
 
     /// C3 regression. A hostile probe with ?error=..., a token with the
@@ -1515,8 +1615,7 @@ mod tests {
         // made this test fail whenever Kurisu was running or another copy
         // of the test was, and it could steal the port from a sign in
         // in progress.
-        let (state, port, rx) =
-            super::start_callback_server_on(0).expect("bind callback listener");
+        let (state, port, rx) = super::start_callback_server_on(0).expect("bind callback listener");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1543,7 +1642,9 @@ mod tests {
             assert!(r.status().is_success());
             // Token with the RIGHT state. The receiver resolves.
             let r = http
-                .get(format!("{base}/__capture__?access_token=good-token&state={state}"))
+                .get(format!(
+                    "{base}/__capture__?access_token=good-token&state={state}"
+                ))
                 .send()
                 .await
                 .unwrap();

@@ -43,13 +43,25 @@ const AUTO_ASK_DELAY: Duration = Duration::from_secs(15);
 /// on Linux, the source AppUserModelId on Windows.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 const BROWSER_PLAYERS: &[&str] = &[
-    "firefox", "librewolf", "mozilla", "zen", "waterfox", "floorp", "chrome", "chromium", "brave",
-    "vivaldi", "opera", "edge",
+    "firefox",
+    "librewolf",
+    "mozilla",
+    "zen",
+    "waterfox",
+    "floorp",
+    "chrome",
+    "chromium",
+    "brave",
+    "vivaldi",
+    "opera",
+    "edge",
     // Bridges that forward another device or app's media on the bus under
     // their own name. KDE browser integration, KDE Connect for paired phones,
     // and playerctld which mirrors whatever it last controlled. These bypass
     // the browser check above.
-    "browser", "kdeconnect", "playerctld",
+    "browser",
+    "kdeconnect",
+    "playerctld",
     // Opaque AppUserModelIDs. A name substring denylist can't catch a browser
     // whose AUMID carries no name. The classic non-Store Firefox installer
     // registers this hash, so YouTube in Firefox would drive tracking on
@@ -60,6 +72,27 @@ const BROWSER_PLAYERS: &[&str] = &[
     // banner or tracking. Bus name org.mpris.MediaPlayer2.spotify on Linux,
     // SpotifyAB.SpotifyMusic AUMID on Windows.
     "spotify",
+    // Local music players. Same rule as Spotify: anime OST tags like
+    // "Sousou no Frieren - 05" tier match the recognizer and a full song
+    // satisfies the watch gates, which wrote progress for a song. No
+    // denylist can be complete, so Linux additionally refuses to match URLs
+    // carrying an audio file extension. Windows exposes no URL at all and
+    // only this list defends.
+    "amberol",
+    "lollypop",
+    "rhythmbox",
+    "elisa",
+    "audacious",
+    "foobar2000",
+    "musicbee",
+    "clementine",
+    "strawberry",
+    "quodlibet",
+    "deadbeef",
+    "sayonara",
+    "gmusicbrowser",
+    "cmus",
+    "mpd",
 ];
 
 /// Windows GSMTC exposes only an AppUserModelId so the denylist can never
@@ -67,8 +100,35 @@ const BROWSER_PLAYERS: &[&str] = &[
 /// future denylist entry would match it.
 #[cfg_attr(not(windows), allow(dead_code))]
 const KNOWN_VIDEO_PLAYERS: &[&str] = &[
-    "mpv", "vlc", "mpc-hc", "mpc-be", "potplayer", "celluloid", "haruna", "smplayer",
+    "mpv",
+    "vlc",
+    "mpc-hc",
+    "mpc-be",
+    "potplayer",
+    "celluloid",
+    "haruna",
+    "smplayer",
 ];
+
+/// Audio file extensions. A track whose URL carries one is a song, not an
+/// episode, and is never matched. Only definite audio is refused, streams
+/// and extensionless URLs still flow through the recognizer.
+#[cfg(target_os = "linux")]
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "aiff",
+];
+
+/// True when the URL points at an audio file.
+#[cfg(target_os = "linux")]
+fn is_audio_url(url: &str) -> bool {
+    let Some(name) = url.rsplit(['/', '\\']).next() else {
+        return false;
+    };
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    AUDIO_EXTS.contains(&ext.to_lowercase().as_str())
+}
 
 // ─────────────────────────── payloads ───────────────────────────
 
@@ -291,13 +351,19 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     );
 
     // Advance or reset the per track state machine.
-    let key = if !info.trackid.is_empty() { info.trackid.clone() } else { info.title.clone() };
+    let key = if !info.trackid.is_empty() {
+        info.trackid.clone()
+    } else {
+        info.title.clone()
+    };
     if active.as_ref().map(|t| &t.key) != Some(&key) {
         *active = Some(ActiveTrack::new(key));
     }
     // Provably Some since the branch above just set it. Spelled as a let else
     // so a future edit to that condition can't turn it into a panic.
-    let Some(track) = active.as_mut() else { return Ok(()) };
+    let Some(track) = active.as_mut() else {
+        return Ok(());
+    };
     // Only credit the interval when playing at both ticks. We sample every 5s
     // so we can't see pauses within an interval. Under counting is the safe
     // direction since it just means a slightly late prompt.
@@ -311,8 +377,12 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     track.last_tick = Instant::now();
 
     // Tracking only applies once we've matched a list entry and parsed an episode.
-    let Some(media_id) = info.media_id else { return Ok(()) };
-    let Some(episode) = info.episode else { return Ok(()) };
+    let Some(media_id) = info.media_id else {
+        return Ok(());
+    };
+    let Some(episode) = info.episode else {
+        return Ok(());
+    };
     let progress = app
         .state::<AppState>()
         .db
@@ -342,7 +412,10 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
             TrackingPrompt {
                 media_id,
                 episode,
-                title: info.matched_title.clone().unwrap_or_else(|| info.title.clone()),
+                title: info
+                    .matched_title
+                    .clone()
+                    .unwrap_or_else(|| info.title.clone()),
                 raw_title: info.title.clone(),
                 progress,
             },
@@ -358,7 +431,10 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
                     TrackingPrompt {
                         media_id,
                         episode,
-                        title: info.matched_title.clone().unwrap_or_else(|| info.title.clone()),
+                        title: info
+                            .matched_title
+                            .clone()
+                            .unwrap_or_else(|| info.title.clone()),
                         raw_title: info.title.clone(),
                         progress,
                     },
@@ -393,7 +469,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
                         track.incremented = true;
                         let _ = app.emit("kurisu://episode-updated", entry);
                     }
-                        Ok(None) => track.incremented = true, // rewound past episode between check and write
+                    Ok(None) => track.incremented = true, // rewound past episode between check and write
                     Err(e) => {
                         track.fail_count += 1;
                         track.retry_at = Some(Instant::now() + auto_push_backoff(track.fail_count));
@@ -513,13 +589,17 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
 
     // Bare mpv without the mpris script is invisible above. Ask its IPC
     // socket. A playing mpv outranks a paused MPRIS player, same policy
-    // as Playing-before-Paused inside MPRIS. When the MPRIS pick IS an
-    // mpv the mpris script is loaded and the socket would be the same
-    // instance read twice, so IPC is skipped.
-    let mpris_playing = picked.as_ref().map(|(_, playing)| *playing).unwrap_or(false);
-    let mpris_is_mpv = picked.as_ref().map(|(p, _)| is_mpris_mpv(p)).unwrap_or(false);
+    // as Playing-before-Paused inside MPRIS. Probed whenever the MPRIS pick
+    // is not playing, even when the pick is itself an mpv: a paused scripted
+    // mpv used to hide a DIFFERENT bare mpv that was playing, and reading
+    // the same paused instance over IPC is harmless, it just loses to the
+    // MPRIS pick like any other paused source.
+    let mpris_playing = picked
+        .as_ref()
+        .map(|(_, playing)| *playing)
+        .unwrap_or(false);
     let mut ipc: Option<TickInfo> = None;
-    if !mpris_playing && !mpris_is_mpv {
+    if !mpris_playing {
         ipc = probe_mpv(app);
         if ipc.as_ref().is_some_and(|i| i.playing) {
             return Ok(ipc);
@@ -527,10 +607,11 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     }
 
     if let Some((player, playing)) = picked {
-        let md = match player.get_metadata() {
-            Ok(m) => m,
-            Err(_) => return Ok(None),
-        };
+        // One failed metadata read must not null the whole tick. Returning
+        // None here dropped the banner and wiped the accumulated watch state
+        // for the track. Degrade to empty metadata like the Windows path
+        // does, keeping the state machine alive.
+        let md = player.get_metadata().unwrap_or_default();
 
         let title = md.title().map(|t| t.to_string()).unwrap_or_default();
         let url = md.url().map(|u| u.to_string()).unwrap_or_default();
@@ -540,13 +621,24 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
         // mpris 2.x Metadata has no trackid accessor, so synthesize a stable per
         // track key. The file URL is unique per file which is exactly when we want
         // to reset the tracker. Falls back to the title.
-        let trackid = if !url.is_empty() { url.clone() } else { title.clone() };
+        let trackid = if !url.is_empty() {
+            url.clone()
+        } else {
+            title.clone()
+        };
 
         let state = app.state::<AppState>();
         // Matchers come from the shared cache rebuilt on every list mutation.
         // Rebuilding them from the DB every 5s tick was the hot path's main cost.
         let matchers = state.matchers.lock().clone();
-        let matched = match_title(&matchers, &title, &url);
+        // A local audio file is a song, not an episode. Music players that
+        // slipped past the name denylist used to tier match an OST title and
+        // write progress for a song.
+        let matched = if is_audio_url(&url) {
+            None
+        } else {
+            match_title(&matchers, &title, &url)
+        };
         let base = basename(&url);
         let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
 
@@ -568,14 +660,6 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     } else {
         Ok(None)
     }
-}
-
-/// True if an MPRIS player is an mpv instance. Means the mpris script is
-/// loaded, the IPC fallback would read the same player twice, and the
-/// MPRIS data is richer anyway.
-#[cfg(target_os = "linux")]
-fn is_mpris_mpv(player: &mpris::Player) -> bool {
-    format!("{} {}", player.bus_name(), player.identity()).to_lowercase().contains("mpv")
 }
 
 fn read_config(app: &AppHandle) -> TrackingConfig {
@@ -740,7 +824,10 @@ mod tests {
     fn seeking_to_the_credits_does_not_push() {
         // The whole point of the accumulated time gate. A file opened and
         // dragged straight to 90% has position but no playback behind it.
-        let g = AutoGate { accumulated: Duration::from_secs(5), ..watched() };
+        let g = AutoGate {
+            accumulated: Duration::from_secs(5),
+            ..watched()
+        };
         assert!(!g.should_push());
         // And one 5s sample of a file that only just appeared can't push
         // either, however far into it the player resumed.
@@ -787,20 +874,44 @@ mod tests {
 
     #[test]
     fn below_threshold_or_already_done_does_not_push() {
-        let g = AutoGate { position_us: 24 * 60 * 1_000_000 / 2, ..watched() };
+        let g = AutoGate {
+            position_us: 24 * 60 * 1_000_000 / 2,
+            ..watched()
+        };
         assert!(!g.should_push(), "50% is under the 80% threshold");
-        let g = AutoGate { incremented: true, ..watched() };
+        let g = AutoGate {
+            incremented: true,
+            ..watched()
+        };
         assert!(!g.should_push(), "already pushed for this track");
-        let g = AutoGate { episode: 4, progress: 4, ..watched() };
-        assert!(!g.should_push(), "never rewinds or rewrites the same episode");
-        let g = AutoGate { episode: 2, progress: 9, ..watched() };
-        assert!(!g.should_push(), "rewatching an earlier episode must not rewind");
+        let g = AutoGate {
+            episode: 4,
+            progress: 4,
+            ..watched()
+        };
+        assert!(
+            !g.should_push(),
+            "never rewinds or rewrites the same episode"
+        );
+        let g = AutoGate {
+            episode: 2,
+            progress: 9,
+            ..watched()
+        };
+        assert!(
+            !g.should_push(),
+            "rewatching an earlier episode must not rewind"
+        );
     }
 
     #[test]
     fn a_player_with_no_duration_never_auto_pushes() {
         // pct() is 0 without a length, so the percentage gate can never open.
-        let g = AutoGate { length_us: 0, position_us: 0, ..watched() };
+        let g = AutoGate {
+            length_us: 0,
+            position_us: 0,
+            ..watched()
+        };
         assert_eq!(g.pct(), 0.0);
         assert!(!g.should_push());
     }
@@ -808,13 +919,25 @@ mod tests {
     #[test]
     fn failed_pushes_back_off_and_then_give_up() {
         // Backed off. The retry instant hasn't arrived yet.
-        let g = AutoGate { fail_count: 1, retry_due: false, ..watched() };
+        let g = AutoGate {
+            fail_count: 1,
+            retry_due: false,
+            ..watched()
+        };
         assert!(!g.should_push());
         // Backoff elapsed. Try again.
-        let g = AutoGate { fail_count: 1, retry_due: true, ..watched() };
+        let g = AutoGate {
+            fail_count: 1,
+            retry_due: true,
+            ..watched()
+        };
         assert!(g.should_push());
         // Too many consecutive failures. Stop hammering AniList for this track.
-        let g = AutoGate { fail_count: MAX_AUTO_PUSH_FAILURES, retry_due: true, ..watched() };
+        let g = AutoGate {
+            fail_count: MAX_AUTO_PUSH_FAILURES,
+            retry_due: true,
+            ..watched()
+        };
         assert!(!g.should_push());
         assert!(auto_push_backoff(1) < auto_push_backoff(2));
         assert!(auto_push_backoff(2) < auto_push_backoff(3));
@@ -822,18 +945,28 @@ mod tests {
 
     #[test]
     fn browsers_are_excluded_but_known_players_are_not() {
-        assert!(is_browser_str("org.mpris.MediaPlayer2.firefox.instance_1 Firefox"));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.firefox.instance_1 Firefox"
+        ));
         assert!(is_browser_str("308046B0AF4A39CB"), "opaque Firefox AUMID");
         assert!(is_browser_str("Chromium"));
         // Bridges that forward browser or phone media under their own name.
-        assert!(is_browser_str("org.mpris.MediaPlayer2.plasma.browser.integration Plasma Browser Integration"));
-        assert!(is_browser_str("org.mpris.MediaPlayer2.kdeconnect.pixel_7 KDE Connect"));
-        assert!(is_browser_str("org.mpris.MediaPlayer2.playerctld playerctld"));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.plasma.browser.integration Plasma Browser Integration"
+        ));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.kdeconnect.pixel_7 KDE Connect"
+        ));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.playerctld playerctld"
+        ));
         assert!(!is_browser_str("org.mpris.MediaPlayer2.mpv mpv"));
         assert!(!is_browser_str("io.github.celluloid_player.Celluloid"));
         assert!(!is_browser_str("VLC media player"));
         // A known player wins even when its path contains a denylisted word.
-        assert!(!is_browser_str(r"C:\Users\opera\AppData\mpv.net\mpvnet.exe"));
+        assert!(!is_browser_str(
+            r"C:\Users\opera\AppData\mpv.net\mpvnet.exe"
+        ));
     }
 
     /// A playing song is not an episode. Spotify must never drive the
@@ -849,7 +982,46 @@ mod tests {
         assert!(is_browser_str("SpotifyAB.SpotifyMusic-hz89res2p8targ!App"));
         // Third party clients and daemons expose the same name on the bus.
         assert!(is_browser_str("org.mpris.MediaPlayer2.spotifyd spotifyd"));
-        assert!(is_browser_str("org.mpris.MediaPlayer2.spotify-qt spotify-qt"));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.spotify-qt spotify-qt"
+        ));
+    }
+
+    /// Local music players are excluded like Spotify. An anime OST tagged
+    /// "Sousou no Frieren - 05" tier matches and a full song satisfies the
+    /// watch gates, so the player name is the defense on Windows.
+    #[test]
+    fn local_music_players_are_excluded() {
+        assert!(is_browser_str("org.mpris.MediaPlayer2.amberol Amberol"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.lollypop Lollypop"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.rhythmbox Rhythmbox"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.elisa Elisa"));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.audacious Audacious"));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.clementine Clementine"
+        ));
+        assert!(is_browser_str(
+            "org.mpris.MediaPlayer2.strawberry Strawberry"
+        ));
+        assert!(is_browser_str("org.mpris.MediaPlayer2.mpd mpd"));
+        assert!(is_browser_str("foobar2000"));
+        // Real video players stay allowed.
+        assert!(!is_browser_str("org.mpris.MediaPlayer2.vlc VLC"));
+        assert!(!is_browser_str("org.mpris.MediaPlayer2.mpv mpv"));
+    }
+
+    /// A local audio file is a song, not an episode, whatever player it sits
+    /// in. Only definite audio extensions are refused, extensionless
+    /// streams still match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn audio_urls_never_match() {
+        assert!(is_audio_url("file:///music/Sousou no Frieren - 05.flac"));
+        assert!(is_audio_url("file:///music/ost.MP3"));
+        assert!(is_audio_url("http://127.0.0.1:8000/stream.opus"));
+        assert!(!is_audio_url("file:///anime/[Group] Show - 05 [1080p].mkv"));
+        assert!(!is_audio_url("https://example.com/stream"));
+        assert!(!is_audio_url("file:///anime/movie.2024"));
     }
 
     /// Same drift guard as models.rs, for the event payloads the watcher emits.

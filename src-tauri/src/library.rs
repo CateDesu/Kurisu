@@ -21,8 +21,13 @@ const BINDINGS_KEY: &str = "library_bindings";
 /// Recursion cap. Plenty for Anime/Series/Season 2/file.mkv layouts.
 /// Keeps a symlink loop from running away.
 const MAX_DEPTH: usize = 8;
+/// Every extension the opener scope allows. The two lists must agree: the
+/// scanner lowercases before checking, so an uppercase file listed here but
+/// missing there gets a Play button the scope refuses, and one allowed by
+/// the scope but not scanned never shows up at all.
 const VIDEO_EXTS: &[&str] = &[
-    "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv",
+    "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv", "mpg", "mpeg", "m2ts",
+    "vob", "ogv", "3gp", "rmvb", "asf", "divx",
 ];
 /// The folder list and bindings map are JSON values in the settings table,
 /// read then modified then written back. Serialize mutations so two
@@ -58,7 +63,9 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     // Overlapping folders would scan every shared file twice. The Library
     // page keys on path, so duplicates crash its render. Refuse them.
     if let Some(existing) = folders.iter().find(|f| folders_overlap(f, path)) {
-        return Err(anyhow!("folder overlaps existing library folder: {existing}"));
+        return Err(anyhow!(
+            "folder overlaps existing library folder: {existing}"
+        ));
     }
     folders.push(path.to_string());
     save_folders(db, &folders)?;
@@ -155,7 +162,10 @@ pub fn scan_paths(
     for folder in folders {
         let root = std::path::Path::new(folder);
         if let Err(e) = std::fs::read_dir(root) {
-            unreadable.push(UnreadableFolder { path: folder.clone(), error: e.to_string() });
+            unreadable.push(UnreadableFolder {
+                path: folder.clone(),
+                error: e.to_string(),
+            });
             continue;
         }
         collect_videos(root, 0, &mut paths);
@@ -200,7 +210,9 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
     if depth > MAX_DEPTH {
         return;
     }
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in read.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -211,7 +223,9 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
         // metadata(), not DirEntry::metadata, follows symlinks, so symlinked
         // folders and files get scanned. A symlink loop just bottoms out
         // at MAX_DEPTH.
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.is_dir() {
             collect_videos(&path, depth + 1, out);
         } else if meta.is_file()
@@ -229,7 +243,10 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
             // pipeline uses.
             match path.to_str() {
                 Some(p) => out.push(p.to_owned()),
-                None => log::warn!("library scan skipping non UTF-8 file: {}", path.to_string_lossy()),
+                None => log::warn!(
+                    "library scan skipping non UTF-8 file: {}",
+                    path.to_string_lossy()
+                ),
             }
         }
     }

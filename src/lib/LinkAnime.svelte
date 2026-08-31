@@ -92,8 +92,14 @@
   }
 
   let dialog = $state<HTMLDivElement | null>(null);
+  /// Dismissal is refused while a binding write is in flight. Closing mid
+  /// write hid the error banner, so a failed link looked like a success.
+  function tryClose() {
+    if (busy !== null) return;
+    onclose();
+  }
   function onWindowKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") onclose();
+    if (e.key === "Escape") tryClose();
   }
   $effect(() => dialog?.focus());
 </script>
@@ -103,7 +109,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
   class="fixed inset-0 bg-black/60 grid place-items-center z-50 backdrop-blur-sm"
-  onclick={onclose}
+  onclick={tryClose}
   role="presentation"
 >
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
@@ -188,7 +194,7 @@
     <div class="flex justify-end pt-3">
       <button
         type="button"
-        onclick={onclose}
+        onclick={tryClose}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
       >
         Cancel

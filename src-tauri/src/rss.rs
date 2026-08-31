@@ -54,27 +54,41 @@ fn save_feeds(db: &Db, feeds: &[String]) -> Result<()> {
 }
 
 pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    // Parse first. Scheme, host and userinfo all come out of the parser
+    // instead of string prefix checks: http://127.0.0.1.evil.com/feed and
+    // http://127.0.0.1@evil.com/ both used to pass a 127. prefix or
+    // authority split and were fetched as plaintext from a remote host.
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| anyhow!("feed URL must be a valid http:// or https:// URL"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(anyhow!("feed URL must start with http:// or https://"));
     }
     // Plain http can be tampered with in transit. Feed items carry magnet
     // links, so a tampered feed hands the user attacker chosen torrents
     // dressed up as new episodes of shows they watch. A reader self hosted
     // on this machine is the one legitimate plain http case.
-    if let Some(rest) = url.strip_prefix("http://") {
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        let host = if let Some(inner) = authority.strip_prefix('[') {
-            inner.split(']').next().unwrap_or(inner)
-        } else {
-            authority.split(':').next().unwrap_or("")
-        };
-        let loopback = host == "localhost" || host.starts_with("127.") || host == "::1";
+    if parsed.scheme() == "http" {
+        // host_str gives the parsed host, no userinfo, so a numeric loopback
+        // or localhost passes and everything else, including a dotted quad
+        // smuggled into a domain or a userinfo prefix, does not. IPv6 hosts
+        // come back wrapped in brackets, strip them before parsing.
+        let host = parsed
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
         if !loopback {
             return Err(anyhow!(
                 "plain http feeds are only allowed for addresses on this machine, use https"
             ));
         }
     }
+    let url = parsed.as_str();
     let _guard = FEEDS_LOCK.lock();
     let mut feeds = get_feeds(db);
     if !feeds.iter().any(|f| f == url) {
@@ -143,7 +157,9 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                     return Err(anyhow!("{feed}: HTTP {status}"));
                 }
                 if resp.content_length().unwrap_or(0) > MAX_FEED_BYTES {
-                    return Err(anyhow!("{feed}: response larger than {MAX_FEED_BYTES} bytes"));
+                    return Err(anyhow!(
+                        "{feed}: response larger than {MAX_FEED_BYTES} bytes"
+                    ));
                 }
                 let mut body: Vec<u8> = Vec::new();
                 while let Some(chunk) = resp.chunk().await? {
@@ -179,7 +195,8 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     for (feed, fetched) in results {
         match fetched {
             Ok(xml) => {
-                let items = parse_rss(&xml);
+                let parsed = parse_rss_checked(&xml);
+                let items = parsed.items;
                 // A 200 that isn't RSS, like a captive portal, an error page
                 // or a moved feed, yields zero items and used to be
                 // indistinguishable from nothing new. An empty but valid
@@ -191,11 +208,35 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 if items.is_empty() && !lower.contains("<rss") && !lower.contains("<channel") {
                     let msg = format!("{feed}: response was not an RSS feed");
                     log::warn!("{msg}");
-                    failures.push(FeedFailure { url: feed, error: msg });
+                    failures.push(FeedFailure {
+                        url: feed,
+                        error: msg,
+                    });
                     continue;
                 }
+                // A parse that died mid document keeps its recovered items
+                // but must say so. Silent truncation looked exactly like a
+                // healthy feed with nothing new, the failure this list
+                // exists to prevent.
+                if let Some(err) = parsed.error {
+                    let msg = format!(
+                        "{feed}: feed broke off mid parse, kept {} items recovered before the error: {err}",
+                        items.len()
+                    );
+                    log::warn!("{msg}");
+                    failures.push(FeedFailure {
+                        url: feed.clone(),
+                        error: msg,
+                    });
+                }
                 ok += 1;
-                for item in items {
+                for mut item in items {
+                    // Scope the guid to its feed. Two feeds can reuse a guid
+                    // string, an incremental counter or a colliding link,
+                    // and a bare guid used to drop the second item and share
+                    // seen state across feeds. The separator is a control
+                    // character no URL or title contains.
+                    item.guid = format!("{feed}\u{1}{}", item.guid);
                     if seen_guids.insert(item.guid.clone()) {
                         out.push(item);
                     }
@@ -203,7 +244,10 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
             }
             Err(e) => {
                 log::warn!("RSS fetch failed: {e}");
-                failures.push(FeedFailure { url: feed, error: e.to_string() });
+                failures.push(FeedFailure {
+                    url: feed,
+                    error: e.to_string(),
+                });
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
@@ -215,13 +259,31 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
             return Err(e);
         }
     }
-    Ok(FeedFetch { items: out, failures })
+    Ok(FeedFetch {
+        items: out,
+        failures,
+    })
+}
+
+/// parse_rss plus the early stop reason when the document was malformed.
+pub(crate) struct ParsedFeed {
+    pub items: Vec<RawItem>,
+    /// Set when quick-xml gave up partway through. The items recovered
+    /// before the error are kept, the caller must report the truncation.
+    pub error: Option<String>,
+}
+
+/// Items-only view of parse_rss_checked, for the tests and any caller that
+/// does not care whether the document was well formed end to end.
+#[cfg(test)]
+pub fn parse_rss(xml: &str) -> Vec<RawItem> {
+    parse_rss_checked(xml).items
 }
 
 /// Pull <item>s out of an RSS 2.0 document. Namespaced nyaa extras like
 /// nyaa:seeders and nyaa:infoHash are matched on their qualified name. Unknown
 /// elements are ignored so non nyaa feeds still yield the basics.
-pub fn parse_rss(xml: &str) -> Vec<RawItem> {
+pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
     let mut reader = Reader::from_str(xml);
     let mut out = Vec::new();
     let mut item: Option<RawItem> = None;
@@ -232,6 +294,7 @@ pub fn parse_rss(xml: &str) -> Vec<RawItem> {
     let mut field_depth = 0usize;
     let mut depth = 0usize;
     let mut buf = String::new();
+    let mut error = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
@@ -297,12 +360,13 @@ pub fn parse_rss(xml: &str) -> Vec<RawItem> {
             // looks identical to a clean short feed otherwise.
             Err(e) => {
                 log::warn!("RSS parse stopped early: {e}");
+                error = Some(e.to_string());
                 break;
             }
             _ => {}
         }
     }
-    out
+    ParsedFeed { items: out, error }
 }
 
 /// Decode a text node without letting one bad entity blank the whole run.
@@ -373,7 +437,9 @@ fn finish_item(mut it: RawItem) -> RawItem {
 pub fn magnet_for(info_hash: &str, title: &str) -> String {
     let h = info_hash.trim();
     let valid = (h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
-        || (h.len() == 32 && h.chars().all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')));
+        || (h.len() == 32
+            && h.chars()
+                .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')));
     if valid {
         format!(
             "magnet:?xt=urn:btih:{h}&dn={}",
@@ -446,17 +512,28 @@ mod tests {
     fn magnet_builds() {
         let hash = "abcdef0123456789abcdef0123456789abcdef01";
         let m = magnet_for(hash, "My Show - 05");
-        assert_eq!(m, format!("magnet:?xt=urn:btih:{hash}&dn=My%20Show%20-%2005"));
+        assert_eq!(
+            m,
+            format!("magnet:?xt=urn:btih:{hash}&dn=My%20Show%20-%2005")
+        );
         // base32 hashes are valid too
-        assert!(magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t").starts_with("magnet:?xt=urn:btih:"));
+        assert!(
+            magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t").starts_with("magnet:?xt=urn:btih:")
+        );
     }
 
     /// A crafted "hash" must not smuggle extra magnet parameters into xt.
     #[test]
     fn magnet_rejects_malformed_info_hash() {
         let m = magnet_for("abc&tr=http://evil/announce", "My Show");
-        assert!(!m.contains("urn:btih"), "malformed hash must not reach xt: {m}");
-        assert!(!m.contains("evil"), "no injected parameters may survive: {m}");
+        assert!(
+            !m.contains("urn:btih"),
+            "malformed hash must not reach xt: {m}"
+        );
+        assert!(
+            !m.contains("evil"),
+            "no injected parameters may survive: {m}"
+        );
         assert!(m.starts_with("magnet:?dn="));
     }
 
@@ -580,7 +657,9 @@ mod tests {
 
     /// Serve one canned HTTP response on a loopback port, then run fetch_all
     /// against it.
-    async fn fetch_with_server(respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> Result<Vec<RawItem>> {
+    async fn fetch_with_server(
+        respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> Result<Vec<RawItem>> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -594,7 +673,9 @@ mod tests {
 
     /// Same loopback server, but the whole FeedFetch so the per feed failure
     /// list can be asserted on.
-    async fn fetch_full(respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> FeedFetch {
+    async fn fetch_full(
+        respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> FeedFetch {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -630,7 +711,10 @@ mod tests {
         ))
         .await;
         assert!(f.items.is_empty());
-        assert!(f.failures.is_empty(), "an empty valid feed must not be reported failed");
+        assert!(
+            f.failures.is_empty(),
+            "an empty valid feed must not be reported failed"
+        );
     }
 
     /// A 200 that is not RSS at all still counts as a feed failure.
@@ -668,7 +752,9 @@ mod tests {
             let mut req = [0u8; 1024];
             let _ = stream.read(&mut req);
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
                 .unwrap();
             let chunk = vec![b'a'; 4 * 1024 * 1024];
             for _ in 0..4 {
@@ -684,5 +770,91 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("exceeded"), "got: {err}");
+    }
+
+    /// The plain http guard is a parsed host check, not a string prefix.
+    /// Both classic bypasses must be refused: a dotted quad inside a domain
+    /// and a userinfo prefix in front of a remote host.
+    #[test]
+    fn plain_http_loopback_check_is_not_a_prefix_match() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        assert!(add_feed(&db, "http://127.0.0.1.evil.com/feed").is_err());
+        assert!(add_feed(&db, "http://127.0.0.1@evil.com/feed").is_err());
+        assert!(add_feed(&db, "http://localhost@evil.com/").is_err());
+        assert!(add_feed(&db, "http://evil.com/").is_err());
+        assert!(add_feed(&db, "ftp://127.0.0.1/rss").is_err());
+        assert!(add_feed(&db, "not a url").is_err());
+        // The legitimate self hosted reader cases still pass.
+        assert!(add_feed(&db, "http://127.0.0.1:8123/rss").is_ok());
+        assert!(add_feed(&db, "http://localhost/rss").is_ok());
+        assert!(add_feed(&db, "http://[::1]/rss").is_ok());
+        assert!(add_feed(&db, "https://nyaa.si/?page=rss&c=1_2&f=0").is_ok());
+    }
+
+    /// A feed that breaks off mid document keeps its recovered items but the
+    /// refresh reports it as a failure. It used to count as healthy, showing
+    /// "no new torrents" forever with zero indication anything was wrong.
+    #[tokio::test]
+    async fn a_feed_that_breaks_mid_document_is_reported() {
+        let body = "<rss version=\"2.0\"><channel>
+            <item>
+              <title>Good - 01</title>
+              <link>https://example.com/1.torrent</link>
+            </item>
+            <item>
+              <title>Broken</oops>
+              <link>https://example.com/2.torrent</link>
+            </item>
+        </channel></rss>";
+        let f = fetch_full(serve_body(body)).await;
+        assert_eq!(f.items.len(), 1, "the recovered item rides along");
+        assert_eq!(f.failures.len(), 1);
+        assert!(
+            f.failures[0].error.contains("broke off mid parse"),
+            "got: {}",
+            f.failures[0].error
+        );
+    }
+
+    /// Two feeds reusing a guid string are two different items. The guid is
+    /// scoped per feed, so neither dedup nor the seen state crosses feeds.
+    #[tokio::test]
+    async fn guid_collisions_across_feeds_stay_distinct() {
+        let body = "<rss version=\"2.0\"><channel>
+            <item>
+              <title>Feed A - 01</title>
+              <link>https://a.example/1.torrent</link>
+              <guid>1</guid>
+            </item>
+        </channel></rss>";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                responder2(&mut stream, body);
+            }
+        });
+        let feeds = vec![
+            format!("http://127.0.0.1:{port}/a"),
+            format!("http://127.0.0.1:{port}/b"),
+        ];
+        let f = fetch_all(&feeds).await.unwrap();
+        assert_eq!(f.items.len(), 2, "both feeds' items survive");
+        assert!(f.failures.is_empty());
+        assert_ne!(f.items[0].guid, f.items[1].guid);
+    }
+
+    fn responder2(stream: &mut std::net::TcpStream, body: &str) {
+        use std::io::{Read, Write};
+        let mut req = [0u8; 1024];
+        let _ = stream.read(&mut req);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
     }
 }

@@ -13,6 +13,23 @@
 
   const inputCls =
     "w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent";
+
+  // min/max/step on a number input are hints, typed values bind raw. An out
+  // of range score made AniList reject the whole mutation, so the user's
+  // status and progress edits failed with an error pointing nowhere near the
+  // score field. Clamp and round to the format on change instead.
+  const NUMERIC_BOUNDS: Record<string, [number, number, number]> = {
+    POINT_10: [0, 10, 1],
+    POINT_10_DECIMAL: [0, 10, 0.1],
+    POINT_100: [0, 100, 1],
+  };
+  function clampTyped() {
+    const [min, max, step] = NUMERIC_BOUNDS[format ?? ""] ?? [0, 100, 1];
+    if (value == null || Number.isNaN(value)) return;
+    let v = Math.min(max, Math.max(min, value));
+    v = Math.round(v / step) * step;
+    value = Math.round(v * 10) / 10;
+  }
 </script>
 
 {#if format === "POINT_3"}
@@ -54,10 +71,10 @@
     {/if}
   </div>
 {:else if format === "POINT_10"}
-  <input {id} type="number" bind:value min="0" max="10" step="1" class={inputCls} />
+  <input {id} type="number" bind:value min="0" max="10" step="1" onchange={clampTyped} class={inputCls} />
 {:else if format === "POINT_10_DECIMAL"}
-  <input {id} type="number" bind:value min="0" max="10" step="0.1" class={inputCls} />
+  <input {id} type="number" bind:value min="0" max="10" step="0.1" onchange={clampTyped} class={inputCls} />
 {:else}
   <!-- POINT_100 or unknown -->
-  <input {id} type="number" bind:value min="0" max="100" step="1" class={inputCls} />
+  <input {id} type="number" bind:value min="0" max="100" step="1" onchange={clampTyped} class={inputCls} />
 {/if}

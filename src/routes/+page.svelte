@@ -7,10 +7,12 @@
   // rendered as the new one's.
   let syncedFor: number | null = null;
 
-  // Auto-sync on empty fires once per session. Kept at module scope for
-  // the same reason. As component state it reset on every mount, so an
-  // empty list triggered a full sync on every visit to this tab.
+  // Auto-sync on empty fires once per session, keyed to the auth epoch so a
+  // logout and login inside one app run counts as the new session it is.
+  // The flag alone stayed true forever, so the relogin showed an empty list
+  // that looked like data loss until a manual sync.
   let autoSynced = false;
+  let autoSyncedEpoch = 0;
 
   // One collator for the session. localeCompare with options builds a fresh
   // Intl.Collator on every call. The title sort runs O(n log n) over a
@@ -169,6 +171,12 @@
       const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
       entries = switched ? [] : list;
       syncedFor = uid;
+      // New session since the last auto sync: relogin, account switch, or
+      // a session the backend cleared after a token rejection.
+      if (auth.epoch !== autoSyncedEpoch) {
+        autoSynced = false;
+        autoSyncedEpoch = auth.epoch;
+      }
       if ((list.length === 0 && !autoSynced) || switched) {
         autoSynced = true;
         await sync(id);
@@ -286,7 +294,7 @@
       {/each}
     </div>
 
-    {#if loading}
+    {#if loading && entries.length === 0}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
     {:else if visible.length === 0}
       <div class="text-ink-dim py-10 text-center">{q.trim() ? "No matches." : "Nothing here yet."}</div>

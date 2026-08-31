@@ -21,8 +21,14 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // WAL plus NORMAL sync. The default FULL fsyncs the WAL on every
+        // single commit, which turned a list sync into thousands of
+        // individually fsynced statements. NORMAL is the standard WAL
+        // pairing: the WAL absorbs writes and checkpoints do the fsyncing.
+        // A power cut can lose the last commits but never corrupts the db,
+        // fine for a cache of AniList data.
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )?;
         Self::migrate(&conn)?;
         // The settings table stores the AniList token in plaintext. Connection::open
@@ -150,9 +156,27 @@ impl Db {
 
     pub fn upsert_media(&self, m: &Media) -> Result<()> {
         let c = self.0.lock();
-        // The detail only fields are COALESCEd. A lean upsert from search,
-        // season or list sync must not wipe values a detail fetch already
-        // cached. Everything the lean queries do fetch takes the fresh value.
+        upsert_media_row(&c, m)
+    }
+
+    /// Many media rows in ONE transaction. Search, season and sync caching
+    /// used to autocommit per row, one fsynced statement each while holding
+    /// callers up, and a reader mid batch saw a half cached set.
+    pub fn upsert_media_batch(&self, media: &[Media]) -> Result<()> {
+        let mut c = self.0.lock();
+        let tx = c.transaction()?;
+        for m in media {
+            upsert_media_row(&tx, m)?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// Detail-page upsert. Unlike the lean variant this OVERWRITES the
+    /// detail-only fields, so a studio or genre AniList no longer lists can
+    /// actually clear locally. The lean queries never fetch those columns,
+    /// and a COALESCE upsert would have kept the stale value forever.
+    pub fn upsert_media_detail(&self, m: &Media) -> Result<()> {
+        let c = self.0.lock();
         c.execute(
             "INSERT INTO media
              (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
@@ -168,11 +192,11 @@ impl Db {
               season_year=excluded.season_year, description=excluded.description,
               next_airing_episode=excluded.next_airing_episode,
               next_airing_at=excluded.next_airing_at,
-              banner_image=COALESCE(excluded.banner_image, banner_image),
-              genres=COALESCE(excluded.genres, genres),
-              duration=COALESCE(excluded.duration, duration),
-              source=COALESCE(excluded.source, source),
-              studios=COALESCE(excluded.studios, studios),
+              banner_image=excluded.banner_image,
+              genres=excluded.genres,
+              duration=excluded.duration,
+              source=excluded.source,
+              studios=excluded.studios,
               cached_at=excluded.cached_at",
             rusqlite::params![
                 m.id, m.id_mal, m.title_romaji, m.title_english, m.title_native,
@@ -208,17 +232,22 @@ impl Db {
              (media_id,entry_id,status,progress,score,repeat,updated_at)
              VALUES (?,?,?,?,?,?,?)",
             rusqlite::params![
-                e.media_id, e.id, e.status, e.progress, e.score, e.repeat, e.updated_at
+                e.media_id,
+                e.id,
+                e.status,
+                e.progress,
+                e.score,
+                e.repeat,
+                e.updated_at
             ],
         )?;
         Ok(())
     }
 
     pub fn delete_entry(&self, media_id: i64) -> Result<()> {
-        self.0.lock().execute(
-            "DELETE FROM list_entry WHERE media_id = ?",
-            [media_id],
-        )?;
+        self.0
+            .lock()
+            .execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
         Ok(())
     }
 
@@ -226,31 +255,50 @@ impl Db {
     /// that was merged or deleted upstream, so every surface refetches instead
     /// of serving a dead entry that can never be added or updated again.
     pub fn delete_media(&self, media_id: i64) -> Result<()> {
-        self.0.lock().execute("DELETE FROM media WHERE id = ?", [media_id])?;
+        self.0
+            .lock()
+            .execute("DELETE FROM media WHERE id = ?", [media_id])?;
         Ok(())
     }
 
-    /// Delete every local entry whose media_id is NOT in `keep`. Used after a
-    /// full list sync. Rows the remote no longer has were deleted elsewhere or
-    /// belong to a previous account, and must not linger or the recognizer
-    /// still matches them and the watcher could resurrect them on AniList.
-    pub fn delete_entries_not_in(&self, keep: &std::collections::HashSet<i64>) -> Result<()> {
+    /// Land a complete remote list snapshot and reconcile stale rows, all in
+    /// ONE transaction. The old path autocommitted per row, about two
+    /// individually synced statements per entry while entry_lock blocked
+    /// every progress write, and a reader mid walk saw a torn half old half
+    /// new list. Here the swap is atomic: either the whole snapshot lands
+    /// and the remote deletions run, or nothing changes at all.
+    pub fn replace_list_snapshot(&self, entries: &[ListEntry]) -> Result<()> {
         let mut c = self.0.lock();
-        let stale: Vec<i64> = {
-            let mut stmt = c.prepare("SELECT media_id FROM list_entry")?;
-            let ids = stmt
-                .query_map([], |r| r.get(0))?
-                .filter_map(Result::ok)
-                .filter(|id| !keep.contains(id))
-                .collect();
-            ids
-        };
         let tx = c.transaction()?;
-        for id in stale {
-            tx.execute("DELETE FROM list_entry WHERE media_id = ?", [id])?;
+        for e in entries {
+            if let Some(m) = &e.media {
+                upsert_media_row(&tx, m)?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO list_entry
+                 (media_id,entry_id,status,progress,score,repeat,updated_at)
+                 VALUES (?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    e.media_id,
+                    e.id,
+                    e.status,
+                    e.progress,
+                    e.score,
+                    e.repeat,
+                    e.updated_at
+                ],
+            )?;
         }
-        tx.commit()?;
-        Ok(())
+        // Reconcile inside the same transaction. Rows the remote no longer
+        // has were deleted elsewhere or belong to a previously signed in
+        // account. The keep set goes in as one JSON array, NOT IN with a
+        // thousand bound parameters would blow the SQLite variable limit.
+        let keep: Vec<i64> = entries.iter().map(|e| e.media_id).collect();
+        tx.execute(
+            "DELETE FROM list_entry WHERE media_id NOT IN (SELECT value FROM json_each(?))",
+            [serde_json::to_string(&keep)?],
+        )?;
+        Ok(tx.commit()?)
     }
 
     /// All local entries with cached media joined in. Backs the frontend list view.
@@ -369,25 +417,37 @@ impl Db {
     pub fn scrub_setting(&self, key: &str) -> Result<()> {
         let c = self.0.lock();
         c.execute("DELETE FROM settings WHERE key = ?", [key])?;
-        // VACUUM won't run inside a transaction. execute_batch runs these as
-        // top level statements.
-        c.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        // VACUUM won't run inside a transaction. execute_batch runs it as a
+        // top level statement, rebuilding the file from live rows only, so
+        // the freed page that still held the secret goes away.
+        c.execute_batch("VACUUM")?;
+        // The checkpoint returns a busy flag as its first column: a reader
+        // holding the WAL makes TRUNCATE decline, and that used to be
+        // indistinguishable from success, reporting a clean scrub while
+        // token pages stayed in the WAL sidecar. Surface it.
+        let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy != 0 {
+            return Err(anyhow::anyhow!(
+                "the WAL checkpoint came back busy, the sidecar was not truncated"
+            ));
+        }
         Ok(())
     }
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .0
             .lock()
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?",
-                [key],
-                |r| r.get::<_, String>(0),
-            )
+            .query_row("SELECT value FROM settings WHERE key = ?", [key], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()?)
     }
     /// Read multiple keys in one lock acquisition. Prevents a torn read where
     /// a concurrent set_settings leaves some keys pre write and some post.
-    pub fn get_settings_batch(&self, keys: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+    pub fn get_settings_batch(
+        &self,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>> {
         let c = self.0.lock();
         let mut out = std::collections::HashMap::new();
         for k in keys {
@@ -395,7 +455,9 @@ impl Db {
             // error look exactly like every key being unset, which silently
             // reset tracking to its defaults while the rows were intact.
             if let Some(v) = c
-                .query_row("SELECT value FROM settings WHERE key = ?", [*k], |r| r.get::<_, String>(0))
+                .query_row("SELECT value FROM settings WHERE key = ?", [*k], |r| {
+                    r.get::<_, String>(0)
+                })
                 .optional()?
             {
                 out.insert((*k).to_string(), v);
@@ -447,13 +509,32 @@ impl Db {
         Ok(())
     }
 
-    /// Drop seen marks older than `days`. The items have left every feed long ago.
-    pub fn prune_rss_seen(&self, days: i64) -> Result<()> {
+    /// Drop seen marks older than `days`, except the ones the current fetch
+    /// still carries. A blanket age prune resurrected dismissed items that a
+    /// quiet feed keeps listing past the cutoff, and they came back flagged
+    /// NEW. The keep set rides in as one JSON array to stay under the bound
+    /// parameter limit.
+    pub fn prune_rss_seen_keeping(&self, days: i64, keep: &[String]) -> Result<()> {
         let cutoff = chrono::Utc::now().timestamp() - days * 86_400;
-        self.0
-            .lock()
-            .execute("DELETE FROM rss_seen WHERE seen_at < ?", [cutoff])?;
+        self.0.lock().execute(
+            "DELETE FROM rss_seen WHERE seen_at < ? AND guid NOT IN (SELECT value FROM json_each(?))",
+            rusqlite::params![cutoff, serde_json::to_string(keep)?],
+        )?;
         Ok(())
+    }
+
+    /// Drop cached media rows no list entry references and that have not been
+    /// refreshed in `days`. The cache used to grow without bound, cached_at
+    /// was written and never read. Rows behind the list survive, they back
+    /// the recognizer and the offline list view. Anything else refetches on
+    /// demand the next time it is opened.
+    pub fn prune_media_cache(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - days * 86_400;
+        let n = self.0.lock().execute(
+            "DELETE FROM media WHERE cached_at < ? AND id NOT IN (SELECT media_id FROM list_entry)",
+            [cutoff],
+        )?;
+        Ok(n)
     }
 
     // ---- watched-file log (recognizer dedup) ----
@@ -471,13 +552,69 @@ impl Db {
         Ok(self
             .0
             .lock()
-            .query_row(
-                "SELECT 1 FROM watched_file WHERE path = ?",
-                [path],
-                |_| Ok(()),
-            )
+            .query_row("SELECT 1 FROM watched_file WHERE path = ?", [path], |_| {
+                Ok(())
+            })
             .is_ok())
     }
+}
+
+/// Lean media upsert on an open connection or transaction. The detail only
+/// fields are COALESCEd. A lean upsert from search, season or list sync must
+/// not wipe values a detail fetch already cached. Everything the lean
+/// queries do fetch takes the fresh value.
+fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
+    c.execute(
+        "INSERT INTO media
+         (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
+          episodes,format,status,average_score,season,season_year,description,
+          next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,cached_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+          id_mal=excluded.id_mal, title_romaji=excluded.title_romaji,
+          title_english=excluded.title_english, title_native=excluded.title_native,
+          cover_medium=excluded.cover_medium, cover_large=excluded.cover_large,
+          episodes=excluded.episodes, format=excluded.format, status=excluded.status,
+          average_score=excluded.average_score, season=excluded.season,
+          season_year=excluded.season_year, description=excluded.description,
+          next_airing_episode=excluded.next_airing_episode,
+          next_airing_at=excluded.next_airing_at,
+          banner_image=COALESCE(excluded.banner_image, banner_image),
+          genres=COALESCE(excluded.genres, genres),
+          duration=COALESCE(excluded.duration, duration),
+          source=COALESCE(excluded.source, source),
+          studios=COALESCE(excluded.studios, studios),
+          cached_at=excluded.cached_at",
+        rusqlite::params![
+            m.id,
+            m.id_mal,
+            m.title_romaji,
+            m.title_english,
+            m.title_native,
+            m.cover_medium,
+            m.cover_large,
+            m.episodes,
+            m.format,
+            m.status,
+            m.average_score,
+            m.season,
+            m.season_year,
+            m.description,
+            m.next_airing_episode,
+            m.next_airing_at,
+            m.banner_image,
+            m.genres
+                .as_ref()
+                .and_then(|g| serde_json::to_string(g).ok()),
+            m.duration,
+            m.source,
+            m.studios
+                .as_ref()
+                .and_then(|s| serde_json::to_string(s).ok()),
+            chrono::Utc::now().timestamp(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn row_to_media(r: &rusqlite::Row) -> rusqlite::Result<Media> {
@@ -518,6 +655,282 @@ fn row_to_media_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Media> {
 mod tests {
     use super::*;
 
+    /// A full snapshot lands whole and reconciles stale rows in the same
+    /// transaction, the sync path's core write.
+    #[test]
+    fn replace_list_snapshot_lands_and_reconciles() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        // Stale rows from an earlier sync, one keeps its media, one does not.
+        db.upsert_entry(&ListEntry {
+            id: Some(1),
+            media_id: 1,
+            status: "CURRENT".into(),
+            progress: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            id: Some(2),
+            media_id: 2,
+            status: "PLANNING".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let snapshot = vec![
+            ListEntry {
+                id: Some(11),
+                media_id: 1,
+                status: "CURRENT".into(),
+                progress: 7,
+                score: Some(9.0),
+                repeat: 0,
+                updated_at: Some(5),
+                media: Some(Media {
+                    id: 1,
+                    episodes: Some(12),
+                    ..Default::default()
+                }),
+            },
+            ListEntry {
+                id: Some(12),
+                media_id: 3,
+                status: "COMPLETED".into(),
+                progress: 24,
+                ..Default::default()
+            },
+        ];
+        db.replace_list_snapshot(&snapshot).unwrap();
+        let rows = db.entries_with_media().unwrap();
+        assert_eq!(rows.len(), 2, "row 2 was reconciled away");
+        let one = db.get_entry(1).unwrap().unwrap();
+        assert_eq!((one.id, one.progress, one.score), (Some(11), 7, Some(9.0)));
+        assert_eq!(one.media.as_ref().and_then(|m| m.episodes), Some(12));
+        assert!(db.get_entry(2).unwrap().is_none());
+        assert!(db.get_entry(3).unwrap().is_some());
+        // An empty snapshot clears the mirror, the logout and account switch
+        // semantics sync also relies on.
+        db.replace_list_snapshot(&[]).unwrap();
+        assert!(db.entries_with_media().unwrap().is_empty());
+    }
+
+    /// The v1 schema as it shipped, before any later rung added columns.
+    /// Duplicated on purpose: the migration tests must build the HISTORICAL
+    /// shape, not whatever migrate happens to create today.
+    const V1_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS media (
+        id              INTEGER PRIMARY KEY,
+        id_mal          INTEGER,
+        title_romaji    TEXT,
+        title_english   TEXT,
+        title_native    TEXT,
+        cover_medium    TEXT,
+        cover_large     TEXT,
+        episodes        INTEGER,
+        format          TEXT,
+        status          TEXT,
+        average_score   INTEGER,
+        season          TEXT,
+        season_year     INTEGER,
+        description     TEXT,
+        cached_at       INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS list_entry (
+        media_id    INTEGER PRIMARY KEY,
+        entry_id    INTEGER,
+        status      TEXT NOT NULL,
+        progress    INTEGER NOT NULL DEFAULT 0,
+        score       REAL,
+        repeat      INTEGER NOT NULL DEFAULT 0,
+        updated_at  INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS watched_file (
+        path        TEXT PRIMARY KEY,
+        media_id    INTEGER NOT NULL,
+        episode     INTEGER NOT NULL,
+        watched_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );";
+
+    /// File backed, because :memory: dies with the connection and the whole
+    /// point is to close and reopen across the migration.
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("kurisu-mig-{}-{}.db", tag, std::process::id()))
+    }
+
+    /// Build a database sitting at `version` with the schema shape that
+    /// version had, one media row and one list row carried over from it.
+    fn build_db_at_version(path: &std::path::Path, version: i64) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        if version >= 2 {
+            conn.execute_batch(
+                "ALTER TABLE media ADD COLUMN next_airing_episode INTEGER;
+                 ALTER TABLE media ADD COLUMN next_airing_at INTEGER;",
+            )
+            .unwrap();
+        }
+        if version >= 3 {
+            conn.execute_batch(
+                "ALTER TABLE media ADD COLUMN banner_image TEXT;
+                 ALTER TABLE media ADD COLUMN genres TEXT;
+                 ALTER TABLE media ADD COLUMN duration INTEGER;
+                 ALTER TABLE media ADD COLUMN source TEXT;
+                 ALTER TABLE media ADD COLUMN studios TEXT;",
+            )
+            .unwrap();
+        }
+        if version >= 4 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS rss_seen (
+                guid    TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
+            );",
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO media (id,title_romaji,episodes,cached_at) VALUES (7,'Old Show',12,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO list_entry (media_id,entry_id,status,progress,score,repeat,updated_at)
+             VALUES (7,77,'CURRENT',3,7.5,0,111)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {version}"))
+            .unwrap();
+    }
+
+    /// Every rung 2 and above was dead code in the test suite, every test
+    /// opened a fresh db at version 0 so only rung 1 ever ran. A broken rung
+    /// would brick startup for every existing user while CI stayed green.
+    #[test]
+    fn migrations_upgrade_every_historical_version() {
+        for from in 1..SCHEMA_VERSION {
+            let path = temp_db_path(&format!("v{from}"));
+            let _ = std::fs::remove_file(&path);
+            build_db_at_version(&path, from);
+            // Opening runs the ladder from `from` to SCHEMA_VERSION.
+            let db = Db::open(&path).unwrap();
+            let version: i64 =
+                db.0.lock()
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap();
+            assert_eq!(version, SCHEMA_VERSION, "upgrade from v{from} stalled");
+            // The carried rows survive with their values in the right columns.
+            let m = db.get_media(7).unwrap().expect("media row survived");
+            assert_eq!(m.title_romaji.as_deref(), Some("Old Show"));
+            assert_eq!(m.episodes, Some(12));
+            let e = db.get_entry(7).unwrap().expect("entry row survived");
+            assert_eq!(
+                (e.status.as_str(), e.progress, e.score),
+                ("CURRENT", 3, Some(7.5))
+            );
+            assert_eq!(e.id, Some(77));
+            assert_eq!(e.updated_at, Some(111));
+            // Rung 4's table exists after any path up.
+            db.rss_seen_set().unwrap();
+            drop(db);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The entries_with_media join selects a 21 column media projection with
+    /// detail fields as literal NULL and maps it through a fixed column
+    /// offset. A shift here scrambles titles into cover URLs and the like,
+    /// and nothing else tests it.
+    #[test]
+    fn entries_with_media_maps_the_joined_columns() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&Media {
+            id: 9,
+            id_mal: Some(99),
+            title_romaji: Some("Romaji Title".into()),
+            title_english: Some("English Title".into()),
+            title_native: Some("Native".into()),
+            cover_medium: Some("m.jpg".into()),
+            cover_large: Some("l.jpg".into()),
+            episodes: Some(24),
+            format: Some("TV".into()),
+            status: Some("FINISHED".into()),
+            average_score: Some(82),
+            season: Some("WINTER".into()),
+            season_year: Some(2024),
+            description: Some("Long html".into()),
+            next_airing_episode: Some(4),
+            next_airing_at: Some(1234),
+            // Detail fields are fetched but must NOT come back from the join.
+            banner_image: Some("banner.jpg".into()),
+            genres: Some(vec!["Action".into()]),
+            duration: Some(24),
+            source: Some("MANGA".into()),
+            studios: Some(vec!["MAPPA".into()]),
+        })
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            id: Some(55),
+            media_id: 9,
+            status: "REPEATING".into(),
+            progress: 6,
+            score: Some(8.5),
+            repeat: 1,
+            updated_at: Some(42),
+            media: None,
+        })
+        .unwrap();
+        let rows = db.entries_with_media().unwrap();
+        assert_eq!(rows.len(), 1);
+        let e = &rows[0];
+        assert_eq!(
+            (e.id, e.media_id, e.status.as_str(), e.progress, e.repeat),
+            (Some(55), 9, "REPEATING", 6, 1)
+        );
+        assert_eq!((e.score, e.updated_at), (Some(8.5), Some(42)));
+        let m = e.media.as_ref().expect("media joined");
+        assert_eq!(m.id, 9);
+        assert_eq!(m.id_mal, Some(99));
+        assert_eq!(m.title_romaji.as_deref(), Some("Romaji Title"));
+        assert_eq!(m.title_english.as_deref(), Some("English Title"));
+        assert_eq!(m.title_native.as_deref(), Some("Native"));
+        assert_eq!(m.cover_medium.as_deref(), Some("m.jpg"));
+        assert_eq!(m.cover_large.as_deref(), Some("l.jpg"));
+        assert_eq!(m.episodes, Some(24));
+        assert_eq!(m.format.as_deref(), Some("TV"));
+        assert_eq!(m.status.as_deref(), Some("FINISHED"));
+        assert_eq!(m.average_score, Some(82));
+        assert_eq!(m.season.as_deref(), Some("WINTER"));
+        assert_eq!(m.season_year, Some(2024));
+        // Description rides with the detail fields in this projection, the
+        // list view never renders a synopsis and multi KB HTML dominated
+        // the payload. get_media serves it.
+        assert_eq!(m.description, None);
+        assert_eq!(
+            db.get_media(9).unwrap().unwrap().description.as_deref(),
+            Some("Long html")
+        );
+        assert_eq!(m.next_airing_episode, Some(4));
+        assert_eq!(m.next_airing_at, Some(1234));
+        assert_eq!(
+            m.banner_image, None,
+            "detail fields stay out of the list join"
+        );
+        assert_eq!(m.genres, None);
+        assert_eq!(m.duration, None);
+        assert_eq!(m.source, None);
+        assert_eq!(m.studios, None);
+        // get_entry shares the same projection.
+        let one = db.get_entry(9).unwrap().unwrap();
+        assert_eq!(
+            one.media.as_ref().unwrap().title_romaji.as_deref(),
+            Some("Romaji Title")
+        );
+        assert_eq!(one.media.as_ref().unwrap().banner_image, None);
+    }
+
     /// A lean upsert from search, season or sync has no detail fields. It must
     /// not wipe the rich fields a detail fetch already cached. Everything the
     /// lean queries do fetch takes the fresh value.
@@ -544,10 +957,89 @@ mod tests {
         let m = db.get_media(1).unwrap().unwrap();
         assert_eq!(m.title_english.as_deref(), Some("New Title"));
         assert_eq!(m.banner_image.as_deref(), Some("banner.jpg"));
-        assert_eq!(m.genres, Some(vec!["Action".to_string(), "Drama".to_string()]));
+        assert_eq!(
+            m.genres,
+            Some(vec!["Action".to_string(), "Drama".to_string()])
+        );
         assert_eq!(m.duration, Some(24));
         assert_eq!(m.source.as_deref(), Some("MANGA"));
         assert_eq!(m.studios, Some(vec!["MAPPA".to_string()]));
+    }
+
+    /// The detail upsert overwrites the rich fields. A studio or banner
+    /// AniList no longer lists must actually clear, the lean COALESCE upsert
+    /// kept the stale value forever.
+    #[test]
+    fn detail_upsert_clears_removed_fields() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media_detail(&Media {
+            id: 1,
+            title_english: Some("Old Title".into()),
+            banner_image: Some("banner.jpg".into()),
+            genres: Some(vec!["Action".into()]),
+            studios: Some(vec!["MAPPA".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_media_detail(&Media {
+            id: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let m = db.get_media(1).unwrap().unwrap();
+        assert_eq!(m.banner_image, None);
+        assert_eq!(m.genres, None);
+        assert_eq!(m.studios, None);
+    }
+
+    /// The media cache prune only drops rows nothing references. A row behind
+    /// a list entry backs the recognizer and the offline list and survives no
+    /// matter how stale.
+    #[test]
+    fn media_cache_prune_spares_list_rows() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&Media {
+            id: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_media(&Media {
+            id: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.0.lock()
+            .execute("UPDATE media SET cached_at = 1", [])
+            .unwrap();
+        assert_eq!(db.prune_media_cache(30).unwrap(), 1);
+        assert!(
+            db.get_media(1).unwrap().is_some(),
+            "list backed row survives"
+        );
+        assert!(db.get_media(2).unwrap().is_none(), "unreferenced row goes");
+    }
+
+    /// The seen prune keeps the guids the current fetch still carries, so a
+    /// quiet feed cannot resurrect a dismissed item past the age cutoff.
+    #[test]
+    fn seen_prune_keeps_currently_carried_guids() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.mark_rss_seen(&["old-gone".into(), "old-carried".into()])
+            .unwrap();
+        db.0.lock()
+            .execute("UPDATE rss_seen SET seen_at = 1", [])
+            .unwrap();
+        db.prune_rss_seen_keeping(60, &["old-carried".into()])
+            .unwrap();
+        let seen = db.rss_seen_set().unwrap();
+        assert!(!seen.contains("old-gone"));
+        assert!(seen.contains("old-carried"));
     }
 
     /// Logout scrub. After scrub_setting the secret's bytes must be gone from
@@ -555,7 +1047,8 @@ mod tests {
     /// Needs a file backed db. :memory: has no file to inspect.
     #[test]
     fn scrub_setting_removes_the_value_from_the_db_files() {
-        let path = std::env::temp_dir().join(format!("kurisu-scrub-test-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("kurisu-scrub-test-{}.db", std::process::id()));
         let needle = b"sekrit-token-value-1234567890";
         let mut files = vec![path.clone()];
         for suffix in ["-wal", "-shm"] {
@@ -568,10 +1061,13 @@ mod tests {
         }
         {
             let db = Db::open(&path).unwrap();
-            db.set_setting("anilist_token", std::str::from_utf8(needle).unwrap()).unwrap();
+            db.set_setting("anilist_token", std::str::from_utf8(needle).unwrap())
+                .unwrap();
             // Checkpoint first so the row reaches the main file. The scrub must
             // clean a long checkpointed page, not just the fresh WAL.
-            db.0.lock().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            db.0.lock()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
             db.scrub_setting("anilist_token").unwrap();
             assert_eq!(db.get_setting("anilist_token").unwrap(), None);
             // Inspect while the connection is still open. Closing it would

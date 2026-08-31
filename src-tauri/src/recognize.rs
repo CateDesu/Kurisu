@@ -64,8 +64,7 @@ static RE_SEASON_TOKEN: LazyLock<Regex> =
 /// Bare trailing revision token like the v2 in Show - 05 v2. Only stripped
 /// when it stands alone. Glued to the episode like 04v2 it belongs to the
 /// number and RE_EP_NUM reads them as one token.
-static RE_REV_TAIL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\s+v\d+\s*$").unwrap());
+static RE_REV_TAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+v\d+\s*$").unwrap());
 
 /// Resolutions to discard when picking the episode number.
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
@@ -101,13 +100,29 @@ fn status_rank(status: &str) -> u8 {
 }
 
 pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
-    let entries = db.entries_with_media().unwrap_or_default();
+    let entries = match db.entries_with_media() {
+        Ok(v) => v,
+        // An empty list on a read failure used to be indistinguishable from
+        // an empty list, which quietly disabled matching until the next
+        // mutation. Log it so the real state is discoverable.
+        Err(e) => {
+            log::warn!("matcher build could not read the list, matching is off until the next list mutation: {e}");
+            Vec::new()
+        }
+    };
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
         let Some(m) = e.media else { continue };
         let mut variants = Vec::new();
         let mut norms = Vec::new();
-        for v in [m.title_english.as_deref(), m.title_romaji.as_deref(), m.title_native.as_deref()].into_iter().flatten() {
+        for v in [
+            m.title_english.as_deref(),
+            m.title_romaji.as_deref(),
+            m.title_native.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if !v.trim().is_empty() {
                 // norm_title, not clean_title. The episode-tail strip is for
                 // release names. On list titles it ate numeric suffixes.
@@ -178,7 +193,11 @@ fn norm_match_tier(norm: &str, cand: &str) -> Option<u8> {
     if norm == cand {
         return Some(3);
     }
-    let (short, long) = if norm.len() <= cand.len() { (norm, cand) } else { (cand, norm) };
+    let (short, long) = if norm.len() <= cand.len() {
+        (norm, cand)
+    } else {
+        (cand, norm)
+    };
     if short.len() < 4 {
         return None;
     }
@@ -210,7 +229,10 @@ fn parse_season_word(raw: &str) -> Option<u32> {
         .captures(&lower)
         .or_else(|| RE_NTH_SEASON.captures(&lower))?
         .name("n")?;
-    n.as_str().parse::<u32>().ok().filter(|&v| (1..=MAX_SEASON).contains(&v))
+    n.as_str()
+        .parse::<u32>()
+        .ok()
+        .filter(|&v| (1..=MAX_SEASON).contains(&v))
 }
 
 /// Standalone S3 token form. Third season read behind the marker and word
@@ -237,7 +259,9 @@ fn norm_season_ordinal(norm: &str) -> Option<u32> {
     // token. A number mid-title is part of the name, not a season ordinal.
     words.last().and_then(|w| {
         if w.len() <= 2 {
-            w.parse::<u32>().ok().filter(|&n| (1..=MAX_SEASON).contains(&n))
+            w.parse::<u32>()
+                .ok()
+                .filter(|&n| (1..=MAX_SEASON).contains(&n))
         } else {
             None
         }
@@ -297,7 +321,11 @@ type TiebreakKey = (
 /// title, so a Re:ZERO Season 4 file wrote progress to a one episode OVA.
 /// Ordinal 1 is special: AniList never numbers a first season, so an
 /// ordinal-less norm counts as season 1.
-pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -> Option<&'a Matcher> {
+pub(crate) fn match_title<'a>(
+    matchers: &'a [Matcher],
+    title: &str,
+    url: &str,
+) -> Option<&'a Matcher> {
     let candidates = [clean_title(title), clean_title(&basename(url))];
     // Season ordinal from the raw inputs before clean_title strips the marker.
     let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
@@ -341,9 +369,8 @@ pub(crate) fn match_title<'a>(matchers: &'a [Matcher], title: &str, url: &str) -
                 // this entry's norms encodes the same ordinal. Strongest
                 // franchise disambiguator. Picks the right season even when
                 // every sibling shares a prefix at the same tier and status.
-                let season_match = cand_season.is_some_and(|cs| {
-                    m.norms.iter().any(|n| norm_season_ordinal(n) == Some(cs))
-                });
+                let season_match = cand_season
+                    .is_some_and(|cs| m.norms.iter().any(|n| norm_season_ordinal(n) == Some(cs)));
                 let key = (
                     season_match,
                     tier,
@@ -378,7 +405,11 @@ pub(crate) fn clean_title(s: &str) -> String {
     // episode-tail to the regex. Keep the unstripped form when stripping leaves
     // nothing to match on.
     let normed = normalize(&stripped);
-    let out = if normed.is_empty() { normalize(&s) } else { normed };
+    let out = if normed.is_empty() {
+        normalize(&s)
+    } else {
+        normed
+    };
     season_ordinals(&out)
 }
 
@@ -411,7 +442,11 @@ pub(crate) fn norm_title(s: &str) -> String {
     let res_stripped = RE_RES.replace_all(&s, " ");
     // Don't let codec-name stripping empty a real title. The film Opus would
     // lose its only word to the opus codec alias.
-    let s = if normalize(&res_stripped).is_empty() { s } else { res_stripped };
+    let s = if normalize(&res_stripped).is_empty() {
+        s
+    } else {
+        res_stripped
+    };
     season_ordinals(&normalize(&s))
 }
 
@@ -420,7 +455,11 @@ pub(crate) fn norm_title(s: &str) -> String {
 /// a norm carrying 3.
 fn canon_ordinal(s: &str) -> &str {
     let d = s.trim_start_matches('0');
-    if d.is_empty() { "0" } else { d }
+    if d.is_empty() {
+        "0"
+    } else {
+        d
+    }
 }
 
 /// Collapse season markers to a bare ordinal so both sides of a comparison agree.
@@ -431,12 +470,22 @@ fn season_ordinals(normed: &str) -> String {
     // Marker form first. S02E03 collapses to 2 and takes its episode digits
     // along, so a dot separated scene name whose trailing dot blocked the
     // episode tail strip still lands on its season norm.
-    let out = RE_SEASON_EP.replace_all(normed, |c: &regex::Captures| canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string());
-    let out = RE_NTH_SEASON.replace_all(&out, |c: &regex::Captures| canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string());
-    let out = RE_SEASON_N.replace_all(&out, |c: &regex::Captures| canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string());
+    let out = RE_SEASON_EP.replace_all(normed, |c: &regex::Captures| {
+        canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string()
+    });
+    let out = RE_NTH_SEASON.replace_all(&out, |c: &regex::Captures| {
+        canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string()
+    });
+    let out = RE_SEASON_N.replace_all(&out, |c: &regex::Captures| {
+        canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string()
+    });
     // The S3 token form last. Its trailing word boundary keeps a marker
     // glued to its episode like S02E03 intact.
-    RE_SEASON_TOKEN.replace_all(&out, |c: &regex::Captures| canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string()).into_owned()
+    RE_SEASON_TOKEN
+        .replace_all(&out, |c: &regex::Captures| {
+            canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string()
+        })
+        .into_owned()
 }
 
 fn normalize(s: &str) -> String {
@@ -478,10 +527,7 @@ fn strip_ext(s: &str) -> String {
 /// Last path segment of a file URL or any path-ish string. Extension stripped
 /// and percent-decoded.
 pub(crate) fn basename(url: &str) -> String {
-    let seg = url
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(url);
+    let seg = url.rsplit(['/', '\\']).next().unwrap_or(url);
     let seg = strip_ext(seg);
     percent_decode(&seg)
 }
@@ -597,8 +643,14 @@ fn parse_last_episode_number(s: &str) -> Option<i64> {
     // past the noise filter. It must stand alone. Glued to a letter it is
     // part of a tag, like the 264 in x264 or a resolution with its p.
     let after_title = RE_EP_NUM.find(&s).and_then(|m| {
-        let lone = s[..m.start()].chars().next_back().is_none_or(|c| !c.is_alphanumeric())
-            && s[m.end()..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        let lone = s[..m.start()]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+            && s[m.end()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
         if lone {
             m.as_str().split('v').next()?.parse::<i64>().ok()
         } else {
@@ -614,9 +666,7 @@ fn parse_last_episode_number(s: &str) -> Option<i64> {
             // resolution strip, and .last() below would crown it over the
             // real episode. The after title number already rejects it via
             // the alphanumeric edge check.
-            if m.start() > 0
-                && matches!(s[..m.start()].chars().next_back(), Some('v' | 'V'))
-            {
+            if m.start() > 0 && matches!(s[..m.start()].chars().next_back(), Some('v' | 'V')) {
                 return None;
             }
             m.as_str().split('v').next()?.parse::<i64>().ok()
@@ -668,9 +718,15 @@ mod tests {
 
     #[test]
     fn basename_decodes_and_strips() {
-        assert_eq!(basename("file:///media/anime/My%20Show%20-%2003.mkv"), "My Show - 03");
+        assert_eq!(
+            basename("file:///media/anime/My%20Show%20-%2003.mkv"),
+            "My Show - 03"
+        );
         // multi-byte UTF-8 survives decoding
-        assert_eq!(basename("file:///x/%E3%82%AF%E3%83%AA%E3%82%B9.mkv"), "クリス");
+        assert_eq!(
+            basename("file:///x/%E3%82%AF%E3%83%AA%E3%82%B9.mkv"),
+            "クリス"
+        );
     }
 
     #[test]
@@ -714,18 +770,30 @@ mod tests {
             Some(7)
         );
         // v2 revision suffix belongs to the episode it follows
-        assert_eq!(parse_episode_guess("Some Show - 04v2 [BD 1080p].mkv"), Some(4));
-        assert_eq!(parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"), Some(11));
+        assert_eq!(
+            parse_episode_guess("Some Show - 04v2 [BD 1080p].mkv"),
+            Some(4)
+        );
+        assert_eq!(
+            parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"),
+            Some(11)
+        );
     }
 
     /// Digits in trailing release tags must not beat the real episode number.
     #[test]
     fn episode_guess_ignores_trailing_release_tags() {
-        assert_eq!(parse_episode_guess("[Group] Show - 05 [1080p] AAC2.0 x265"), Some(5));
+        assert_eq!(
+            parse_episode_guess("[Group] Show - 05 [1080p] AAC2.0 x265"),
+            Some(5)
+        );
         assert_eq!(parse_episode_guess("Show - 05 DDP2.0 H 264"), Some(5));
         assert_eq!(parse_episode_guess("Show S02E05 AAC2.0"), Some(5));
         assert_eq!(parse_episode_guess("Show - 12 Opus2.0"), Some(12));
-        assert_eq!(parse_episode_guess("Show - 05 [Multi-Subs] DDP5.1"), Some(5));
+        assert_eq!(
+            parse_episode_guess("Show - 05 [Multi-Subs] DDP5.1"),
+            Some(5)
+        );
         assert_eq!(
             parse_episode_guess("[SubsPlease] Frieren - 28 (1080p) [AB12CD34]"),
             Some(28)
@@ -737,7 +805,10 @@ mod tests {
     /// episode even when a resolution tag would eat it.
     #[test]
     fn resolution_valued_episode_numbers_parse() {
-        assert_eq!(parse_episode_guess("One Piece - 1080 (1080p) [ABC123]"), Some(1080));
+        assert_eq!(
+            parse_episode_guess("One Piece - 1080 (1080p) [ABC123]"),
+            Some(1080)
+        );
         assert_eq!(parse_episode_guess("One Piece - 360 [1080p]"), Some(360));
         assert_eq!(parse_episode_guess("One Piece - 480 (720p)"), Some(480));
         assert_eq!(parse_episode_guess("One Piece - 720"), Some(720));
@@ -748,7 +819,10 @@ mod tests {
         assert_eq!(parse_episode_guess("Show 1080p"), None);
         // The exemption must not turn first number wins. 86 is the title
         // here and 11 is the episode.
-        assert_eq!(parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"), Some(11));
+        assert_eq!(
+            parse_episode_guess("[GJM] 86 - 11 (1080p) [DEADBEEF].mkv"),
+            Some(11)
+        );
         // A year right after the title is still a year, not an episode.
         assert_eq!(parse_episode_guess("Movie 2016 [BD]"), None);
     }
@@ -757,7 +831,10 @@ mod tests {
     /// and a detached revision token all used to beat the episode number.
     #[test]
     fn episode_guess_ignores_fps_4k_and_detached_revisions() {
-        assert_eq!(parse_episode_guess("Show.S02E05.1080p60.WEB-DL.H.264-GROUP"), Some(5));
+        assert_eq!(
+            parse_episode_guess("Show.S02E05.1080p60.WEB-DL.H.264-GROUP"),
+            Some(5)
+        );
         assert_eq!(parse_episode_guess("Show - 05 4K"), Some(5));
         assert_eq!(parse_episode_guess("Show - 05 (1080p) v2"), Some(5));
     }
@@ -787,8 +864,12 @@ mod tests {
             mk(2, "Kusuriya no Hitorigoto 2nd Season"),
         ];
         assert_eq!(
-            match_title(&matchers, "[Judas] Kusuriya no Hitorigoto Season 2 [1080p]", "")
-                .map(|m| m.media_id),
+            match_title(
+                &matchers,
+                "[Judas] Kusuriya no Hitorigoto Season 2 [1080p]",
+                ""
+            )
+            .map(|m| m.media_id),
             Some(2)
         );
     }
@@ -803,7 +884,10 @@ mod tests {
         );
         // Batch file. Title matched but no episode. Some(None) must stop callers
         // from guessing or guessing would return 91.
-        assert_eq!(parse_episode_after("91 Days [BD 1080p]", &variants), Some(None));
+        assert_eq!(
+            parse_episode_after("91 Days [BD 1080p]", &variants),
+            Some(None)
+        );
         // No variant in the string at all. None means guessing is allowed.
         assert_eq!(parse_episode_after("Something Else - 03", &variants), None);
     }
@@ -818,9 +902,15 @@ mod tests {
             status_rank: 0,
         };
         // Batch file. Matched, no episode. None, not 91.
-        assert_eq!(resolve_episode(&days, &["91 Days", "91 Days [BD 1080p]"]), None);
+        assert_eq!(
+            resolve_episode(&days, &["91 Days", "91 Days [BD 1080p]"]),
+            None
+        );
         // Player title cleaned, filename carries the episode. Read it there.
-        assert_eq!(resolve_episode(&days, &["91 Days", "91 Days - 05 [BD]"]), Some(5));
+        assert_eq!(
+            resolve_episode(&days, &["91 Days", "91 Days - 05 [BD]"]),
+            Some(5)
+        );
         // Alias case. The raw variant never appears since the colon was dropped.
         // The normalized match falls back to guessing.
         let rezero = Matcher {
@@ -830,7 +920,10 @@ mod tests {
             norms: vec!["re zero kara hajimeru isekai seikatsu".into()],
             status_rank: 0,
         };
-        assert_eq!(resolve_episode(&rezero, &["Re Zero - 05", "Re Zero - 05"]), Some(5));
+        assert_eq!(
+            resolve_episode(&rezero, &["Re Zero - 05", "Re Zero - 05"]),
+            Some(5)
+        );
     }
 
     #[test]
@@ -854,9 +947,18 @@ mod tests {
     #[test]
     fn match_title_without_separator_before_episode() {
         let matchers = vec![mk(1, "Steins;Gate"), mk(2, "Fate"), mk(3, "One Piece")];
-        assert_eq!(match_title(&matchers, "Steins;Gate 01", "").map(|m| m.media_id), Some(1));
-        assert_eq!(match_title(&matchers, "Fate 01", "").map(|m| m.media_id), Some(2));
-        assert_eq!(match_title(&matchers, "One Piece 1015", "").map(|m| m.media_id), Some(3));
+        assert_eq!(
+            match_title(&matchers, "Steins;Gate 01", "").map(|m| m.media_id),
+            Some(1)
+        );
+        assert_eq!(
+            match_title(&matchers, "Fate 01", "").map(|m| m.media_id),
+            Some(2)
+        );
+        assert_eq!(
+            match_title(&matchers, "One Piece 1015", "").map(|m| m.media_id),
+            Some(3)
+        );
     }
 
     fn mk(media_id: i64, title: &str) -> Matcher {
@@ -870,7 +972,10 @@ mod tests {
     }
 
     fn mk_status(media_id: i64, title: &str, status: &str) -> Matcher {
-        Matcher { status_rank: status_rank(status), ..mk(media_id, title) }
+        Matcher {
+            status_rank: status_rank(status),
+            ..mk(media_id, title)
+        }
     }
 
     /// A sequel on the list must win over its own base series. AniList writes
@@ -909,9 +1014,21 @@ mod tests {
     fn season_ordinal_absent_from_list_stays_unmatched() {
         let matchers = vec![
             mk_status(101, "Re:Zero kara Hajimeru Isekai Seikatsu", "COMPLETED"),
-            mk_status(102, "Re:Zero kara Hajimeru Isekai Seikatsu -Memory Snow-", "COMPLETED"),
-            mk_status(103, "Re:Zero kara Hajimeru Isekai Seikatsu -Hyouketsu no Kizuna-", "COMPLETED"),
-            mk_status(104, "Re:Zero kara Hajimeru Isekai Seikatsu 2nd Season", "COMPLETED"),
+            mk_status(
+                102,
+                "Re:Zero kara Hajimeru Isekai Seikatsu -Memory Snow-",
+                "COMPLETED",
+            ),
+            mk_status(
+                103,
+                "Re:Zero kara Hajimeru Isekai Seikatsu -Hyouketsu no Kizuna-",
+                "COMPLETED",
+            ),
+            mk_status(
+                104,
+                "Re:Zero kara Hajimeru Isekai Seikatsu 2nd Season",
+                "COMPLETED",
+            ),
         ];
         for release in [
             "[SubsPlease] Re:Zero kara Hajimeru Isekai Seikatsu Season 4 - 01 [1080p].mkv",
@@ -931,7 +1048,11 @@ mod tests {
     fn season_ordinal_present_on_list_resolves() {
         let matchers = vec![
             mk_status(101, "Re:Zero kara Hajimeru Isekai Seikatsu", "COMPLETED"),
-            mk_status(105, "Re:Zero kara Hajimeru Isekai Seikatsu 4th Season", "CURRENT"),
+            mk_status(
+                105,
+                "Re:Zero kara Hajimeru Isekai Seikatsu 4th Season",
+                "CURRENT",
+            ),
         ];
         for release in [
             "[SubsPlease] Re:Zero kara Hajimeru Isekai Seikatsu Season 4 - 01 [1080p].mkv",
@@ -971,7 +1092,8 @@ mod tests {
         // the list an S01 release still matches nothing.
         let s2_only = vec![mk(2, "Boku no Hero Academia 2nd Season")];
         assert_eq!(
-            match_title(&s2_only, "[Judas] Boku no Hero Academia - S01E05.mkv", "").map(|m| m.media_id),
+            match_title(&s2_only, "[Judas] Boku no Hero Academia - S01E05.mkv", "")
+                .map(|m| m.media_id),
             None
         );
     }
@@ -988,7 +1110,10 @@ mod tests {
         );
         // Season 3 not on the list. The base entry may not take it.
         let base_only = vec![mk(1, "Show")];
-        assert_eq!(match_title(&base_only, "[G] Show S3 - 05.mkv", "").map(|m| m.media_id), None);
+        assert_eq!(
+            match_title(&base_only, "[G] Show S3 - 05.mkv", "").map(|m| m.media_id),
+            None
+        );
         // A token glued inside a bracket tag is not a season marker.
         assert_eq!(
             match_title(&base_only, "[G] Show - 05 [AB12S2].mkv", "").map(|m| m.media_id),
@@ -1027,12 +1152,27 @@ mod tests {
             mk_status(10, "Some Show", "COMPLETED"),
             mk_status(20, "Some Show", "CURRENT"),
         ];
-        assert_eq!(match_title(&watching, "Some Show - 03", "").map(|m| m.media_id), Some(20));
+        assert_eq!(
+            match_title(&watching, "Some Show - 03", "").map(|m| m.media_id),
+            Some(20)
+        );
         // same status on both. Lower id wins, and it wins in either order.
-        let a = vec![mk_status(20, "Some Show", "CURRENT"), mk_status(10, "Some Show", "CURRENT")];
-        let b = vec![mk_status(10, "Some Show", "CURRENT"), mk_status(20, "Some Show", "CURRENT")];
-        assert_eq!(match_title(&a, "Some Show - 03", "").map(|m| m.media_id), Some(10));
-        assert_eq!(match_title(&b, "Some Show - 03", "").map(|m| m.media_id), Some(10));
+        let a = vec![
+            mk_status(20, "Some Show", "CURRENT"),
+            mk_status(10, "Some Show", "CURRENT"),
+        ];
+        let b = vec![
+            mk_status(10, "Some Show", "CURRENT"),
+            mk_status(20, "Some Show", "CURRENT"),
+        ];
+        assert_eq!(
+            match_title(&a, "Some Show - 03", "").map(|m| m.media_id),
+            Some(10)
+        );
+        assert_eq!(
+            match_title(&b, "Some Show - 03", "").map(|m| m.media_id),
+            Some(10)
+        );
     }
 
     /// A literal percent in a filename must not be decoded. Old code parsed a
@@ -1045,7 +1185,10 @@ mod tests {
         assert_eq!(basename("file:///x/100%.mkv"), "100%");
         assert_eq!(basename("file:///x/%zz.mkv"), "%zz");
         // real escapes still decode, including multi-byte sequences
-        assert_eq!(basename("file:///x/%E3%82%AF%E3%83%AA%E3%82%B9.mkv"), "クリス");
+        assert_eq!(
+            basename("file:///x/%E3%82%AF%E3%83%AA%E3%82%B9.mkv"),
+            "クリス"
+        );
     }
 
     /// Unicode norms must not panic the token scan.
@@ -1066,7 +1209,10 @@ mod tests {
         assert_eq!(norm_title("Dr. STONE"), "dr stone");
         assert_eq!(norm_title("86"), "86");
         assert_eq!(norm_title("Steins;Gate 0"), "steins gate 0");
-        assert_eq!(norm_title("Ghost in the Shell 2.0"), "ghost in the shell 2 0");
+        assert_eq!(
+            norm_title("Ghost in the Shell 2.0"),
+            "ghost in the shell 2 0"
+        );
         // release names still get the episode tail and extension stripped
         assert_eq!(clean_title("Show Name - 03.mkv"), "show name");
         assert_eq!(clean_title("Show Name - 03.MKV"), "show name");
@@ -1093,20 +1239,39 @@ mod tests {
             mk(5, "K"),
         ];
         // another mid-string in an unrelated title. Single word means no match.
-        assert!(match_title(&matchers, "[G] Re:Zero Starting Life in Another World - 05", "").is_none());
+        assert!(match_title(
+            &matchers,
+            "[G] Re:Zero Starting Life in Another World - 05",
+            ""
+        )
+        .is_none());
         // dr must not live inside dreaming. no 6 needs whole tokens.
-        assert!(match_title(&matchers, "[ToonsHub] Grand Blue Dreaming S03E03 1080p", "").is_none());
+        assert!(
+            match_title(&matchers, "[ToonsHub] Grand Blue Dreaming S03E03 1080p", "").is_none()
+        );
         assert!(match_title(&matchers, "[G] Sora wa Akai Kawa no Hotori - 03", "").is_none());
         // 1-char norm K matches nothing but itself
         assert!(match_title(&matchers, "Walking the Way All Alone S01E16 1080p", "").is_none());
-        assert_eq!(match_title(&matchers, "K - 05", "").map(|m| m.media_id), Some(5));
+        assert_eq!(
+            match_title(&matchers, "K - 05", "").map(|m| m.media_id),
+            Some(5)
+        );
         // the real shows still match
-        assert_eq!(match_title(&matchers, "[SubsPlease] Another - 05 (1080p)", "").map(|m| m.media_id), Some(1));
-        assert_eq!(match_title(&matchers, "[SubsPlease] 86 - 11 (1080p)", "").map(|m| m.media_id), Some(2));
+        assert_eq!(
+            match_title(&matchers, "[SubsPlease] Another - 05 (1080p)", "").map(|m| m.media_id),
+            Some(1)
+        );
+        assert_eq!(
+            match_title(&matchers, "[SubsPlease] 86 - 11 (1080p)", "").map(|m| m.media_id),
+            Some(2)
+        );
         // No season 3 on the list, so the bare S3 token vetoes the base
         // entry rather than writing season 3 progress to season 1.
         assert!(match_title(&matchers, "[SubsPlease] Dr. Stone S3 - 05 (1080p)", "").is_none());
-        assert_eq!(match_title(&matchers, "[G] No.6 - 03 [720p]", "").map(|m| m.media_id), Some(4));
+        assert_eq!(
+            match_title(&matchers, "[G] No.6 - 03 [720p]", "").map(|m| m.media_id),
+            Some(4)
+        );
     }
 
     /// Prefix in either direction and long interior phrases still match. Token
@@ -1124,7 +1289,10 @@ mod tests {
         assert!(match_title(&matchers, "[G] Shirobako - 05", "").is_none());
         // shortened release title is a prefix of the full list title
         let rezero = vec![mk(1, "Re:Zero kara Hajimeru Isekai Seikatsu")];
-        assert_eq!(match_title(&rezero, "Re Zero - 05", "").map(|m| m.media_id), Some(1));
+        assert_eq!(
+            match_title(&rezero, "Re Zero - 05", "").map(|m| m.media_id),
+            Some(1)
+        );
         // list title is a prefix of a longer release string
         let yama = vec![mk(1, "Yama no Susume")];
         assert_eq!(
@@ -1150,16 +1318,39 @@ mod tests {
         // All six real Mushoku entries. Only Season 3 (178789) is CURRENT.
         let titles: &[(i64, &str, &str)] = &[
             (108465, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation"),
-            (127720, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Cour 2"),
-            (141534, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer"),
-            (146065, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 2"),
-            (166873, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 2 Part 2"),
-            (178789, "CURRENT", "Mushoku Tensei: Jobless Reincarnation Season 3"),
+            (
+                127720,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Cour 2",
+            ),
+            (
+                141534,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer",
+            ),
+            (
+                146065,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Season 2",
+            ),
+            (
+                166873,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Season 2 Part 2",
+            ),
+            (
+                178789,
+                "CURRENT",
+                "Mushoku Tensei: Jobless Reincarnation Season 3",
+            ),
         ];
         let rom_by_id: std::collections::HashMap<i64, &str> = [
             (108465, "Mushoku Tensei: Isekai Ittara Honki Dasu"),
             (127720, "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2"),
-            (141534, "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2 - Eris no Goblin Toubatsu"),
+            (
+                141534,
+                "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2 - Eris no Goblin Toubatsu",
+            ),
             (146065, "Mushoku Tensei II: Isekai Ittara Honki Dasu"),
             (166873, "Mushoku Tensei II: Isekai Ittara Honki Dasu Part 2"),
             (178789, "Mushoku Tensei III: Isekai Ittara Honki Dasu"),
@@ -1182,7 +1373,10 @@ mod tests {
         ] {
             let url = format!("file:///home/cate/Videos/Torrents/{raw}");
             let m = match_title(&matchers, raw, &url).expect("should match a franchise entry");
-            assert_eq!(m.media_id, 178789, "S03 release must resolve to Season 3 (CURRENT)");
+            assert_eq!(
+                m.media_id, 178789,
+                "S03 release must resolve to Season 3 (CURRENT)"
+            );
             let ep = resolve_episode(m, &[raw, basename(&url).as_str()]);
             assert_eq!(ep, raw.contains("E04").then_some(4).or(Some(5)));
         }
@@ -1198,13 +1392,28 @@ mod tests {
         // title entry (141534, the special) would win.
         let titles: &[(i64, &str, &str)] = &[
             (108465, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation"),
-            (141534, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer"),
-            (146065, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 2"),
-            (178789, "COMPLETED", "Mushoku Tensei: Jobless Reincarnation Season 3"),
+            (
+                141534,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer",
+            ),
+            (
+                146065,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Season 2",
+            ),
+            (
+                178789,
+                "COMPLETED",
+                "Mushoku Tensei: Jobless Reincarnation Season 3",
+            ),
         ];
         let rom_by_id: std::collections::HashMap<i64, &str> = [
             (108465, "Mushoku Tensei: Isekai Ittara Honki Dasu"),
-            (141534, "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2 - Eris no Goblin Toubatsu"),
+            (
+                141534,
+                "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2 - Eris no Goblin Toubatsu",
+            ),
             (146065, "Mushoku Tensei II: Isekai Ittara Honki Dasu"),
             (178789, "Mushoku Tensei III: Isekai Ittara Honki Dasu"),
         ]
@@ -1222,7 +1431,10 @@ mod tests {
             .collect();
         let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")
             .expect("should match");
-        assert_eq!(m.media_id, 178789, "S03 must resolve to Season 3 even when all are COMPLETED");
+        assert_eq!(
+            m.media_id, 178789,
+            "S03 must resolve to Season 3 even when all are COMPLETED"
+        );
     }
 
     /// The season ordinal wins over status. Even if the user is currently
@@ -1248,7 +1460,10 @@ mod tests {
         ];
         let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")
             .expect("should match");
-        assert_eq!(m.media_id, 178789, "S03 release must resolve to Season 3 (PAUSED) not S2 (CURRENT)");
+        assert_eq!(
+            m.media_id, 178789,
+            "S03 release must resolve to Season 3 (PAUSED) not S2 (CURRENT)"
+        );
     }
 
     /// A season pack with no episode number must not have its season number
@@ -1259,9 +1474,15 @@ mod tests {
         let variants = vec!["Some Show".to_string()];
         // Some Show S02. The season marker should be stripped, leaving no
         // episode number.
-        assert_eq!(parse_episode_after("Some Show S02 [1080p]", &variants), Some(None));
+        assert_eq!(
+            parse_episode_after("Some Show S02 [1080p]", &variants),
+            Some(None)
+        );
         // Some Show S02E05. The episode number is still read correctly.
-        assert_eq!(parse_episode_after("Some Show S02E05 [1080p]", &variants), Some(Some(5)));
+        assert_eq!(
+            parse_episode_after("Some Show S02E05 [1080p]", &variants),
+            Some(Some(5))
+        );
     }
 
     /// A non-seasonal release must not get a season boost. The status tiebreak
@@ -1288,7 +1509,11 @@ mod tests {
     fn dotted_scene_marker_routes_to_the_matching_season() {
         let matchers = vec![
             mk_status(21355, "Re:Zero kara Hajimeru Isekai Seikatsu", "COMPLETED"),
-            mk_status(189046, "Re:Zero kara Hajimeru Isekai Seikatsu 4th Season", "CURRENT"),
+            mk_status(
+                189046,
+                "Re:Zero kara Hajimeru Isekai Seikatsu 4th Season",
+                "CURRENT",
+            ),
         ];
         let release = "Re.Zero.kara.Hajimeru.Isekai.Seikatsu.S04E05.1080p.WEB-DL.mkv";
         let m = match_title(&matchers, release, "").expect("dot scene form must match season 4");

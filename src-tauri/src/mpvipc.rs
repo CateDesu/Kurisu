@@ -16,10 +16,26 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::time::Duration;
 
+/// Whole round trip budget. The per read timeout below bounds a single read,
+/// but a peer trickling a garbage line just under that cadence kept the loop
+/// alive forever, and on Windows a named pipe peer that accepts but never
+/// answers blocks read_line with no timeout at all. One deadline for the
+/// entire exchange closes both.
+const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Windows named pipes that missed their deadline once are skipped for the
+/// rest of the session. std cannot time out a synchronous pipe read, so the
+/// reader thread is abandoned when the deadline hits. Retrying on every 5s
+/// tick would leak one thread per tick against a wedged pipe.
+#[cfg(windows)]
+static POISONED_PIPES: parking_lot::Mutex<std::collections::HashSet<String>> =
+    parking_lot::Mutex::new(std::collections::HashSet::new());
+
 /// Per read and write cap so a wedged mpv can't stall the tick. The
 /// whole round trip is a few small lines, anything slower than this is
 /// a dead connection. Unix sockets only, the Windows named pipe has no
-/// timeout support and blocks instead.
+/// timeout support and blocks instead, which is what the deadline and
+/// the poison set above are for.
 #[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -62,6 +78,10 @@ pub(crate) fn probe(paths: &[String]) -> Option<MpvSnapshot> {
         if std::fs::metadata(p).is_err() {
             continue;
         }
+        #[cfg(windows)]
+        if POISONED_PIPES.lock().contains(p) {
+            continue;
+        }
         if let Some(s) = probe_one(p) {
             return Some(s);
         }
@@ -79,28 +99,61 @@ fn probe_one(path: &str) -> Option<MpvSnapshot> {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let writer = stream.try_clone().ok()?;
-    query(BufReader::new(stream), writer)
+    query(
+        BufReader::new(stream),
+        writer,
+        std::time::Instant::now() + QUERY_DEADLINE,
+    )
 }
 
 /// Windows named pipe. mpv listens with one pipe instance per client so
-/// a plain read plus write open is a full duplex connection. std File
-/// has no read timeout here, so the round trip blocks until mpv answers
-/// or the pipe breaks. mpv replies to IPC immediately, and a wedged
-/// player is hung for the OS media stack too, so this is the same bet
-/// the blocking GSMTC calls make.
+/// a plain read plus write open is a full duplex connection, but std has no
+/// read timeout here: a peer that accepts and never answers parks read_line
+/// forever, which killed detection for the whole session and leaked a
+/// blocking thread per tick. The open and the query run on a helper thread
+/// with a deadline, and a pipe that misses it is poisoned so the abandoned
+/// thread is the last one we spend on it.
 #[cfg(windows)]
 fn probe_one(path: &str) -> Option<MpvSnapshot> {
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path).ok()?;
-    let writer = file.try_clone().ok()?;
-    query(BufReader::new(file), writer)
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_string();
+    std::thread::spawn(move || {
+        let snap = (|| {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .ok()?;
+            let writer = file.try_clone().ok()?;
+            query(
+                BufReader::new(file),
+                writer,
+                std::time::Instant::now() + QUERY_DEADLINE,
+            )
+        })();
+        let _ = tx.send(snap);
+    });
+    match rx.recv_timeout(QUERY_DEADLINE + std::time::Duration::from_secs(1)) {
+        Ok(snap) => snap,
+        Err(_) => {
+            POISONED_PIPES.lock().insert(path.to_string());
+            None
+        }
+    }
 }
 
 /// Send every get_property in one burst, then read lines until all six
 /// answers arrived. mpv pushes event notifications on the same socket
 /// unasked, so any line carrying an event key is skipped. A response is
 /// matched by request id, and a failed property simply yields none for
-/// its slot instead of sinking the round trip.
-fn query<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Option<MpvSnapshot> {
+/// its slot instead of sinking the round trip. The whole exchange is
+/// bounded by `deadline`, so a peer that never answers or keeps feeding
+/// garbage lines cannot hold the caller.
+fn query<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    deadline: std::time::Instant,
+) -> Option<MpvSnapshot> {
     let mut out = String::new();
     for (prop, id) in PROPS {
         out.push_str(&format!(
@@ -113,17 +166,24 @@ fn query<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Option<MpvSnapsh
     let mut vals: Vec<Option<serde_json::Value>> = vec![None; PROPS.len() + 1];
     let mut answered = 0;
     loop {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) => return None, // mpv closed the connection
             Ok(_) => {}
             Err(_) => return None, // timeout or broken pipe, not worth retrying
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
         if v.get("event").is_some() {
             continue;
         }
-        let Some(rid) = v.get("request_id").and_then(|x| x.as_u64()) else { continue };
+        let Some(rid) = v.get("request_id").and_then(|x| x.as_u64()) else {
+            continue;
+        };
         // Every command went out with an id from PROPS, so a 0 or unknown
         // id is a foreign peer talking and must not consume a slot.
         if rid == 0 || rid as usize >= vals.len() || vals[rid as usize].is_some() {
@@ -148,7 +208,13 @@ fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
     if path.is_empty() {
         return None;
     }
-    let str_at = |i: usize| vals[i].as_ref().and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let str_at = |i: usize| {
+        vals[i]
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let secs_to_us = |i: usize| {
         vals[i]
             .as_ref()
@@ -202,8 +268,47 @@ mod tests {
     /// the write half and captures the command burst.
     fn query_lines(lines: &str) -> (Option<MpvSnapshot>, String) {
         let mut sink = Vec::new();
-        let snap = query(BufReader::new(Cursor::new(lines.to_string())), &mut sink);
+        let snap = query(
+            BufReader::new(Cursor::new(lines.to_string())),
+            &mut sink,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
         (snap, String::from_utf8(sink).unwrap())
+    }
+
+    /// A reader that never ends and never says anything useful. Each read
+    /// hands back one plausible looking garbage line, the trickle pattern
+    /// that kept the old unbounded loop alive forever. The deadline must
+    /// cut it off.
+    struct Trickle;
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(6);
+            buf[..n].copy_from_slice(&b"junk\n\n"[..n]);
+            Ok(n)
+        }
+    }
+    impl BufRead for Trickle {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Ok(&b"junk\n"[..])
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn an_ever_trickling_peer_hits_the_deadline() {
+        let mut sink = Vec::new();
+        let started = std::time::Instant::now();
+        let snap = query(
+            Trickle,
+            &mut sink,
+            std::time::Instant::now() + Duration::from_millis(200),
+        );
+        assert!(snap.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline must bound the exchange"
+        );
     }
 
     fn ok(id: usize, data: &str) -> String {
@@ -232,7 +337,9 @@ mod tests {
         // One get_property line per property, each carrying its request id.
         for (prop, id) in PROPS {
             assert!(
-                sent.contains(&format!("[\"get_property\",\"{prop}\"],\"request_id\":{id}")),
+                sent.contains(&format!(
+                    "[\"get_property\",\"{prop}\"],\"request_id\":{id}"
+                )),
                 "command burst must ask for {prop} with id {id}"
             );
         }
@@ -361,8 +468,7 @@ mod tests {
         }
         assert!(appeared, "mpv never opened the IPC socket");
 
-        let snap = probe_one(sock.to_str().unwrap())
-            .expect("mpv answers with a loaded file");
+        let snap = probe_one(sock.to_str().unwrap()).expect("mpv answers with a loaded file");
         assert!(snap.playing);
         assert!(snap.path.ends_with("t.wav"));
         assert_eq!(snap.duration_us, 5_000_000);

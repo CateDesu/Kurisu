@@ -198,7 +198,11 @@
     <!-- Folders being scanned -->
     <div class="mb-5">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Folders</h2>
-      {#if library.folders.length === 0}
+      {#if library.foldersFailed}
+        <p class="text-sm text-amber-400 mb-2">
+          Could not read your library folders. Check that the drive is mounted and try again.
+        </p>
+      {:else if library.folders.length === 0}
         <p class="text-sm text-ink-dim mb-2">
           No library folders yet — add the folders where your anime files live.
         </p>

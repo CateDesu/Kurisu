@@ -9,6 +9,10 @@ let files = $state<LibraryFile[]>([]);
 // Configured roots the last scan could not read. Unmounted drive, permissions.
 let unreadable = $state<UnreadableFolder[]>([]);
 let folders = $state<string[]>([]);
+// Set when reading the configured folders failed. The Library page used to
+// render that as "no library folders yet", which reads as an setup hint, not
+// an error worth fixing.
+let foldersFailed = $state(false);
 let scanning = $state(false);
 let lastScanAt = $state(0);
 // Set when a scan is requested during another scan. For example, removeFolder's
@@ -22,8 +26,11 @@ let scanGen = 0;
 async function loadFolders() {
   try {
     folders = await api.getLibraryFolders();
-  } catch {
+    foldersFailed = false;
+  } catch (e) {
     folders = [];
+    foldersFailed = true;
+    console.error("could not read library folders", e);
   }
 }
 
@@ -59,6 +66,10 @@ export const library = {
   get folders() {
     return folders;
   },
+  /** The last folder read failed. Distinguish a broken read from empty. */
+  get foldersFailed() {
+    return foldersFailed;
+  },
   get scanning() {
     return scanning;
   },
@@ -82,6 +93,7 @@ export const library = {
     files = [];
     folders = [];
     unreadable = [];
+    foldersFailed = false;
     lastScanAt = 0;
     pendingScan = false;
   },

@@ -96,9 +96,12 @@ jobs:
       # A dispatch from any ref other than main would roll that branch into
       # the rolling latest and ship it to every user — fail fast instead.
       - name: Manual runs only from main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::manual runs are only allowed from main (this ref: ${{ github.ref }})"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::manual runs are only allowed from main (this ref: $REF)"
             exit 1
           fi
 
@@ -106,11 +109,17 @@ jobs:
       # The 4th segment is the main commit count, never github.run_number:
       # run_number is scoped to this file and resets if it is renamed, which
       # would rank new tags below already-installed builds and strand users.
+      # github context rides in through env, never interpolated into the run
+      # body: ref names are attacker influenced and shell interpolation is
+      # an injection vector. Same discipline discord-notify.yml keeps.
       - id: v
         shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            TAG="${{ github.ref_name }}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
             ROLL=false
           else
             BASE=$(sed -n 's/.*"version": "\([0-9.]*\)".*/\1/p' src-tauri/tauri.conf.json | head -1)
@@ -210,6 +219,13 @@ jobs:
           cd src-tauri/target/release/bundle/nsis
           for f in *.exe; do sha256sum "$f" > "$f.sha256"; done
 
+      # The bare kurisu.exe ships as an asset too, so it gets the sidecar
+      # the workflow header promises every asset.
+      - name: Write SHA-256 sidecar for the bare exe
+        working-directory: src-tauri/target/release
+        shell: bash
+        run: sha256sum kurisu.exe > kurisu.exe.sha256
+
       # Attach the assets to the draft meta created. Plain `gh release upload`
       # (same as the Linux job): it never touches the draft flag, whereas the
       # softprops action re-edits the release and could publish it early.
@@ -219,7 +235,8 @@ jobs:
           gh release upload "${{ needs.meta.outputs.tag }}" \
             src-tauri/target/release/bundle/nsis/*.exe \
             src-tauri/target/release/bundle/nsis/*.exe.sha256 \
-            src-tauri/target/release/kurisu.exe --clobber
+            src-tauri/target/release/kurisu.exe \
+            src-tauri/target/release/kurisu.exe.sha256 --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

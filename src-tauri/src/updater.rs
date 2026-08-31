@@ -207,15 +207,21 @@ pub fn is_ci_build() -> bool {
 }
 
 /// True when this build participates in the startup auto check. CI builds
-/// always do. A release build compiled from source does too: someone who
-/// built the app themselves wants update notices just like an installed CI
-/// build, and the swap lands in their own target dir harmlessly. Debug
-/// builds are the dev loop and stay quiet, a modal every `tauri dev` boot
-/// helps nobody. The auto_update setting turns the check off entirely, the
-/// right escape hatch for anyone tracking main at the same X.Y.Z base as
-/// the rolling release. Manual check from Settings works on every build.
+/// always do. A release build compiled from source on Linux does too: the
+/// in place swap lands in the builder's own target dir harmlessly. An
+/// UNSTAMPED Windows build is excluded: it reports the base X.Y.Z, every
+/// rolling release looks newer forever, and the install path launches the
+/// NSIS installer into its own location instead of replacing the source
+/// built binary, so the modal recurred every boot and each accept re
+/// downloaded 150 MB. Stamped Windows builds know their exact version and
+/// update normally. Debug builds are the dev loop and stay quiet. The
+/// auto_update setting turns the check off entirely, and a manual check
+/// from Settings works on every build.
 pub fn auto_check_eligible() -> bool {
-    is_ci_build() || !cfg!(debug_assertions)
+    if is_ci_build() {
+        return true;
+    }
+    !cfg!(debug_assertions) && !cfg!(windows)
 }
 
 // ── Release lookup ──────────────────────────────────────────────────────────
@@ -231,16 +237,19 @@ pub struct Release {
     pub assets: HashMap<String, String>,
 }
 
-/// Fetch the latest full, non-prerelease, non-draft release. The rolling
-/// workflow prunes superseded rolling releases, so this is always the newest
-/// main build, or the newest hand-cut milestone if one is newer.
+/// Fetch the newest full, non-prerelease, non-draft release by VERSION, not
+/// by publication order. /releases/latest is chronological: a hand cut
+/// v1.1.0 got superseded in latest by the next rolling v1.0.0.N push, so
+/// users on 1.1.0 saw "up to date" and stranded until the rolling tag
+/// passed them, and users on old rolling builds skipped the milestone. The
+/// walk picks the max by the same version key the updater compares with.
 pub async fn fetch_latest_release() -> Result<Release, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=100");
     let data: Value = client
         .get(url)
         .send()
@@ -251,7 +260,30 @@ pub async fn fetch_latest_release() -> Result<Release, String> {
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(parse_release(&data))
+    pick_latest_release(&data).ok_or_else(|| "no published releases found".to_string())
+}
+
+/// Max semver release out of a GitHub /releases listing. Drafts and
+/// prereleases are invisible to /releases/latest and stay excluded here.
+fn pick_latest_release(data: &Value) -> Option<Release> {
+    let arr = data.as_array()?;
+    let mut best: Option<Release> = None;
+    let mut best_key: Option<(Vec<u64>, u8, u64)> = None;
+    for entry in arr {
+        if entry.get("draft").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if entry.get("prerelease").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let rel = parse_release(entry);
+        let key = version_key(&rel.version);
+        if best_key.as_ref().is_none_or(|k| key > *k) {
+            best_key = Some(key);
+            best = Some(rel);
+        }
+    }
+    best
 }
 
 fn parse_release(data: &Value) -> Release {
@@ -282,7 +314,11 @@ fn parse_release(data: &Value) -> Release {
             .filter(|s| !s.is_empty())
             .unwrap_or(&format!("https://github.com/{REPO}/releases/latest"))
             .to_string(),
-        body: data.get("body").and_then(Value::as_str).unwrap_or("").to_string(),
+        body: data
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         assets,
     }
 }
@@ -358,13 +394,7 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
         .timeout(Duration::from_secs(15))
         .build()
         .ok()?;
-    let mut resp = client
-        .get(url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?;
+    let mut resp = client.get(url).send().await.ok()?.error_for_status().ok()?;
     if resp
         .content_length()
         .is_some_and(|n| n > MAX_SIDECAR_BYTES as u64)
@@ -414,7 +444,9 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
         PathBuf::from(p)
     };
     if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     let res: Result<(), String> = async {
         let client = reqwest::Client::builder()
@@ -435,16 +467,22 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let total = resp.content_length().unwrap_or(0);
         if total > MAX_DOWNLOAD_BYTES {
-            return Err(format!("update download is implausibly large ({total} bytes)"));
+            return Err(format!(
+                "update download is implausibly large ({total} bytes)"
+            ));
         }
-        let mut file = tokio::fs::File::create(&part).await.map_err(|e| e.to_string())?;
+        let mut file = tokio::fs::File::create(&part)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut got: u64 = 0;
         while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             got += chunk.len() as u64;
             // The header can lie (or be absent): enforce the cap on the stream too.
             if got > MAX_DOWNLOAD_BYTES {
-                return Err(format!("update download exceeded {MAX_DOWNLOAD_BYTES} bytes"));
+                return Err(format!(
+                    "update download exceeded {MAX_DOWNLOAD_BYTES} bytes"
+                ));
             }
         }
         file.flush().await.map_err(|e| e.to_string())?;
@@ -453,7 +491,9 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
         if total != 0 && got < total {
             return Err(format!("download incomplete: {got} of {total} bytes"));
         }
-        tokio::fs::rename(&part, dest).await.map_err(|e| e.to_string())?;
+        tokio::fs::rename(&part, dest)
+            .await
+            .map_err(|e| e.to_string())?;
         // The caller verifies and then installs or executes these bytes. Make
         // the rename itself durable too, best effort. Windows can't fsync a
         // directory handle opened this way, for example.
@@ -543,7 +583,9 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     if !elf_file_matches_arch(new_bin)
         .map_err(|e| format!("could not read the downloaded update: {e}"))?
     {
-        return Err("the downloaded update is not built for this machine's architecture".to_string());
+        return Err(
+            "the downloaded update is not built for this machine's architecture".to_string(),
+        );
     }
     let exe = match EXE_PATH.get() {
         Some(p) => p.clone(),
@@ -665,7 +707,11 @@ pub fn sweep_update_leftovers(dir: &Path) {
                 // ancient. Treat it as fresh. Deleting on the error path could
                 // unlink a live download mid write, the exact thing the hour
                 // long grace exists to prevent.
-                .map(|t| t.elapsed().map(|age| age > Duration::from_secs(3600)).unwrap_or(false))
+                .map(|t| {
+                    t.elapsed()
+                        .map(|age| age > Duration::from_secs(3600))
+                        .unwrap_or(false)
+                })
                 .unwrap_or(true);
             if stale {
                 let _ = std::fs::remove_file(entry.path());
@@ -722,7 +768,8 @@ mod tests {
 
     /// A stamped build is always auto check eligible. In the test profile
     /// there is no stamp and debug assertions are on, so eligibility here is
-    /// the source debug answer, the dev loop staying quiet.
+    /// the source debug answer, the dev loop staying quiet. The remaining
+    /// cases are compile time flags a single profile cannot assert.
     #[test]
     fn auto_check_eligibility_covers_every_build_kind() {
         if is_ci_build() {
@@ -730,9 +777,38 @@ mod tests {
         } else if cfg!(debug_assertions) {
             assert!(!auto_check_eligible());
         }
-        // A source release build, the case this guards, has no stamp and no
-        // debug assertions. It cannot be asserted from inside a single
-        // profile, the compile time flags are what decide it.
+    }
+
+    /// /releases/latest is chronological. The walk must pick the max by
+    /// version instead, or a milestone cut before newer rolling pushes
+    /// strands users that already installed it.
+    #[test]
+    fn release_walk_picks_the_highest_version_not_the_newest_published() {
+        let listing = serde_json::json!([
+            { "tag_name": "v1.0.0.412", "html_url": "https://x/412", "assets": [] },
+            { "tag_name": "v1.1.0", "html_url": "https://x/110", "assets": [] },
+            { "tag_name": "v1.0.0.413", "html_url": "https://x/413", "assets": [] },
+            // Drafts and prereleases are invisible to latest and excluded here.
+            { "tag_name": "v9.9.9", "draft": true, "assets": [] },
+            { "tag_name": "v8.8.8", "prerelease": true, "assets": [] }
+        ]);
+        let rel = pick_latest_release(&listing).expect("a winner");
+        assert_eq!(rel.version, "1.1.0");
+        assert_eq!(rel.tag, "v1.1.0");
+        // Once the rolling base is bumped past the milestone, rolling wins
+        // again on its fourth segment.
+        let listing = serde_json::json!([
+            { "tag_name": "v1.1.0", "assets": [] },
+            { "tag_name": "v1.1.0.2", "assets": [] }
+        ]);
+        let rel = pick_latest_release(&listing).expect("a winner");
+        assert_eq!(rel.version, "1.1.0.2");
+        // Nothing publishable means no update offer, not a garbage one.
+        assert!(pick_latest_release(&serde_json::json!([
+            { "tag_name": "v9.9.9", "draft": true }
+        ]))
+        .is_none());
+        assert!(pick_latest_release(&serde_json::json!([])).is_none());
     }
 
     #[test]
@@ -796,6 +872,58 @@ mod tests {
         assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu")).is_ok());
         assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu.kurisu-old")).is_err());
         assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu (deleted)")).is_err());
+    }
+
+    /// The fail closed boundary before anything is executed. verify_and_open
+    /// and the sidecar formats it accepts had zero tests: a refactor
+    /// inverting the verdict would have shipped green.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn verify_and_open_accepts_only_a_matching_digest() {
+        let dir = std::env::temp_dir().join(format!("kurisu-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.bin");
+        std::fs::write(&path, b"kurisu update payload").unwrap();
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"kurisu update payload");
+            let d = h.finalize();
+            d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        // The exact digest passes and rewinds the handle.
+        let sidecars = [
+            digest.clone(),
+            format!("{digest}  payload.bin"),
+            format!("SHA256 (payload.bin) = {digest}"),
+            digest.to_uppercase(),
+        ];
+        for sc in &sidecars {
+            let mut f = verify_and_open(&path, sc)
+                .expect("sidecar readable")
+                .expect("digest matched");
+            let mut buf = String::new();
+            use std::io::Read;
+            f.read_to_string(&mut buf).unwrap();
+            assert_eq!(
+                buf, "kurisu update payload",
+                "handle must be rewound, sidecar {sc}"
+            );
+        }
+        // A different digest means a tampered or truncated download: refusal.
+        let mut wrong = digest.clone();
+        wrong.replace_range(0..1, if wrong.starts_with('0') { "1" } else { "0" });
+        assert!(matches!(verify_and_open(&path, &wrong), Ok(None)));
+        // No digest token at all is an error, never a silent pass.
+        assert!(verify_and_open(&path, "not a digest").is_err());
+        assert!(verify_and_open(&path, "").is_err());
+        // A missing file is an IO error, a short one is a digest mismatch:
+        // both refuse, the short one as Ok(None).
+        assert!(verify_and_open(&dir.join("absent.bin"), &digest).is_err());
+        let short = dir.join("short.bin");
+        std::fs::write(&short, b"xy").unwrap();
+        assert!(matches!(verify_and_open(&short, &digest), Ok(None)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(target_os = "linux")]

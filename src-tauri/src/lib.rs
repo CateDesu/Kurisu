@@ -48,8 +48,12 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
         .map(|p| p.data_local_dir().join("kurisu.db"))
         .filter(|p| p != &db_path)
     {
-        let target_free = std::fs::metadata(&db_path).map(|m| m.len() == 0).unwrap_or(true);
-        let legacy_has_data = std::fs::metadata(&legacy).map(|m| m.len() > 0).unwrap_or(false);
+        let target_free = std::fs::metadata(&db_path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
+        let legacy_has_data = std::fs::metadata(&legacy)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
         if target_free && legacy_has_data {
             migrate_legacy_db(&legacy, &db_path);
         }
@@ -86,8 +90,10 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) {
                 tmp_side.push(suffix);
                 let mut dst_side = db_path.as_os_str().to_os_string();
                 dst_side.push(suffix);
-                let (tmp_side, dst_side) =
-                    (std::path::PathBuf::from(tmp_side), std::path::PathBuf::from(dst_side));
+                let (tmp_side, dst_side) = (
+                    std::path::PathBuf::from(tmp_side),
+                    std::path::PathBuf::from(dst_side),
+                );
                 std::fs::copy(&side, &tmp_side)?;
                 staged.push((tmp_side, dst_side));
             }
@@ -150,6 +156,12 @@ const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:39418";
 /// local service.
 const SINGLE_INSTANCE_ACK: u8 = b'k';
 
+/// The app handle for the instance ack thread, set during setup. The thread
+/// starts before the builder runs, when no handle exists yet, so a poke
+/// arriving during early startup is acknowledged but cannot raise the
+/// window. The next poke, or any poke after setup, can.
+static INSTANCE_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
 /// Ask the holder of the single instance port whether it is Kurisu.
 /// True only when it answers with the ack byte. A connect failure, a
 /// garbage reply, or a holder that accepts but never answers within two
@@ -169,8 +181,10 @@ pub fn run() {
     // Logger for the log facade calls, playback tick diagnostics. Our
     // crate at debug, deps at info. Override with RUST_LOG. Stderr lands
     // in the systemd user journal on most desktops.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("kurisu_lib=debug,info"))
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("kurisu_lib=debug,info"),
+    )
+    .init();
 
     // WebKit2GTK's DMA-BUF renderer crashes in Mesa/GBM teardown on exit
     // on many Wayland setups. SIGSEGV in dri_gbm.so during process exit.
@@ -214,6 +228,35 @@ pub fn run() {
             None
         }
     };
+
+    // Answer pokes from the moment the port is bound, BEFORE the database
+    // open, legacy migration, matcher build and tray setup that follow.
+    // The ack thread used to spawn at the end of setup, and a second launch
+    // inside that slow startup window got its 2s poke timeout, decided the
+    // holder was not Kurisu, and started anyway. Two processes then shared
+    // one SQLite file with separate state, or opened it mid migration copy.
+    // The window raise needs the app handle, which does not exist yet, so
+    // it goes through INSTANCE_HANDLE and simply no-ops until setup runs.
+    if let Some(guard) = instance_guard {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            for stream in guard.incoming() {
+                // The ack tells the other launch that a Kurisu
+                // holds this port. The connection itself is
+                // still the whole message.
+                if let Ok(mut stream) = stream {
+                    let _ = stream.write_all(&[SINGLE_INSTANCE_ACK]);
+                }
+                if let Some(handle) = INSTANCE_HANDLE.get() {
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+            }
+        });
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -275,6 +318,12 @@ pub fn run() {
             if let Err(e) = updater::init_install_path() {
                 log::warn!("updater: {e}");
             }
+            // Hand the handle to the instance ack thread and to the write
+            // paths that emit kurisu://auth-expired when a session dies.
+            INSTANCE_HANDLE
+                .set(app.handle().clone())
+                .expect("instance handle set once");
+            commands::set_app_handle(app.handle().clone());
 
             let db = match open_database(app) {
                 Ok(db) => db,
@@ -303,66 +352,79 @@ pub fn run() {
             let matchers = recognize::build_matchers(&db);
             app.manage(AppState {
                 anilist: Mutex::new(anilist),
-                db,
+                db: std::sync::Arc::new(db),
                 user: Mutex::new(None),
                 entry_lock: tokio::sync::Mutex::new(()),
                 matchers: Mutex::new(Arc::new(matchers)),
             });
 
-            let show = MenuItem::with_id(app, "show", "Show Kurisu", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            // Tray is best effort. A missing icon or a failed build used to
+            // abort startup through setup's `?`, and the panic only reached
+            // a console nobody watches, especially on Windows. The app still
+            // runs without it, the window close button just quits.
+            let tray_result: Result<(), String> = (|| {
+                let icon = app
+                    .default_window_icon()
+                    .cloned()
+                    .ok_or_else(|| "default window icon missing".to_string())?;
+                let show = MenuItem::with_id(app, "show", "Show Kurisu", true, None::<&str>)
+                    .map_err(|e| e.to_string())?;
+                let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)
+                    .map_err(|e| e.to_string())?;
+                let menu = Menu::with_items(app, &[&show, &quit]).map_err(|e| e.to_string())?;
 
-            let _tray = TrayIconBuilder::with_id("main")
-                .icon(
-                    app.default_window_icon()
-                        .cloned()
-                        .expect("default window icon missing"),
-                )
-                .tooltip("Kurisu")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            // unminimize FIRST. show() does not de-iconify,
-                            // and set_focus() is a no-op on a minimized
-                            // window, so a window minimized to the taskbar
-                            // could not be brought back from the tray at all.
-                            let _ = w.unminimize();
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    // Left click toggles the window. Right click opens the menu.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            // A minimized window is still "visible" to Tauri,
-                            // so toggling one used to HIDE it to the tray
-                            // instead of restoring it. The click appeared to
-                            // do nothing.
-                            let minimized = w.is_minimized().unwrap_or(false);
-                            if w.is_visible().unwrap_or(false) && !minimized {
-                                let _ = w.hide();
-                            } else {
+                let _tray = TrayIconBuilder::with_id("main")
+                    .icon(icon)
+                    .tooltip("Kurisu")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                // unminimize FIRST. show() does not de-iconify,
+                                // and set_focus() is a no-op on a minimized
+                                // window, so a window minimized to the taskbar
+                                // could not be brought back from the tray at all.
                                 let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
                             }
                         }
-                    }
-                })
-                .build(app)?;
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        // Left click toggles the window. Right click opens the menu.
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                // A minimized window is still "visible" to Tauri,
+                                // so toggling one used to HIDE it to the tray
+                                // instead of restoring it. The click appeared to
+                                // do nothing.
+                                let minimized = w.is_minimized().unwrap_or(false);
+                                if w.is_visible().unwrap_or(false) && !minimized {
+                                    let _ = w.hide();
+                                } else {
+                                    let _ = w.unminimize();
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                        }
+                    })
+                    .build(app)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })();
+            if let Err(e) = tray_result {
+                log::warn!("tray unavailable, continuing without it: {e}");
+            }
 
             // The window close button quits by default, this being the
             // only window, closing ends the app. The Settings toggle,
@@ -383,32 +445,6 @@ pub fn run() {
                         if close_to_tray {
                             api.prevent_close();
                             let _ = w.hide();
-                        }
-                    }
-                });
-            }
-
-            // Hold the single instance listener for the process lifetime
-            // and answer later launches by raising this window. The OS
-            // drops the binding when the process dies, so there is no
-            // stale state to clear. When the port was held by something
-            // that is not Kurisu there is no guard to hold and no
-            // thread to spawn.
-            if let Some(guard) = instance_guard {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    use std::io::Write;
-                    for stream in guard.incoming() {
-                        // The ack tells the other launch that a Kurisu
-                        // holds this port. The connection itself is
-                        // still the whole message.
-                        if let Ok(mut stream) = stream {
-                            let _ = stream.write_all(&[SINGLE_INSTANCE_ACK]);
-                        }
-                        if let Some(w) = handle.get_webview_window("main") {
-                            let _ = w.unminimize();
-                            let _ = w.show();
-                            let _ = w.set_focus();
                         }
                     }
                 });
@@ -514,7 +550,8 @@ mod tests {
     use super::migrate_legacy_db;
 
     fn test_dirs(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-        let base = std::env::temp_dir().join(format!("kurisu-migrate-{name}-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("kurisu-migrate-{name}-{}", std::process::id()));
         let legacy_dir = base.join("legacy");
         let dest_dir = base.join("dest");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -541,8 +578,14 @@ mod tests {
         migrate_legacy_db(&legacy, &db_path);
 
         assert_eq!(std::fs::read(&db_path).unwrap(), b"legacy data");
-        assert_eq!(std::fs::read(dest_dir.join("kurisu.db-wal")).unwrap(), b"legacy wal");
-        assert_eq!(std::fs::read(dest_dir.join("kurisu.db-shm")).unwrap(), b"legacy shm");
+        assert_eq!(
+            std::fs::read(dest_dir.join("kurisu.db-wal")).unwrap(),
+            b"legacy wal"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.join("kurisu.db-shm")).unwrap(),
+            b"legacy shm"
+        );
         assert!(!dest_dir.join(".kurisu-migrate.tmp").exists());
         std::fs::remove_dir_all(&base).ok();
     }

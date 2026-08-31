@@ -28,3 +28,5 @@ Thumbs.db
 # internal working notes (not user-facing)
 project-status.md
 .claude/
+# security and code audits stay local, never published
+audit-*.md

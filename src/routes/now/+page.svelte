@@ -18,6 +18,9 @@
 
   // Idle state continue watching. The user's CURRENT entries.
   let current = $state<ListEntry[]>([]);
+  // Set when reading them failed, so the section says so instead of
+  // rendering as "watching nothing".
+  let currentError = $state("");
 
   const np = $derived(nowPlaying());
   const pct = $derived(
@@ -69,8 +72,11 @@
     try {
       const all = await api.localEntries();
       current = all.filter((e) => e.status === "CURRENT");
-    } catch {
+      currentError = "";
+    } catch (e) {
       current = [];
+      // A failed read used to look exactly like "you are watching nothing".
+      currentError = String(e);
     }
   }
 
@@ -267,7 +273,9 @@
       </div>
     {/if}
 
-    {#if current.length > 0}
+    {#if currentError}
+      <p class="text-sm text-amber-400">{currentError}</p>
+    {:else if current.length > 0}
       <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Continue watching</h2>
       <div class="grid grid-cols-1 gap-2">
         {#each current as e (e.media_id)}
