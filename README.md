@@ -19,7 +19,7 @@ Kurisu is an anime tracker inspired by [Taiga](https://taiga.moe), built in Rust
 - **Playback tracking** - detects playback, matches the title against your list, and prompts or auto-updates progress to the detected episode. Any MPRIS2 player on Linux, GSMTC on Windows, and bare MPV through its IPC socket.
 - **Notifications** - your AniList inbox, mirroring anilist.co/notifications.
 - **Desktop integration** - custom dark title bar, system tray, borderless window with edge/corner resize.
-- **Self-update** - CI builds check the rolling GitHub release on startup (Settings → Updates, on by default) and install in place on Linux and Windows. Builds are verified against a SHA-256 sidecar before anything is run. Locally compiled builds don't auto-check, so developing never nags.
+- **Self-update** - checks the rolling GitHub release on startup (Settings → Updates, on by default) and installs in place on Linux and Windows. Builds are verified against a SHA-256 sidecar before anything is run. Release builds compiled from source auto-check too; only debug builds stay quiet, so developing never nags.
 
 ## MPV
 
