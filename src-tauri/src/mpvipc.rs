@@ -28,8 +28,8 @@ const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 /// reader thread is abandoned when the deadline hits. Retrying on every 5s
 /// tick would leak one thread per tick against a wedged pipe.
 #[cfg(windows)]
-static POISONED_PIPES: parking_lot::Mutex<std::collections::HashSet<String>> =
-    parking_lot::Mutex::new(std::collections::HashSet::new());
+static POISONED_PIPES: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 /// Per read and write cap so a wedged mpv can't stall the tick. The
 /// whole round trip is a few small lines, anything slower than this is
