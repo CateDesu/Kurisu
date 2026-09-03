@@ -29,7 +29,8 @@ export const api = {
     promptSeconds: number,
     autoPercent: number,
     autoAsk: boolean,
-    mpvIpcSocket: string
+    mpvIpcSocket: string,
+    discordEnabled: boolean
   ) =>
     invoke<TrackingConfig>("set_tracking_config", {
       mode,
@@ -37,6 +38,7 @@ export const api = {
       autoPercent,
       autoAsk,
       mpvIpcSocket,
+      discordEnabled,
     }),
 
   getAppSetting: (key: string) =>

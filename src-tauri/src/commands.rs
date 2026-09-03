@@ -116,7 +116,8 @@ fn write_err(state: &AppState, e: &anyhow::Error) -> String {
 /// Mode defaults to `off` since tracking edits the live AniList list. `auto_ask`
 /// is independent of mode. When on, the watcher jumps to Currently Watching and
 /// asks to update after a few seconds of playback. This is the main detection
-/// surface.
+/// surface. `discord_enabled` is independent of mode too. It only announces the
+/// detected episode as Discord Rich Presence and never touches the list.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackingConfig {
     pub mode: String,        // "off" | "prompt" | "auto"
@@ -127,6 +128,8 @@ pub struct TrackingConfig {
     /// known defaults. Bare mpv never registers with the OS media session
     /// so the watcher reads the socket directly.
     pub mpv_ipc_socket: String,
+    /// Show the detected episode as Discord Rich Presence.
+    pub discord_enabled: bool,
 }
 
 impl Default for TrackingConfig {
@@ -137,6 +140,7 @@ impl Default for TrackingConfig {
             auto_percent: 80,
             auto_ask: true,
             mpv_ipc_socket: String::new(),
+            discord_enabled: true,
         }
     }
 }
@@ -146,6 +150,7 @@ const TRACKING_PROMPT_KEY: &str = "tracking_prompt_seconds";
 const TRACKING_AUTO_KEY: &str = "tracking_auto_percent";
 const TRACKING_AUTO_ASK_KEY: &str = "tracking_auto_ask";
 const TRACKING_MPV_SOCKET_KEY: &str = "tracking_mpv_socket";
+const TRACKING_DISCORD_KEY: &str = "tracking_discord";
 
 impl TrackingConfig {
     pub fn load(db: &Db) -> Self {
@@ -157,6 +162,7 @@ impl TrackingConfig {
             TRACKING_AUTO_KEY,
             TRACKING_AUTO_ASK_KEY,
             TRACKING_MPV_SOCKET_KEY,
+            TRACKING_DISCORD_KEY,
         ]) {
             Ok(kv) => kv,
             // Surface the failure instead of silently degrading to defaults.
@@ -189,12 +195,19 @@ impl TrackingConfig {
             .map(|s| s != "0")
             .unwrap_or(true);
         let mpv_ipc_socket = kv.get(TRACKING_MPV_SOCKET_KEY).cloned().unwrap_or_default();
+        // Discord presence defaults ON like auto_ask. Only "0" turns it off,
+        // so existing installs pick it up without a migration.
+        let discord_enabled = kv
+            .get(TRACKING_DISCORD_KEY)
+            .map(|s| s != "0")
+            .unwrap_or(true);
         Self {
             mode,
             prompt_seconds,
             auto_percent,
             auto_ask,
             mpv_ipc_socket,
+            discord_enabled,
         }
     }
 
@@ -207,6 +220,7 @@ impl TrackingConfig {
             (TRACKING_AUTO_KEY, &self.auto_percent.to_string()),
             (TRACKING_AUTO_ASK_KEY, if self.auto_ask { "1" } else { "0" }),
             (TRACKING_MPV_SOCKET_KEY, self.mpv_ipc_socket.trim()),
+            (TRACKING_DISCORD_KEY, if self.discord_enabled { "1" } else { "0" }),
         ])
         .map_err(|e| e.to_string())
     }
@@ -289,6 +303,7 @@ pub fn set_tracking_config(
     auto_percent: u64,
     auto_ask: bool,
     mpv_ipc_socket: String,
+    discord_enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<TrackingConfig, String> {
     let normalized_mode = match mode.as_str() {
@@ -304,6 +319,7 @@ pub fn set_tracking_config(
         auto_percent: auto_percent.clamp(1, 100),
         auto_ask,
         mpv_ipc_socket,
+        discord_enabled,
     };
     cfg.save(&state.db)?;
     Ok(cfg)

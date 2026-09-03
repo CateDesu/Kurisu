@@ -5,7 +5,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
 
-  let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80, auto_ask: true, mpv_ipc_socket: "" });
+  let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80, auto_ask: true, mpv_ipc_socket: "", discord_enabled: true });
   let trackingLoaded = $state(false);
   let trackingSaving = $state(false);
   let trackingSavedAt = $state(0);
@@ -80,18 +80,20 @@
       // Same 512 char cap as set_tracking_config, so the guard below compares
       // against what the backend will actually persist.
       mpv_ipc_socket: cfg.mpv_ipc_socket.trim().slice(0, 512),
+      discord_enabled: cfg.discord_enabled,
     };
     // Reflect the normalized values so the field shows what was saved.
     cfg.prompt_seconds = snap.prompt_seconds;
     cfg.auto_percent = snap.auto_percent;
     try {
-      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent, snap.auto_ask, snap.mpv_ipc_socket);
+      const saved = await api.setTrackingConfig(snap.mode, snap.prompt_seconds, snap.auto_percent, snap.auto_ask, snap.mpv_ipc_socket, snap.discord_enabled);
       if (
         cfg.mode === snap.mode &&
         cfg.prompt_seconds === snap.prompt_seconds &&
         cfg.auto_percent === snap.auto_percent &&
         cfg.auto_ask === snap.auto_ask &&
-        cfg.mpv_ipc_socket.trim() === snap.mpv_ipc_socket
+        cfg.mpv_ipc_socket.trim() === snap.mpv_ipc_socket &&
+        cfg.discord_enabled === snap.discord_enabled
       ) {
         cfg = saved;
       }
@@ -243,6 +245,22 @@
         <span class="block text-xs text-ink-dim mt-0.5">
           On by default. When a show on your list is detected, Kurisu switches to the
           detection tab and prompts you — harder to miss than the banner alone.
+        </span>
+      </span>
+    </label>
+    <label class="flex items-start gap-2 text-sm cursor-pointer mb-4">
+      <input
+        type="checkbox"
+        bind:checked={cfg.discord_enabled}
+        onchange={() => (trackingSavedAt = 0)}
+        class="accent-accent mt-0.5"
+      />
+      <span>
+        Show what I'm watching as my Discord status
+        <span class="block text-xs text-ink-dim mt-0.5">
+          Rich Presence. Announces the matched show and episode with the time left
+          while it plays, and clears when playback stops. Works in every tracking
+          mode, including Off, and needs the Discord desktop app running.
         </span>
       </span>
     </label>

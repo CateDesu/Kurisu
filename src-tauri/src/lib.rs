@@ -5,6 +5,7 @@
 mod anilist;
 mod commands;
 mod db;
+mod discord;
 mod library;
 mod models;
 mod mpvipc;

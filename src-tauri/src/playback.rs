@@ -10,7 +10,9 @@
 //! on every OS.
 //!
 //! Feedback is in-app only. We emit Tauri events for a Now Playing banner
-//! and a prompt modal. No desktop or tray notifications, by request.
+//! and a prompt modal. No desktop or tray notifications, by request. The
+//! one external surface is Discord Rich Presence, driven from the tick and
+//! toggled in Settings.
 //!
 //! Media session calls are blocking round trips on D-Bus and WinRT, so each
 //! tick's reads happen inside a spawn_blocking task. The accumulated play
@@ -24,6 +26,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::{self, AppState, TrackingConfig};
+use crate::discord;
 use crate::mpvipc;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
 use crate::recognize::basename;
@@ -331,6 +334,10 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         if active.is_some() {
             let _ = app.emit("kurisu://now-playing", idle());
             *active = None;
+            // A track was active, so Discord may still show it. Clear the
+            // presence. Skipped when nothing ever played since the manager
+            // starts empty and there is nothing to clear.
+            let _ = tokio::task::spawn_blocking(|| discord::update(None)).await;
         }
         return Ok(());
     };
@@ -376,6 +383,45 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     track.was_playing = info.playing;
     track.last_tick = Instant::now();
 
+    let cfg = read_config(app);
+
+    // Discord Rich Presence follows detection alone, never the tracking
+    // mode. Announces matched shows in every mode including off, and
+    // clears on unmatched playback or when the toggle is off. The entry
+    // read fetches the cover and episode total from the media cache. It
+    // runs before the tracking arms since presence does not need a parsed
+    // episode. Socket I/O stays off the async runtime, and a panic in the
+    // presence code must not take tracking down with it, hence the
+    // discarded JoinError.
+    let desired = if cfg.discord_enabled {
+        match (info.matched_title.as_ref(), info.media_id) {
+            (Some(title), Some(media_id)) => {
+                let (cover_url, total_episodes) = app
+                    .state::<AppState>()
+                    .db
+                    .get_entry(media_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.media)
+                    .map(|m| (m.cover_large.or(m.cover_medium), m.episodes))
+                    .unwrap_or_default();
+                Some(discord::PresenceInfo {
+                    title: title.clone(),
+                    episode: info.episode,
+                    playing: info.playing,
+                    length_us: info.length_us,
+                    position_us: info.position_us,
+                    cover_url,
+                    total_episodes,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let _ = tokio::task::spawn_blocking(move || discord::update(desired)).await;
+
     // Tracking only applies once we've matched a list entry and parsed an episode.
     let Some(media_id) = info.media_id else {
         return Ok(());
@@ -391,8 +437,6 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         .flatten()
         .map(|e| e.progress)
         .unwrap_or(0);
-
-    let cfg = read_config(app);
 
     // Auto ask. Independent of mode. After a few seconds of actual playback of
     // a matched episode that's ahead of progress, switch the UI to Currently
