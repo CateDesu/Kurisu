@@ -301,6 +301,7 @@ pub fn run() {
             commands::remove_rss_feed,
             commands::fetch_torrents,
             commands::mark_torrents_seen,
+            commands::search_torrents,
             commands::get_user_stats,
             commands::check_update,
             commands::install_update,

@@ -12,7 +12,7 @@ Kurisu is an anime tracker inspired by [Taiga](https://taiga.moe), built in Rust
 - **My List** - grouped by status, −/+ episode stepper that auto-commits, "next episode airs" countdowns, in-place edit dialog, text filter and sorting (title / score / progress / last updated / next airing).
 - **Detail pages** - native anime pages with banner, genres, description, your entry controls, related anime, characters and staff, and recommendations. Covers and titles link to them everywhere.
 - **Airing calendar** - the week's airing schedule grouped by day, for your shows or everything.
-- **Torrent feeds** - watch nyaa-style RSS feeds; releases are matched against your list, new episodes past your progress get flagged, open as magnet or .torrent.
+- **Torrent feeds** - watch nyaa-style RSS feeds; releases are matched against your list, new episodes past your progress get flagged, open as magnet or .torrent. A built-in nyaa search finds anything else and opens it in your torrent client.
 - **Stats** - your AniList profile statistics: time watched, score distribution, genres, formats, release years.
 - **Library scan** - point it at your anime folders; files are matched against your list, watched state follows your progress, play the next episode directly. Unmatched files can be linked to a show by hand (per file or whole folder).
 - **Seasons + recommendations** - browse any AniList season; the edit dialog shows community recommendations.

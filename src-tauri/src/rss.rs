@@ -265,6 +265,18 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     })
 }
 
+/// Search nyaa for arbitrary torrents, any anime subcategory. A nyaa search
+/// page doubles as a feed when page=rss is set, so this rides the same fetch
+/// and parse path as the configured feeds. The host is fixed and only the
+/// query text is user input, so none of the feed URL validation applies.
+pub async fn search(query: &str) -> Result<Vec<RawItem>> {
+    let url = format!(
+        "https://nyaa.si/?page=rss&c=1_0&f=0&q={}",
+        crate::anilist::urlencoding::encode(query)
+    );
+    Ok(fetch_all(&[url]).await?.items)
+}
+
 /// parse_rss plus the early stop reason when the document was malformed.
 pub(crate) struct ParsedFeed {
     pub items: Vec<RawItem>,

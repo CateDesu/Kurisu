@@ -39,7 +39,6 @@
     else next.add(mediaId);
     expanded = next;
   }
-  let marking = $state(false);
   let error = $state("");
   let loaded = $state(false);
 
@@ -104,20 +103,25 @@
     items = items.map((t) => (guids.has(t.guid) ? { ...t, seen: true, is_new: false } : t));
   }
 
-  async function openItem(t: TorrentItem, url: string) {
+  async function openLink(url: string): Promise<boolean> {
     // Only http, https and magnet reach the OS handler. A crafted feed
     // could publish file, data or a custom protocol in the link tag.
     const scheme = url.split(":")[0]?.toLowerCase().trim();
     if (scheme !== "http" && scheme !== "https" && scheme !== "magnet") {
       error = `Refused to open link with scheme "${scheme}:"`;
-      return;
+      return false;
     }
     try {
       await openUrl(url);
+      return true;
     } catch (e) {
       error = `Could not open ${url.startsWith("magnet:") ? "magnet link" : "link"}: ${String(e)}`;
-      return;
+      return false;
     }
+  }
+
+  async function openItem(t: TorrentItem, url: string) {
+    if (!(await openLink(url))) return;
     // Opening a torrent counts as acting on it. Clear NEW state.
     try {
       await api.markTorrentsSeen([t.guid]);
@@ -127,20 +131,28 @@
     }
   }
 
-  async function markAllSeen() {
-    // The badge counts every item, so collect from items. groups skips
-    // whatever the filter hid, and those would keep the badge stuck.
-    const guids = items.filter((t) => !t.seen).map((t) => t.guid);
-    if (guids.length === 0) return;
-    marking = true;
+  let searchQ = $state("");
+  let searching = $state(false);
+  let searched = $state(false);
+  let results = $state<TorrentItem[]>([]);
+
+  // Overlapping searches resolve latest wins.
+  let searchId = 0;
+  async function search() {
+    const query = searchQ.trim();
+    if (!query) return;
+    const id = ++searchId;
+    searching = true;
     error = "";
     try {
-      await api.markTorrentsSeen(guids);
-      markLocal(new Set(guids));
+      const found = await api.searchTorrents(query);
+      if (id !== searchId) return;
+      results = found;
+      searched = true;
     } catch (e) {
-      error = String(e);
+      if (id === searchId) error = String(e);
     } finally {
-      marking = false;
+      if (id === searchId) searching = false;
     }
   }
 
@@ -224,14 +236,6 @@
         </button>
       </div>
       <button
-        onclick={markAllSeen}
-        disabled={marking || newCount === 0}
-        class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
-        title="Mark every listed item as seen"
-      >
-        {marking ? "Marking…" : "Mark all seen"}
-      </button>
-      <button
         onclick={load}
         disabled={loading}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50 flex items-center gap-1.5"
@@ -294,6 +298,74 @@
           + Add feed
         </button>
       </form>
+    </div>
+
+    <!-- Free search, not limited to the feeds or the list. The magnet and
+         torrent links hand off to the OS handler, which opens the torrent
+         client. -->
+    <div class="mb-5">
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Search</h2>
+      <form
+        onsubmit={(e) => {
+          e.preventDefault();
+          search();
+        }}
+        class="flex gap-2"
+      >
+        <input
+          bind:value={searchQ}
+          placeholder="Search nyaa for any torrent…"
+          class="flex-1 bg-panel border border-edge rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-accent"
+        />
+        <button
+          class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+          type="submit"
+          disabled={searching}
+        >
+          {searching ? "Searching…" : "Search"}
+        </button>
+      </form>
+      {#if searched}
+        {#if results.length === 0}
+          <div class="text-sm text-ink-dim mt-2">No results.</div>
+        {:else}
+          <div class="mt-2 bg-panel border border-edge rounded-lg divide-y divide-edge/60 overflow-hidden">
+            {#each results as t (t.guid)}
+              <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
+                <span class="flex-1 min-w-0 truncate" title={t.title}>{t.title}</span>
+                {#if t.size}
+                  <span class="shrink-0 text-xs text-ink-dim">{t.size}</span>
+                {/if}
+                {#if t.seeders != null}
+                  <span class="shrink-0 text-xs text-accent/80 tabular-nums" title="Seeders">↑{t.seeders}</span>
+                {/if}
+                {#if t.leechers != null}
+                  <span class="shrink-0 text-xs text-ink-dim tabular-nums" title="Leechers">↓{t.leechers}</span>
+                {/if}
+                {#if t.published}
+                  <span class="shrink-0 text-xs text-ink-dim/70 w-10 text-right">{timeAgo(t.published)}</span>
+                {/if}
+                {#if t.magnet}
+                  <button
+                    onclick={() => openLink(t.magnet ?? t.link)}
+                    title="Open magnet in your torrent client"
+                    class="text-ink-dim hover:text-accent px-1 grid place-items-center"
+                  >
+                    <Icon name="magnet" size={14} />
+                  </button>
+                {/if}
+                <button
+                  onclick={() => openLink(t.link)}
+                  title="Download .torrent"
+                  class="text-ink-dim hover:text-ink px-1 grid place-items-center"
+                >
+                  <Icon name="download" size={14} />
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
     </div>
 
     {#if loading && !loaded}

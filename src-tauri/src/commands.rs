@@ -1428,6 +1428,36 @@ pub fn mark_torrents_seen(guids: Vec<String>, state: State<'_, AppState>) -> Res
     state.db.mark_rss_seen(&guids).map_err(|e| e.to_string())
 }
 
+/// nyaa search for arbitrary torrents, list match or not. Results are not
+/// run through the recognizer and carry no seen state. They exist to be
+/// opened in the torrent client.
+#[tauri::command]
+pub async fn search_torrents(query: String) -> Result<Vec<TorrentItem>, String> {
+    let query = query.trim().to_string();
+    if query.is_empty() || query.chars().count() > 200 {
+        return Err("empty or overlong search query".to_string());
+    }
+    let raw = rss::search(&query).await.map_err(|e| e.to_string())?;
+    Ok(raw
+        .into_iter()
+        .map(|r| TorrentItem {
+            magnet: r.info_hash.as_deref().map(|h| rss::magnet_for(h, &r.title)),
+            title: r.title,
+            link: r.link,
+            guid: r.guid,
+            size: r.size,
+            seeders: r.seeders,
+            leechers: r.leechers,
+            published: r.published,
+            media_id: None,
+            matched: None,
+            episode: None,
+            is_new: false,
+            seen: false,
+        })
+        .collect())
+}
+
 // ───────────────────────────── stats M6 ─────────────────────────────
 
 /// AniList's server-side profile statistics for the signed-in user.

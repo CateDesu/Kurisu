@@ -100,6 +100,8 @@ export const api = {
   fetchTorrents: () => invoke<TorrentFetch>("fetch_torrents"),
   markTorrentsSeen: (guids: string[]) =>
     invoke<void>("mark_torrents_seen", { guids }),
+  searchTorrents: (query: string) =>
+    invoke<TorrentItem[]>("search_torrents", { query }),
 
   getUserStats: () => invoke<UserStats>("get_user_stats"),
 

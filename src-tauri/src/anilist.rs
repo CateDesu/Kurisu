@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -125,12 +126,23 @@ pub struct SavedEntry {
     pub repeat: Option<i64>,
 }
 
+/// Last rate window AniList reported. Every response carries
+/// X-RateLimit-Remaining and X-RateLimit-Reset, 429s included, and clones
+/// of this client share one budget, so a wall one command ran into
+/// throttles the whole process instead of just itself.
+#[derive(Default)]
+struct RateBudget {
+    remaining: Option<u64>,
+    reset_at: Option<i64>,
+}
+
 /// reqwest::Client is cheap to clone, Arc backed. Cloning AniList lets us
 /// drop the lock before any .await. Tauri futures must be Send.
 #[derive(Clone)]
 pub struct AniList {
     http: reqwest::Client,
     token: Option<String>,
+    rate: Arc<Mutex<RateBudget>>,
 }
 
 impl AniList {
@@ -140,7 +152,11 @@ impl AniList {
             .timeout(Duration::from_secs(20))
             .build()
             .expect("reqwest client");
-        AniList { http, token: None }
+        AniList {
+            http,
+            token: None,
+            rate: Arc::new(Mutex::new(RateBudget::default())),
+        }
     }
     pub fn set_token(&mut self, t: Option<String>) {
         self.token = t;
@@ -154,6 +170,55 @@ impl AniList {
         self.token.clone()
     }
 
+    /// Record the rate headers every AniList response carries, 429s
+    /// included, so the next request can wait out an exhausted window
+    /// instead of firing into it.
+    fn note_rate_headers(&self, h: &reqwest::header::HeaderMap) {
+        let remaining = h
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let reset_at = h
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok());
+        if remaining.is_none() && reset_at.is_none() {
+            return;
+        }
+        let mut b = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = remaining {
+            b.remaining = Some(r);
+        }
+        if let Some(t) = reset_at {
+            b.reset_at = Some(t);
+        }
+    }
+
+    /// Sleep out the rest of an exhausted rate window before sending. The
+    /// alternative is firing into a known 429 and paying the penalty
+    /// anyway. Capped like the reactive retry: a reset far in the future
+    /// is reported, not slept through.
+    async fn wait_for_budget(&self) {
+        let (remaining, reset_at) = {
+            let b = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+            (b.remaining, b.reset_at)
+        };
+        if remaining != Some(0) {
+            return;
+        }
+        let Some(reset) = reset_at else { return };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let wait = reset - now + 1;
+        if wait <= 0 || wait > 65 {
+            return;
+        }
+        log::info!("AniList rate window exhausted, waiting {wait}s for the reset");
+        tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+    }
+
     async fn gql<T: for<'de> serde::Deserialize<'de>>(
         &self,
         query: &str,
@@ -165,6 +230,7 @@ impl AniList {
             .ok_or_else(|| anyhow!("not authenticated"))?;
         let payload = serde_json::json!({ "query": query, "variables": vars });
         let mut retries = 0;
+        self.wait_for_budget().await;
         // AniList error envelope: { "errors": [ { "message": "..." } ] }
         let (status, body) = loop {
             let resp = self
@@ -177,11 +243,13 @@ impl AniList {
                 .send()
                 .await?;
             let status = resp.status();
+            self.note_rate_headers(resp.headers());
             // Rate limited. Honor Retry-After and retry, bounded. Do not
-            // fail the whole operation on a transient 429. A wait longer
-            // than 30s means both bounded retries would burn themselves on
-            // a doomed schedule, so fail fast with the friendly message
-            // instead. The header is read before the body is consumed.
+            // fail the whole operation on a transient 429. The documented
+            // penalty is a one minute timeout and Retry-After names the
+            // exact second the window resets, so a wait up to 65s is worth
+            // sleeping through. Past that, fail fast with the friendly
+            // message. The header is read before the body is consumed.
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let wait = resp
                     .headers()
@@ -189,7 +257,7 @@ impl AniList {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(1);
-                if retries < 2 && wait <= 30 {
+                if retries < 2 && wait <= 65 {
                     retries += 1;
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                     continue;
@@ -313,13 +381,19 @@ impl AniList {
             page: Page,
         }
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Page {
             // The list and its items are both nullable in the schema. A
             // stray null must not fail the whole query.
             media: Option<Vec<Option<AniMedia>>>,
+            // Without the camelCase rename, serde looked for page_info and
+            // has_next_page, never matched AniList's pageInfo and
+            // hasNextPage, and both Options silently deserialized as None.
+            // Every walk then aborted on page 1 as a null hasNextPage.
             page_info: Option<PageInfo>,
         }
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct PageInfo {
             has_next_page: Option<bool>,
         }
@@ -354,8 +428,18 @@ impl AniList {
                 )
                 .await?;
             let media = r.page.media.unwrap_or_default();
+            let got = media.len();
             for m in media.into_iter().flatten() {
                 out.push(Media::from(m));
+            }
+            // An empty page past the first means AniList stopped returning
+            // entries while still claiming more pages. Its browse index is
+            // degraded and currently caps a season at the top 100 entries.
+            // Returning here would pass a truncated season off as complete.
+            if page > 1 && got == 0 {
+                anyhow::bail!(
+                    "AniList stopped returning entries partway through this season while claiming more pages; its API is degraded right now, try again later"
+                );
             }
             // A null hasNextPage is not "walk done". Breaking here would
             // hand back a truncated season as if it were complete. Abort
@@ -818,6 +902,7 @@ impl AniList {
                 )
                 .await?;
             let scheds = r.page.airing_schedules.unwrap_or_default();
+            let got = scheds.len();
             for s in scheds {
                 let Some(m) = s.media else { continue };
                 if m.is_adult == Some(true) {
@@ -828,6 +913,14 @@ impl AniList {
                     episode: s.episode,
                     media: m.media.into(),
                 });
+            }
+            // An empty page past the first means AniList stopped returning
+            // entries while still claiming more pages. Returning here would
+            // pass a truncated week off as complete.
+            if page > 1 && got == 0 {
+                anyhow::bail!(
+                    "AniList stopped returning entries partway through this week while claiming more pages; its API is degraded right now, try again later"
+                );
             }
             // A null hasNextPage is not "walk done". Breaking here would
             // hand back a truncated calendar as if it were complete. Abort
