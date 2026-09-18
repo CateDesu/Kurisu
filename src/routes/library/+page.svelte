@@ -6,6 +6,7 @@
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
   import { displayTitle, type LibraryFile, type ListEntry } from "$lib/types";
+  import Confirm from "$lib/Confirm.svelte";
   import Icon from "$lib/Icon.svelte";
   import LinkAnime from "$lib/LinkAnime.svelte";
   import Login from "$lib/Login.svelte";
@@ -20,6 +21,17 @@
   /// show with hundreds of episodes from burying the next series. Play
   /// button stays in the header either way.
   let expanded = $state<Set<number>>(new Set());
+  /// Show awaiting confirmation of manual link removal.
+  let unlinking = $state<Group | null>(null);
+  let unlinkBusy = $state(false);
+  /// Folder path awaiting removal confirmation.
+  let removingFolder = $state<string | null>(null);
+  /// Removals in flight by path. Guards the row button against a double fire.
+  let removing = $state<Set<string>>(new Set());
+  /// Stamp and file count from the last manual scan. Drives the flash next
+  /// to Rescan, cleared a few seconds later.
+  let scannedAt = $state(0);
+  let scannedCount = $state(0);
 
   function toggle(mediaId: number) {
     const next = new Set(expanded);
@@ -85,18 +97,34 @@
   }
 
   async function removeFolder(path: string) {
+    if (removing.has(path)) return;
     error = "";
+    removing = new Set(removing).add(path);
     try {
       await library.removeFolder(path);
     } catch (e) {
       error = String(e);
+    } finally {
+      const next = new Set(removing);
+      next.delete(path);
+      removing = next;
+      removingFolder = null;
     }
   }
 
   async function rescan() {
+    // With a scan already running, scan() only queues a follow up and
+    // returns at once. The flash would read the pre-scan file count.
+    if (library.scanning) return;
     error = "";
     try {
       await library.scan();
+      scannedCount = library.files.length;
+      const stamp = Date.now();
+      scannedAt = stamp;
+      setTimeout(() => {
+        if (scannedAt === stamp) scannedAt = 0;
+      }, 3000);
     } catch (e) {
       error = String(e);
     }
@@ -144,12 +172,17 @@
   }
 
   async function unlink(g: Group) {
+    if (unlinkBusy) return;
     error = "";
+    unlinkBusy = true;
     try {
       await api.unbindLibraryMedia(g.mediaId);
       await library.scan();
     } catch (e) {
       error = String(e);
+    } finally {
+      unlinkBusy = false;
+      unlinking = null;
     }
   }
 
@@ -166,6 +199,11 @@
   <div class="p-5 max-w-5xl mx-auto">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-xl font-semibold flex-1">Library</h1>
+      {#if scannedAt}
+        <span class="text-xs text-accent">
+          Scan finished · {scannedCount} file{scannedCount === 1 ? "" : "s"}
+        </span>
+      {/if}
       <button
         onclick={rescan}
         disabled={library.scanning || library.folders.length === 0}
@@ -212,9 +250,10 @@
             <div class="flex items-center gap-2 bg-panel border border-edge rounded-md px-3 py-1.5">
               <span class="text-sm truncate flex-1 font-mono">{folder}</span>
               <button
-                onclick={() => removeFolder(folder)}
+                onclick={() => (removingFolder = folder)}
+                disabled={removing.has(folder)}
                 title="Remove this folder"
-                class="text-ink-dim hover:text-red-400 px-1 grid place-items-center"
+                class="text-ink-dim hover:text-red-400 px-1 grid place-items-center disabled:opacity-50"
               >
                 <Icon name="x" size={14} />
               </button>
@@ -304,7 +343,7 @@
                 <button
                   onclick={(ev) => {
                     ev.stopPropagation();
-                    unlink(g);
+                    unlinking = g;
                   }}
                   title="Manually linked — click to remove the link"
                   class="text-ink-dim hover:text-red-400 px-1 grid place-items-center shrink-0"
@@ -411,6 +450,30 @@
       </div>
     {/if}
   </div>
+{/if}
+
+{#if unlinking}
+  {@const g = unlinking}
+  <Confirm
+    title={`Remove manual links for ${g.entry ? displayTitle(g.entry.media) : g.title}?`}
+    body="The recognizer will guess these files again on the next scan."
+    confirmLabel="Remove links"
+    busy={unlinkBusy}
+    onconfirm={() => unlink(g)}
+    oncancel={() => (unlinking = null)}
+  />
+{/if}
+
+{#if removingFolder}
+  {@const path = removingFolder}
+  <Confirm
+    title="Remove library folder?"
+    body={`${path} will no longer be scanned. The files stay on disk.`}
+    confirmLabel="Remove"
+    busy={removing.has(path)}
+    onconfirm={() => removeFolder(path)}
+    oncancel={() => (removingFolder = null)}
+  />
 {/if}
 
 {#if linking}

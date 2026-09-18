@@ -38,9 +38,19 @@
       ? "file"
       : (scopeChoice ?? (folderAllowed ? "folder" : "file"))
   );
+  const bindTarget = $derived(scope === "folder" ? dir : path);
+
   let q = $state("");
   let busy = $state<number | null>(null);
   let err = $state("");
+  // The binding already on the target, if any. Re-pointing one takes a
+  // second click so a path never silently moves to another show. Picks stay
+  // disabled until the lookup settles, or a fast click could bind over an
+  // existing link without the relink confirm.
+  let currentBinding = $state<number | null>(null);
+  let currentTitle = $state("");
+  let pendingRelink = $state<number | null>(null);
+  let bindingChecked = $state(false);
 
   // Watching first since those are the likely targets. Then the rest in title order.
   const STATUS_ORDER: Record<string, number> = {
@@ -76,12 +86,45 @@
   });
   const truncated = $derived(entries.length > candidates.length && candidates.length === MAX_ROWS);
 
+  $effect(() => {
+    const target = bindTarget;
+    currentBinding = null;
+    currentTitle = "";
+    pendingRelink = null;
+    bindingChecked = false;
+    let stale = false;
+    api
+      .getLibraryBinding(target)
+      .then(async (id) => {
+        if (stale || id === null) return;
+        currentBinding = id;
+        try {
+          const media = await api.getMedia(id);
+          if (!stale) currentTitle = displayTitle(media);
+        } catch {
+          // The title is cosmetic. The relink guard works off the id alone.
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!stale) bindingChecked = true;
+      });
+    return () => {
+      stale = true;
+    };
+  });
+
   async function pick(e: ListEntry) {
-    if (busy !== null) return;
+    if (busy !== null || !bindingChecked || e.media_id === currentBinding) return;
+    // Re-pointing an existing binding needs a second explicit click.
+    if (currentBinding !== null && pendingRelink !== e.media_id) {
+      pendingRelink = e.media_id;
+      return;
+    }
     busy = e.media_id;
     err = "";
     try {
-      await api.bindLibraryPath(scope === "folder" ? dir : path, e.media_id);
+      await api.bindLibraryPath(bindTarget, e.media_id);
       onlinked();
       onclose();
     } catch (ex) {
@@ -123,6 +166,16 @@
   >
     <h3 class="font-semibold mb-1">Link to a show on your list</h3>
     <p class="text-xs text-ink-dim font-mono truncate mb-3" title={path}>{fileName}</p>
+
+    {#if currentBinding !== null}
+      <div
+        class="text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md p-2 mb-3"
+      >
+        {scope === "folder" ? "This folder" : "This file"} is linked to
+        <span class="font-medium">{currentTitle || `show #${currentBinding}`}</span>. Picking a
+        different show relinks it.
+      </div>
+    {/if}
 
     {#if err}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-3">
@@ -169,7 +222,7 @@
           <button
             type="button"
             onclick={() => pick(e)}
-            disabled={busy !== null}
+            disabled={busy !== null || !bindingChecked || e.media_id === currentBinding}
             class="cv-row w-full text-left flex items-center gap-2.5 rounded-md p-1.5 hover:bg-panel-2/60 disabled:opacity-50"
           >
             {#if e.media?.cover_medium}
@@ -178,9 +231,15 @@
               <div class="w-8 h-11 bg-panel-2 rounded shrink-0"></div>
             {/if}
             <span class="flex-1 min-w-0 truncate text-sm">
-              {busy === e.media_id ? "Linking…" : displayTitle(e.media)}
+              {busy === e.media_id
+                ? "Linking…"
+                : pendingRelink === e.media_id
+                  ? `Relink to ${displayTitle(e.media)}`
+                  : displayTitle(e.media)}
             </span>
-            <span class="shrink-0 text-xs text-ink-dim">{STATUS_LABEL[e.status] ?? e.status}</span>
+            <span class="shrink-0 text-xs text-ink-dim">
+              {e.media_id === currentBinding ? "Linked" : (STATUS_LABEL[e.status] ?? e.status)}
+            </span>
           </button>
         {/each}
         {#if truncated}

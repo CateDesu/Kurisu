@@ -159,6 +159,21 @@
     }
     untrack(() => load(mediaId));
   });
+
+  $effect(() => {
+    if (auth.isLoggedIn) {
+      // The Play button reads files from the last scan, and nothing else on
+      // this route starts one. Same loadFolders plus scan guard as the Now
+      // page, with the catch so a backend failure is not an unhandled
+      // rejection.
+      library.loadFolders().then(() => {
+        // scanning too: hasScan only flips when a scan finishes, so without
+        // it a visit during the Now page's scan queues a duplicate walk.
+        if (library.folders.length > 0 && !library.hasScan && !library.scanning)
+          library.scan().catch((e) => console.error("library scan failed", e));
+      });
+    }
+  });
 </script>
 
 {#if !auth.isLoggedIn}

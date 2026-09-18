@@ -31,6 +31,7 @@
     displayTitle,
     scoreLabel,
     STATUS_LABEL,
+    timeAgo,
     type ListEntry,
   } from "$lib/types";
   import Login from "$lib/Login.svelte";
@@ -45,7 +46,6 @@
   let syncing = $state(false);
   let error = $state("");
   let stepError = $state("");
-  let filter = $state<string>("CURRENT");
   let editing = $state<ListEntry | null>(null);
 
   const statuses = ["CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"];
@@ -83,7 +83,23 @@
       return SORT_DEFAULT_DESC[key];
     }
   }
-  let q = $state("");
+  function readFilter(): string {
+    try {
+      const v = localStorage.getItem("kurisu.list.filter");
+      return v !== null && statuses.includes(v) ? v : "CURRENT";
+    } catch {
+      return "CURRENT";
+    }
+  }
+  function readQ(): string {
+    try {
+      return localStorage.getItem("kurisu.list.q") ?? "";
+    } catch {
+      return "";
+    }
+  }
+  let filter = $state(readFilter());
+  let q = $state(readQ());
   let sortKey = $state<SortKey>(readSort());
   let sortDesc = $state(readDesc(readSort()));
   function persistSort() {
@@ -102,6 +118,54 @@
     sortDesc = !sortDesc;
     persistSort();
   }
+  function persistFilter() {
+    try {
+      localStorage.setItem("kurisu.list.filter", filter);
+      localStorage.setItem("kurisu.list.q", q);
+    } catch {
+      // storage unavailable. Choice won't persist.
+    }
+  }
+  $effect(persistFilter);
+
+  // Last successful sync, ms epoch. Zero means never synced, so the
+  // freshness label stays hidden.
+  function readSyncedAt(): number {
+    try {
+      const v = Number(localStorage.getItem("kurisu.list.synced"));
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    } catch {
+      return 0;
+    }
+  }
+  function persistSyncedAt() {
+    try {
+      localStorage.setItem("kurisu.list.synced", String(syncedAt));
+    } catch {
+      // storage unavailable. Choice won't persist.
+    }
+  }
+  let syncedAt = $state(readSyncedAt());
+  let syncedFlash = $state(false);
+  let flashTimer: ReturnType<typeof setTimeout> | null = null;
+  function markSynced() {
+    // Stamp from the shared clock, not Date.now. The clock ticks on 30s
+    // intervals, so a wall stamp could sit ahead of it and stretch the
+    // "Synced just now" window.
+    syncedAt = nowMs();
+    persistSyncedAt();
+    syncedFlash = true;
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => {
+      syncedFlash = false;
+      flashTimer = null;
+    }, 3000);
+  }
+  const syncLabel = $derived.by(() => {
+    if (!syncedAt) return "";
+    const t = timeAgo(Math.floor(syncedAt / 1000));
+    return t === "just now" ? "Synced just now" : `Synced ${t} ago`;
+  });
 
   function matchesQuery(e: ListEntry, needle: string): boolean {
     const m = e.media;
@@ -169,6 +233,21 @@
       // previous account's rows with live steppers.
       const uid = auth.user?.id ?? null;
       const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
+      if (switched) {
+        // The persisted view state belongs to the previous account. A new
+        // account must not inherit its filter, its query text, or a
+        // freshness stamp its own list has not earned.
+        filter = "CURRENT";
+        q = "";
+        syncedAt = 0;
+        try {
+          localStorage.removeItem("kurisu.list.filter");
+          localStorage.removeItem("kurisu.list.q");
+          localStorage.removeItem("kurisu.list.synced");
+        } catch {
+          // storage unavailable. Nothing to clear.
+        }
+      }
       entries = switched ? [] : list;
       syncedFor = uid;
       // New session since the last auto sync: relogin, account switch, or
@@ -195,7 +274,10 @@
     error = "";
     try {
       const list = await api.syncMyList();
-      if (fromLoad === undefined || fromLoad === loadId) entries = list;
+      if (fromLoad === undefined || fromLoad === loadId) {
+        entries = list;
+        markSynced();
+      }
     } catch (e) {
       if (fromLoad === undefined || fromLoad === loadId) error = String(e);
     } finally {
@@ -264,6 +346,11 @@
       >
         {#if syncing}Syncing…{:else}<Icon name="refresh" size={14} /> Sync{/if}
       </button>
+      {#if syncedFlash}
+        <span class="text-xs text-accent">Synced ✓</span>
+      {:else if syncLabel}
+        <span class="text-xs text-ink-dim">{syncLabel}</span>
+      {/if}
     </div>
 
     {#if error}

@@ -2,6 +2,7 @@
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
+  import Confirm from "$lib/Confirm.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
 
@@ -15,6 +16,10 @@
 
   // Auto-update defaults on. Only an explicit 0 turns it off.
   let autoUpdate = $state(true);
+  // Set when a toggle save fails. Keyed on the setting so the banner lands in
+  // the section of the toggle that failed. Cleared on the next attempt.
+  let toggleError = $state("");
+  let toggleErrorKey = $state("");
   let update = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
   let updateError = $state("");
@@ -23,6 +28,9 @@
 
   let signingIn = $state(false);
   let signInErr = $state("");
+  // Logout clears the token and the cached list, so it asks first.
+  let confirmingLogout = $state(false);
+  let loggingOut = $state(false);
 
   const modes: Array<[TrackingConfig["mode"], string]> = [
     ["off", "Off — don't track playback"],
@@ -51,6 +59,27 @@
       signingIn = false;
     }
   }
+  async function doLogout() {
+    if (loggingOut) return;
+    loggingOut = true;
+    signInErr = "";
+    try {
+      await auth.logout();
+      confirmingLogout = false;
+    } catch (e) {
+      // A failed logout still drops the local session, so the page flips to
+      // the signed out branch where signInErr shows.
+      signInErr = String(e);
+      confirmingLogout = false;
+    } finally {
+      loggingOut = false;
+    }
+  }
+  // A forced logout, for example a rejected token, drops the user while the
+  // dialog is open. Don't leave it hanging over the signed-out UI.
+  $effect(() => {
+    if (!auth.user) confirmingLogout = false;
+  });
   async function saveTracking() {
     if (trackingSaving) return;
     trackingSaving = true;
@@ -105,22 +134,32 @@
     }
   }
   async function toggleCloseToTray() {
-    const prev = closeToTray;
+    // bind:checked flips the value before this handler runs, so the state
+    // before the click is the inverse.
+    const prev = !closeToTray;
+    toggleError = "";
+    toggleErrorKey = "";
     try {
       await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
     } catch (e) {
-      // bind:checked already flipped the checkbox. Without the revert it
-      // kept showing a state that was never persisted.
+      // Revert or the checkbox keeps showing a state that was never persisted.
       closeToTray = prev;
+      toggleError = String(e);
+      toggleErrorKey = "close_to_tray";
       console.error("failed to save close_to_tray", e);
     }
   }
   async function toggleAutoUpdate() {
-    const prev = autoUpdate;
+    // Same flip before the handler, see toggleCloseToTray.
+    const prev = !autoUpdate;
+    toggleError = "";
+    toggleErrorKey = "";
     try {
       await api.setAppSetting("auto_update", autoUpdate ? "1" : "0");
     } catch (e) {
       autoUpdate = prev;
+      toggleError = String(e);
+      toggleErrorKey = "auto_update";
       console.error("failed to save auto_update", e);
     }
   }
@@ -168,7 +207,7 @@
     {#if auth.user}
       <p class="text-sm mb-2">Signed in as <b>{auth.user.name}</b>.</p>
       <button
-        onclick={() => auth.logout().catch((e) => (signInErr = String(e)))}
+        onclick={() => (confirmingLogout = true)}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
       >
         Log out
@@ -312,6 +351,11 @@
       Off by default — the close button quits Kurisu outright. Turn this on to keep
       it running in the tray instead (Quit is always available in the tray menu).
     </p>
+    {#if toggleErrorKey === "close_to_tray"}
+      <p class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-2">
+        Couldn't save setting: {toggleError}
+      </p>
+    {/if}
   </section>
 
   <section class="pt-4 border-t border-edge">
@@ -328,6 +372,11 @@
     <p class="text-xs text-ink-dim mt-1 mb-3">
       On by default. Checks GitHub for a newer build and offers to install it.
     </p>
+    {#if toggleErrorKey === "auto_update"}
+      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-3">
+        Couldn't save setting: {toggleError}
+      </div>
+    {/if}
     <div class="flex items-center gap-2">
       <button
         onclick={checkForUpdate}
@@ -376,3 +425,14 @@
     {/if}
   </section>
 </div>
+
+{#if confirmingLogout}
+  <Confirm
+    title="Log out?"
+    body="Removes your token and clears the cached list. Everything syncs back on your next login."
+    confirmLabel="Log out"
+    busy={loggingOut}
+    onconfirm={doLogout}
+    oncancel={() => (confirmingLogout = false)}
+  />
+{/if}

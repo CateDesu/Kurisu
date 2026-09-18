@@ -10,6 +10,7 @@
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
   import Updater from "$lib/Updater.svelte";
+  import Confirm from "$lib/Confirm.svelte";
   import Icon from "$lib/Icon.svelte";
   import Img from "$lib/Img.svelte";
   let { children } = $props();
@@ -34,6 +35,30 @@
 
   // Set when the backend side of a logout fails. Shown in the sidebar.
   let logoutErr = $state("");
+  // Logout clears the token and the cached list, so it asks first.
+  let confirmingLogout = $state(false);
+  let loggingOut = $state(false);
+
+  // A forced logout, for example a rejected token, drops the user while the
+  // dialog is open. Don't leave it hanging over the signed-out UI.
+  $effect(() => {
+    if (!auth.user) confirmingLogout = false;
+  });
+
+  async function doLogout() {
+    if (loggingOut) return;
+    loggingOut = true;
+    logoutErr = "";
+    try {
+      await auth.logout();
+      confirmingLogout = false;
+    } catch (e) {
+      logoutErr = String(e);
+      confirmingLogout = false;
+    } finally {
+      loggingOut = false;
+    }
+  }
 
   // Inline SVG icons. Stroke style, inherit text color.
   const nav = [
@@ -133,10 +158,7 @@
               <div class="text-xs text-ink-dim truncate">View AniList</div>
             </button>
             <button
-              onclick={() => {
-                logoutErr = "";
-                auth.logout().catch((e) => (logoutErr = String(e)));
-              }}
+              onclick={() => (confirmingLogout = true)}
               title="Log out"
               class="text-ink-dim hover:text-ink px-1 grid place-items-center"
             >
@@ -165,6 +187,16 @@
 
   <!-- Edge and corner resize grips for CSD. Thin overlays that show a resize
        cursor and hand the gesture to the compositor. -->
+  {#if confirmingLogout}
+    <Confirm
+      title="Log out?"
+      body="Removes your token and clears the cached list. Everything syncs back on your next login."
+      confirmLabel="Log out"
+      busy={loggingOut}
+      onconfirm={doLogout}
+      oncancel={() => (confirmingLogout = false)}
+    />
+  {/if}
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute top-0 inset-x-0 h-1 cursor-n-resize z-50" onpointerdown={() => resize("North")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->

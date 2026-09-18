@@ -43,6 +43,19 @@
     timer = setTimeout(commit, 3000);
   }
 
+  // Arrow keys go through the same guards as the buttons. Swallow them so
+  // the page doesn't scroll and they don't bubble to the parent row.
+  function onKeydown(e: KeyboardEvent) {
+    let delta = 0;
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") delta = -1;
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") delta = 1;
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (saving || (delta < 0 && atMin) || (delta > 0 && atMax)) return;
+    step(delta);
+  }
+
   async function commit() {
     timer = null;
     if (pending === saved || saving) return;
@@ -107,12 +120,17 @@
 
   const btnCls =
     "w-6 h-6 grid place-items-center rounded bg-edge/50 hover:bg-edge text-ink-dim hover:text-ink " +
-    "disabled:opacity-30 disabled:hover:bg-edge/50 disabled:hover:text-ink-dim text-sm leading-none transition-colors";
+    "disabled:opacity-30 disabled:hover:bg-edge/50 disabled:hover:text-ink-dim text-sm leading-none transition-colors " +
+    "focus:outline-none focus:ring-1 focus:ring-accent";
 </script>
 
 <!-- stopPropagation so clicking anywhere in the stepper doesn't fire the parent row's click handler -->
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="flex items-center gap-1 select-none" role="presentation" onclick={(e) => e.stopPropagation()}>
+<div
+  class="flex items-center gap-1 select-none"
+  role="presentation"
+  onclick={(e) => e.stopPropagation()}
+>
   <span class="w-3 shrink-0 text-[10px] text-center leading-none">
     {#if saving}
       <span class="text-ink-dim">…</span>
@@ -125,6 +143,7 @@
   <button
     type="button"
     onclick={(e) => { e.stopPropagation(); step(-1); }}
+    onkeydown={onKeydown}
     disabled={atMin || saving}
     aria-label="One less episode"
     class={btnCls}>−</button
@@ -139,6 +158,7 @@
   <button
     type="button"
     onclick={(e) => { e.stopPropagation(); step(1); }}
+    onkeydown={onKeydown}
     disabled={atMax || saving}
     aria-label="One more episode"
     class={btnCls}>+</button

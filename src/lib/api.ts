@@ -91,6 +91,8 @@ export const api = {
   scanLibrary: () => invoke<LibraryScan>("scan_library"),
   bindLibraryPath: (path: string, mediaId: number) =>
     invoke<void>("bind_library_path", { path, mediaId }),
+  getLibraryBinding: (path: string) =>
+    invoke<number | null>("library_binding_for", { path }),
   unbindLibraryMedia: (mediaId: number) =>
     invoke<void>("unbind_library_media", { mediaId }),
 

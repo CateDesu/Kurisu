@@ -2,15 +2,48 @@
   import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import { displayTitle, type Media } from "$lib/types";
+  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
+  import type { Snapshot } from "./$types";
 
   let query = $state("");
   let results = $state<Media[]>([]);
   let searching = $state(false);
   let error = $state("");
   let adding = $state<number | null>(null);
+
+  // Own list status per result, from the local cache. Reassign on change,
+  // mutating a Map would not rerun the lookups in the template.
+  let listByMedia = $state(new Map<number, ListEntry>());
+
+  $effect(() => {
+    if (!auth.isLoggedIn) return;
+    api
+      .localEntries()
+      .then((es) => (listByMedia = new Map(es.map((e) => [e.media_id, e]))))
+      .catch((e) => console.error("could not read local list", e));
+  });
+
+  /// Badge line for a result that's already on the list, with progress when
+  /// there is any. Null when the show is not tracked.
+  function listBadge(m: Media): string | null {
+    const e = listByMedia.get(m.id);
+    if (!e) return null;
+    const label = STATUS_LABEL[e.status] ?? e.status;
+    if (e.progress <= 0) return label;
+    return m.episodes ? `${label} · ${e.progress}/${m.episodes}` : `${label} · ${e.progress}`;
+  }
+
+  // Keep the last search alive across detail pages so Back returns to the
+  // results instead of the empty form. Fresh visits still start clean.
+  export const snapshot: Snapshot<{ query: string; results: Media[] }> = {
+    capture: () => ({ query, results }),
+    restore: (v) => {
+      query = v.query;
+      results = v.results;
+    },
+  };
 
   const status_options = [
     { v: "CURRENT", label: "Watching" },
@@ -42,7 +75,8 @@
         error = `${displayTitle(m)} is already on your list.`;
         return;
       }
-      await api.updateEntry(m.id, status, 0, null, 0);
+      const entry = await api.updateEntry(m.id, status, 0, null, 0);
+      listByMedia = new Map(listByMedia).set(m.id, entry);
     } catch (err) {
       error = String(err);
     } finally {
@@ -78,6 +112,7 @@
 
   <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
     {#each results as m (m.id)}
+      {@const entry = listByMedia.get(m.id)}
       <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
         <button type="button" onclick={() => goto(`/anime/${m.id}`)} title="Open details" class="block">
           {#if m.cover_large}
@@ -101,12 +136,21 @@
             {#if m.episodes}· {m.episodes} eps{/if}
             {#if m.average_score}· ★ {m.average_score}{/if}
           </div>
+          {#if entry}
+            <div class="mb-2">
+              <span class="inline-block text-xs px-2 py-0.5 rounded bg-accent/15 text-accent">
+                {listBadge(m)}
+              </span>
+            </div>
+          {/if}
           <div class="mt-auto flex gap-1 flex-wrap">
             {#each status_options as o}
               <button
                 onclick={() => add(m, o.v)}
                 disabled={adding === m.id}
-                class="text-xs px-2 py-1 rounded bg-panel-2 hover:bg-edge disabled:opacity-50"
+                class="text-xs px-2 py-1 rounded disabled:opacity-50 {entry?.status === o.v
+                  ? 'bg-accent text-white'
+                  : 'bg-panel-2 hover:bg-edge'}"
               >
                 {o.label}
               </button>

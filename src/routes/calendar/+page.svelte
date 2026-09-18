@@ -7,6 +7,7 @@
   import { displayTitle, STATUS_LABEL, type AiringItem, type ListEntry } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
+  import type { Snapshot } from "./$types";
 
   const MINE_KEY = "kurisu.cal.mine";
   function readMine(): boolean {
@@ -54,6 +55,9 @@
 
   // Guard for rapid Prev/Next clicks. Latest result wins.
   let loadId = 0;
+  // Set by the first settled load. Breaks the retrigger loop an empty
+  // week would cause once the load effect tracks items.
+  let loadedOnce = false;
   async function load() {
     const id = ++loadId;
     loading = true;
@@ -70,7 +74,10 @@
     } catch (e) {
       if (id === loadId) error = String(e);
     } finally {
-      if (id === loadId) loading = false;
+      if (id === loadId) {
+        loading = false;
+        loadedOnce = true;
+      }
     }
   }
 
@@ -79,7 +86,26 @@
     load();
   }
 
+  // Keep the viewed week and its data across detail pages so Back returns
+  // where you left off. Fresh visits still start on the current week.
+  // SvelteKit restores the snapshot after the mount effect has already
+  // fired, so restore bumps loadId to discard the fetch the mount effect
+  // started for the default week, and clears its loading flag. A capture
+  // taken mid-fetch holds the new week with the old items, so store items
+  // empty and let the load effect refetch the right thing.
+  export const snapshot: Snapshot<{ weekOffset: number; items: AiringItem[]; entries: ListEntry[] }> = {
+    capture: () => (loading ? { weekOffset, items: [], entries } : { weekOffset, items, entries }),
+    restore: (v) => {
+      weekOffset = v.weekOffset;
+      items = v.items;
+      entries = v.entries;
+      loadId++;
+      loading = false;
+    },
+  };
+
   const onList = $derived(new Map(entries.map((e) => [e.media_id, e.status])));
+  const progressByMedia = $derived(new Map(entries.map((e) => [e.media_id, e.progress])));
   const visible = $derived(items.filter((i) => !mineOnly || onList.has(i.media.id)));
   const days = $derived.by(() => {
     const map = new Map<string, { date: Date; items: AiringItem[] }>();
@@ -114,8 +140,14 @@
 
   const aired = (unix: number) => unix * 1000 < nowMs();
 
+  // Loads on mount and again if a snapshot restore lands an empty week,
+  // which is how a mid-fetch capture is stored. items is tracked so the
+  // restore re-runs this effect. loadedOnce breaks the retrigger loop an
+  // empty week would otherwise cause.
   $effect(() => {
-    if (auth.isLoggedIn) untrack(() => load());
+    if (!auth.isLoggedIn || loadedOnce) return;
+    if (items.length > 0) return;
+    untrack(() => load());
   });
 </script>
 
@@ -189,6 +221,7 @@
             <div class="bg-panel border border-edge rounded-lg divide-y divide-edge/60 overflow-hidden">
               {#each day.items as it (`${it.media.id}-${it.episode}`)}
                 {@const status = onList.get(it.media.id)}
+                {@const progress = progressByMedia.get(it.media.id)}
                 <button
                   onclick={() => goto(`/anime/${it.media.id}`)}
                   class="cv-row w-full text-left flex items-center gap-3 px-3 py-2 hover:bg-panel-2/60 transition-colors {aired(it.airing_at) ? 'opacity-55' : ''}"
@@ -203,6 +236,15 @@
                   <span class="shrink-0 text-sm text-ink-dim tabular-nums">
                     Ep {it.episode}{it.media.episodes ? `/${it.media.episodes}` : ""}
                   </span>
+                  {#if progress !== undefined}
+                    <span
+                      class="shrink-0 text-xs px-2 py-0.5 rounded bg-panel-2 tabular-nums {progress < it.episode - 1
+                        ? 'text-amber-400'
+                        : 'text-ink-dim'}"
+                    >
+                      you: {progress}/{it.episode}
+                    </span>
+                  {/if}
                   {#if status}
                     <span class="shrink-0 text-xs px-2 py-0.5 rounded bg-panel-2 text-accent">
                       {STATUS_LABEL[status] ?? status}

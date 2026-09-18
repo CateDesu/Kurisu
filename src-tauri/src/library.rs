@@ -123,22 +123,39 @@ pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
     db.set_setting(BINDINGS_KEY, &serde_json::to_string(&bindings)?)
 }
 
-/// The media a path is manually bound to, if any. An exact file binding,
-/// else the DEEPEST directory binding containing the path, so a nested
-/// Specials/ binding beats its parent's.
-fn binding_for(bindings: &std::collections::HashMap<String, i64>, path: &str) -> Option<i64> {
+/// The media this exact path is bound to, if any. Unlike bound_live this
+/// does not walk up to containing directory bindings. The link dialog uses
+/// it to show the current binding and confirm before replacing it.
+pub fn binding_for_exact(db: &Db, path: &str) -> Option<i64> {
+    get_bindings(db).get(path).copied()
+}
+
+/// The bound media for a path, with dead bindings skipped. Priority is an
+/// exact file binding, then containing directory bindings deepest first, so
+/// a nested Specials/ binding beats its parent's. A binding whose show fails
+/// `live`, for example one the user removed from their list, shadows nothing:
+/// the next deepest live binding answers instead.
+fn bound_live(
+    bindings: &std::collections::HashMap<String, i64>,
+    path: &str,
+    live: impl Fn(i64) -> bool,
+) -> Option<i64> {
     if let Some(id) = bindings.get(path) {
-        return Some(*id);
+        if live(*id) {
+            return Some(*id);
+        }
     }
-    bindings
+    let mut dirs: Vec<_> = bindings
         .iter()
         .filter(|(prefix, _)| {
             path.len() > prefix.len()
                 && path.starts_with(prefix.as_str())
                 && matches!(path.as_bytes()[prefix.len()], b'/' | b'\\')
         })
-        .max_by_key(|(prefix, _)| prefix.len())
-        .map(|(_, id)| *id)
+        .collect();
+    // Deepest first. The first live one wins.
+    dirs.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+    dirs.into_iter().map(|(_, id)| *id).find(|id| live(*id))
 }
 
 // ─────────────────────────── scan ───────────────────────────
@@ -186,11 +203,13 @@ pub fn scan_paths(
         .into_iter()
         .map(|path| {
             let base = basename(&path);
-            // A binding to a show no longer on the list has no matcher,
-            // no titles to show or parse against. Fall through to the
-            // recognizer.
-            let bound = binding_for(bindings, &path)
-                .and_then(|id| matchers.iter().find(|m| m.media_id == id));
+            // A binding to a show no longer on the list has no matcher.
+            // It shadows nothing: deeper live bindings answer first, then
+            // the recognizer.
+            let bound = bound_live(bindings, &path, |id| {
+                matchers.iter().any(|m| m.media_id == id)
+            })
+            .and_then(|id| matchers.iter().find(|m| m.media_id == id));
             let matched = bound.or_else(|| match_title(matchers, "", &path));
             let episode = matched.and_then(|m| resolve_episode(m, &[base.as_str()]));
             LibraryFile {
@@ -254,7 +273,7 @@ fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_folder, binding_for, folders_overlap, get_folders, scan_paths};
+    use super::{add_folder, bound_live, folders_overlap, get_folders, scan_paths};
     use crate::db::Db;
     use std::collections::HashMap;
 
@@ -264,17 +283,31 @@ mod tests {
         b.insert("/a/Show".to_string(), 1_i64);
         b.insert("/a/Show/Specials".to_string(), 2);
         b.insert("/a/file.mkv".to_string(), 3);
+        let live = |_| true;
         // exact file binding
-        assert_eq!(binding_for(&b, "/a/file.mkv"), Some(3));
+        assert_eq!(bound_live(&b, "/a/file.mkv", live), Some(3));
         // dir binding covers files below it
-        assert_eq!(binding_for(&b, "/a/Show/ep01.mkv"), Some(1));
+        assert_eq!(bound_live(&b, "/a/Show/ep01.mkv", live), Some(1));
         // deepest dir wins
-        assert_eq!(binding_for(&b, "/a/Show/Specials/sp1.mkv"), Some(2));
+        assert_eq!(bound_live(&b, "/a/Show/Specials/sp1.mkv", live), Some(2));
         // "Show 2" is NOT under the "Show" binding, no separator boundary
-        assert_eq!(binding_for(&b, "/a/Show 2/ep01.mkv"), None);
+        assert_eq!(bound_live(&b, "/a/Show 2/ep01.mkv", live), None);
         // Windows separators count as a boundary too
-        assert_eq!(binding_for(&b, "/a/Show\\ep01.mkv"), Some(1));
-        assert_eq!(binding_for(&b, "/other/x.mkv"), None);
+        assert_eq!(bound_live(&b, "/a/Show\\ep01.mkv", live), Some(1));
+        assert_eq!(bound_live(&b, "/other/x.mkv", live), None);
+    }
+
+    #[test]
+    fn dead_binding_shadows_nothing() {
+        // The file binding points at a show the user removed from their list.
+        let mut b = HashMap::new();
+        b.insert("/a/Show/ep01.mkv".to_string(), 9_i64);
+        b.insert("/a/Show".to_string(), 1_i64);
+        let live = |id: i64| id != 9;
+        // it falls through to the live folder binding
+        assert_eq!(bound_live(&b, "/a/Show/ep01.mkv", live), Some(1));
+        // with no live binding at all the recognizer gets the file
+        assert_eq!(bound_live(&b, "/a/Show/ep01.mkv", |_| false), None);
     }
 
     #[test]

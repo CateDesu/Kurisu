@@ -295,6 +295,7 @@ pub fn run() {
             commands::remove_library_folder,
             commands::scan_library,
             commands::bind_library_path,
+            commands::library_binding_for,
             commands::unbind_library_media,
             commands::get_rss_feeds,
             commands::add_rss_feed,
@@ -365,10 +366,9 @@ pub fn run() {
             // a console nobody watches, especially on Windows. The app still
             // runs without it, the window close button just quits.
             let tray_result: Result<(), String> = (|| {
-                let icon = app
-                    .default_window_icon()
-                    .cloned()
-                    .ok_or_else(|| "default window icon missing".to_string())?;
+                // tray gets its own cog art instead of the window icon
+                let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))
+                    .map_err(|e| e.to_string())?;
                 let show = MenuItem::with_id(app, "show", "Show Kurisu", true, None::<&str>)
                     .map_err(|e| e.to_string())?;
                 let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)

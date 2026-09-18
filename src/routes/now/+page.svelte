@@ -7,6 +7,7 @@
   import { library } from "$lib/library.svelte";
   import { nowPlaying } from "$lib/nowplaying.svelte";
   import { displayTitle, scoreLabel, type ListEntry } from "$lib/types";
+  import EpisodeStepper from "$lib/EpisodeStepper.svelte";
   import Icon from "$lib/Icon.svelte";
   import Img from "$lib/Img.svelte";
   import Login from "$lib/Login.svelte";
@@ -15,6 +16,7 @@
   let entry = $state<ListEntry | null>(null);
   let updating = $state(false);
   let error = $state("");
+  let stepError = $state("");
 
   // Idle state continue watching. The user's CURRENT entries.
   let current = $state<ListEntry[]>([]);
@@ -62,7 +64,7 @@
       // rejects on backend failure; without the catch every revisit of this
       // page logged another unhandled rejection.
       library.loadFolders().then(() => {
-        if (library.folders.length > 0 && !library.hasScan)
+        if (library.folders.length > 0 && !library.hasScan && !library.scanning)
           library.scan().catch((e) => console.error("library scan failed", e));
       });
     }
@@ -78,6 +80,16 @@
       // A failed read used to look exactly like "you are watching nothing".
       currentError = String(e);
     }
+  }
+
+  // Merge a stepper save into the local list without a full reload. A
+  // finale commit flips the entry to COMPLETED, and this list is CURRENT
+  // only, so that row drops out instead of showing a full bar until the
+  // episode-updated reload refilters.
+  function applyEntry(entry: ListEntry) {
+    current = current
+      .map((x) => (x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x))
+      .filter((x) => x.status === "CURRENT");
   }
 
   // Refresh when progress is written anywhere. entryLoadId guards
@@ -273,6 +285,15 @@
       </div>
     {/if}
 
+    {#if stepError}
+      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4 flex items-center justify-between gap-2">
+        <span>Episode update failed: {stepError}</span>
+        <button onclick={() => (stepError = "")} class="text-ink-dim hover:text-ink shrink-0">
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/if}
+
     {#if currentError}
       <p class="text-sm text-amber-400">{currentError}</p>
     {:else if current.length > 0}
@@ -307,10 +328,18 @@
               }}
             >
               <div class="truncate font-medium">{displayTitle(e.media)}</div>
-              <div class="text-xs text-ink-dim">
-                Ep {e.progress}{e.media?.episodes ? `/${e.media.episodes}` : ""}
-                {#if sc}<span class="opacity-40">·</span> {sc}{/if}
-              </div>
+              {#if sc}
+                <div class="text-xs text-ink-dim">{sc}</div>
+              {/if}
+            </div>
+            <div class="shrink-0">
+              <EpisodeStepper
+                mediaId={e.media_id}
+                progress={e.progress}
+                total={e.media?.episodes ?? null}
+                onchange={(entry) => { stepError = ""; applyEntry(entry); }}
+                onerror={(msg) => { stepError = msg; }}
+              />
             </div>
             {#if nf}
               <button

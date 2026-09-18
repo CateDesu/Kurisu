@@ -4,9 +4,11 @@
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { timeAgo, type FeedFailure, type ListEntry, type TorrentItem } from "$lib/types";
+  import Confirm from "$lib/Confirm.svelte";
   import Icon from "$lib/Icon.svelte";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
+  import type { Snapshot } from "./$types";
 
   const NEW_KEY = "kurisu.torrents.new";
   function readNewOnly(): boolean {
@@ -32,6 +34,9 @@
   /// next group.
   let expanded = $state<Set<number>>(new Set());
   let loading = $state(false);
+  // Success flash next to the refresh button. Stamped so an older
+  // timeout never clears a newer flash.
+  let refreshedAt = $state(0);
 
   function toggle(mediaId: number) {
     const next = new Set(expanded);
@@ -53,7 +58,7 @@
 
   // Overlapping refreshes resolve latest wins.
   let loadId = 0;
-  async function load() {
+  async function load(flash = false) {
     const id = ++loadId;
     loading = true;
     error = "";
@@ -69,6 +74,7 @@
       entries = myEntries;
       feeds = myFeeds;
       loaded = true;
+      if (flash) flashRefreshed();
     } catch (e) {
       if (id === loadId) error = String(e);
     } finally {
@@ -76,9 +82,19 @@
     }
   }
 
+  function flashRefreshed() {
+    refreshedAt = Date.now();
+    const stamp = refreshedAt;
+    setTimeout(() => {
+      if (refreshedAt === stamp) refreshedAt = 0;
+    }, 3000);
+  }
+
+  let addingFeed = $state(false);
   async function addFeed() {
     const url = feedInput.trim();
-    if (!url) return;
+    if (!url || addingFeed) return;
+    addingFeed = true;
     error = "";
     try {
       feeds = await api.addRssFeed(url);
@@ -86,16 +102,29 @@
       await load();
     } catch (e) {
       error = String(e);
+    } finally {
+      addingFeed = false;
     }
   }
 
-  async function removeFeed(url: string) {
+  // Removing a feed asks first. The url sits in state so the dialog can
+  // name it and a double click cannot fire twice.
+  let removingFeed = $state<string | null>(null);
+  let removing = $state(false);
+
+  async function removeFeed() {
+    const url = removingFeed;
+    if (!url || removing) return;
+    removing = true;
     error = "";
     try {
       feeds = await api.removeRssFeed(url);
       await load();
     } catch (e) {
       error = String(e);
+    } finally {
+      removing = false;
+      removingFeed = null;
     }
   }
 
@@ -155,6 +184,17 @@
       if (id === searchId) searching = false;
     }
   }
+
+  // Keep the last search alive across detail pages so Back returns to the
+  // results instead of the empty form. Fresh visits still start clean.
+  export const snapshot: Snapshot<{ searchQ: string; results: TorrentItem[]; searched: boolean }> = {
+    capture: () => ({ searchQ, results, searched }),
+    restore: (v) => {
+      searchQ = v.searchQ;
+      results = v.results;
+      searched = v.searched;
+    },
+  };
 
   interface Group {
     mediaId: number;
@@ -236,12 +276,15 @@
         </button>
       </div>
       <button
-        onclick={load}
+        onclick={() => load(true)}
         disabled={loading}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50 flex items-center gap-1.5"
       >
         {#if loading}Refreshing…{:else}<Icon name="refresh" size={14} /> Refresh{/if}
       </button>
+      {#if refreshedAt}
+        <span class="text-xs text-accent">Refreshed ✓</span>
+      {/if}
     </div>
 
     {#if error}
@@ -272,7 +315,7 @@
             <div class="flex items-center gap-2 bg-panel border border-edge rounded-md px-3 py-1.5">
               <span class="text-sm truncate flex-1 font-mono">{feed}</span>
               <button
-                onclick={() => removeFeed(feed)}
+                onclick={() => (removingFeed = feed)}
                 title="Remove this feed"
                 class="text-ink-dim hover:text-red-400 px-1 grid place-items-center"
               >
@@ -294,8 +337,12 @@
           placeholder="https://nyaa.si/?page=rss&q=…"
           class="flex-1 bg-panel border border-edge rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-accent"
         />
-        <button class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm" type="submit">
-          + Add feed
+        <button
+          class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+          type="submit"
+          disabled={addingFeed}
+        >
+          {addingFeed ? "Adding…" : "+ Add feed"}
         </button>
       </form>
     </div>
@@ -493,4 +540,14 @@
       </div>
     {/if}
   </div>
+  {#if removingFeed}
+    <Confirm
+      title="Remove feed?"
+      body={removingFeed}
+      confirmLabel="Remove"
+      busy={removing}
+      onconfirm={removeFeed}
+      oncancel={() => (removingFeed = null)}
+    />
+  {/if}
 {/if}

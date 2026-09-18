@@ -6,6 +6,7 @@
   import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
+  import type { Snapshot } from "./$types";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;
   const SEASON_LABEL: Record<string, string> = {
@@ -33,11 +34,48 @@
   let error = $state("");
   let adding = $state<number | null>(null);
 
-  // media_id → list status, for the on-list badges.
-  const onList = $derived(new Map(entries.map((e) => [e.media_id, e.status])));
+  // media_id → list entry, for the on-list badges.
+  const onList = $derived(new Map(entries.map((e) => [e.media_id, e])));
+
+  /// Badge line for a show already on the list, with progress when there is
+  /// any. Null when the show is not tracked.
+  function listBadge(m: Media): string | null {
+    const e = onList.get(m.id);
+    if (!e) return null;
+    const label = STATUS_LABEL[e.status] ?? e.status;
+    if (e.progress <= 0) return label;
+    return m.episodes ? `${label} · ${e.progress}/${m.episodes}` : `${label} · ${e.progress}`;
+  }
+
+  // Keep the picked season and its list across detail pages so Back returns
+  // here instead of bouncing to the current season. SvelteKit restores the
+  // snapshot after the mount effect has already fired, so restore bumps
+  // loadId to discard the fetch the mount effect started for the default
+  // season, and clears its loading flag. A capture taken mid-fetch holds
+  // the new season with the old grid, so store media empty and let the
+  // load effect refetch the right thing.
+  export const snapshot: Snapshot<{
+    season: string;
+    year: number;
+    media: Media[];
+    entries: ListEntry[];
+  }> = {
+    capture: () => (loading ? { season, year, media: [], entries } : { season, year, media, entries }),
+    restore: (v) => {
+      season = v.season;
+      year = v.year;
+      media = v.media;
+      entries = v.entries;
+      loadId++;
+      loading = false;
+    },
+  };
 
   // Rapid Prev/Next (or a login change mid-fetch) resolves latest-wins.
   let loadId = 0;
+  // Set by the first settled load. An empty season reassigns media to a
+  // fresh empty array, which would retrigger the load effect forever.
+  let loadedOnce = false;
   async function load() {
     const id = ++loadId;
     loading = true;
@@ -53,7 +91,10 @@
     } catch (e) {
       if (id === loadId) error = String(e);
     } finally {
-      if (id === loadId) loading = false;
+      if (id === loadId) {
+        loading = false;
+        loadedOnce = true;
+      }
     }
   }
 
@@ -74,6 +115,13 @@
     adding = m.id;
     error = "";
     try {
+      // Adding writes status and progress unconditionally. Refuse to clobber
+      // an entry that's already on the list. The badge map can be stale
+      // after a snapshot restore, so ask the backend.
+      if (await api.getEntry(m.id)) {
+        error = `${displayTitle(m)} is already on your list.`;
+        return;
+      }
       const entry = await api.updateEntry(m.id, status, 0, null, 0);
       entries = [...entries.filter((e) => e.media_id !== m.id), entry];
     } catch (e) {
@@ -83,8 +131,13 @@
     }
   }
 
+  // Loads on mount and again if a snapshot restore lands an empty grid,
+  // which is how a mid-fetch capture is stored. loadedOnce breaks the
+  // retrigger loop an empty season would otherwise cause.
   $effect(() => {
-    if (auth.isLoggedIn) untrack(() => load());
+    if (!auth.isLoggedIn || loadedOnce) return;
+    if (media.length > 0) return;
+    untrack(() => load());
   });
 </script>
 
@@ -155,7 +208,7 @@
               <div class="mt-auto">
                 {#if listed}
                   <span class="text-xs px-2 py-1 rounded bg-panel-2 text-accent">
-                    ✓ {STATUS_LABEL[listed] ?? listed}
+                    ✓ {listBadge(m)}
                   </span>
                 {:else}
                   <div class="flex gap-1 flex-wrap">

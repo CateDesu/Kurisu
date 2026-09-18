@@ -39,11 +39,14 @@
   let saving = $state(false);
   let removing = $state(false);
   let err = $state("");
+  let confirmingRemove = $state(false);
+  let removeTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Community recommendations for this title. Failures just hide the strip.
   let recs = $state<Media[]>([]);
   let addingRec = $state<number | null>(null);
   let addedRecs = $state<number[]>([]);
+  let recErr = $state("");
 
   const statusOptions = Object.entries(STATUS_LABEL).map(([value, label]) => ({
     value: value as ListEntry["status"],
@@ -85,6 +88,7 @@
 
   async function addRec(m: Media) {
     addingRec = m.id;
+    recErr = "";
     try {
       // updateEntry writes status and progress unconditionally. Only push when
       // the show isn't on the list yet, or its entry would be reset.
@@ -92,24 +96,33 @@
         await api.updateEntry(m.id, "PLANNING", 0, null, 0);
       }
       addedRecs.push(m.id);
-    } catch {
+    } catch (e) {
       // leave the button enabled so the user can retry
+      recErr = String(e);
     } finally {
       addingRec = null;
     }
   }
 
+  // The backend clamps silently. Mirror it so the field shows what gets stored.
+  function clampInputs() {
+    if (progress != null) {
+      progress = Math.max(0, total != null ? Math.min(progress, total) : progress);
+    }
+    if (repeat != null) repeat = Math.max(0, repeat);
+  }
+
   async function save() {
     if (saving || removing) return; // form still submits on Enter mid-save
+    // Touched flags come from the raw values. Clamping first would turn a
+    // silent clamp of an untouched field into a change the user never made.
+    const progressTouched = progress !== snap.progress;
+    const repeatTouched = repeat !== snap.repeat;
+    clampInputs();
     // An untouched form has nothing to send. The backend answers an all null
     // update with an error, which would show up as a failure banner on what
     // the user meant as a plain close.
-    if (
-      status === snap.status &&
-      progress === snap.progress &&
-      score === snap.score &&
-      repeat === snap.repeat
-    ) {
+    if (status === snap.status && !progressTouched && score === snap.score && !repeatTouched) {
       onclose();
       return;
     }
@@ -124,12 +137,12 @@
       await api.updateEntry(
         entry.media_id,
         status !== snap.status ? status : null,
-        progress !== snap.progress ? (progress ?? snap.progress) : null,
+        progressTouched ? (progress ?? snap.progress) : null,
         // A cleared score binds null, but the backend omits null variables,
         // so AniList would keep the old score. Send 0. AniList treats 0 as
         // unrated and scoreLabel renders it as no score.
         score !== snap.score ? (score ?? 0) : null,
-        repeat !== snap.repeat ? (repeat ?? snap.repeat) : null
+        repeatTouched ? (repeat ?? snap.repeat) : null
       );
       onclose();
     } catch (e) {
@@ -139,8 +152,17 @@
     }
   }
 
+  // First click only arms the button. A second click deletes. Left alone
+  // for a few seconds it disarms itself.
   async function remove() {
     if (removing || saving) return;
+    if (!confirmingRemove) {
+      confirmingRemove = true;
+      removeTimer = setTimeout(() => (confirmingRemove = false), 4000);
+      return;
+    }
+    if (removeTimer) clearTimeout(removeTimer);
+    confirmingRemove = false;
     removing = true;
     err = "";
     try {
@@ -152,6 +174,11 @@
       removing = false;
     }
   }
+
+  // The disarm timer must not fire into a closed modal.
+  $effect(() => () => {
+    if (removeTimer) clearTimeout(removeTimer);
+  });
 
   // Escape closes the modal. Select swallows it first when its dropdown is
   // open. The dialog takes focus so Tab stays inside the modal.
@@ -247,6 +274,7 @@
             min="0"
             max={total ?? undefined}
             bind:value={progress}
+            onblur={clampInputs}
             class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
           />
         </div>
@@ -261,6 +289,7 @@
             type="number"
             min="0"
             bind:value={repeat}
+            onblur={clampInputs}
             class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
           />
         </div>
@@ -271,10 +300,12 @@
           type="button"
           onclick={remove}
           disabled={removing || saving}
-          class="px-3 py-1.5 rounded-md text-sm text-red-400/80 hover:text-red-400 hover:bg-red-500/10 disabled:opacity-40"
+          class={confirmingRemove
+            ? "px-3 py-1.5 rounded-md text-sm bg-red-500/20 text-red-300 hover:bg-red-500/30 disabled:opacity-40"
+            : "px-3 py-1.5 rounded-md text-sm text-red-400/80 hover:text-red-400 hover:bg-red-500/10 disabled:opacity-40"}
           title="Remove this series from your list"
         >
-          {removing ? "Removing…" : "Remove from list"}
+          {removing ? "Removing…" : confirmingRemove ? "Confirm remove" : "Remove from list"}
         </button>
         <div class="flex gap-2">
           <button
@@ -301,6 +332,11 @@
         <h4 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">
           You might also like
         </h4>
+        {#if recErr}
+          <div class="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-2">
+            {recErr}
+          </div>
+        {/if}
         <div class="flex gap-2 overflow-x-auto pb-1">
           {#each recs as r (r.id)}
             <button

@@ -1312,6 +1312,13 @@ pub fn bind_library_path(
     library::bind_path(&state.db, &path, media_id).map_err(|e| e.to_string())
 }
 
+/// The media this exact path is currently bound to, if any. Lets the link
+/// dialog show the existing binding and confirm before replacing it.
+#[tauri::command]
+pub fn library_binding_for(path: String, state: State<'_, AppState>) -> Option<i64> {
+    library::binding_for_exact(&state.db, &path)
+}
+
 /// Remove every manual link pointing at this show.
 #[tauri::command]
 pub fn unbind_library_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
