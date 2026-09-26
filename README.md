@@ -1,64 +1,48 @@
 # ク Kurisu
 
-**Platform:** Linux · Windows  ·  [Discord](https://discord.com/invite/TQJrbZcgKF)
+Linux · Windows · [Downloads](https://github.com/CateDesu/Kurisu/releases) · [Discord](https://discord.com/invite/TQJrbZcgKF)
 
-Kurisu is an anime tracker inspired by [Taiga](https://taiga.moe), built in Rust. It runs on Linux and Windows, syncs with [AniList](https://anilist.co), detects what you're watching through the OS media APIs, and caches your list locally.
+Kurisu is an anime tracking program inspired by [Taiga](https://taiga.moe). It syncs with [AniList](https://anilist.co), detects playback, and caches your list locally.
 
-> ⚠️ **Early development.** Kurisu is a work in progress. Features are incomplete and things will change as it evolves. It's a personal project, not a polished release. Expect bugs.
+**Early development.** Expect bugs and incomplete features.
 
 ## Features
 
-- **AniList sync** - OAuth2 sign-in (built-in client, no setup), search, list management, scoring in your format (100 / 10 / 10-decimal / 5-star / 3-smiley). The token is stored locally in plaintext (`kurisu.db`).
-- **My List** - grouped by status, −/+ episode stepper that auto-commits, "next episode airs" countdowns, in-place edit dialog, text filter and sorting (title / score / progress / last updated / next airing).
-- **Detail pages** - native anime pages with banner, genres, description, your entry controls, related anime, characters and staff, and recommendations. Covers and titles link to them everywhere.
-- **Airing calendar** - the week's airing schedule grouped by day, for your shows or everything.
-- **Torrent feeds** - watch nyaa-style RSS feeds; releases are matched against your list, new episodes past your progress get flagged, open as magnet or .torrent. A built-in nyaa search finds anything else and opens it in your torrent client.
-- **Stats** - your AniList profile statistics: time watched, score distribution, genres, formats, release years.
-- **Library scan** - point it at your anime folders; files are matched against your list, watched state follows your progress, play the next episode directly. Unmatched files can be linked to a show by hand (per file or whole folder).
-- **Seasons + recommendations** - browse any AniList season; the edit dialog shows community recommendations.
-- **Playback tracking** - detects playback, matches the title against your list, and prompts or auto-updates progress to the detected episode. Any MPRIS2 player on Linux, GSMTC on Windows, and bare MPV through its IPC socket. Can also show the detected episode as your Discord status (Rich Presence).
-- **Notifications** - your AniList inbox, mirroring anilist.co/notifications.
-- **Desktop integration** - custom dark title bar, system tray, borderless window with edge/corner resize.
-- **Self-update** - checks the rolling GitHub release on startup (Settings → Updates, on by default) and installs in place on Linux and Windows. Builds are verified against a SHA-256 sidecar before anything is run. Release builds compiled from source auto-check too; only debug builds stay quiet, so developing never nags.
+- AniList sign-in, list editing, scoring, search, and notifications.
+- Anime details, recommendations, seasonal browsing, airing calendar, and profile statistics.
+- Local library scanning, manual file links, and next episode playback.
+- Playback detection through Linux MPRIS2, Windows GSMTC, or MPV IPC, with progress prompts or automatic updates and optional Discord Rich Presence.
+- Torrent RSS feeds matched to your list, nyaa search, and magnet or torrent links opened in your client.
+- Dark window controls, system tray, and self-updates on Linux and Windows. Updates require a matching SHA-256 sidecar and can be disabled in Settings.
+
+AniList tokens are stored locally in plaintext. See [Privacy](PRIVACY.md) and [Terms](TERMS.md).
 
 ## MPV
 
-Bare MPV doesn't register with the OS media APIs on either platform. Linux MPRIS needs the `mpv-mpris` script and Windows GSMTC only sees mpv.net. Kurisu reads MPV's JSON IPC socket instead. Turn it on once in `~/.config/mpv/mpv.conf`:
+Enable IPC in `mpv.conf` for bare MPV detection:
 
 ```ini
 input-ipc-server=/tmp/mpvsocket
 ```
 
-Detection, matching, and progress updates then work exactly like with any other player. A different socket path can be set in Settings → Playback tracking; leaving it blank tries the common defaults.
+On Windows, use `input-ipc-server=\\.\pipe\mpvsocket`. Set a custom path in Settings → Playback tracking, or leave it blank to try the defaults. Players exposing MPRIS2 or GSMTC need no IPC setup.
 
-## Windows
+## Build
 
-Playback detection uses GSMTC (Windows media controls). Any player that registers with it works - mpv.net and VLC do. Bare MPV is detected through its IPC socket as described above, with `input-ipc-server=\\.\pipe\mpvsocket` in `mpv.conf`.
+Install Rust, Node, and a C toolchain. Linux also needs WebKitGTK 4.1, GTK 3, Ayatana AppIndicator, and librsvg development packages. Windows needs WebView2.
 
-Getting a build:
-
-- **Download:** grab the NSIS installer exe from Releases - `/releases/latest` always points at the newest rolling main build (older rolling builds are pruned automatically). The WebView2 bootstrapper is embedded, so the installer handles everything itself. No manual extra downloads. The bare `kurisu.exe` in the same release works on machines that already have WebView2 (any Windows 11).
-- **Build on Windows:** `npx tauri build` (needs Rust, Node, and WebView2 - preinstalled on Windows 11).
-- **Cross-build from Linux:** `cargo xwin build --target x86_64-pc-windows-msvc --release` in `src-tauri` (needs `cargo-xwin`, an `xwin splat` SDK in `~/.cache/xwin`, and `clang-cl`/`lld-link`/`llvm-lib`). Output goes to `target/x86_64-pc-windows-msvc/release/kurisu.exe`. Installers can't be bundled this way - use CI for those.
-
-## Stack
-
-Tauri 2 + Rust, SvelteKit 5 + Tailwind v4, SQLite.
-
-## Build (Linux)
-
-```fish
-cd Kurisu
-npm install
-npm run check                # svelte-check (frontend types)
-npx tauri build --no-bundle  # production binary at src-tauri/target/release/kurisu
-npm run tauri dev            # live dev
+```sh
+npm ci
+npm run check
+npx tauri build --no-bundle
 ```
 
-Dependencies: `webkit2gtk-4.1`, `rustup`, and a C toolchain.
+The binary is in `src-tauri/target/release/`. Use `npm run tauri dev` for development or `npx tauri build` on Windows to create an installer. The downloadable Windows installer includes the WebView2 bootstrapper. The bare executable needs WebView2 already installed.
 
-> **Use `npx tauri build`, not a bare `cargo build` in `src-tauri`.** The Tauri CLI runs the frontend build first and embeds the output in the binary. A bare `cargo build` skips that step, so the binary ships with no frontend and the window opens to "Could not connect to localhost: Connection refused" with no list visible.
+Build through the Tauri CLI so it compiles and embeds the frontend. Set `KURISU_BUILD_VERSION` to the release version for local release builds. Startup update checks skip debug builds and unstamped Windows builds.
+
+To cross-build a Windows executable from Linux, build the frontend with `npm run build`, then run `cargo xwin build --target x86_64-pc-windows-msvc --release` in `src-tauri`. This requires `cargo-xwin`, an `xwin splat` SDK in `~/.cache/xwin`, and `clang-cl`, `lld-link`, and `llvm-lib`. The binary goes to `target/x86_64-pc-windows-msvc/release/kurisu.exe`. Use the Windows workflow for installers.
 
 ## License
 
-MIT
+[MIT](LICENSE)

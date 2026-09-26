@@ -1,8 +1,9 @@
 [package]
 name = "kurisu"
 version = "1.0.0"
-description = "A Taiga-style anime tracker for Linux"
+description = "An anime tracking program for Linux and Windows with AniList sync"
 authors = ["CateDesu"]
+license = "MIT"
 edition = "2021"
 
 [lib]
@@ -18,36 +19,22 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# AniList GraphQL over HTTP. system-proxy honors OS and env proxy settings,
-# without it the updater and AniList traffic silently fail to connect on
-# corporate and school networks where browsing works fine.
+# system-proxy keeps AniList and update requests working on managed networks.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
-# async runtime for HTTP + the OAuth callback listener
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time"] }
-# local library + cache
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "io-util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-# XDG app-data dirs
 directories = "5"
-# timestamps
 chrono = { version = "0.4", features = ["serde"] }
-# error handling
 anyhow = "1"
-# filename / now-playing title parsing — milestone 2/3
 regex = "1"
 log = "0.4"
 env_logger = "0.11"
-# non-poisoning mutexes (a panic while holding one must not wedge every command)
 parking_lot = "0.12"
-# OAuth state randomness (already in the tree via rustls)
 ring = "0.17"
-# update download integrity (SHA-256 sidecar verification)
 sha2 = "0.10"
-# RSS feed parsing (torrent awareness — milestone 6)
 quick-xml = "0.37"
 discord-rich-presence = "1.1.0"
 
-# MPRIS2 playback detection (MPV/VLC/Celluloid/…) — Linux only. Windows uses
-# GSMTC via the `windows` crate below; other platforms get a no-op stub.
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris = "2.0"
 

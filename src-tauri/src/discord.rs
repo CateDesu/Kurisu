@@ -1,32 +1,19 @@
-//! Discord Rich Presence. While a matched episode plays, the local Discord
-//! client shows it as the user's activity: the show, the episode, and the
-//! time left. Cleared when playback stops or the show is not on the list.
-//! Local IPC only, no network. The activity lives and dies with the socket
-//! connection, so a crash never leaves a stale presence behind.
-//!
-//! Presence follows detection, not the tracking mode. Mode off still
-//! announces. Only matched list entries are announced since an unmatched
-//! title could be anything the player happens to have open.
-//!
-//! The manager is a static behind a non poisoning mutex so the playback
-//! tick can reach it from a blocking thread. All socket I/O is sync and
-//! must stay off the async runtime.
+//! Presence follows detection independently of progress tracking. Announce only matched titles.
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::activity::{Activity, Assets, Timestamps};
-use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
-use parking_lot::Mutex;
+use tokio::sync::watch;
 
-/// Discord application the presence shows under. The name Discord displays
-/// comes from the application with this ID in the developer portal.
-/// KURISU_DISCORD_CLIENT_ID overrides for development.
+#[path = "discord_transport.rs"]
+mod transport;
+
+/// KURISU_DISCORD_CLIENT_ID overrides this for development.
 const DEFAULT_CLIENT_ID: &str = "1544894569454506124";
 
-/// What the playback tick wants Discord to show. The title is the matched
-/// display title from the list, never the raw player title. cover_url is the
-/// AniList cover from the media cache, total_episodes is the show's episode
-/// count, None while AniList has none announced.
+#[derive(Clone)]
 pub struct PresenceInfo {
     pub title: String,
     pub episode: Option<i64>,
@@ -37,45 +24,30 @@ pub struct PresenceInfo {
     pub total_episodes: Option<i64>,
 }
 
-/// What Discord currently shows, so steady playback does not rewrite the
-/// same activity every 5s tick. Discord throttles activity updates and a
-/// rewrite that changes nothing is pure churn.
 struct Shown {
     title: String,
     episode: Option<i64>,
     playing: bool,
-    /// End timestamp last sent, unix milliseconds. Seeks surface as drift
-    /// here while steady playback keeps it nearly constant.
+    /// Unix milliseconds. Seeks change this while steady playback leaves it nearly constant.
     end_ms: i64,
-    /// Compared so a cover or episode count that lands in the cache after
-    /// the first announce still makes it to Discord.
     cover_url: Option<String>,
     total_episodes: Option<i64>,
 }
 
-/// A seek smaller than this is not worth a rewrite. The countdown Discord
-/// renders just drifts by that much until the next real change.
+/// Ignore small seeks and timing jitter.
 const SEEK_DRIFT_MS: i64 = 30_000;
 
+#[derive(Default)]
 struct Presence {
-    client: Option<DiscordIpcClient>,
+    client: Option<transport::Client>,
     shown: Option<Shown>,
-    /// Consecutive connect or write failures and the earliest instant the
-    /// next attempt may run. Discord is often simply not running and the
-    /// socket path then fails instantly, so without a backoff every tick
-    /// would log a failed connect while anything plays.
     fail_count: u32,
     retry_at: Option<Instant>,
 }
 
-static PRESENCE: Mutex<Presence> = Mutex::new(Presence {
-    client: None,
-    shown: None,
-    fail_count: 0,
-    retry_at: None,
-});
+static UPDATES: OnceLock<watch::Sender<Option<PresenceInfo>>> = OnceLock::new();
+const IPC_DEADLINE: Duration = Duration::from_secs(3);
 
-/// Same ladder the auto progress push uses. 30s, 2m, 10m.
 fn backoff(fail_count: u32) -> Duration {
     match fail_count {
         0 | 1 => Duration::from_secs(30),
@@ -91,68 +63,83 @@ fn client_id() -> String {
         .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string())
 }
 
-/// Drive the presence toward the desired state. None clears. Blocking
-/// socket I/O, call it off the async runtime. Cheap when nothing changed.
 pub fn update(desired: Option<PresenceInfo>) {
-    let mut p = PRESENCE.lock();
-    match desired {
-        None => p.clear(),
-        Some(d) => p.set(&d),
+    let updates = UPDATES.get_or_init(|| {
+        let (tx, rx) = watch::channel(None);
+        tauri::async_runtime::spawn(run_worker(rx, transport::socket_paths(), IPC_DEADLINE));
+        tx
+    });
+    updates.send_replace(desired);
+}
+
+async fn run_worker(
+    mut updates: watch::Receiver<Option<PresenceInfo>>,
+    paths: Vec<PathBuf>,
+    deadline: Duration,
+) {
+    let mut presence = Presence::default();
+    loop {
+        let desired = updates.borrow_and_update().clone();
+        tokio::select! {
+            changed = updates.changed() => {
+                presence.clear();
+                if changed.is_err() { break; }
+                continue;
+            }
+            result = tokio::time::timeout(deadline, presence.apply(desired, &paths)) => {
+                if !matches!(result, Ok(Ok(()))) {
+                    presence.clear();
+                    presence.fail_count = presence.fail_count.saturating_add(1);
+                    presence.retry_at = Some(Instant::now() + backoff(presence.fail_count));
+                    log::debug!("Discord presence failed or timed out");
+                }
+            }
+        }
+        if updates.changed().await.is_err() {
+            break;
+        }
     }
 }
 
 impl Presence {
     fn clear(&mut self) {
-        if self.shown.take().is_none() {
-            return;
-        }
-        if let Some(c) = self.client.as_mut() {
-            // A dead socket here just means Discord already dropped the
-            // activity itself. Drop the client so the next set reconnects.
-            if c.clear_activity().is_err() {
-                self.client = None;
+        self.shown = None;
+        self.client = None;
+    }
+
+    async fn apply(
+        &mut self,
+        desired: Option<PresenceInfo>,
+        paths: &[PathBuf],
+    ) -> std::io::Result<()> {
+        match desired {
+            Some(d) => self.set(&d, paths).await,
+            None => {
+                self.clear();
+                Ok(())
             }
         }
     }
 
-    fn set(&mut self, d: &PresenceInfo) {
+    async fn set(&mut self, d: &PresenceInfo, paths: &[PathBuf]) -> std::io::Result<()> {
         let end_ms = end_timestamp_ms(d);
         if self.client.is_some() && !changed(self.shown.as_ref(), d, end_ms) {
-            return;
+            return Ok(());
         }
         if let Some(t) = self.retry_at {
             if Instant::now() < t {
-                return;
+                return Ok(());
             }
         }
         if self.client.is_none() {
             let id = client_id();
-            if id.is_empty() {
-                log::debug!("discord presence: no client id configured, staying dormant");
-                self.fail_count += 1;
-                self.retry_at = Some(Instant::now() + backoff(self.fail_count));
-                return;
-            }
-            let mut c = DiscordIpcClient::new(&id);
-            if let Err(e) = c.connect() {
-                self.fail_count += 1;
-                self.retry_at = Some(Instant::now() + backoff(self.fail_count));
-                log::debug!(
-                    "discord presence: connect failed (attempt {}): {e}",
-                    self.fail_count
-                );
-                return;
-            }
-            self.client = Some(c);
-            self.fail_count = 0;
-            self.retry_at = None;
+            self.client = Some(transport::Client::connect(paths, &id).await?);
         }
         let activity = build_activity(d, end_ms);
-        // Provably Some, the block above either connected or returned.
         let Some(client) = self.client.as_mut() else {
-            return;
+            return Ok(());
         };
-        match client.set_activity(activity) {
+        match client.set_activity(activity).await {
             Ok(()) => {
                 self.shown = Some(Shown {
                     title: d.title.clone(),
@@ -162,24 +149,15 @@ impl Presence {
                     cover_url: d.cover_url.clone(),
                     total_episodes: d.total_episodes,
                 });
+                self.fail_count = 0;
+                self.retry_at = None;
+                Ok(())
             }
-            Err(e) => {
-                // The socket died, Discord most likely quit. Drop the client
-                // and clear the shown state so the next tick reconnects and
-                // resends instead of trusting a presence nobody displays.
-                log::debug!("discord presence: write failed, will reconnect: {e}");
-                self.client = None;
-                self.shown = None;
-                self.fail_count += 1;
-                self.retry_at = Some(Instant::now() + backoff(self.fail_count));
-            }
+            Err(e) => Err(e),
         }
     }
 }
 
-/// True when the desired state differs enough from what Discord shows to
-/// justify a rewrite. Anything playing counts as changed when nothing is
-/// connected, the caller checks the client separately.
 fn changed(shown: Option<&Shown>, d: &PresenceInfo, end_ms: i64) -> bool {
     let Some(s) = shown else {
         return true;
@@ -192,9 +170,6 @@ fn changed(shown: Option<&Shown>, d: &PresenceInfo, end_ms: i64) -> bool {
         || s.total_episodes != d.total_episodes
 }
 
-/// Discord timestamps are unix MILLISECONDS, not seconds. Zero means no
-/// countdown: paused playback must not keep ticking down on friends'
-/// screens, and a player that reports no duration has nothing to count.
 fn end_timestamp_ms(d: &PresenceInfo) -> i64 {
     if !d.playing || d.length_us <= 0 || d.position_us >= d.length_us {
         return 0;
@@ -207,12 +182,12 @@ fn end_timestamp_ms(d: &PresenceInfo) -> i64 {
     now_ms + remaining_ms
 }
 
-/// The second line under the title. "Episode 6/10" when the show's total
-/// is known, "Episode 6/-" when AniList has no count announced, and a bare
-/// Watching or Paused when the episode number itself was not parsed.
 fn state_line(episode: Option<i64>, total: Option<i64>, playing: bool) -> String {
     let base = match episode {
-        Some(ep) => format!("Episode {ep}/{}", total.map(|t| t.to_string()).unwrap_or_else(|| "-".into())),
+        Some(ep) => format!(
+            "Episode {ep}/{}",
+            total.map(|t| t.to_string()).unwrap_or_else(|| "-".into())
+        ),
         None => return if playing { "Watching" } else { "Paused" }.to_string(),
     };
     if playing {
@@ -223,15 +198,14 @@ fn state_line(episode: Option<i64>, total: Option<i64>, playing: bool) -> String
 }
 
 fn build_activity(d: &PresenceInfo, end_ms: i64) -> Activity<'static> {
-    // Discord rejects fields over 128 chars. Long romaji titles can reach
-    // that, so truncate rather than have the whole update rejected.
+    // Discord limits title fields to 128 characters.
     let title: String = d.title.chars().take(128).collect();
-    let mut activity = Activity::new()
-        .details(title.clone())
-        .state(state_line(d.episode, d.total_episodes, d.playing));
-    // The AniList cover as the card image. Discord fetches external URLs
-    // through its own proxy, no asset upload needed. Asset keys and URLs
-    // cap at 256 chars, AniList covers sit well under.
+    let mut activity = Activity::new().details(title.clone()).state(state_line(
+        d.episode,
+        d.total_episodes,
+        d.playing,
+    ));
+    // Discord fetches cover URLs through its image proxy.
     if let Some(url) = &d.cover_url {
         let url: String = url.chars().take(256).collect();
         activity = activity.assets(Assets::new().large_image(url).large_text(title));
@@ -246,8 +220,6 @@ fn build_activity(d: &PresenceInfo, end_ms: i64) -> Activity<'static> {
 mod tests {
     use super::*;
 
-    /// A 24 minute episode, 10 minutes in and playing. The baseline every
-    /// case below perturbs by one field.
     fn playing() -> PresenceInfo {
         PresenceInfo {
             title: "Frieren".into(),
@@ -257,6 +229,124 @@ mod tests {
             position_us: 10 * 60 * 1_000_000,
             cover_url: Some("https://s4.anilist.co/cover.jpg".into()),
             total_episodes: Some(28),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn read_frame(socket: &mut tokio::net::UnixStream) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0; 8];
+        socket.read_exact(&mut header).await.unwrap();
+        let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        let mut body = vec![0; size];
+        socket.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn ready(socket: &mut tokio::net::UnixStream) {
+        use tokio::io::AsyncWriteExt;
+        let body = br#"{"evt":"READY"}"#;
+        socket.write_all(&1u32.to_le_bytes()).await.unwrap();
+        socket
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        socket.write_all(body).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_handshakes_close_on_deadline_or_disable() {
+        use tokio::io::AsyncReadExt;
+        for disable in [false, true] {
+            let path = std::env::temp_dir()
+                .join(format!("kurisu-discord-{}-{disable}", std::process::id()));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (tx, rx) = watch::channel(Some(playing()));
+            let worker = tokio::spawn(run_worker(
+                rx,
+                vec![path.clone()],
+                Duration::from_millis(100),
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_frame(&mut socket).await["v"], 1);
+                if disable {
+                    tx.send_replace(None);
+                }
+                assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+                tx.send_replace(None);
+                drop(tx);
+                worker.await.unwrap();
+            })
+            .await
+            .unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn newer_presence_cancels_a_stalled_handshake_and_can_publish() {
+        use tokio::io::AsyncReadExt;
+        let path =
+            std::env::temp_dir().join(format!("kurisu-discord-latest-{}", std::process::id()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = watch::channel(Some(playing()));
+        let worker = tokio::spawn(run_worker(rx, vec![path.clone()], Duration::from_secs(1)));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (mut stale, _) = listener.accept().await.unwrap();
+            read_frame(&mut stale).await;
+            let mut latest = playing();
+            latest.episode = Some(13);
+            tx.send_replace(Some(latest));
+            assert_eq!(stale.read(&mut [0]).await.unwrap(), 0);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_frame(&mut socket).await;
+            ready(&mut socket).await;
+            let activity = read_frame(&mut socket).await;
+            assert_eq!(activity["cmd"], "SET_ACTIVITY");
+            assert_eq!(activity["args"]["activity"]["state"], "Episode 13/28");
+            tx.send_replace(None);
+            assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+            drop(tx);
+            worker.await.unwrap();
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_handshakes_are_closed_without_waiting_for_the_claimed_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (index, opcode, size, body) in [
+            (0, 1u32, u32::MAX, &b""[..]),
+            (1, 2, 0, &b""[..]),
+            (2, 1, 15, &br#"{"evt":"ERROR"}"#[..]),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-discord-invalid-{}-{index}",
+                std::process::id()
+            ));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (tx, rx) = watch::channel(Some(playing()));
+            let worker = tokio::spawn(run_worker(rx, vec![path.clone()], Duration::from_secs(10)));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_frame(&mut socket).await;
+                socket.write_all(&opcode.to_le_bytes()).await.unwrap();
+                socket.write_all(&size.to_le_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+                drop(tx);
+                worker.await.unwrap();
+            })
+            .await
+            .unwrap();
+            std::fs::remove_file(path).unwrap();
         }
     }
 
@@ -304,11 +394,8 @@ mod tests {
     fn small_seeks_do_not_rewrite_but_big_ones_do() {
         let d = playing();
         let s = shown_for(&d);
-        // Ten seconds of jitter from sampling or a small seek stays under
-        // the drift threshold.
         let jittered = end_ms(&d) - 10_000;
         assert!(!changed(Some(&s), &d, jittered));
-        // Skipping the opening moves the end by well over the threshold.
         let skipped = end_ms(&d) - 90_000;
         assert!(changed(Some(&s), &d, skipped));
     }
@@ -341,18 +428,17 @@ mod tests {
     #[test]
     fn state_line_shows_episode_out_of_total() {
         assert_eq!(state_line(Some(6), Some(10), true), "Episode 6/10");
-        // No total announced on AniList. A dash, not a made up count.
         assert_eq!(state_line(Some(6), None, true), "Episode 6/-");
-        assert_eq!(state_line(Some(6), Some(10), false), "Episode 6/10 · Paused");
-        // Episode number itself unparseable.
+        assert_eq!(
+            state_line(Some(6), Some(10), false),
+            "Episode 6/10 · Paused"
+        );
         assert_eq!(state_line(None, Some(10), true), "Watching");
         assert_eq!(state_line(None, None, false), "Paused");
     }
 
     #[test]
     fn late_cover_or_total_still_updates() {
-        // The media cache can fill in after the first announce. Both fields
-        // are part of the dedupe key so the card picks them up.
         let d = playing();
         let bare = PresenceInfo {
             cover_url: None,

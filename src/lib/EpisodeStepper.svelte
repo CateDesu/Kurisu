@@ -1,9 +1,8 @@
 <script lang="ts">
-  // Compact minus plus stepper. Edits buffer 3s then auto commit.
-  // Pending changes flush on unmount. Grey only, no white.
   import { untrack } from "svelte";
   import { emit } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
+  import { auth } from "$lib/auth.svelte";
   import type { ListEntry } from "$lib/types";
 
   let {
@@ -23,13 +22,14 @@
   let pending = $state(untrack(() => progress));
   let saved = $state(untrack(() => progress));
   let saving = $state(false);
-  // Last commit failure. Show the snapback instead of silently reverting.
   let failed = $state("");
   let timer: ReturnType<typeof setTimeout> | null = null;
+  const targetId = untrack(() => mediaId);
+  const epoch = untrack(() => auth.epoch);
+  const current = () => epoch === auth.epoch && auth.isLoggedIn;
 
   const dirty = $derived(pending !== saved);
   const atMin = $derived(pending <= 0);
-  // No episode count known. Cap at a sane ceiling.
   const atMax = $derived(pending >= (total ?? 9999));
 
   function step(delta: number) {
@@ -43,8 +43,6 @@
     timer = setTimeout(commit, 3000);
   }
 
-  // Arrow keys go through the same guards as the buttons. Swallow them so
-  // the page doesn't scroll and they don't bubble to the parent row.
   function onKeydown(e: KeyboardEvent) {
     let delta = 0;
     if (e.key === "ArrowLeft" || e.key === "ArrowDown") delta = -1;
@@ -58,14 +56,13 @@
 
   async function commit() {
     timer = null;
-    if (pending === saved || saving) return;
+    if (pending === saved || saving || !current()) return;
     saving = true;
     const v = pending;
     failed = "";
     try {
-      // CAS on saved. If something else moved progress while this was in
-      // flight, the backend skips our stale write and returns the live entry.
-      const entry = await api.setProgress(mediaId, v, saved);
+      const entry = await api.setProgress(targetId, v, saved);
+      if (!current()) return;
       if (entry.progress === v) {
         saved = v;
         onchange?.(entry);
@@ -76,30 +73,26 @@
         onchange?.(entry);
       }
     } catch (e) {
-      // revert to what actually saved
+      if (!current()) return;
       pending = saved;
       failed = String(e);
       console.error("set progress failed", e);
-      // Surface to the page. A console log alone is invisible to the user.
       onerror?.(failed);
     } finally {
       saving = false;
     }
   }
 
-  // Flush a pending edit if the row scrolls off or re-renders.
   $effect(() => {
     return () => {
       if (timer) {
         clearTimeout(timer);
         timer = null;
-        void commit();
+        queueMicrotask(() => { void commit(); });
       }
     };
   });
 
-  // Follow external progress changes. When idle, mirror the prop. When
-  // editing, hold the baseline and don't clobber the pending value.
   $effect(() => {
     const p = progress;
     untrack(() => {
@@ -107,11 +100,7 @@
         pending = p;
         saved = p;
       } else if (p !== saved) {
-        // Dirty. Keep saved on the baseline commit CASes against. Moving
-        // it to the fresh value here would let our stale write pass the
-        // backend check and rewind progress something else just set.
-        // Only adopt a higher value when the user was also incrementing.
-        // Don't reverse a decrement silently.
+        // Keep the original baseline while dirty so stale edits cannot pass the backend check.
         const wasIncrementing = pending > saved;
         if (wasIncrementing && p > pending) pending = p;
       }
@@ -124,7 +113,6 @@
     "focus:outline-none focus:ring-1 focus:ring-accent";
 </script>
 
-<!-- stopPropagation so clicking anywhere in the stepper doesn't fire the parent row's click handler -->
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
   class="flex items-center gap-1 select-none"

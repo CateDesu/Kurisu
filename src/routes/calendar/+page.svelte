@@ -1,7 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
   import { api } from "$lib/api";
+  import { preferences } from "$lib/preferences";
   import { auth } from "$lib/auth.svelte";
   import { nowMs } from "$lib/now.svelte";
   import { displayTitle, STATUS_LABEL, type AiringItem, type ListEntry } from "$lib/types";
@@ -10,32 +12,41 @@
   import type { Snapshot } from "./$types";
 
   const MINE_KEY = "kurisu.cal.mine";
-  function readMine(): boolean {
-    try {
-      return localStorage.getItem(MINE_KEY) !== "0";
-    } catch {
-      return true;
-    }
-  }
-
   let weekOffset = $state(0);
-  let mineOnly = $state(readMine());
+  let watchingOnly = $state(preferences.get(MINE_KEY) !== "0");
   let items = $state<AiringItem[]>([]);
   let entries = $state<ListEntry[]>([]);
+  let entriesLoading = $state(false);
+  let entriesLoaded = $state(false);
+  let entriesError = $state("");
   let loading = $state(false);
   let error = $state("");
 
-  function setMine(v: boolean) {
-    mineOnly = v;
+  let entriesLoadId = 0;
+  async function refreshEntries() {
+    const id = ++entriesLoadId;
+    const epoch = auth.epoch;
+    entriesLoading = true;
+    entriesLoaded = false;
+    entriesError = "";
+    entries = [];
     try {
-      localStorage.setItem(MINE_KEY, v ? "1" : "0");
-    } catch {
-      // Storage unavailable. The toggle just won't persist.
+      const fresh = await api.localEntries();
+      if (id !== entriesLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      entries = fresh;
+      entriesLoaded = true;
+    } catch (e) {
+      if (id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn) entriesError = String(e);
+    } finally {
+      if (id === entriesLoadId && epoch === auth.epoch) entriesLoading = false;
     }
   }
 
-  /// Rolling 7 day window. From local midnight today plus offset weeks,
-  /// ending 7 days later.
+  function setWatchingOnly(v: boolean) {
+    watchingOnly = v;
+    preferences.set(MINE_KEY, v ? "1" : "0");
+  }
+
   function range(offset: number): { start: Date; end: Date } {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
@@ -53,28 +64,23 @@
     return `${fmt(start)} – ${fmt(last)}`;
   });
 
-  // Guard for rapid Prev/Next clicks. Latest result wins.
   let loadId = 0;
-  // Set by the first settled load. Breaks the retrigger loop an empty
-  // week would cause once the load effect tracks items.
+  // Prevent a settled empty week from retriggering the load effect.
   let loadedOnce = false;
   async function load() {
     const id = ++loadId;
+    const epoch = auth.epoch;
     loading = true;
     error = "";
     try {
       const { start, end } = range(weekOffset);
-      const [schedule, myEntries] = await Promise.all([
-        api.getAiringSchedule(Math.floor(start.getTime() / 1000), Math.floor(end.getTime() / 1000)),
-        api.localEntries(),
-      ]);
-      if (id !== loadId) return;
+      const schedule = await api.getAiringSchedule(Math.floor(start.getTime() / 1000), Math.floor(end.getTime() / 1000));
+      if (id !== loadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
       items = schedule;
-      entries = myEntries;
     } catch (e) {
-      if (id === loadId) error = String(e);
+      if (id === loadId && epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     } finally {
-      if (id === loadId) {
+      if (id === loadId && epoch === auth.epoch) {
         loading = false;
         loadedOnce = true;
       }
@@ -83,30 +89,27 @@
 
   function shift(delta: number) {
     weekOffset += delta;
-    load();
+    void load();
+    void refreshEntries();
   }
 
-  // Keep the viewed week and its data across detail pages so Back returns
-  // where you left off. Fresh visits still start on the current week.
-  // SvelteKit restores the snapshot after the mount effect has already
-  // fired, so restore bumps loadId to discard the fetch the mount effect
-  // started for the default week, and clears its loading flag. A capture
-  // taken mid-fetch holds the new week with the old items, so store items
-  // empty and let the load effect refetch the right thing.
-  export const snapshot: Snapshot<{ weekOffset: number; items: AiringItem[]; entries: ListEntry[] }> = {
-    capture: () => (loading ? { weekOffset, items: [], entries } : { weekOffset, items, entries }),
+  // Restore invalidates the mount fetch. Captures during loading must refetch the selected week.
+  export const snapshot: Snapshot<{ weekOffset: number; items: AiringItem[] }> = {
+    capture: () => ({ weekOffset, items: loading ? [] : items }),
     restore: (v) => {
       weekOffset = v.weekOffset;
       items = v.items;
-      entries = v.entries;
       loadId++;
+      loadedOnce = true;
       loading = false;
+      if (items.length === 0) void load();
+      void refreshEntries();
     },
   };
 
   const onList = $derived(new Map(entries.map((e) => [e.media_id, e.status])));
   const progressByMedia = $derived(new Map(entries.map((e) => [e.media_id, e.progress])));
-  const visible = $derived(items.filter((i) => !mineOnly || onList.has(i.media.id)));
+  const visible = $derived(items.filter((i) => !watchingOnly || onList.get(i.media.id) === "CURRENT"));
   const days = $derived.by(() => {
     const map = new Map<string, { date: Date; items: AiringItem[] }>();
     for (const it of [...visible].sort((a, b) => a.airing_at - b.airing_at)) {
@@ -140,10 +143,43 @@
 
   const aired = (unix: number) => unix * 1000 < nowMs();
 
-  // Loads on mount and again if a snapshot restore lands an empty week,
-  // which is how a mid-fetch capture is stored. items is tracked so the
-  // restore re-runs this effect. loadedOnce breaks the retrigger loop an
-  // empty week would otherwise cause.
+  $effect(() => {
+    const epoch = auth.epoch;
+    const loggedIn = auth.isLoggedIn;
+    loadId++;
+    entriesLoadId++;
+    items = [];
+    entries = [];
+    loadedOnce = false;
+    loading = false;
+    entriesLoaded = false;
+    entriesLoading = false;
+    entriesError = "";
+    error = "";
+    if (!loggedIn) return;
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+    listen("kurisu://episode-updated", () => {
+      if (alive && epoch === auth.epoch) void refreshEntries();
+    }).then((stop) => {
+      if (alive && epoch === auth.epoch) {
+        unlisten = stop;
+        void refreshEntries();
+      } else stop();
+    }).catch((e) => {
+      if (alive && epoch === auth.epoch) {
+        error = `Could not listen for list updates: ${String(e)}`;
+        void refreshEntries();
+      }
+    });
+    return () => {
+      alive = false;
+      unlisten?.();
+      loadId++;
+      entriesLoadId++;
+    };
+  });
+
   $effect(() => {
     if (!auth.isLoggedIn || loadedOnce) return;
     if (items.length > 0) return;
@@ -156,20 +192,22 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-3xl mx-auto">
+  <div class="page-content">
     <div class="flex items-center gap-3 mb-4 flex-wrap">
       <h1 class="text-xl font-semibold">Calendar</h1>
       <span class="text-sm text-ink-dim flex-1">{rangeLabel}</span>
       <div class="flex rounded-md border border-edge overflow-hidden text-sm">
         <button
-          onclick={() => setMine(true)}
-          class="px-3 py-1.5 {mineOnly ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink'}"
+          onclick={() => setWatchingOnly(true)}
+          aria-pressed={watchingOnly}
+          class="px-3 py-1.5 {watchingOnly ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink'}"
         >
-          My shows
+          Watching
         </button>
         <button
-          onclick={() => setMine(false)}
-          class="px-3 py-1.5 {!mineOnly ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink'}"
+          onclick={() => setWatchingOnly(false)}
+          aria-pressed={!watchingOnly}
+          class="px-3 py-1.5 {!watchingOnly ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink'}"
         >
           All
         </button>
@@ -184,7 +222,7 @@
           ←
         </button>
         <button
-          onclick={() => { weekOffset = 0; load(); }}
+          onclick={() => { weekOffset = 0; void load(); void refreshEntries(); }}
           disabled={loading || weekOffset === 0}
           class="px-2.5 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
         >
@@ -207,11 +245,22 @@
       </div>
     {/if}
 
-    {#if loading && items.length === 0}
+    {#if entriesError}
+      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4 flex items-center gap-3">
+        <span class="flex-1">Could not read your list: {entriesError}</span>
+        <button onclick={() => refreshEntries()} disabled={entriesLoading} class="shrink-0 underline disabled:opacity-50">Retry list</button>
+      </div>
+    {/if}
+
+    {#if watchingOnly && !entriesLoaded}
+      {#if !entriesError}
+        <div class="text-ink-dim py-10 text-center">Loading your list…</div>
+      {/if}
+    {:else if loading && items.length === 0}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
     {:else if days.length === 0}
       <div class="text-ink-dim py-10 text-center">
-        {mineOnly ? "Nothing on your list airs this week." : "Nothing airing this week."}
+        {watchingOnly ? "None of your Watching shows air this week." : "Nothing airing this week."}
       </div>
     {:else}
       <div class="space-y-5">
@@ -232,24 +281,28 @@
                   {:else}
                     <div class="w-8 h-11 bg-panel-2 rounded shrink-0"></div>
                   {/if}
-                  <span class="flex-1 min-w-0 truncate text-sm">{displayTitle(it.media)}</span>
-                  <span class="shrink-0 text-sm text-ink-dim tabular-nums">
-                    Ep {it.episode}{it.media.episodes ? `/${it.media.episodes}` : ""}
+                  <span class="flex-1 min-w-0">
+                    <span class="block text-sm">{displayTitle(it.media)}</span>
+                    <span class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1">
+                      <span class="text-sm text-ink-dim tabular-nums">
+                        Ep {it.episode}{it.media.episodes ? `/${it.media.episodes}` : ""}
+                      </span>
+                      {#if progress !== undefined}
+                        <span
+                          class="text-xs px-2 py-0.5 rounded bg-panel-2 tabular-nums {progress < it.episode - 1
+                            ? 'text-amber-400'
+                            : 'text-ink-dim'}"
+                        >
+                          you: {progress}/{it.episode}
+                        </span>
+                      {/if}
+                      {#if status}
+                        <span class="text-xs px-2 py-0.5 rounded bg-panel-2 text-accent">
+                          {STATUS_LABEL[status] ?? status}
+                        </span>
+                      {/if}
+                    </span>
                   </span>
-                  {#if progress !== undefined}
-                    <span
-                      class="shrink-0 text-xs px-2 py-0.5 rounded bg-panel-2 tabular-nums {progress < it.episode - 1
-                        ? 'text-amber-400'
-                        : 'text-ink-dim'}"
-                    >
-                      you: {progress}/{it.episode}
-                    </span>
-                  {/if}
-                  {#if status}
-                    <span class="shrink-0 text-xs px-2 py-0.5 rounded bg-panel-2 text-accent">
-                      {STATUS_LABEL[status] ?? status}
-                    </span>
-                  {/if}
                 </button>
               {/each}
             </div>

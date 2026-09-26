@@ -1,23 +1,17 @@
 <script lang="ts">
-  // Format aware score editor. Adapts to the user's AniList scoreFormat:
-  // POINT_100, POINT_10_DECIMAL, POINT_10, POINT_5 stars, POINT_3 smileys.
-  // value is null when unrated. AniList stores it as a number.
   let {
     value = $bindable(),
     format,
     id,
   }: { value: number | null; format?: string | null; id?: string } = $props();
 
-  const smiles = ["😞", "😐", "😊"]; // index 0 → score 1
+  const smiles = ["😞", "😐", "😊"];
   const stars = [1, 2, 3, 4, 5];
 
   const inputCls =
     "w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent";
 
-  // min/max/step on a number input are hints, typed values bind raw. An out
-  // of range score made AniList reject the whole mutation, so the user's
-  // status and progress edits failed with an error pointing nowhere near the
-  // score field. Clamp and round to the format on change instead.
+  // Number input bounds do not clamp typed values.
   const NUMERIC_BOUNDS: Record<string, [number, number, number]> = {
     POINT_10: [0, 10, 1],
     POINT_10_DECIMAL: [0, 10, 0.1],
@@ -75,6 +69,5 @@
 {:else if format === "POINT_10_DECIMAL"}
   <input {id} type="number" bind:value min="0" max="10" step="0.1" onchange={clampTyped} class={inputCls} />
 {:else}
-  <!-- POINT_100 or unknown -->
   <input {id} type="number" bind:value min="0" max="100" step="1" onchange={clampTyped} class={inputCls} />
 {/if}

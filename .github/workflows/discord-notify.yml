@@ -1,12 +1,4 @@
-# Posts a message to Discord whenever code lands on main.
-#
-# Why an Action and not a direct webhook: GitHub's event JSON isn't shaped like a
-# Discord message ({"content":"…"}), so pointing a GitHub webhook straight at a
-# Discord webhook URL 400s. This Action is the format-converting bridge.
-#
-# Setup (one-time): repo → Settings → Secrets and variables → Actions →
-# "New repository secret" → Name = DISCORD_WEBHOOK, Value = your Discord
-# webhook URL (https://discord.com/api/webhooks/…). No other config needed.
+# Set the DISCORD_WEBHOOK repository secret to the destination webhook URL.
 name: Discord notify
 
 on:
@@ -20,8 +12,7 @@ jobs:
     steps:
       - name: Post push to Discord
         env:
-          # Passed via env (not interpolated into the script) to avoid shell injection
-          # from a crafted commit message.
+          # Pass commit text through env to prevent shell injection.
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}

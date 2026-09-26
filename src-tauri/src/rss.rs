@@ -1,11 +1,3 @@
-//! M6 torrent feed awareness, the other half of the Taiga style flow. Fetches
-//! the user's RSS feeds, nyaa style, parses the items and hands them to the
-//! command layer which matches titles against the list with the shared
-//! recognizer.
-//!
-//! Feed list lives in the settings table as a JSON array under rss_feeds, same
-//! pattern as the library folders. Seen state lives in the rss_seen table.
-
 use anyhow::{anyhow, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -13,13 +5,9 @@ use quick_xml::Reader;
 use crate::db::Db;
 
 const FEEDS_KEY: &str = "rss_feeds";
-/// nyaa.si Anime English translated, trusted or normal filter. The Taiga
-/// default, editable on the Torrents page.
 const DEFAULT_FEEDS: &[&str] = &["https://nyaa.si/?page=rss&c=1_2&f=0"];
-/// Read modify write JSON in the settings table. Serialize mutations.
 static FEEDS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// One raw feed item, before any list matching.
 #[derive(Debug, Default, Clone)]
 pub struct RawItem {
     pub title: String,
@@ -29,19 +17,17 @@ pub struct RawItem {
     pub size: Option<String>,
     pub seeders: Option<i64>,
     pub leechers: Option<i64>,
+    pub category_id: Option<String>,
+    pub category: Option<String>,
+    pub trusted: Option<bool>,
+    pub remake: Option<bool>,
     pub published: Option<i64>,
 }
 
-// ─────────────────────────── feed settings ───────────────────────────
-
-/// Configured feeds. The built in default only applies while the setting has
-/// never been written, so an emptied list stays empty.
+/// Use defaults only when unset. An explicitly empty list stays empty.
 pub fn get_feeds(db: &Db) -> Vec<String> {
     match db.get_setting(FEEDS_KEY).ok().flatten() {
         Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            // A corrupt row used to look exactly like "no feeds configured",
-            // silently erasing the user's list. Log it so the real state is
-            // at least discoverable.
             log::warn!("corrupt rss_feeds setting, starting from empty: {e}");
             Vec::new()
         }),
@@ -54,24 +40,13 @@ fn save_feeds(db: &Db, feeds: &[String]) -> Result<()> {
 }
 
 pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
-    // Parse first. Scheme, host and userinfo all come out of the parser
-    // instead of string prefix checks: http://127.0.0.1.evil.com/feed and
-    // http://127.0.0.1@evil.com/ both used to pass a 127. prefix or
-    // authority split and were fetched as plaintext from a remote host.
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| anyhow!("feed URL must be a valid http:// or https:// URL"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(anyhow!("feed URL must start with http:// or https://"));
     }
-    // Plain http can be tampered with in transit. Feed items carry magnet
-    // links, so a tampered feed hands the user attacker chosen torrents
-    // dressed up as new episodes of shows they watch. A reader self hosted
-    // on this machine is the one legitimate plain http case.
+    // Allow plaintext HTTP only for a local feed reader.
     if parsed.scheme() == "http" {
-        // host_str gives the parsed host, no userinfo, so a numeric loopback
-        // or localhost passes and everything else, including a dotted quad
-        // smuggled into a domain or a userinfo prefix, does not. IPv6 hosts
-        // come back wrapped in brackets, strip them before parsing.
         let host = parsed
             .host_str()
             .unwrap_or("")
@@ -106,18 +81,10 @@ pub fn remove_feed(db: &Db, url: &str) -> Result<Vec<String>> {
     Ok(feeds)
 }
 
-// ─────────────────────────── fetch + parse ───────────────────────────
-
-/// Hard ceiling on one feed body. Real feeds are tens of kilobytes. This
-/// bounds how much memory a hostile or pathological endpoint can make us
-/// buffer. Feed URLs are arbitrary user input over plaintext http.
 const MAX_FEED_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Items from every feed plus a per feed report. Lets the UI say WHICH feed
-/// failed instead of showing a silently short list.
 pub struct FeedFetch {
     pub items: Vec<RawItem>,
-    /// One entry per configured feed, in the configured order.
     pub failures: Vec<FeedFailure>,
 }
 
@@ -126,25 +93,13 @@ pub struct FeedFailure {
     pub error: String,
 }
 
-/// Fetch every feed and merge the items, deduped by guid. One dead feed doesn't
-/// fail the refresh. If ALL feeds fail the first error is returned. Feeds are
-/// fetched concurrently. Run serially with a 20s timeout each and a few dead
-/// feeds stalled the Torrents page for a minute or more before showing anything.
 pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let http = reqwest::Client::builder()
         .user_agent("Kurisu")
         .timeout(std::time::Duration::from_secs(20))
-        // Limit redirects rather than fully disabling them. HTTP to HTTPS
-        // upgrades and domain canonicalisation are common, and blocking them
-        // entirely breaks legitimate feeds. Capping at 3 hops bounds the attack
-        // surface. The SSRF vector via redirect to loopback or metadata still
-        // exists per hop, but feeds are user added not attacker controlled and
-        // the response is parsed as RSS, never executed.
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()?;
 
-    // tokio::spawn rather than a futures combinator. No new dependency, and the
-    // handles are awaited in order so the merged list stays deterministic.
     let mut tasks = Vec::with_capacity(feeds.len());
     for feed in feeds {
         let http = http.clone();
@@ -164,7 +119,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 let mut body: Vec<u8> = Vec::new();
                 while let Some(chunk) = resp.chunk().await? {
                     body.extend_from_slice(&chunk);
-                    // The header can lie or be absent. Cap the stream too.
+                    // Enforce the cap even when Content-Length is missing or false.
                     if body.len() as u64 > MAX_FEED_BYTES {
                         return Err(anyhow!("{feed}: response exceeded {MAX_FEED_BYTES} bytes"));
                     }
@@ -179,10 +134,6 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     for (i, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok(pair) => results.push(pair),
-            // A panic in one feed's task must not lose the others. Report
-            // the feed as failed too. Dropping the pair hid it from the
-            // failure list, and a run where every task died reported
-            // success with an empty item list.
             Err(e) => results.push((feeds[i].clone(), Err(anyhow!("feed task failed: {e}")))),
         }
     }
@@ -197,13 +148,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
             Ok(xml) => {
                 let parsed = parse_rss_checked(&xml);
                 let items = parsed.items;
-                // A 200 that isn't RSS, like a captive portal, an error page
-                // or a moved feed, yields zero items and used to be
-                // indistinguishable from nothing new. An empty but valid
-                // feed like a nyaa search with zero hits still has the rss
-                // and channel elements, so only their absence is a failure.
-                // Case insensitive. XML is case sensitive in general but
-                // real world generators have emitted <RSS>.
+                // Distinguish an empty RSS feed from an error page returned with HTTP 200.
                 let lower = xml.to_lowercase();
                 if items.is_empty() && !lower.contains("<rss") && !lower.contains("<channel") {
                     let msg = format!("{feed}: response was not an RSS feed");
@@ -214,10 +159,6 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                     });
                     continue;
                 }
-                // A parse that died mid document keeps its recovered items
-                // but must say so. Silent truncation looked exactly like a
-                // healthy feed with nothing new, the failure this list
-                // exists to prevent.
                 if let Some(err) = parsed.error {
                     let msg = format!(
                         "{feed}: feed broke off mid parse, kept {} items recovered before the error: {err}",
@@ -231,11 +172,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 }
                 ok += 1;
                 for mut item in items {
-                    // Scope the guid to its feed. Two feeds can reuse a guid
-                    // string, an incremental counter or a colliding link,
-                    // and a bare guid used to drop the second item and share
-                    // seen state across feeds. The separator is a control
-                    // character no URL or title contains.
+                    // Scope GUIDs by feed so deduplication and seen state cannot cross feeds.
                     item.guid = format!("{feed}\u{1}{}", item.guid);
                     if seen_guids.insert(item.guid.clone()) {
                         out.push(item);
@@ -265,51 +202,57 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     })
 }
 
-/// Search nyaa for arbitrary torrents, any anime subcategory. A nyaa search
-/// page doubles as a feed when page=rss is set, so this rides the same fetch
-/// and parse path as the configured feeds. The host is fixed and only the
-/// query text is user input, so none of the feed URL validation applies.
-pub async fn search(query: &str) -> Result<Vec<RawItem>> {
-    let url = format!(
-        "https://nyaa.si/?page=rss&c=1_0&f=0&q={}",
-        crate::anilist::urlencoding::encode(query)
-    );
-    Ok(fetch_all(&[url]).await?.items)
+fn search_url(query: &str, category: &str, filter: &str) -> Result<String> {
+    if !matches!(category, "1_0" | "1_1" | "1_2" | "1_3" | "1_4") {
+        return Err(anyhow!("unsupported torrent category"));
+    }
+    if !matches!(filter, "0" | "1" | "2") {
+        return Err(anyhow!("unsupported torrent filter"));
+    }
+    let mut url = reqwest::Url::parse("https://nyaa.si/")?;
+    url.query_pairs_mut()
+        .append_pair("page", "rss")
+        .append_pair("c", category)
+        .append_pair("f", filter)
+        .append_pair("q", query);
+    Ok(url.into())
 }
 
-/// parse_rss plus the early stop reason when the document was malformed.
+pub async fn search(query: &str, category: &str, filter: &str) -> Result<Vec<RawItem>> {
+    let url = search_url(query, category, filter)?;
+    let fetched = fetch_all(&[url]).await?;
+    if let Some(failure) = fetched.failures.first() {
+        return Err(anyhow!("Could not complete the search: {}", failure.error));
+    }
+    Ok(fetched.items)
+}
+
 pub(crate) struct ParsedFeed {
     pub items: Vec<RawItem>,
-    /// Set when quick-xml gave up partway through. The items recovered
-    /// before the error are kept, the caller must report the truncation.
+    /// Keep recovered items, but report a truncated document.
     pub error: Option<String>,
 }
 
-/// Items-only view of parse_rss_checked, for the tests and any caller that
-/// does not care whether the document was well formed end to end.
 #[cfg(test)]
 pub fn parse_rss(xml: &str) -> Vec<RawItem> {
     parse_rss_checked(xml).items
 }
 
-/// Pull <item>s out of an RSS 2.0 document. Namespaced nyaa extras like
-/// nyaa:seeders and nyaa:infoHash are matched on their qualified name. Unknown
-/// elements are ignored so non nyaa feeds still yield the basics.
 pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
     let mut reader = Reader::from_str(xml);
     let mut out = Vec::new();
     let mut item: Option<RawItem> = None;
-    // Field being accumulated plus the element depth at which it opened, so a
-    // nested child element can't clobber it. Only the End that closes the
-    // element which opened the field commits the buffer.
+    // Only the closing tag at this depth may commit the field.
     let mut field: Option<String> = None;
     let mut field_depth = 0usize;
     let mut depth = 0usize;
+    let mut document_depth = 0usize;
     let mut buf = String::new();
     let mut error = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
+                document_depth += 1;
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if name == "item" {
                     item = Some(RawItem::default());
@@ -335,6 +278,7 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
                 }
             }
             Ok(Event::End(e)) => {
+                document_depth = document_depth.saturating_sub(1);
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if name == "item" {
                     if let Some(it) = item.take() {
@@ -359,6 +303,14 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
                                 "nyaa:size" => it.size = Some(v.to_string()),
                                 "nyaa:seeders" => it.seeders = v.parse().ok(),
                                 "nyaa:leechers" => it.leechers = v.parse().ok(),
+                                "nyaa:categoryId" => {
+                                    it.category_id = (!v.is_empty()).then(|| v.to_string())
+                                }
+                                "nyaa:category" => {
+                                    it.category = (!v.is_empty()).then(|| v.to_string())
+                                }
+                                "nyaa:trusted" => it.trusted = parse_flag(v),
+                                "nyaa:remake" => it.remake = parse_flag(v),
                                 _ => {}
                             }
                             buf.clear();
@@ -366,10 +318,12 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            // Ill formed markup like a mismatched closing tag stops the parse
-            // here. Keep what was accumulated but say so. Silent truncation
-            // looks identical to a clean short feed otherwise.
+            Ok(Event::Eof) => {
+                if document_depth != 0 {
+                    error = Some("unexpected end of RSS document".to_string());
+                }
+                break;
+            }
             Err(e) => {
                 log::warn!("RSS parse stopped early: {e}");
                 error = Some(e.to_string());
@@ -381,10 +335,15 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
     ParsedFeed { items: out, error }
 }
 
-/// Decode a text node without letting one bad entity blank the whole run.
-/// quick-xml resolves only the five predefined XML entities, so map the common
-/// HTML ones too. Fall back to the raw text for anything unknown instead of
-/// dropping it. An emptied title or link silently deletes the item.
+fn parse_flag(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "yes" | "true" | "1" => Some(true),
+        "no" | "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Preserve unknown entities instead of discarding the entire text node.
 fn decode_text(t: &quick_xml::events::BytesText) -> String {
     t.unescape_with(|name| {
         Some(match name {
@@ -412,9 +371,7 @@ fn decode_text(t: &quick_xml::events::BytesText) -> String {
     .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned())
 }
 
-/// RSS 2.0 dates are RFC 2822, but plenty of feeds ship ISO 8601. RSS 1.0's
-/// dc:date is ISO by spec, and some carry no timezone at all. Try the strict
-/// parsers first, then a couple of naive layouts treated as UTC.
+/// Dates without a timezone use UTC.
 fn parse_date(s: &str) -> Option<i64> {
     if let Ok(d) = chrono::DateTime::parse_from_rfc2822(s) {
         return Some(d.timestamp());
@@ -433,7 +390,6 @@ fn parse_date(s: &str) -> Option<i64> {
     None
 }
 
-/// Fill derived fields: guid falls back to the link.
 fn finish_item(mut it: RawItem) -> RawItem {
     if it.guid.is_empty() {
         it.guid = it.link.clone();
@@ -441,11 +397,7 @@ fn finish_item(mut it: RawItem) -> RawItem {
     it
 }
 
-/// magnet URI from an info hash. Clients resolve peers over DHT or trackers.
-/// The hash is feed text. Validate the shape, a 40 char hex or 32 char base32
-/// value, so a crafted "hash" can not smuggle extra magnet parameters into
-/// xt. A bad value degrades to a hashless magnet. The item's torrent page
-/// link still works for those.
+/// Validate the hash before embedding it so feed text cannot inject magnet parameters.
 pub fn magnet_for(info_hash: &str, title: &str) -> String {
     let h = info_hash.trim();
     let valid = (h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
@@ -467,6 +419,30 @@ pub fn magnet_for(info_hash: &str, title: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn truncated_xml_reports_recovered_items() {
+        let first =
+            "<rss><channel><item><title>First</title><link>https://example.com/1</link></item>";
+        for suffix in ["<item><title>Second", "", "</channel>"] {
+            let xml = format!("{first}{suffix}");
+            let parsed = parse_rss_checked(&xml);
+            assert_eq!(parsed.items.len(), 1);
+            assert!(parsed.error.is_some());
+            let fetched = fetch_full(serve_body(&xml)).await;
+            assert_eq!(fetched.items.len(), 1);
+            assert_eq!(fetched.failures.len(), 1);
+        }
+        for xml in [
+            "<rss><channel/></rss>",
+            "<rss/>",
+            "<rss><channel></channel></rss>",
+        ] {
+            let parsed = parse_rss_checked(xml);
+            assert!(parsed.items.is_empty());
+            assert!(parsed.error.is_none());
+        }
+    }
+
     const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa">
   <channel>
@@ -480,12 +456,20 @@ mod tests {
       <nyaa:leechers>7</nyaa:leechers>
       <nyaa:infoHash>abcdef0123456789abcdef0123456789abcdef01</nyaa:infoHash>
       <nyaa:size>1.4 GiB</nyaa:size>
+      <nyaa:categoryId>1_2</nyaa:categoryId>
+      <nyaa:category>Anime - English-translated</nyaa:category>
+      <nyaa:trusted>Yes</nyaa:trusted>
+      <nyaa:remake>No</nyaa:remake>
     </item>
     <item>
       <title><![CDATA[[Group] R&D Show - 02 [720p]]]></title>
       <link>https://nyaa.si/download/1000002.torrent</link>
       <guid>https://nyaa.si/view/1000002</guid>
       <pubDate>not a date</pubDate>
+      <nyaa:categoryId>1_3</nyaa:categoryId>
+      <nyaa:category>Anime - Non-English-translated</nyaa:category>
+      <nyaa:trusted>No</nyaa:trusted>
+      <nyaa:remake>Yes</nyaa:remake>
     </item>
     <item>
       <title>Entity &amp; Escapes - 09</title>
@@ -505,19 +489,60 @@ mod tests {
         assert_eq!(a.seeders, Some(123));
         assert_eq!(a.leechers, Some(7));
         assert_eq!(a.size.as_deref(), Some("1.4 GiB"));
+        assert_eq!(a.category_id.as_deref(), Some("1_2"));
+        assert_eq!(a.category.as_deref(), Some("Anime - English-translated"));
+        assert_eq!(a.trusted, Some(true));
+        assert_eq!(a.remake, Some(false));
         assert!(a.published.is_some());
         assert_eq!(
             a.info_hash.as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef01")
         );
-        // CDATA title with raw ampersand survives. Bad pubDate maps to None.
         let b = &items[1];
         assert_eq!(b.title, "[Group] R&D Show - 02 [720p]");
         assert_eq!(b.published, None);
-        // No guid means link is the identity. Escaped entity decoded.
+        assert_eq!(b.category_id.as_deref(), Some("1_3"));
+        assert_eq!(b.trusted, Some(false));
+        assert_eq!(b.remake, Some(true));
         let c = &items[2];
         assert_eq!(c.title, "Entity & Escapes - 09");
         assert_eq!(c.guid, c.link);
+        assert_eq!(c.category_id, None);
+        assert_eq!(c.category, None);
+        assert_eq!(c.trusted, None);
+        assert_eq!(c.remake, None);
+    }
+
+    #[test]
+    fn malformed_release_flags_stay_unknown() {
+        let items = parse_rss(
+            r#"<rss xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item>
+            <title>Unknown</title><link>https://example.com/1</link>
+            <nyaa:trusted>maybe</nyaa:trusted><nyaa:remake>unknown</nyaa:remake>
+            </item></channel></rss>"#,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].trusted, None);
+        assert_eq!(items[0].remake, None);
+    }
+
+    #[test]
+    fn search_filters_preserve_query_syntax() {
+        let query = r#""進撃の巨人"|"Attack on Titan" -1080p &c=0_0"#;
+        for category in ["1_0", "1_1", "1_2", "1_3", "1_4"] {
+            for filter in ["0", "1", "2"] {
+                let url = reqwest::Url::parse(&search_url(query, category, filter).unwrap()).unwrap();
+                let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                assert_eq!(url.host_str(), Some("nyaa.si"));
+                assert_eq!(pairs.len(), 4);
+                assert_eq!(pairs["page"], "rss");
+                assert_eq!(pairs["c"], category);
+                assert_eq!(pairs["f"], filter);
+                assert_eq!(pairs["q"], query);
+            }
+        }
+        assert!(search_url(query, "1_2&f=0", "2").is_err());
+        assert!(search_url(query, "1_2", "unknown").is_err());
     }
 
     #[test]
@@ -528,13 +553,11 @@ mod tests {
             m,
             format!("magnet:?xt=urn:btih:{hash}&dn=My%20Show%20-%2005")
         );
-        // base32 hashes are valid too
         assert!(
             magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t").starts_with("magnet:?xt=urn:btih:")
         );
     }
 
-    /// A crafted "hash" must not smuggle extra magnet parameters into xt.
     #[test]
     fn magnet_rejects_malformed_info_hash() {
         let m = magnet_for("abc&tr=http://evil/announce", "My Show");
@@ -549,7 +572,6 @@ mod tests {
         assert!(m.starts_with("magnet:?dn="));
     }
 
-    // Captures log output so the truncation warning can be asserted on.
     struct Capture;
     static CAPTURE: Capture = Capture;
     static LOG_LINES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
@@ -569,8 +591,6 @@ mod tests {
 
     #[test]
     fn bad_entity_keeps_text() {
-        // One unknown entity must not blank the whole text node. An emptied
-        // title or link silently deletes the item.
         let xml = r#"<rss version="2.0"><channel>
             <item>
               <title>Show&nbsp;Name &amp; Friends - 01</title>
@@ -584,14 +604,11 @@ mod tests {
         let items = parse_rss(xml);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "Show\u{a0}Name & Friends - 01");
-        // Unknown entity. The raw text is kept verbatim rather than dropped.
         assert_eq!(items[1].title, "Odd &bogus; Entity - 02");
     }
 
     #[test]
     fn nested_element_inside_field() {
-        // A child element inside <title> must not clobber the field state or
-        // drop the item. The text around the child is kept.
         let xml = r#"<rss version="2.0"><channel>
             <item>
               <title>Foo <b>Bar</b> Baz - 03</title>
@@ -607,8 +624,6 @@ mod tests {
     #[test]
     fn truncated_feed_keeps_items_and_warns() {
         install_logger();
-        // A mismatched closing tag mid feed. Keep the items parsed so far and
-        // log a warning instead of silently truncating.
         let xml = r#"<rss version="2.0"><channel>
             <item>
               <title>Good - 01</title>
@@ -667,8 +682,6 @@ mod tests {
         assert_eq!(items[4].published, Some(ts - (21 * 3600 + 38 * 60)));
     }
 
-    /// Serve one canned HTTP response on a loopback port, then run fetch_all
-    /// against it.
     async fn fetch_with_server(
         respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
     ) -> Result<Vec<RawItem>> {
@@ -683,8 +696,6 @@ mod tests {
             .map(|f| f.items)
     }
 
-    /// Same loopback server, but the whole FeedFetch so the per feed failure
-    /// list can be asserted on.
     async fn fetch_full(
         respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
     ) -> FeedFetch {
@@ -699,7 +710,8 @@ mod tests {
             .expect("one feed failure must not fail the whole fetch")
     }
 
-    fn serve_body(body: &'static str) -> impl FnOnce(&mut std::net::TcpStream) + Send + 'static {
+    fn serve_body(body: &str) -> impl FnOnce(&mut std::net::TcpStream) + Send + 'static {
+        let body = body.to_owned();
         move |stream| {
             use std::io::{Read, Write};
             let mut req = [0u8; 1024];
@@ -714,8 +726,6 @@ mod tests {
         }
     }
 
-    /// A nyaa search with zero hits returns a well formed rss document with
-    /// no items. That is a healthy feed, not a failure.
     #[tokio::test]
     async fn empty_but_valid_feed_is_not_a_failure() {
         let f = fetch_full(serve_body(
@@ -729,7 +739,6 @@ mod tests {
         );
     }
 
-    /// A 200 that is not RSS at all still counts as a feed failure.
     #[tokio::test]
     async fn non_rss_response_is_still_a_failure() {
         let f = fetch_full(serve_body("<html><body>moved</body></html>")).await;
@@ -759,7 +768,6 @@ mod tests {
     #[tokio::test]
     async fn streamed_oversize_is_rejected() {
         use std::io::{Read, Write};
-        // No Content-Length. The running total cap must catch it instead.
         let err = fetch_with_server(move |stream| {
             let mut req = [0u8; 1024];
             let _ = stream.read(&mut req);
@@ -775,7 +783,7 @@ mod tests {
                     || stream.write_all(&chunk).is_err()
                     || stream.write_all(b"\r\n").is_err()
                 {
-                    break; // client bailed once the cap tripped
+                    break;
                 }
             }
         })
@@ -784,9 +792,6 @@ mod tests {
         assert!(err.to_string().contains("exceeded"), "got: {err}");
     }
 
-    /// The plain http guard is a parsed host check, not a string prefix.
-    /// Both classic bypasses must be refused: a dotted quad inside a domain
-    /// and a userinfo prefix in front of a remote host.
     #[test]
     fn plain_http_loopback_check_is_not_a_prefix_match() {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
@@ -796,16 +801,12 @@ mod tests {
         assert!(add_feed(&db, "http://evil.com/").is_err());
         assert!(add_feed(&db, "ftp://127.0.0.1/rss").is_err());
         assert!(add_feed(&db, "not a url").is_err());
-        // The legitimate self hosted reader cases still pass.
         assert!(add_feed(&db, "http://127.0.0.1:8123/rss").is_ok());
         assert!(add_feed(&db, "http://localhost/rss").is_ok());
         assert!(add_feed(&db, "http://[::1]/rss").is_ok());
         assert!(add_feed(&db, "https://nyaa.si/?page=rss&c=1_2&f=0").is_ok());
     }
 
-    /// A feed that breaks off mid document keeps its recovered items but the
-    /// refresh reports it as a failure. It used to count as healthy, showing
-    /// "no new torrents" forever with zero indication anything was wrong.
     #[tokio::test]
     async fn a_feed_that_breaks_mid_document_is_reported() {
         let body = "<rss version=\"2.0\"><channel>
@@ -828,8 +829,6 @@ mod tests {
         );
     }
 
-    /// Two feeds reusing a guid string are two different items. The guid is
-    /// scoped per feed, so neither dedup nor the seen state crosses feeds.
     #[tokio::test]
     async fn guid_collisions_across_feeds_stay_distinct() {
         let body = "<rss version=\"2.0\"><channel>

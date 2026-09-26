@@ -1,16 +1,3 @@
-//! Self-update over the rolling GitHub release. Same shape as NyaaTriggers'
-//! updater. Fetch releases/latest, compare numeric version tuples, download
-//! with a SHA-256 check that fails closed, then hand off per platform.
-//!
-//! - Windows: launch the verified NSIS installer and quit, so it can
-//!   overwrite the install.
-//! - Linux: swap the running binary for the verified one via two adjacent
-//!   renames. A running Linux binary can be replaced, unlike Windows. Let
-//!   the UI prompt a restart.
-//!
-//! Anything else reports can_install: false and updates by hand from the
-//! release page.
-
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,60 +11,36 @@ use serde_json::Value;
 const REPO: &str = "CateDesu/Kurisu";
 const USER_AGENT: &str = "Kurisu";
 
-/// Dropped next to the exe when a swap fails so badly the rollback rename also
-/// failed. exe missing, only the .kurisu-old backup remains. The next launch,
-/// possible only after a manual restore, surfaces it. The file is removed only
-/// once the frontend acknowledges the notice.
+/// Legacy failure marker. Keep until acknowledged.
 pub const FAILED_MARKER: &str = ".kurisu-update-failed";
 
-/// Notice text for the doubly failed swap state the marker records. Shared by
-/// the emit fast path and the take_update_failed pull so both say the same
-/// thing.
 pub const FAILED_MESSAGE: &str = "The last update failed to install cleanly, so the previous version was kept. Nothing was lost — you can retry the update from Settings.";
 
-// ── Process-wide updater state ──────────────────────────────────────────────
-
-/// The exe path captured ONCE at process start, via init_install_path from app
-/// setup. After a successful Linux swap, /proc/self/exe follows the renamed
-/// inode, so a current_exe() at apply time would return the .kurisu-old
-/// backup and the install would target the wrong path.
+/// Keep the original launch path after Linux replaces the running inode.
 static EXE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Set after a successful in-place swap: the on-disk binary is then newer than
-/// the still-running process, whose current_version() is a compile-time
-/// constant, so no further install may be offered or applied until restart.
+/// After a swap, require restart before offering another install.
 static UPDATE_APPLIED: AtomicBool = AtomicBool::new(false);
 
-/// Set when startup found the doubly failed swap marker. Cleared, and the
-/// marker file removed, only when the frontend acknowledges the notice via
-/// take_update_failed.
 static UPDATE_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// The startup check's update-available payload, stashed so a webview that
-/// booted after the one-shot emit can still pull it on mount.
+/// Retain the startup result for a webview that misses the event.
 static PENDING_UPDATE: Mutex<Option<Value>> = Mutex::new(None);
 
-/// Per-invocation counter for scratch paths. A bare pid is shared by every
-/// concurrent install in the same process.
 #[cfg(any(windows, target_os = "linux"))]
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Unique per-invocation scratch suffix. See SCRATCH_SEQ.
 #[cfg(any(windows, target_os = "linux"))]
 fn scratch_suffix() -> u64 {
     SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Capture the exe path at process start, before any update can have swapped
-/// it. See EXE_PATH. Repeat calls keep the first capture.
 pub fn init_install_path() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let _ = EXE_PATH.set(sane_exe_path(exe)?);
     Ok(())
 }
 
-/// Backstop sanity check on an install target. Never a .kurisu-old backup,
-/// never an unlinked but running inode, flagged by a ` (deleted)` suffix on Linux.
 fn sane_exe_path(exe: PathBuf) -> Result<PathBuf, String> {
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name.ends_with(".kurisu-old") || name.contains(" (deleted)") {
@@ -86,8 +49,6 @@ fn sane_exe_path(exe: PathBuf) -> Result<PathBuf, String> {
     Ok(exe)
 }
 
-/// The install dir. Parent of the startup-captured exe path, falling back to a
-/// fresh current_exe() when init_install_path never ran. Unit tests use the fallback.
 fn install_dir() -> Option<PathBuf> {
     let exe = EXE_PATH
         .get()
@@ -96,12 +57,6 @@ fn install_dir() -> Option<PathBuf> {
     exe.parent().map(Path::to_path_buf)
 }
 
-/// Startup sweep next to the exe. Leftovers first, then the doubly failed swap
-/// marker. Returns true when a marker was found, meaning a previous update's
-/// swap AND its rollback both failed, and the user only got here by manually
-/// restoring the backup. The marker file is NOT removed here. It stays until
-/// the frontend acknowledges the notice via take_update_failed, because the
-/// one-shot emit can race a slow webview boot and drop, losing the warning.
 pub fn sweep_install_dir() -> bool {
     let Some(dir) = install_dir() else {
         return false;
@@ -114,8 +69,6 @@ pub fn sweep_install_dir() -> bool {
     false
 }
 
-/// The frontend's pull half of the failed-update notice. Returns the notice
-/// text once per marker and removes the marker file only now.
 #[tauri::command]
 pub fn take_update_failed() -> Option<String> {
     if !UPDATE_FAILED.swap(false, Ordering::SeqCst) {
@@ -127,34 +80,20 @@ pub fn take_update_failed() -> Option<String> {
     Some(FAILED_MESSAGE.to_string())
 }
 
-/// Stash the startup update-available payload for the pull path.
 pub fn set_pending_update(payload: Value) {
     *PENDING_UPDATE.lock() = Some(payload);
 }
 
-/// The stashed update-available payload, handed out once. The emit carrying
-/// the same payload can fire before a slow-booting webview has its listener
-/// registered, so pulling on mount is the reliable path.
 #[tauri::command]
 pub fn take_pending_update() -> Option<Value> {
     PENDING_UPDATE.lock().take()
 }
 
-// ── Version comparison (same semantics as NyaaTriggers' parse_version) ──────
-
-/// `v1.0.0.8` becomes `(1, 0, 0, 8)`. Each dot segment contributes only its
-/// leading digits. No leading digit means 0. Handles the rolling 4-segment tags.
-/// Comparisons go through version_key. This stays for the tests and as a
-/// plain release-tuple view.
 #[allow(dead_code)]
 pub fn parse_version(s: &str) -> Vec<u64> {
     version_key(s).0
 }
 
-/// Comparable version key. Release segments first, then a prerelease marker
-/// that sorts ANY prerelease below the plain release of the same numbers,
-/// so 1.0.0-rc1 < 1.0.0 < 1.0.0.8. The prerelease's first digit run breaks
-/// rc1 and rc2 style ties.
 fn version_key(s: &str) -> (Vec<u64>, u8, u64) {
     let trimmed = s.trim().trim_start_matches(['v', 'V']);
     let (core, pre) = match trimmed.split_once('-') {
@@ -170,7 +109,6 @@ fn version_key(s: &str) -> (Vec<u64>, u8, u64) {
         .collect();
     let release = if release.is_empty() { vec![0] } else { release };
     let (pre_rank, pre_num) = match pre {
-        // No prerelease sorts above any prerelease of the same release numbers.
         None => (1, 0),
         Some(p) => {
             let digits: String = p
@@ -184,15 +122,11 @@ fn version_key(s: &str) -> (Vec<u64>, u8, u64) {
     (release, pre_rank, pre_num)
 }
 
-/// True if `remote` is strictly newer than `current`.
 pub fn is_newer(remote: &str, current: &str) -> bool {
     version_key(remote) > version_key(current)
 }
 
-/// This build's version. The CI-stamped release version when present,
-/// KURISU_BUILD_VERSION at build time, including the rolling 4th segment, else
-/// the crate version. Without the stamp an installed rolling build would keep
-/// reporting the X.Y.Z base and re-offer the same update forever.
+/// Stamp the full rolling version to avoid offering the installed release again.
 pub fn current_version() -> &'static str {
     match option_env!("KURISU_BUILD_VERSION") {
         Some(v) if !v.is_empty() => v,
@@ -200,23 +134,11 @@ pub fn current_version() -> &'static str {
     }
 }
 
-/// True only when this binary was stamped by CI via KURISU_BUILD_VERSION.
-/// Stamped builds know their exact rolling version, X.Y.Z plus run number.
 pub fn is_ci_build() -> bool {
     matches!(option_env!("KURISU_BUILD_VERSION"), Some(v) if !v.is_empty())
 }
 
-/// True when this build participates in the startup auto check. CI builds
-/// always do. A release build compiled from source on Linux does too: the
-/// in place swap lands in the builder's own target dir harmlessly. An
-/// UNSTAMPED Windows build is excluded: it reports the base X.Y.Z, every
-/// rolling release looks newer forever, and the install path launches the
-/// NSIS installer into its own location instead of replacing the source
-/// built binary, so the modal recurred every boot and each accept re
-/// downloaded 150 MB. Stamped Windows builds know their exact version and
-/// update normally. Debug builds are the dev loop and stay quiet. The
-/// auto_update setting turns the check off entirely, and a manual check
-/// from Settings works on every build.
+/// Unstamped Windows builds cannot update their own location through NSIS. Debug builds stay quiet.
 pub fn auto_check_eligible() -> bool {
     if is_ci_build() {
         return true;
@@ -224,10 +146,6 @@ pub fn auto_check_eligible() -> bool {
     !cfg!(debug_assertions) && !cfg!(windows)
 }
 
-// ── Release lookup ──────────────────────────────────────────────────────────
-
-/// A GitHub release, reduced to what the updater needs. assets maps asset
-/// name to browser download URL.
 #[derive(Debug, Clone, Default)]
 pub struct Release {
     pub tag: String,
@@ -237,12 +155,7 @@ pub struct Release {
     pub assets: HashMap<String, String>,
 }
 
-/// Fetch the newest full, non-prerelease, non-draft release by VERSION, not
-/// by publication order. /releases/latest is chronological: a hand cut
-/// v1.1.0 got superseded in latest by the next rolling v1.0.0.N push, so
-/// users on 1.1.0 saw "up to date" and stranded until the rolling tag
-/// passed them, and users on old rolling builds skipped the milestone. The
-/// walk picks the max by the same version key the updater compares with.
+/// Choose by version. Publication order can put an older rolling build after a milestone.
 pub async fn fetch_latest_release() -> Result<Release, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -263,8 +176,6 @@ pub async fn fetch_latest_release() -> Result<Release, String> {
     pick_latest_release(&data).ok_or_else(|| "no published releases found".to_string())
 }
 
-/// Max semver release out of a GitHub /releases listing. Drafts and
-/// prereleases are invisible to /releases/latest and stay excluded here.
 fn pick_latest_release(data: &Value) -> Option<Release> {
     let arr = data.as_array()?;
     let mut best: Option<Release> = None;
@@ -323,26 +234,10 @@ fn parse_release(data: &Value) -> Release {
     }
 }
 
-/// The updatable asset for THIS platform in `rel`. The NSIS installer for
-/// this arch on Windows. The bare `kurisu` binary on Linux.
-/// None elsewhere, and None once an update was applied this session. The
-/// running process is then older than the on-disk binary, so the version
-/// comparison would keep re-offering the install until restart. Never matches
-/// the .sha256 sidecars. Linux CI publishes x86-64 only, so other arches get
-/// None, can_install: false, rather than a binary their kernel cannot exec.
-/// Whether an update was already applied this session. The running process is
-/// then older than the on-disk binary, so no further install should be offered
-/// until a restart.
 pub fn update_applied() -> bool {
     UPDATE_APPLIED.load(Ordering::SeqCst)
 }
 
-/// The NSIS installer for `arch` out of a release's asset names. CI names it
-/// like Kurisu_1.0.0_x64-setup.exe. The arch marker is required so a second
-/// installer for another arch can never be picked at random out of the
-/// HashMap. Zero or more than one candidate means None. Better no update
-/// than the wrong arch installer. CI ships x64 only, so other arches get
-/// None like the Linux arm below.
 #[cfg(any(windows, test))]
 fn windows_installer<'a>(names: impl Iterator<Item = &'a String>, arch: &str) -> Option<&'a str> {
     let marker = match arch {
@@ -381,10 +276,6 @@ pub fn platform_asset(rel: &Release) -> Option<&str> {
     }
 }
 
-/// Fetch the .sha256 sidecar text for an asset, if the release publishes one.
-/// Bounded like the module's other fetches. A sidecar is under 100 bytes, so a
-/// 15 s deadline, HTTP error statuses don't count as sidecar text, and the
-/// body is capped rather than read unbounded.
 #[cfg(any(windows, target_os = "linux"))]
 pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
     const MAX_SIDECAR_BYTES: usize = 4096;
@@ -417,24 +308,9 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-// ── Download + integrity ────────────────────────────────────────────────────
-
-/// Hard ceiling on an update download. The real assets are around 20 MB for
-/// the Linux binary and 150 MB for the NSIS installer with the WebView2
-/// bootstrapper. This leaves room for an offline-installer future while
-/// bounding how much disk a pathological or compromised asset can fill.
 #[cfg(any(windows, target_os = "linux"))]
 const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Stream `url` to `dest`. Writes to a unique per-invocation .part-N sibling
-/// so concurrent installs in one process never share a scratch file, and
-/// renames on success so a half-download is never mistaken for complete.
-/// Verifies Content-Length, since a clean early close is a short read with no
-/// error, and refuses anything past MAX_DOWNLOAD_BYTES, header-claimed or
-/// streamed. The .part is removed on failure. The staged bytes and the
-/// directory entry are fsync'd before returning, so a crash in the writeback
-/// window can't leave an unflushed file at `dest`. File I/O goes through
-/// tokio::fs so the writes stay off the async workers.
 #[cfg(any(windows, target_os = "linux"))]
 pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
@@ -451,10 +327,7 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
     let res: Result<(), String> = async {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            // NSIS plus the embedded WebView2 bootstrapper is about 150 MB.
-            // At roughly 1 Mbps that is a 20-minute pull, so give slow links
-            // 30 minutes before cutting off. The half-download is deleted
-            // either way.
+            // Allow slow links enough time to download the Windows installer.
             .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|e| e.to_string())?;
@@ -478,7 +351,6 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
         while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             got += chunk.len() as u64;
-            // The header can lie (or be absent): enforce the cap on the stream too.
             if got > MAX_DOWNLOAD_BYTES {
                 return Err(format!(
                     "update download exceeded {MAX_DOWNLOAD_BYTES} bytes"
@@ -494,9 +366,6 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
         tokio::fs::rename(&part, dest)
             .await
             .map_err(|e| e.to_string())?;
-        // The caller verifies and then installs or executes these bytes. Make
-        // the rename itself durable too, best effort. Windows can't fsync a
-        // directory handle opened this way, for example.
         if let Some(parent) = dest.parent() {
             if let Ok(d) = tokio::fs::File::open(parent).await {
                 let _ = d.sync_all().await;
@@ -511,20 +380,8 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
     res
 }
 
-/// Whether the .sha256 sidecar authorizes `path`. Ok(Some(_)) means the digest
-/// matches. Ok(None) means a digest was found but does NOT match. Err(_) means
-/// no readable digest or unreadable file. Callers fail closed on anything but
-/// Ok(Some(_)).
-///
-/// The digest is computed from a freshly opened handle and that handle,
-/// rewound, is returned on success, so the caller installs or executes THE
-/// SAME BYTES it verified. A process that swaps the file between verify and
-/// use, a TOCTOU, gets nowhere:
-///
-/// - Linux: the apply step copies FROM this handle, never re-opening the path.
-/// - Windows: the handle is opened with read-only sharing, so the file can't
-///   be renamed or overwritten while it's held. The caller keeps it open
-///   until the installer has been launched from the path.
+/// Return the verified handle, rewound. None is a mismatch and errors also refuse installation.
+/// Linux copies from this handle. Windows must keep it open through installer launch.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std::fs::File>> {
     use sha2::{Digest, Sha256};
@@ -556,30 +413,12 @@ pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std
     Ok(Some(f))
 }
 
-// ── Apply: Linux in-place binary swap ───────────────────────────────────────
-
-/// Replace the running exe with the verified download. Refuse when an update
-/// already went in this session, since the running process is older than the
-/// on-disk binary now and needs a restart first. Refuse bytes that are not an
-/// ELF for this architecture. Then copy FROM the verified handle, never
-/// re-open the download path, to keep the verify and use chain on the same
-/// bytes. fsync, stage next to the live exe on the same filesystem under a
-/// unique per-invocation name, and do two adjacent renames. The live exe goes
-/// aside to <name>.kurisu-old, the staged file goes in as the exe, followed
-/// by an fsync of the install dir so the rename metadata is durable. ext4's
-/// rename-onto-existing flush heuristic can't fire here because the target is
-/// renamed away FIRST. Rolls back if the second rename fails. The backup is
-/// swept on the next launch. The install path is the one captured at process
-/// start, not a fresh current_exe(). After a swap the latter points at the
-/// .kurisu-old backup. The caller prompts the user to restart.
 #[cfg(target_os = "linux")]
 pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if UPDATE_APPLIED.load(Ordering::SeqCst) {
         return Err("an update was already installed; restart Kurisu to finish it".to_string());
     }
-    // CI ships exactly one Linux build (x86-64): never swap in bytes this
-    // kernel cannot exec.
     if !elf_file_matches_arch(new_bin)
         .map_err(|e| format!("could not read the downloaded update: {e}"))?
     {
@@ -606,22 +445,11 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
         let mut staged = std::fs::File::create(&staging)?;
         io::copy(new_bin, &mut staged)?;
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
-        // Flush data AND metadata before the renames commit the path. Without
-        // this a crash in the writeback window can leave a zero-length exe.
+        // Flush before publishing so a crash cannot leave an empty executable.
         staged.sync_all()?;
         drop(staged);
-        std::fs::rename(&exe, &backup)?;
-        if let Err(e) = std::fs::rename(&staging, &exe) {
-            // Roll the exe swap back. If even that fails, the install is left
-            // with no working exe, only the backup. Drop a marker the next
-            // launch surfaces, and sweep_install_leftovers keeps the orphaned
-            // backup, so a manual restore is always possible.
-            if std::fs::rename(&backup, &exe).is_err() {
-                let _ = std::fs::write(dir.join(FAILED_MARKER), "");
-            }
-            sync_dir(dir);
-            return Err(e);
-        }
+        preserve_executable(&exe, &backup)?;
+        std::fs::rename(&staging, &exe)?;
         sync_dir(dir);
         Ok(())
     })();
@@ -632,8 +460,35 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     result.map_err(|e| format!("could not install the update: {e}"))
 }
 
-/// fsync a directory so rename metadata inside it survives a crash. Best
-/// effort. The swap itself already succeeded, or already failed.
+#[cfg(target_os = "linux")]
+fn preserve_executable(exe: &Path, backup: &Path) -> io::Result<()> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| io::Error::other("no install directory"))?;
+    let temporary = dir.join(format!(
+        ".kurisu-new-{}-{}",
+        std::process::id(),
+        scratch_suffix()
+    ));
+    let result = (|| {
+        if std::fs::hard_link(exe, &temporary).is_err() {
+            let mut old = std::fs::File::open(exe)?;
+            let mut copy = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            io::copy(&mut old, &mut copy)?;
+            copy.set_permissions(old.metadata()?.permissions())?;
+            copy.sync_all()?;
+        }
+        std::fs::rename(&temporary, backup)?;
+        sync_dir(dir);
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
 #[cfg(target_os = "linux")]
 fn sync_dir(dir: &Path) {
     if let Ok(d) = std::fs::File::open(dir) {
@@ -641,8 +496,6 @@ fn sync_dir(dir: &Path) {
     }
 }
 
-/// The e_machine value an ELF must carry for this process's architecture, when
-/// known. None means we cannot check, so we do not refuse.
 #[cfg(target_os = "linux")]
 fn expected_elf_machine() -> Option<u16> {
     match std::env::consts::ARCH {
@@ -652,9 +505,7 @@ fn expected_elf_machine() -> Option<u16> {
     }
 }
 
-/// True when a 20-byte ELF prefix, e_ident plus e_type plus e_machine, matches
-/// the running architecture. e_machine sits at offset 18 for both ELF classes.
-/// EI_DATA, byte 5, picks its endianness. Anything unparseable is NOT a match.
+/// ELF byte 5 selects endianness. The machine ID starts at byte 18 in both classes.
 #[cfg(target_os = "linux")]
 fn elf_header_matches_arch(ident: &[u8; 20]) -> bool {
     let Some(want) = expected_elf_machine() else {
@@ -671,8 +522,6 @@ fn elf_header_matches_arch(ident: &[u8; 20]) -> bool {
     machine == want
 }
 
-/// Read the ELF header from the verified handle, then rewind. The install
-/// copies from this same handle, so it must be left back at offset 0.
 #[cfg(target_os = "linux")]
 fn elf_file_matches_arch(file: &mut std::fs::File) -> io::Result<bool> {
     use std::io::{Read, Seek};
@@ -682,14 +531,7 @@ fn elf_file_matches_arch(file: &mut std::fs::File) -> io::Result<bool> {
     Ok(elf_header_matches_arch(&ident))
 }
 
-// ── Leftover sweeps ─────────────────────────────────────────────────────────
-
-/// Remove leftover .kurisu-update-* downloads in `dir`. A finished or aborted
-/// update leaves the download behind. Best-effort, every launch. Files younger
-/// than an hour are left alone. Without a single-instance guard a second
-/// Kurisu could be mid-download, chunk writes keep the mtime fresh, or in the
-/// verify gap, and unlinking its file out from under it aborts that update.
-/// The download timeout is 30 minutes, so an hour means certainly dead.
+/// Leave files younger than an hour in case another process is still downloading or verifying.
 pub fn sweep_update_leftovers(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -703,10 +545,7 @@ pub fn sweep_update_leftovers(dir: &Path) {
             let stale = entry
                 .metadata()
                 .and_then(|m| m.modified())
-                // A future mtime means the clock jumped, not that the file is
-                // ancient. Treat it as fresh. Deleting on the error path could
-                // unlink a live download mid write, the exact thing the hour
-                // long grace exists to prevent.
+                // A future mtime means a clock change. Treat it as fresh.
                 .map(|t| {
                     t.elapsed()
                         .map(|age| age > Duration::from_secs(3600))
@@ -720,12 +559,7 @@ pub fn sweep_update_leftovers(dir: &Path) {
     }
 }
 
-/// Remove update leftovers next to the installed exe. .kurisu-new-* staging
-/// files from an interrupted swap, and <name>.kurisu-old backups. A launched
-/// build no longer needs its rollback copy, since the swap already proved
-/// itself by running. A backup whose exe is MISSING is kept. After a doubly
-/// failed swap it's the only working copy, and deleting it would brick the
-/// install.
+/// Keep backups whose executable is missing. They may be the only working copy.
 pub fn sweep_install_leftovers(exe_dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(exe_dir) {
         for entry in entries.flatten() {
@@ -750,26 +584,19 @@ mod tests {
     fn version_parse_and_compare() {
         assert_eq!(parse_version("v0.3.1"), vec![0, 3, 1]);
         assert_eq!(parse_version("1.0.0.8"), vec![1, 0, 0, 8]);
-        assert_eq!(parse_version("0.4-rc1"), vec![0, 4]); // leading digits only
+        assert_eq!(parse_version("0.4-rc1"), vec![0, 4]);
         assert_eq!(parse_version(""), vec![0]);
-        // Rolling tags sort above their X.Y.Z base and increase per build.
         assert!(is_newer("1.0.0.8", "1.0.0"));
         assert!(is_newer("1.0.0.8", "1.0.0.7"));
         assert!(is_newer("1.1.0", "1.0.0.99"));
         assert!(!is_newer("1.0.0", "1.0.0"));
         assert!(!is_newer("1.0.0.7", "1.0.0.8"));
-        // Prereleases sort BELOW the plain release of the same numbers. Digit
-        // runs order rc1 < rc2. A rolling 4th segment still beats any rc.
         assert!(is_newer("1.0.0", "1.0.0-rc1"));
         assert!(!is_newer("1.0.0-rc1", "1.0.0"));
         assert!(is_newer("1.0.0-rc2", "1.0.0-rc1"));
         assert!(is_newer("1.0.0.1", "1.0.0-rc9"));
     }
 
-    /// A stamped build is always auto check eligible. In the test profile
-    /// there is no stamp and debug assertions are on, so eligibility here is
-    /// the source debug answer, the dev loop staying quiet. The remaining
-    /// cases are compile time flags a single profile cannot assert.
     #[test]
     fn auto_check_eligibility_covers_every_build_kind() {
         if is_ci_build() {
@@ -779,31 +606,24 @@ mod tests {
         }
     }
 
-    /// /releases/latest is chronological. The walk must pick the max by
-    /// version instead, or a milestone cut before newer rolling pushes
-    /// strands users that already installed it.
     #[test]
     fn release_walk_picks_the_highest_version_not_the_newest_published() {
         let listing = serde_json::json!([
             { "tag_name": "v1.0.0.412", "html_url": "https://x/412", "assets": [] },
             { "tag_name": "v1.1.0", "html_url": "https://x/110", "assets": [] },
             { "tag_name": "v1.0.0.413", "html_url": "https://x/413", "assets": [] },
-            // Drafts and prereleases are invisible to latest and excluded here.
             { "tag_name": "v9.9.9", "draft": true, "assets": [] },
             { "tag_name": "v8.8.8", "prerelease": true, "assets": [] }
         ]);
         let rel = pick_latest_release(&listing).expect("a winner");
         assert_eq!(rel.version, "1.1.0");
         assert_eq!(rel.tag, "v1.1.0");
-        // Once the rolling base is bumped past the milestone, rolling wins
-        // again on its fourth segment.
         let listing = serde_json::json!([
             { "tag_name": "v1.1.0", "assets": [] },
             { "tag_name": "v1.1.0.2", "assets": [] }
         ]);
         let rel = pick_latest_release(&listing).expect("a winner");
         assert_eq!(rel.version, "1.1.0.2");
-        // Nothing publishable means no update offer, not a garbage one.
         assert!(pick_latest_release(&serde_json::json!([
             { "tag_name": "v9.9.9", "draft": true }
         ]))
@@ -814,53 +634,40 @@ mod tests {
     #[test]
     fn windows_installer_requires_arch_marker_and_a_unique_match() {
         let mut rel = Release::default();
-        // No arch marker on the one installer present. It must not be picked.
         rel.assets
             .insert("Kurisu_1.0.0_arm64-setup.exe".into(), "u1".into());
         assert_eq!(windows_installer(rel.assets.keys(), "x86_64"), None);
-        // The CI name shape picks fine.
         rel.assets
             .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u2".into());
         assert_eq!(
             windows_installer(rel.assets.keys(), "x86_64"),
             Some("Kurisu_1.0.0_x64-setup.exe")
         );
-        // The sidecar is never a candidate.
         rel.assets
             .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u3".into());
         assert_eq!(
             windows_installer(rel.assets.keys(), "x86_64"),
             Some("Kurisu_1.0.0_x64-setup.exe")
         );
-        // Two x64 installers is ambiguous. Fail closed rather than let
-        // HashMap order choose.
         rel.assets
             .insert("Kurisu_1.0.0_x64-debug-setup.exe".into(), "u4".into());
         assert_eq!(windows_installer(rel.assets.keys(), "x86_64"), None);
-        // Arches CI never ships get nothing.
         assert_eq!(windows_installer(rel.assets.keys(), "aarch64"), None);
     }
 
     #[test]
     fn platform_asset_picks_this_platforms_asset() {
         let mut rel = Release::default();
-        // A release carrying ONLY sidecars and near-miss names has nothing
-        // this platform can install. The Windows installer is deliberately
-        // absent here. Asserting None while it was present made this test
-        // impossible to pass on Windows, since platform_asset would rightly
-        // have found it.
         rel.assets
             .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u2".into());
         rel.assets.insert("kurisu.exe".into(), "u3".into());
         rel.assets.insert("kurisu.sha256".into(), "u4".into());
         assert_eq!(platform_asset(&rel), None);
-        // Now publish both platforms' real assets.
         rel.assets
             .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u1".into());
         rel.assets.insert("kurisu".into(), "u5".into());
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         assert_eq!(platform_asset(&rel), Some("kurisu"));
-        // CI publishes x86-64 only. Other arches get no installable asset.
         #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
         assert_eq!(platform_asset(&rel), None);
         #[cfg(target_os = "windows")]
@@ -874,9 +681,6 @@ mod tests {
         assert!(sane_exe_path(PathBuf::from("/usr/bin/kurisu (deleted)")).is_err());
     }
 
-    /// The fail closed boundary before anything is executed. verify_and_open
-    /// and the sidecar formats it accepts had zero tests: a refactor
-    /// inverting the verdict would have shipped green.
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn verify_and_open_accepts_only_a_matching_digest() {
@@ -891,7 +695,6 @@ mod tests {
             let d = h.finalize();
             d.iter().map(|b| format!("{b:02x}")).collect::<String>()
         };
-        // The exact digest passes and rewinds the handle.
         let sidecars = [
             digest.clone(),
             format!("{digest}  payload.bin"),
@@ -910,15 +713,11 @@ mod tests {
                 "handle must be rewound, sidecar {sc}"
             );
         }
-        // A different digest means a tampered or truncated download: refusal.
         let mut wrong = digest.clone();
         wrong.replace_range(0..1, if wrong.starts_with('0') { "1" } else { "0" });
         assert!(matches!(verify_and_open(&path, &wrong), Ok(None)));
-        // No digest token at all is an error, never a silent pass.
         assert!(verify_and_open(&path, "not a digest").is_err());
         assert!(verify_and_open(&path, "").is_err());
-        // A missing file is an IO error, a short one is a digest mismatch:
-        // both refuse, the short one as Ok(None).
         assert!(verify_and_open(&dir.join("absent.bin"), &digest).is_err());
         let short = dir.join("short.bin");
         std::fs::write(&short, b"xy").unwrap();
@@ -930,22 +729,19 @@ mod tests {
     #[test]
     fn elf_header_matches_running_arch() {
         let Some(machine) = expected_elf_machine() else {
-            return; // an arch with no known e_machine, nothing to assert here
+            return;
         };
         let mut ident = [0u8; 20];
         ident[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        ident[5] = 1; // little-endian
+        ident[5] = 1;
         ident[18..20].copy_from_slice(&machine.to_le_bytes());
         assert!(elf_header_matches_arch(&ident));
-        // The other supported architecture's machine id is refused.
         let other: u16 = if machine == 62 { 183 } else { 62 };
         ident[18..20].copy_from_slice(&other.to_le_bytes());
         assert!(!elf_header_matches_arch(&ident));
-        // Big-endian encoding of the right machine is honored.
         ident[5] = 2;
         ident[18..20].copy_from_slice(&machine.to_be_bytes());
         assert!(elf_header_matches_arch(&ident));
-        // No ELF magic, no match.
         ident[0] = 0;
         assert!(!elf_header_matches_arch(&ident));
     }

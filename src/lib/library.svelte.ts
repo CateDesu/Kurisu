@@ -1,26 +1,14 @@
-// Library scan state for M3. Holds the configured folders and last scan so the
-// Library page and the edit modal's "play next" share one scan instead of each
-// walking the disk again. Scans are cheap, a full walk takes under a second,
-// so nothing is persisted.
 import { api } from "./api";
 import type { LibraryFile, UnreadableFolder } from "./types";
 
 let files = $state<LibraryFile[]>([]);
-// Configured roots the last scan could not read. Unmounted drive, permissions.
 let unreadable = $state<UnreadableFolder[]>([]);
 let folders = $state<string[]>([]);
-// Set when reading the configured folders failed. The Library page used to
-// render that as "no library folders yet", which reads as an setup hint, not
-// an error worth fixing.
 let foldersFailed = $state(false);
 let scanning = $state(false);
 let lastScanAt = $state(0);
-// Set when a scan is requested during another scan. For example, removeFolder's
-// rescan to stay honest. Runs one follow up with the current folders when the
-// active scan ends.
 let pendingScan = false;
-// Bumped by reset(). A scan in flight when the account changed must not write
-// its results back, they belong to the previous account's recognizer state.
+// Discard scan results from an account that has since logged out.
 let scanGen = 0;
 
 async function loadFolders() {
@@ -66,7 +54,6 @@ export const library = {
   get folders() {
     return folders;
   },
-  /** The last folder read failed. Distinguish a broken read from empty. */
   get foldersFailed() {
     return foldersFailed;
   },
@@ -79,16 +66,12 @@ export const library = {
   get hasScan() {
     return lastScanAt > 0;
   },
-  /** First scanned file for `mediaId` at `episode`. Used by "play next". */
   fileFor(mediaId: number, episode: number): LibraryFile | undefined {
     return files.find((f) => f.media_id === mediaId && f.episode === episode);
   },
   loadFolders,
   scan,
-  /** Drop everything cached for the current account. Called from logout. */
   reset() {
-    // Invalidate any scan still in flight so its results are not written
-    // back over the reset.
     scanGen++;
     files = [];
     folders = [];
@@ -102,7 +85,6 @@ export const library = {
   },
   async removeFolder(path: string) {
     folders = await api.removeLibraryFolder(path);
-    // The scan still holds files from the removed folder. Rescan to stay honest.
     if (lastScanAt > 0) await scan();
   },
 };

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { listen, emit } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
@@ -12,100 +13,118 @@
   import Img from "$lib/Img.svelte";
   import Login from "$lib/Login.svelte";
 
-  // Detected show's list entry. Cover and progress come from the joined media.
   let entry = $state<ListEntry | null>(null);
   let updating = $state(false);
   let error = $state("");
   let stepError = $state("");
 
-  // Idle state continue watching. The user's CURRENT entries.
   let current = $state<ListEntry[]>([]);
-  // Set when reading them failed, so the section says so instead of
-  // rendering as "watching nothing".
   let currentError = $state("");
+  const loggedIn = $derived(auth.isLoggedIn);
 
   const np = $derived(nowPlaying());
+  const playingId = $derived(np?.media_id ?? null);
   const pct = $derived(
     np && np.length_us > 0
       ? Math.min(100, Math.round((np.position_us / np.length_us) * 100))
       : 0
   );
-  // Next unwatched episode file for the detected show.
   const nextFile = $derived(
     np?.media_id != null && entry
       ? library.fileFor(np.media_id, (entry.progress ?? 0) + 1)
       : undefined
   );
 
-  // Tracks can skip faster than getEntry resolves. Shared latest-wins
-  // guard with the event listener and updateTo below, so an older read
-  // never overwrites a newer one.
+  // Share this guard across reads, events and writes so stale responses cannot win.
   let entryLoadId = 0;
+  let currentLoadId = 0;
+  let updateId = 0;
   async function loadEntry(mediaId: number) {
     const lid = ++entryLoadId;
+    const epoch = auth.epoch;
+    const active = () => lid === entryLoadId && epoch === auth.epoch && auth.isLoggedIn;
     try {
       const e = await api.getEntry(mediaId);
-      if (lid === entryLoadId) entry = e;
+      if (active()) entry = e;
     } catch {
-      if (lid === entryLoadId) entry = null;
+      if (active()) entry = null;
     }
   }
 
   $effect(() => {
-    const id = np?.media_id ?? null;
-    if (id != null) loadEntry(id);
-    else entry = null;
+    auth.epoch;
+    loggedIn;
+    playingId;
+    entry = null;
+    updating = false;
+    return () => { entryLoadId++; updateId++; };
   });
 
   $effect(() => {
-    if (auth.isLoggedIn) {
-      loadCurrent();
-      // Make sure library files are loaded for the Play buttons. scan()
-      // rejects on backend failure; without the catch every revisit of this
-      // page logged another unhandled rejection.
-      library.loadFolders().then(() => {
-        if (library.folders.length > 0 && !library.hasScan && !library.scanning)
-          library.scan().catch((e) => console.error("library scan failed", e));
-      });
+    auth.epoch;
+    loggedIn;
+    current = [];
+    currentError = "";
+    error = "";
+    stepError = "";
+    updating = false;
+    return () => { currentLoadId++; updateId++; };
+  });
+
+  $effect(() => {
+    auth.epoch;
+    const id = playingId;
+    if (auth.isLoggedIn && id != null) {
+      untrack(() => { if (!updating) void loadEntry(id); });
     }
   });
 
+  $effect(() => {
+    const epoch = auth.epoch;
+    if (!auth.isLoggedIn) return;
+    untrack(() => {
+      void loadCurrent();
+      library.loadFolders().then(() => {
+        if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+        if (library.folders.length > 0 && !library.hasScan && !library.scanning)
+          library.scan().catch((e) => console.error("library scan failed", e));
+      });
+    });
+  });
+
   async function loadCurrent() {
+    if (!auth.isLoggedIn) return;
+    const id = ++currentLoadId;
+    const epoch = auth.epoch;
+    const active = () => id === currentLoadId && epoch === auth.epoch && auth.isLoggedIn;
     try {
       const all = await api.localEntries();
+      if (!active()) return;
       current = all.filter((e) => e.status === "CURRENT");
       currentError = "";
     } catch (e) {
+      if (!active()) return;
       current = [];
-      // A failed read used to look exactly like "you are watching nothing".
       currentError = String(e);
     }
   }
 
-  // Merge a stepper save into the local list without a full reload. A
-  // finale commit flips the entry to COMPLETED, and this list is CURRENT
-  // only, so that row drops out instead of showing a full bar until the
-  // episode-updated reload refilters.
   function applyEntry(entry: ListEntry) {
     current = current
       .map((x) => (x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x))
       .filter((x) => x.status === "CURRENT");
   }
 
-  // Refresh when progress is written anywhere. entryLoadId guards
-  // against burst races. N events spawn N concurrent loads, only the
-  // last result is applied.
   $effect(() => {
+    const epoch = auth.epoch;
+    if (!auth.isLoggedIn) return;
     let alive = true;
     let un: (() => void) | undefined;
     listen("kurisu://episode-updated", () => {
-      if (!alive) return;
+      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       const id = np?.media_id ?? null;
       if (id != null) {
-        const lid = ++entryLoadId;
-        api.getEntry(id).then((e) => {
-          if (alive && lid === entryLoadId) entry = e;
-        }).catch(() => {});
+        void loadEntry(id);
       }
       loadCurrent();
     }).then((u) => (alive ? (un = u) : u()));
@@ -117,44 +136,37 @@
 
   async function updateTo(episode: number) {
     const id = np?.media_id;
-    if (id == null || updating) return;
+    if (id == null || updating || !auth.isLoggedIn) return;
+    const request = ++updateId;
+    const epoch = auth.epoch;
+    const active = () => request === updateId && epoch === auth.epoch && auth.isLoggedIn && np?.media_id === id;
+    entryLoadId++;
     updating = true;
     error = "";
     let fresh: ListEntry | null = null;
     try {
       fresh = await api.getEntry(id);
-    } catch (e) {
-      error = String(e);
-      updating = false;
-      return;
-    }
-    if (!fresh) {
-      error = "This show is no longer on your list.";
-      updating = false;
-      return;
-    }
-    if (fresh.progress >= episode) {
-      entry = fresh;
-      updating = false;
-      return;
-    }
-    // Optimistic. Reflect the new progress immediately so the click feels
-    // instant while the AniList round-trip runs.
-    entry = { ...fresh, progress: episode };
-    try {
+      if (!active()) return;
+      if (!fresh) {
+        error = "This show is no longer on your list.";
+        return;
+      }
+      if (fresh.progress >= episode) {
+        entry = fresh;
+        return;
+      }
+      entry = { ...fresh, progress: episode };
       const saved = await api.setProgress(id, episode, fresh.progress);
-      await emit("kurisu://episode-updated", saved);
+      if (!active()) return;
       entry = saved;
-      await loadCurrent();
+      await emit("kurisu://episode-updated", saved);
+      if (active()) await loadCurrent();
     } catch (e) {
+      if (!active()) return;
       error = String(e);
-      // Re-fetch instead of reverting to a stale snapshot. The listener
-      // may have already updated entry past the pre-click value. Guarded
-      // by entryLoadId so a concurrent load isn't clobbered.
-      const lid = ++entryLoadId;
-      try { const e2 = await api.getEntry(id); if (lid === entryLoadId) entry = e2; } catch { /* keep what we have */ }
+      await loadEntry(id);
     } finally {
-      updating = false;
+      if (active()) updating = false;
     }
   }
 
@@ -180,7 +192,7 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-3xl mx-auto">
+  <div class="page-content">
     <h1 class="text-xl font-semibold mb-4">Currently Watching</h1>
 
     {#if np && np.active}
@@ -208,7 +220,7 @@
               <button
                 type="button"
                 onclick={() => np.media_id && goto(`/anime/${np.media_id}`)}
-                class="block max-w-full text-left font-semibold text-lg truncate hover:text-accent transition-colors"
+                class="block max-w-full text-left font-semibold text-lg hover:text-accent transition-colors"
               >
                 {np.matched}
               </button>
@@ -218,7 +230,7 @@
                 </div>
               {/if}
             {:else}
-              <div class="font-semibold text-lg truncate mb-1">Not on your list</div>
+              <div class="font-semibold text-lg mb-1">Not on your list</div>
             {/if}
 
             {#if detectedEp != null}
@@ -238,7 +250,7 @@
               </div>
             {/if}
 
-            <div class="text-xs text-ink-dim mb-3 truncate">Playing in {np.player}</div>
+            <div class="text-xs text-ink-dim mb-3">Playing in {np.player}</div>
 
             <div class="flex items-center gap-2 flex-wrap">
               {#if nextFile}
@@ -327,7 +339,7 @@
                 }
               }}
             >
-              <div class="truncate font-medium">{displayTitle(e.media)}</div>
+              <div class="font-medium">{displayTitle(e.media)}</div>
               {#if sc}
                 <div class="text-xs text-ink-dim">{sc}</div>
               {/if}

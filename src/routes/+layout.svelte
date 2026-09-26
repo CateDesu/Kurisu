@@ -15,32 +15,22 @@
   import Img from "$lib/Img.svelte";
   let { children } = $props();
 
-  // Tick the shared clock so relative labels refresh.
   $effect(() => runClock());
 
-  // One now-playing listener for the whole app. Banner and Currently
-  // Watching both read the shared store.
   $effect(() => {
     void bindNowPlaying();
   });
 
-  // A session that starts offline never recovers on its own. When the
-  // network comes back, refresh the login so the sidebar and score
-  // format pick the user up.
   $effect(() => {
     const onOnline = () => void auth.refresh();
     window.addEventListener("online", onOnline);
     return () => window.removeEventListener("online", onOnline);
   });
 
-  // Set when the backend side of a logout fails. Shown in the sidebar.
   let logoutErr = $state("");
-  // Logout clears the token and the cached list, so it asks first.
   let confirmingLogout = $state(false);
   let loggingOut = $state(false);
 
-  // A forced logout, for example a rejected token, drops the user while the
-  // dialog is open. Don't leave it hanging over the signed-out UI.
   $effect(() => {
     if (!auth.user) confirmingLogout = false;
   });
@@ -60,7 +50,6 @@
     }
   }
 
-  // Inline SVG icons. Stroke style, inherit text color.
   const nav = [
     { href: "/", label: "My List", icon: "list" },
     { href: "/now", label: "Currently Watching", icon: "play" },
@@ -76,13 +65,10 @@
 
   const appWindow = getCurrentWindow();
 
-  /// Persistent back button. Walks in-app history. history.length counts the
-  /// whole tab session so we track our own depth. No-op at the root.
+  /// Track program navigation because browser history includes the whole tab session.
   let navDepth = $state(0);
   afterNavigate(({ type, to, from }) => {
     if (type === "popstate") navDepth = Math.max(0, navDepth - 1);
-    // Clicking the current page's own link goes nowhere. Counting it would
-    // make Back return to the same URL.
     else if (type !== "enter" && to?.url.pathname !== from?.url.pathname) navDepth += 1;
   });
   function back() {
@@ -93,8 +79,6 @@
     if (auth.user) void openUrl(`https://anilist.co/user/${encodeURIComponent(auth.user.name)}`);
   }
 
-  /// Begin a compositor resize gesture from an edge or corner. Only works
-  /// with custom decorations.
   function resize(direction: "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West") {
     void appWindow.startResizeDragging(direction);
   }
@@ -117,7 +101,6 @@
             <span class="text-accent text-3xl leading-none">ク</span>
             <span class="text-xl font-semibold tracking-wide truncate">Kurisu</span>
           </div>
-          <!-- Persistent back. No-op when there's no history. -->
           <button
             onclick={back}
             title="Back"
@@ -166,7 +149,6 @@
             </button>
           </div>
         {:else}
-          <!-- signed out. Quiet unless a logout just failed. -->
           <div class="px-4 py-5 border-t border-edge text-[13px] text-ink-dim/50">
             Not signed in
             {#if logoutErr}
@@ -175,18 +157,15 @@
           </div>
         {/if}
       </aside>
-      <main class="flex-1 overflow-auto">
+      <main class="flex-1 min-w-0 overflow-auto">
         {@render children?.()}
       </main>
-      <!-- East resize grip in-flow. As an overlay it sat on main's scrollbar
-           and won every hit test. Taking layout space keeps both usable. -->
+      <!-- Keep the resize grip in flow so it cannot cover the scrollbar. -->
       <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
       <div class="w-1.5 shrink-0 cursor-e-resize" onpointerdown={() => resize("East")}></div>
     </div>
   {/if}
 
-  <!-- Edge and corner resize grips for CSD. Thin overlays that show a resize
-       cursor and hand the gesture to the compositor. -->
   {#if confirmingLogout}
     <Confirm
       title="Log out?"
@@ -203,7 +182,6 @@
   <div class="absolute bottom-0 inset-x-0 h-1.5 cursor-s-resize z-50" onpointerdown={() => resize("South")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute left-0 inset-y-0 w-1.5 cursor-w-resize z-50" onpointerdown={() => resize("West")}></div>
-  <!-- East grip lives in-flow after main. See above. -->
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute top-0 left-0 w-2 h-2 cursor-nw-resize z-50" onpointerdown={() => resize("NorthWest")}></div>
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->

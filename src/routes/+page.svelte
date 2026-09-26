@@ -1,29 +1,21 @@
 <script module lang="ts">
-  // Which account the cached list was last reconciled against. Kept at
-  // module scope so it survives the route being recreated. As component
-  // state it reset on every navigation, so the account-switch check only
-  // fired when the user logged out and back in without leaving this page.
-  // After a restart or any other route, the previous account's rows
-  // rendered as the new one's.
+  import { api } from "$lib/api";
+
+  // Retain the reconciled account across route changes.
   let syncedFor: number | null = null;
 
-  // Auto-sync on empty fires once per session, keyed to the auth epoch so a
-  // logout and login inside one app run counts as the new session it is.
-  // The flag alone stayed true forever, so the relogin showed an empty list
-  // that looked like data loss until a manual sync.
   let autoSynced = false;
   let autoSyncedEpoch = 0;
+  let pendingSync: { epoch: number; promise: ReturnType<typeof api.syncMyList> } | null = null;
 
-  // One collator for the session. localeCompare with options builds a fresh
-  // Intl.Collator on every call. The title sort runs O(n log n) over a
-  // 1280-entry list on every keystroke.
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
-  import { api } from "$lib/api";
+  import { preferences } from "$lib/preferences";
   import { auth } from "$lib/auth.svelte";
   import { nowMs } from "$lib/now.svelte";
   import {
@@ -47,10 +39,10 @@
   let error = $state("");
   let stepError = $state("");
   let editing = $state<ListEntry | null>(null);
+  const loggedIn = $derived(auth.isLoggedIn);
 
   const statuses = ["CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"];
 
-  // filter and sort. Persisted UI state.
   type SortKey = "title" | "score" | "progress" | "updated" | "airing";
   const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
     { value: "title", label: "Title" },
@@ -59,7 +51,6 @@
     { value: "updated", label: "Last updated" },
     { value: "airing", label: "Next airing" },
   ];
-  /// Natural direction per key. Picking a key resets to it. The arrow flips it.
   const SORT_DEFAULT_DESC: Record<SortKey, boolean> = {
     title: false,
     score: true,
@@ -68,47 +59,24 @@
     airing: false,
   };
   function readSort(): SortKey {
-    try {
-      const v = localStorage.getItem("kurisu.list.sort");
-      return SORT_OPTIONS.some((o) => o.value === v) ? (v as SortKey) : "title";
-    } catch {
-      return "title";
-    }
+    const v = preferences.get("kurisu.list.sort");
+    return SORT_OPTIONS.some((o) => o.value === v) ? (v as SortKey) : "title";
   }
   function readDesc(key: SortKey): boolean {
-    try {
-      const v = localStorage.getItem("kurisu.list.dir");
-      return v === null ? SORT_DEFAULT_DESC[key] : v === "desc";
-    } catch {
-      return SORT_DEFAULT_DESC[key];
-    }
+    const v = preferences.get("kurisu.list.dir");
+    return v === null ? SORT_DEFAULT_DESC[key] : v === "desc";
   }
   function readFilter(): string {
-    try {
-      const v = localStorage.getItem("kurisu.list.filter");
-      return v !== null && statuses.includes(v) ? v : "CURRENT";
-    } catch {
-      return "CURRENT";
-    }
-  }
-  function readQ(): string {
-    try {
-      return localStorage.getItem("kurisu.list.q") ?? "";
-    } catch {
-      return "";
-    }
+    const v = preferences.get("kurisu.list.filter");
+    return v !== null && statuses.includes(v) ? v : "CURRENT";
   }
   let filter = $state(readFilter());
-  let q = $state(readQ());
+  let q = $state(preferences.get("kurisu.list.q") ?? "");
   let sortKey = $state<SortKey>(readSort());
   let sortDesc = $state(readDesc(readSort()));
   function persistSort() {
-    try {
-      localStorage.setItem("kurisu.list.sort", sortKey);
-      localStorage.setItem("kurisu.list.dir", sortDesc ? "desc" : "asc");
-    } catch {
-      // storage unavailable. Choice won't persist.
-    }
+    preferences.set("kurisu.list.sort", sortKey);
+    preferences.set("kurisu.list.dir", sortDesc ? "desc" : "asc");
   }
   function pickSort(k: SortKey) {
     sortDesc = SORT_DEFAULT_DESC[k];
@@ -118,42 +86,22 @@
     sortDesc = !sortDesc;
     persistSort();
   }
-  function persistFilter() {
-    try {
-      localStorage.setItem("kurisu.list.filter", filter);
-      localStorage.setItem("kurisu.list.q", q);
-    } catch {
-      // storage unavailable. Choice won't persist.
-    }
-  }
-  $effect(persistFilter);
+  $effect(() => {
+    preferences.set("kurisu.list.filter", filter);
+    preferences.set("kurisu.list.q", q);
+  });
 
-  // Last successful sync, ms epoch. Zero means never synced, so the
-  // freshness label stays hidden.
   function readSyncedAt(): number {
-    try {
-      const v = Number(localStorage.getItem("kurisu.list.synced"));
-      return Number.isFinite(v) && v > 0 ? v : 0;
-    } catch {
-      return 0;
-    }
-  }
-  function persistSyncedAt() {
-    try {
-      localStorage.setItem("kurisu.list.synced", String(syncedAt));
-    } catch {
-      // storage unavailable. Choice won't persist.
-    }
+    const v = Number(preferences.get("kurisu.list.synced"));
+    return Number.isFinite(v) && v > 0 ? v : 0;
   }
   let syncedAt = $state(readSyncedAt());
   let syncedFlash = $state(false);
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
   function markSynced() {
-    // Stamp from the shared clock, not Date.now. The clock ticks on 30s
-    // intervals, so a wall stamp could sit ahead of it and stretch the
-    // "Synced just now" window.
+    // Use the shared clock so the saved time cannot be ahead of relative labels.
     syncedAt = nowMs();
-    persistSyncedAt();
+    preferences.set("kurisu.list.synced", String(syncedAt));
     syncedFlash = true;
     if (flashTimer) clearTimeout(flashTimer);
     flashTimer = setTimeout(() => {
@@ -178,7 +126,6 @@
   const titleCmp = (a: ListEntry, b: ListEntry) =>
     COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
 
-  /// Sort value for the active key. Null sorts last.
   function keyVal(e: ListEntry): number | null {
     switch (sortKey) {
       case "score":
@@ -215,77 +162,78 @@
     });
   });
 
-  // Overlapping loads resolve latest wins. Stale responses are dropped.
   let loadId = 0;
-  // Local cache isn't namespaced per account. If the user changes, force a
-  // sync. Also purges rows the new account doesn't have.
+  let syncId = 0;
   async function load() {
+    if (!auth.isLoggedIn) return;
     const id = ++loadId;
+    const epoch = auth.epoch;
+    const current = () => id === loadId && epoch === auth.epoch && auth.isLoggedIn;
     loading = true;
     error = "";
+    const uid = auth.user?.id ?? null;
+    const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
+    if (switched) {
+      entries = [];
+      filter = "CURRENT";
+      q = "";
+      syncedAt = 0;
+      preferences.remove("kurisu.list.filter");
+      preferences.remove("kurisu.list.q");
+      preferences.remove("kurisu.list.synced");
+    }
     try {
-      const list = await api.localEntries();
-      if (id !== loadId) return;
-      // Decide before rendering. On account switch the cached rows belong
-      // to the previous user. Showing them invites edits against the wrong
-      // list, so drop them and let sync fill the view. If the reconcile
-      // sync then fails, an empty list under an error banner beats the
-      // previous account's rows with live steppers.
-      const uid = auth.user?.id ?? null;
-      const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
-      if (switched) {
-        // The persisted view state belongs to the previous account. A new
-        // account must not inherit its filter, its query text, or a
-        // freshness stamp its own list has not earned.
-        filter = "CURRENT";
-        q = "";
-        syncedAt = 0;
-        try {
-          localStorage.removeItem("kurisu.list.filter");
-          localStorage.removeItem("kurisu.list.q");
-          localStorage.removeItem("kurisu.list.synced");
-        } catch {
-          // storage unavailable. Nothing to clear.
-        }
+      if (pendingSync?.epoch === epoch) {
+        await sync();
+        return;
       }
+      const list = await api.localEntries();
+      if (!current()) return;
       entries = switched ? [] : list;
       syncedFor = uid;
-      // New session since the last auto sync: relogin, account switch, or
-      // a session the backend cleared after a token rejection.
       if (auth.epoch !== autoSyncedEpoch) {
         autoSynced = false;
         autoSyncedEpoch = auth.epoch;
       }
       if ((list.length === 0 && !autoSynced) || switched) {
         autoSynced = true;
-        await sync(id);
+        await sync();
       }
     } catch (e) {
-      if (id === loadId) error = String(e);
+      if (current()) error = String(e);
     } finally {
-      if (id === loadId) loading = false;
+      if (current()) loading = false;
     }
   }
 
-  // fromLoad ties this sync to a load request id. If a newer load started
-  // mid-sync, the stale result is dropped.
-  async function sync(fromLoad?: number) {
+  async function sync() {
+    if (!auth.isLoggedIn) return;
+    const id = ++syncId;
+    const epoch = auth.epoch;
+    const current = () => id === syncId && epoch === auth.epoch && auth.isLoggedIn;
     syncing = true;
     error = "";
+    const request = pendingSync?.epoch === epoch
+      ? pendingSync
+      : { epoch, promise: api.syncMyList() };
+    pendingSync = request;
     try {
-      const list = await api.syncMyList();
-      if (fromLoad === undefined || fromLoad === loadId) {
+      const list = await request.promise;
+      if (current()) {
+        loadId++;
+        loading = false;
         entries = list;
+        syncedFor = auth.user?.id ?? null;
         markSynced();
       }
     } catch (e) {
-      if (fromLoad === undefined || fromLoad === loadId) error = String(e);
+      if (current()) error = String(e);
     } finally {
-      syncing = false;
+      if (pendingSync === request) pendingSync = null;
+      if (current()) syncing = false;
     }
   }
 
-  /// Merge a saved entry back into the local list without a full reload.
   function applyEntry(entry: ListEntry) {
     entries = entries.map((x) =>
       x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x
@@ -293,21 +241,36 @@
   }
 
   $effect(() => {
-    if (auth.isLoggedIn) load();
+    auth.epoch;
+    loggedIn;
+    entries = [];
+    editing = null;
+    loading = false;
+    syncing = false;
+    error = "";
+    stepError = "";
+    syncedFlash = false;
+    if (flashTimer) clearTimeout(flashTimer);
+    return () => { loadId++; syncId++; };
   });
 
-  // Refresh when the watcher or prompt modal updates an episode. Those
-  // paths don't update the row in place, unlike the stepper. Debounced
-  // so a burst of events collapses into one reload.
   $effect(() => {
+    auth.epoch;
+    if (auth.isLoggedIn) untrack(() => load());
+  });
+
+  $effect(() => {
+    const epoch = auth.epoch;
+    if (!auth.isLoggedIn) return;
     let alive = true;
     let un: (() => void) | undefined;
     let debounce: ReturnType<typeof setTimeout> | null = null;
     listen("kurisu://episode-updated", () => {
+      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => {
         debounce = null;
-        load();
+        if (alive && epoch === auth.epoch && auth.isLoggedIn) void load();
       }, 300);
     }).then((u) => (alive ? (un = u) : u()));
     return () => {
@@ -323,7 +286,7 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-7xl mx-auto">
+  <div class="page-content">
     <div class="flex items-center gap-2 mb-4 flex-wrap">
       <h1 class="text-xl font-semibold flex-1">My List</h1>
       <input
@@ -368,7 +331,7 @@
       </div>
     {/if}
 
-    <div class="flex gap-1 mb-5 border-b border-edge">
+    <div class="flex flex-wrap gap-1 mb-5 border-b border-edge">
       {#each statuses as s}
         {@const count = entries.filter((e) => e.status === s).length}
         <button
@@ -393,10 +356,7 @@
           <div
             onclick={() => (editing = e)}
             onkeydown={(ev) => {
-              // Only when the row itself is focused. The row has real buttons
-              // whose click handlers stop propagation, but keydown wasn't
-              // stopped. So Enter on the stepper both cancelled its click via
-              // preventDefault and opened this modal.
+              // Let nested buttons handle their own keyboard activation.
               if (ev.currentTarget !== ev.target) return;
               if (ev.key === "Enter" || ev.key === " ") {
                 ev.preventDefault();
@@ -423,8 +383,8 @@
               <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
             {/if}
             <div class="flex-1 min-w-0">
-              <div class="truncate font-medium">{displayTitle(e.media)}</div>
-              <div class="text-xs text-ink-dim truncate flex items-center gap-1.5">
+              <div class="font-medium">{displayTitle(e.media)}</div>
+              <div class="text-xs text-ink-dim flex flex-wrap items-center gap-1.5">
                 {#if air}<span>{air}</span>{/if}
                 {#if air && sc}<span class="opacity-40">·</span>{/if}
                 {#if sc}<span>{sc}</span>{/if}

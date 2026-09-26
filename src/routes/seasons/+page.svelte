@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { untrack } from "svelte";
-  import { goto } from "$app/navigation";
+  import { onDestroy, untrack } from "svelte";
+  import { afterNavigate } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
+  import type { ListEntry, Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
-  import Img from "$lib/Img.svelte";
+  import AnimeCard from "$lib/AnimeCard.svelte";
+  import { addToList } from "$lib/list";
   import type { Snapshot } from "./$types";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;
@@ -15,11 +16,6 @@
     SUMMER: "Summer",
     FALL: "Fall",
   };
-  const status_options = [
-    { v: "CURRENT", label: "Watching" },
-    { v: "PLANNING", label: "Plan to watch" },
-    { v: "COMPLETED", label: "Completed" },
-  ];
 
   function currentSeason(): { season: string; year: number } {
     const now = new Date();
@@ -32,69 +28,68 @@
   let entries = $state<ListEntry[]>([]);
   let loading = $state(false);
   let error = $state("");
+  let entriesError = $state("");
   let adding = $state<number | null>(null);
+  const loggedIn = $derived(auth.isLoggedIn);
 
-  // media_id → list entry, for the on-list badges.
   const onList = $derived(new Map(entries.map((e) => [e.media_id, e])));
 
-  /// Badge line for a show already on the list, with progress when there is
-  /// any. Null when the show is not tracked.
-  function listBadge(m: Media): string | null {
-    const e = onList.get(m.id);
-    if (!e) return null;
-    const label = STATUS_LABEL[e.status] ?? e.status;
-    if (e.progress <= 0) return label;
-    return m.episodes ? `${label} · ${e.progress}/${m.episodes}` : `${label} · ${e.progress}`;
-  }
-
-  // Keep the picked season and its list across detail pages so Back returns
-  // here instead of bouncing to the current season. SvelteKit restores the
-  // snapshot after the mount effect has already fired, so restore bumps
-  // loadId to discard the fetch the mount effect started for the default
-  // season, and clears its loading flag. A capture taken mid-fetch holds
-  // the new season with the old grid, so store media empty and let the
-  // load effect refetch the right thing.
   export const snapshot: Snapshot<{
     season: string;
     year: number;
-    media: Media[];
-    entries: ListEntry[];
+    media: Media[] | null;
   }> = {
-    capture: () => (loading ? { season, year, media: [], entries } : { season, year, media, entries }),
+    capture: () => ({ season, year, media: loadedOnce ? media : null }),
     restore: (v) => {
       season = v.season;
       year = v.year;
-      media = v.media;
-      entries = v.entries;
+      media = v.media ?? [];
       loadId++;
+      loadedOnce = v.media !== null;
       loading = false;
+      error = "";
     },
   };
 
-  // Rapid Prev/Next (or a login change mid-fetch) resolves latest-wins.
   let loadId = 0;
-  // Set by the first settled load. An empty season reassigns media to a
-  // fresh empty array, which would retrigger the load effect forever.
+  let entriesLoadId = 0;
+  let addId = 0;
   let loadedOnce = false;
+  let navigationReady = false;
+  let alive = true;
+
+  async function refreshEntries() {
+    const id = ++entriesLoadId;
+    const epoch = auth.epoch;
+    const current = () => alive && id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn;
+    entriesError = "";
+    try {
+      const list = await api.localEntries();
+      if (current()) entries = list;
+    } catch (e) {
+      if (current()) entriesError = String(e);
+    }
+  }
+
   async function load() {
     const id = ++loadId;
+    const epoch = auth.epoch;
+    const current = () => alive && id === loadId && epoch === auth.epoch && auth.isLoggedIn;
+    loadedOnce = false;
+    media = [];
     loading = true;
     error = "";
     try {
-      // Walks every page on the backend. A season carries several hundred
-      // entries and the old single page of 50 hid all but the popular head.
       const seasonMedia = await api.getSeason(season, year);
-      const myEntries = await api.localEntries();
-      if (id !== loadId) return;
+      if (!current()) return;
       media = seasonMedia;
-      entries = myEntries;
+      loadedOnce = true;
     } catch (e) {
-      if (id === loadId) error = String(e);
-    } finally {
-      if (id === loadId) {
-        loading = false;
-        loadedOnce = true;
+      if (current()) {
+        error = String(e);
       }
+    } finally {
+      if (current()) loading = false;
     }
   }
 
@@ -109,36 +104,65 @@
     }
     season = SEASONS[i];
     load();
+    void refreshEntries();
   }
 
   async function add(m: Media, status: string) {
+    const id = ++addId;
+    const epoch = auth.epoch;
+    const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
     adding = m.id;
     error = "";
     try {
-      // Adding writes status and progress unconditionally. Refuse to clobber
-      // an entry that's already on the list. The badge map can be stale
-      // after a snapshot restore, so ask the backend.
-      if (await api.getEntry(m.id)) {
-        error = `${displayTitle(m)} is already on your list.`;
-        return;
-      }
-      const entry = await api.updateEntry(m.id, status, 0, null, 0);
+      const entry = await addToList(m, status);
+      if (!current()) return;
       entries = [...entries.filter((e) => e.media_id !== m.id), entry];
+      void refreshEntries();
     } catch (e) {
-      error = String(e);
+      if (current() && id === addId) error = String(e);
     } finally {
-      adding = null;
+      if (current() && id === addId) adding = null;
     }
   }
 
-  // Loads on mount and again if a snapshot restore lands an empty grid,
-  // which is how a mid-fetch capture is stored. loadedOnce breaks the
-  // retrigger loop an empty season would otherwise cause.
   $effect(() => {
-    if (!auth.isLoggedIn || loadedOnce) return;
-    if (media.length > 0) return;
-    untrack(() => load());
+    auth.epoch;
+    loggedIn;
+    untrack(() => {
+      loadId++;
+      entriesLoadId++;
+      addId++;
+      if (loading) loadedOnce = false;
+      entries = [];
+      loading = false;
+      adding = null;
+      error = "";
+      entriesError = "";
+    });
   });
+
+  $effect(() => {
+    auth.epoch;
+    if (!auth.isLoggedIn) return;
+    untrack(() => {
+      if (!navigationReady) return;
+      if (!loadedOnce && !loading) void load();
+      void refreshEntries();
+    });
+  });
+
+  afterNavigate(() => {
+    // Snapshots restore after navigation callbacks.
+    queueMicrotask(() => {
+      if (!alive) return;
+      navigationReady = true;
+      if (!auth.isLoggedIn) return;
+      if (!loadedOnce && !loading) void load();
+      void refreshEntries();
+    });
+  });
+
+  onDestroy(() => { alive = false; });
 </script>
 
 {#if !auth.isLoggedIn}
@@ -146,8 +170,8 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-5xl mx-auto">
-    <div class="flex items-center gap-3 mb-5">
+  <div class="page-content">
+    <div class="flex flex-wrap items-center gap-3 mb-5">
       <h1 class="text-xl font-semibold flex-1">
         {SEASON_LABEL[season]} {year}
       </h1>
@@ -169,63 +193,22 @@
       </button>
     </div>
 
-    {#if error}
+    {#if error || entriesError}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
-        {error}
+        {error || entriesError}
       </div>
     {/if}
 
     {#if loading}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
     {:else if media.length === 0}
-      <div class="text-ink-dim py-10 text-center">Nothing found for this season.</div>
+      {#if !error}
+        <div class="text-ink-dim py-10 text-center">Nothing found for this season.</div>
+      {/if}
     {:else}
-      <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <div class="media-grid">
         {#each media as m (m.id)}
-          {@const listed = onList.get(m.id)}
-          <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
-            <button type="button" onclick={() => goto(`/anime/${m.id}`)} title="Open details" class="block">
-              {#if m.cover_large}
-                <Img src={m.cover_large} class="w-full h-44 object-cover" />
-              {:else}
-                <div class="w-full h-44 bg-panel-2"></div>
-              {/if}
-            </button>
-            <div class="p-2.5 flex-1 flex flex-col">
-              <button
-                type="button"
-                onclick={() => goto(`/anime/${m.id}`)}
-                title="Open details"
-                class="text-sm font-medium leading-tight line-clamp-2 mb-1 text-left hover:text-accent transition-colors"
-              >
-                {displayTitle(m)}
-              </button>
-              <div class="text-xs text-ink-dim mb-2">
-                {#if m.format}{m.format}{/if}
-                {#if m.episodes}· {m.episodes} eps{/if}
-                {#if m.average_score}· ★ {m.average_score}{/if}
-              </div>
-              <div class="mt-auto">
-                {#if listed}
-                  <span class="text-xs px-2 py-1 rounded bg-panel-2 text-accent">
-                    ✓ {listBadge(m)}
-                  </span>
-                {:else}
-                  <div class="flex gap-1 flex-wrap">
-                    {#each status_options as o}
-                      <button
-                        onclick={() => add(m, o.v)}
-                        disabled={adding === m.id}
-                        class="text-xs px-2 py-1 rounded bg-panel-2 hover:bg-edge disabled:opacity-50"
-                      >
-                        {o.label}
-                      </button>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-            </div>
-          </div>
+          <AnimeCard media={m} entry={onList.get(m.id)} adding={adding === m.id} onadd={add} />
         {/each}
       </div>
     {/if}

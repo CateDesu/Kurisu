@@ -14,10 +14,7 @@
 
   let closeToTray = $state(false);
 
-  // Auto-update defaults on. Only an explicit 0 turns it off.
   let autoUpdate = $state(true);
-  // Set when a toggle save fails. Keyed on the setting so the banner lands in
-  // the section of the toggle that failed. Cleared on the next attempt.
   let toggleError = $state("");
   let toggleErrorKey = $state("");
   let update = $state<UpdateInfo | null>(null);
@@ -28,7 +25,6 @@
 
   let signingIn = $state(false);
   let signInErr = $state("");
-  // Logout clears the token and the cached list, so it asks first.
   let confirmingLogout = $state(false);
   let loggingOut = $state(false);
 
@@ -67,16 +63,12 @@
       await auth.logout();
       confirmingLogout = false;
     } catch (e) {
-      // A failed logout still drops the local session, so the page flips to
-      // the signed out branch where signInErr shows.
       signInErr = String(e);
       confirmingLogout = false;
     } finally {
       loggingOut = false;
     }
   }
-  // A forced logout, for example a rejected token, drops the user while the
-  // dialog is open. Don't leave it hanging over the signed-out UI.
   $effect(() => {
     if (!auth.user) confirmingLogout = false;
   });
@@ -84,14 +76,7 @@
     if (trackingSaving) return;
     trackingSaving = true;
     trackingError = "";
-    // Snapshot what's being saved. Inputs bind straight into cfg so an edit
-    // mid-request must not change what we send. The response must not
-    // clobber a newer edit when it lands.
-    // bind:value on a number input binds null when the field is cleared
-    // and a float when the user types 2.5. Number(null) is 0, which is
-    // finite, so without the empty check a cleared field clamped to the
-    // minimum instead of the fallback. Floats make the Rust u64 params
-    // fail to deserialize. Normalize and clamp to the input ranges.
+    // Normalize empty and fractional inputs before sending Rust integer parameters.
     const int = (v: unknown, fallback: number, lo: number, hi: number) => {
       if (v == null || v === "") return fallback;
       const n = Math.round(Number(v));
@@ -100,18 +85,12 @@
     };
     const snap = {
       mode: cfg.mode,
-      // Must match the backend clamp of 1..3600 in set_tracking_config and
-      // the input's min/max. The old 10..86400 range silently stored 3600
-      // when a user asked for more.
       prompt_seconds: int(cfg.prompt_seconds, 120, 1, 3_600),
       auto_percent: int(cfg.auto_percent, 80, 1, 100),
       auto_ask: cfg.auto_ask,
-      // Same 512 char cap as set_tracking_config, so the guard below compares
-      // against what the backend will actually persist.
       mpv_ipc_socket: cfg.mpv_ipc_socket.trim().slice(0, 512),
       discord_enabled: cfg.discord_enabled,
     };
-    // Reflect the normalized values so the field shows what was saved.
     cfg.prompt_seconds = snap.prompt_seconds;
     cfg.auto_percent = snap.auto_percent;
     try {
@@ -134,15 +113,13 @@
     }
   }
   async function toggleCloseToTray() {
-    // bind:checked flips the value before this handler runs, so the state
-    // before the click is the inverse.
+    // Binding updates before the handler, so the previous value is the inverse.
     const prev = !closeToTray;
     toggleError = "";
     toggleErrorKey = "";
     try {
       await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
     } catch (e) {
-      // Revert or the checkbox keeps showing a state that was never persisted.
       closeToTray = prev;
       toggleError = String(e);
       toggleErrorKey = "close_to_tray";
@@ -150,7 +127,6 @@
     }
   }
   async function toggleAutoUpdate() {
-    // Same flip before the handler, see toggleCloseToTray.
     const prev = !autoUpdate;
     toggleError = "";
     toggleErrorKey = "";
@@ -177,13 +153,10 @@
     }
   }
   async function installUpdate() {
-    // The in-flight flag lives in the shared updater store. An install
-    // started from the update modal blocks a second one here and vice versa.
     updateError = "";
     updateStatus = "";
     try {
       const result = await runInstallUpdate();
-      // installed. The installer launched and the app quits itself.
       if (result === "installed") updateStatus = "Installed — restart Kurisu to finish.";
     } catch (e) {
       updateError = String(e);
@@ -192,7 +165,7 @@
   load();
 </script>
 
-<div class="p-5 max-w-2xl mx-auto space-y-8">
+<div class="page-content space-y-8">
   <div>
     <h1 class="text-xl font-semibold mb-1">Settings</h1>
     {#if loadError}
@@ -244,7 +217,7 @@
       {/each}
     </div>
     {#if cfg.mode === "prompt"}
-      <div class="mb-3 text-sm flex items-center gap-2">
+      <div class="mb-3 text-sm flex flex-wrap items-center gap-2">
         Ask after
         <input
           type="number"
@@ -259,7 +232,7 @@
       </div>
     {/if}
     {#if cfg.mode === "auto"}
-      <div class="mb-3 text-sm flex items-center gap-2">
+      <div class="mb-3 text-sm flex flex-wrap items-center gap-2">
         Update progress at
         <input
           type="number"
@@ -377,7 +350,7 @@
         Couldn't save setting: {toggleError}
       </div>
     {/if}
-    <div class="flex items-center gap-2">
+    <div class="flex flex-wrap items-center gap-2">
       <button
         onclick={checkForUpdate}
         disabled={updateChecking || installInFlight()}

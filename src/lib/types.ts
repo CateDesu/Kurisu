@@ -1,5 +1,4 @@
-// Types mirror the Rust models in src-tauri/src/models.rs. Kept in sync by
-// hand. The invoke wrappers in api.ts are the only call sites.
+// Mirror the Rust payloads. Backend tests check field names for drift.
 
 import { nowMs } from "./now.svelte";
 
@@ -35,14 +34,11 @@ export interface Media {
   studios?: string[] | null;
 }
 
-/// One anime related to another. Shown on the detail page strip. `relation`
-/// is the raw AniList edge type like SEQUEL, PREQUEL, SIDE_STORY.
 export interface MediaRelation {
   relation: string;
   media: Media;
 }
 
-/// One character with Japanese VA on the detail page.
 export interface MediaCharacter {
   role?: string | null;
   name: string;
@@ -51,7 +47,6 @@ export interface MediaCharacter {
   va_image?: string | null;
 }
 
-/// One staff credit on the detail page.
 export interface MediaStaff {
   role?: string | null;
   name: string;
@@ -65,7 +60,6 @@ export interface MediaDetail {
   staff: MediaStaff[];
 }
 
-/// One RSS feed entry matched against the list. Shown on the Torrents page.
 export interface TorrentItem {
   title: string;
   link: string;
@@ -74,6 +68,10 @@ export interface TorrentItem {
   size?: string | null;
   seeders?: number | null;
   leechers?: number | null;
+  category_id?: string | null;
+  category?: string | null;
+  trusted?: boolean | null;
+  remake?: boolean | null;
   published?: number | null;
   media_id?: number | null;
   matched?: string | null;
@@ -87,7 +85,6 @@ export interface UnreadableFolder {
   error: string;
 }
 
-/// One library scan. Holds recognized files plus roots that could not be read.
 export interface LibraryScan {
   files: LibraryFile[];
   unreadable: UnreadableFolder[];
@@ -98,13 +95,11 @@ export interface FeedFailure {
   error: string;
 }
 
-/// A torrent refresh. Holds merged items plus feeds that did not answer.
 export interface TorrentFetch {
   items: TorrentItem[];
   failures: FeedFailure[];
 }
 
-/// AniList profile statistics from the server. Shown on the Stats page.
 export interface UserStats {
   count: number;
   episodes_watched: number;
@@ -118,7 +113,6 @@ export interface UserStats {
   release_years: { year: number; count: number }[];
 }
 
-/// One scheduled episode airing for the calendar view.
 export interface AiringItem {
   airing_at: number;
   episode: number;
@@ -169,8 +163,6 @@ export interface Notification {
   user_avatar?: string | null;
 }
 
-/// One-line text for a notification, mirroring what anilist.co/notifications
-/// shows for the same entry.
 export function notificationText(n: Notification): string {
   const user = n.user_name ?? "Someone";
   const media = n.media_title ?? "A media";
@@ -215,9 +207,6 @@ export function notificationText(n: Notification): string {
   }
 }
 
-/// Where a notification should link. Anime, activity, thread or user. Else inbox.
-/// `encodeURIComponent` on the username. It's AniList-controlled and could
-/// otherwise break out of the path.
 export function notificationUrl(n: Notification): string {
   if (n.media_id) return `https://anilist.co/anime/${n.media_id}`;
   if (n.activity_id) return `https://anilist.co/activity/${n.activity_id}`;
@@ -226,8 +215,6 @@ export function notificationUrl(n: Notification): string {
   return "https://anilist.co/notifications";
 }
 
-/// Per-kind emoji for the inbox list. Exact match on the AniList kind. Substring
-/// matching made the result depend on arm order. THREAD_LIKE hit LIKE first.
 export function notificationIcon(kind: string): string {
   switch (kind.toUpperCase()) {
     case "AIRING":
@@ -258,7 +245,6 @@ export function notificationIcon(kind: string): string {
   }
 }
 
-/// Compact relative timestamp.
 export function timeAgo(unix: number | null | undefined): string {
   if (!unix) return "";
   const s = nowMs() / 1000 - unix;
@@ -278,7 +264,6 @@ export interface TrackingConfig {
   discord_enabled: boolean;
 }
 
-/// "Now Playing" payload pushed from the MPRIS watcher every tick.
 export interface NowPlaying {
   active: boolean;
   player: string;
@@ -290,9 +275,6 @@ export interface NowPlaying {
   position_us: number;
 }
 
-/// Prompt mode request shown as an in app modal, not a tray notification.
-/// `progress` is the entry's current progress. The modal only offers
-/// "set to Ep N" when that's actually ahead.
 export interface TrackingPrompt {
   media_id: number;
   episode: number;
@@ -301,20 +283,18 @@ export interface TrackingPrompt {
   progress: number;
 }
 
-/// Self update check result. Used on the settings page and the startup prompt.
 export interface UpdateInfo {
-  available: boolean; // a newer release exists on GitHub
-  can_install: boolean; // this build can update in place. Windows plus installer asset.
-  restart_pending: boolean; // update was applied this session. Restart to finish.
-  version: string; // latest release version
+  available: boolean;
+  can_install: boolean;
+  restart_pending: boolean;
+  version: string; // latest release
   tag: string;
   html_url: string;
-  body: string; // release notes
-  current: string; // this build's version
+  body: string;
+  current: string; // running build
 }
 
-/// One video file from the library scan. `bound` means matched via a manual
-/// file or folder link rather than the recognizer.
+/// bound means a manual file or folder link supplied the match.
 export interface LibraryFile {
   path: string;
   media_id: number | null;
@@ -332,7 +312,6 @@ export const STATUS_LABEL: Record<string, string> = {
   REPEATING: "Rewatching",
 };
 
-/// AniList media airing status to display label.
 export const MEDIA_STATUS_LABEL: Record<string, string> = {
   RELEASING: "Airing",
   FINISHED: "Finished",
@@ -341,7 +320,6 @@ export const MEDIA_STATUS_LABEL: Record<string, string> = {
   HIATUS: "On hiatus",
 };
 
-/// AniList relation edge type to display label. Used on detail page strips.
 export const RELATION_LABEL: Record<string, string> = {
   PREQUEL: "Prequel",
   SEQUEL: "Sequel",
@@ -358,7 +336,6 @@ export const RELATION_LABEL: Record<string, string> = {
   OTHER: "Related",
 };
 
-/// AniList `source` enum to display label. LIGHT_NOVEL becomes Light Novel.
 export function sourceLabel(source: string | null | undefined): string {
   if (!source) return "";
   return source
@@ -368,9 +345,7 @@ export function sourceLabel(source: string | null | undefined): string {
     .join(" ");
 }
 
-/// AniList descriptions arrive as limited HTML. Tags like <br>, <i>, <b>, plus
-/// entities. Render them as plain text. Strip tags, decode the common entities.
-/// Don't trust remote HTML into {@html}.
+/// Render remote descriptions as plain text. Never pass them to @html.
 export function plainDescription(d: string | null | undefined): string {
   if (!d) return "";
   return d
@@ -387,8 +362,6 @@ export function plainDescription(d: string | null | undefined): string {
     .trim();
 }
 
-/// AniList score formats. The user's chosen format from Viewer.mediaListOptions
-/// decides how scores are shown and edited.
 export type ScoreFormat =
   | "POINT_100"
   | "POINT_10_DECIMAL"
@@ -396,7 +369,6 @@ export type ScoreFormat =
   | "POINT_5"
   | "POINT_3";
 
-/// Render a score for compact display on list rows. Empty string means no score.
 export function scoreLabel(score: number | null | undefined, format?: string | null): string {
   if (score == null || score <= 0) return "";
   switch (format as ScoreFormat) {
@@ -409,7 +381,6 @@ export function scoreLabel(score: number | null | undefined, format?: string | n
   }
 }
 
-/// "Next episode airs" line for display. Null if none or already aired.
 export function airingLabel(m: Media | null | undefined): string | null {
   if (!m?.next_airing_episode || !m?.next_airing_at) return null;
   const diff = m.next_airing_at - nowMs() / 1000;

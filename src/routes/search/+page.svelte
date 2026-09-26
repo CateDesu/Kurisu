@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { goto } from "$app/navigation";
+  import { onDestroy, untrack } from "svelte";
+  import { afterNavigate } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
+  import type { ListEntry, Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
-  import Img from "$lib/Img.svelte";
+  import AnimeCard from "$lib/AnimeCard.svelte";
+  import { addToList } from "$lib/list";
   import type { Snapshot } from "./$types";
 
   let query = $state("");
@@ -12,77 +14,106 @@
   let searching = $state(false);
   let error = $state("");
   let adding = $state<number | null>(null);
+  const loggedIn = $derived(auth.isLoggedIn);
 
-  // Own list status per result, from the local cache. Reassign on change,
-  // mutating a Map would not rerun the lookups in the template.
+  // Reassign the Map so badge lookups react to changes.
   let listByMedia = $state(new Map<number, ListEntry>());
+  let listLoadId = 0;
+  let searchId = 0;
+  let addId = 0;
+  let alive = true;
+  let submittedQuery = "";
+  let resumeQuery: string | null = null;
 
-  $effect(() => {
-    if (!auth.isLoggedIn) return;
-    api
-      .localEntries()
-      .then((es) => (listByMedia = new Map(es.map((e) => [e.media_id, e]))))
-      .catch((e) => console.error("could not read local list", e));
-  });
-
-  /// Badge line for a result that's already on the list, with progress when
-  /// there is any. Null when the show is not tracked.
-  function listBadge(m: Media): string | null {
-    const e = listByMedia.get(m.id);
-    if (!e) return null;
-    const label = STATUS_LABEL[e.status] ?? e.status;
-    if (e.progress <= 0) return label;
-    return m.episodes ? `${label} · ${e.progress}/${m.episodes}` : `${label} · ${e.progress}`;
+  async function loadList() {
+    const id = ++listLoadId;
+    const epoch = auth.epoch;
+    const current = () => alive && id === listLoadId && epoch === auth.epoch && auth.isLoggedIn;
+    try {
+      const es = await api.localEntries();
+      if (current()) listByMedia = new Map(es.map((e) => [e.media_id, e]));
+    } catch (e) {
+      if (current()) error = String(e);
+    }
   }
 
-  // Keep the last search alive across detail pages so Back returns to the
-  // results instead of the empty form. Fresh visits still start clean.
-  export const snapshot: Snapshot<{ query: string; results: Media[] }> = {
-    capture: () => ({ query, results }),
+  $effect(() => {
+    auth.epoch;
+    loggedIn;
+    listByMedia = new Map();
+    error = "";
+    adding = null;
+    searching = false;
+    resumeQuery = null;
+    return () => { listLoadId++; searchId++; addId++; };
+  });
+
+  $effect(() => {
+    auth.epoch;
+    if (auth.isLoggedIn) untrack(() => loadList());
+  });
+
+  export const snapshot: Snapshot<{ query: string; results: Media[]; pendingQuery: string | null }> = {
+    capture: () => ({ query, results, pendingQuery: searching ? submittedQuery : resumeQuery }),
     restore: (v) => {
+      searchId++;
+      searching = false;
       query = v.query;
-      results = v.results;
+      resumeQuery = v.pendingQuery;
+      results = resumeQuery ? [] : v.results;
     },
   };
 
-  const status_options = [
-    { v: "CURRENT", label: "Watching" },
-    { v: "PLANNING", label: "Plan to watch" },
-    { v: "COMPLETED", label: "Completed" },
-  ];
-
-  async function run(e: Event) {
+  function run(e: Event) {
     e.preventDefault();
-    if (!query.trim()) return;
+    void search(query.trim());
+  }
+
+  async function search(term: string) {
+    if (!term || !auth.isLoggedIn) return;
+    const id = ++searchId;
+    const epoch = auth.epoch;
+    const current = () => alive && id === searchId && epoch === auth.epoch && auth.isLoggedIn;
     searching = true;
+    submittedQuery = term;
+    resumeQuery = null;
+    results = [];
     error = "";
     try {
-      results = await api.searchAnime(query.trim());
+      const found = await api.searchAnime(term);
+      if (current()) results = found;
     } catch (err) {
-      error = String(err);
+      if (current()) error = String(err);
     } finally {
-      searching = false;
+      if (current()) searching = false;
     }
   }
 
+  afterNavigate(() => {
+    queueMicrotask(() => {
+      if (alive && auth.isLoggedIn && resumeQuery) void search(resumeQuery);
+    });
+  });
+
   async function add(m: Media, status: string) {
+    const id = ++addId;
+    const epoch = auth.epoch;
+    const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
     adding = m.id;
     error = "";
     try {
-      // Adding writes status and progress unconditionally. Refuse to clobber
-      // an entry that's already on the list.
-      if (await api.getEntry(m.id)) {
-        error = `${displayTitle(m)} is already on your list.`;
-        return;
-      }
-      const entry = await api.updateEntry(m.id, status, 0, null, 0);
+      const entry = await addToList(m, status);
+      if (!current()) return;
       listByMedia = new Map(listByMedia).set(m.id, entry);
+      void loadList();
     } catch (err) {
-      error = String(err);
+      if (current() && id === addId) error = String(err);
     } finally {
-      adding = null;
+      if (current() && id === addId) adding = null;
     }
   }
+
+  onDestroy(() => { alive = false; });
 </script>
 
 {#if !auth.isLoggedIn}
@@ -90,14 +121,14 @@
     <Login />
   </div>
 {:else}
-<div class="p-5 max-w-5xl mx-auto">
+<div class="page-content">
   <h1 class="text-xl font-semibold mb-4">Search</h1>
 
   <form onsubmit={run} class="flex gap-2 mb-5">
     <input
       bind:value={query}
       placeholder="Anime title…"
-      class="flex-1 bg-panel border border-edge rounded-md px-3 py-2 focus:outline-none focus:border-accent"
+      class="flex-1 min-w-0 bg-panel border border-edge rounded-md px-3 py-2 focus:outline-none focus:border-accent"
     />
     <button class="px-4 py-2 rounded-md bg-accent hover:bg-accent-2 text-white" disabled={searching}>
       {searching ? "…" : "Search"}
@@ -110,54 +141,9 @@
     </div>
   {/if}
 
-  <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+  <div class="media-grid">
     {#each results as m (m.id)}
-      {@const entry = listByMedia.get(m.id)}
-      <div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
-        <button type="button" onclick={() => goto(`/anime/${m.id}`)} title="Open details" class="block">
-          {#if m.cover_large}
-            <Img src={m.cover_large} class="w-full h-44 object-cover" />
-          {:else}
-            <div class="w-full h-44 bg-panel-2"></div>
-          {/if}
-        </button>
-        <div class="p-2.5 flex-1 flex flex-col">
-          <button
-            type="button"
-            onclick={() => goto(`/anime/${m.id}`)}
-            title="Open details"
-            class="text-sm font-medium leading-tight line-clamp-2 mb-1 text-left hover:text-accent transition-colors"
-          >
-            {displayTitle(m)}
-          </button>
-          <div class="text-xs text-ink-dim mb-2">
-            {#if m.format}{m.format}{/if}
-            {#if m.season_year}· {m.season_year}{/if}
-            {#if m.episodes}· {m.episodes} eps{/if}
-            {#if m.average_score}· ★ {m.average_score}{/if}
-          </div>
-          {#if entry}
-            <div class="mb-2">
-              <span class="inline-block text-xs px-2 py-0.5 rounded bg-accent/15 text-accent">
-                {listBadge(m)}
-              </span>
-            </div>
-          {/if}
-          <div class="mt-auto flex gap-1 flex-wrap">
-            {#each status_options as o}
-              <button
-                onclick={() => add(m, o.v)}
-                disabled={adding === m.id}
-                class="text-xs px-2 py-1 rounded disabled:opacity-50 {entry?.status === o.v
-                  ? 'bg-accent text-white'
-                  : 'bg-panel-2 hover:bg-edge'}"
-              >
-                {o.label}
-              </button>
-            {/each}
-          </div>
-        </div>
-      </div>
+      <AnimeCard media={m} entry={listByMedia.get(m.id)} adding={adding === m.id} onadd={add} showYear showListedActions />
     {/each}
   </div>
 </div>

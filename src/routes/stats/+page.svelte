@@ -9,23 +9,26 @@
   let error = $state("");
 
   let loadId = 0;
+  let lastEpoch = -1;
   async function load() {
+    if (!auth.isLoggedIn) return;
     const id = ++loadId;
+    const epoch = auth.epoch;
+    const current = () => id === loadId && epoch === auth.epoch && auth.isLoggedIn;
     loading = true;
     error = "";
     try {
       const s = await api.getUserStats();
-      if (id !== loadId) return;
+      if (!current()) return;
       stats = s;
     } catch (e) {
-      if (id === loadId) error = String(e);
+      if (current()) error = String(e);
     } finally {
-      if (id === loadId) loading = false;
+      if (current()) loading = false;
     }
   }
 
   const daysWatched = $derived(stats ? stats.minutes_watched / 1440 : 0);
-  // Fixed presentation order for the status breakdown.
   const STATUS_ORDER = ["CURRENT", "REPEATING", "COMPLETED", "PAUSED", "DROPPED", "PLANNING"];
   const statuses = $derived.by(() => {
     if (!stats) return [];
@@ -44,7 +47,15 @@
   }
 
   $effect(() => {
+    const epoch = auth.epoch;
+    if (epoch !== lastEpoch || !auth.isLoggedIn) {
+      stats = null;
+      error = "";
+      loading = false;
+      lastEpoch = epoch;
+    }
     if (auth.isLoggedIn) load();
+    return () => { loadId++; };
   });
 </script>
 
@@ -53,7 +64,7 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-3xl mx-auto">
+  <div class="page-content">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-xl font-semibold flex-1">Stats</h1>
       <button
@@ -74,8 +85,7 @@
     {#if loading && !stats}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
     {:else if stats}
-      <!-- Headline numbers. -->
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-3 mb-6">
         <div class="bg-panel border border-edge rounded-lg p-3">
           <div class="text-2xl font-semibold tabular-nums">{stats.count}</div>
           <div class="text-xs text-ink-dim mt-0.5">Anime</div>
@@ -138,7 +148,7 @@
           <div class="bg-panel border border-edge rounded-lg p-3 space-y-2">
             {#each stats.genres as g (g.genre)}
               <div class="flex items-center gap-2 text-sm">
-                <span class="w-28 shrink-0 text-ink-dim truncate">{g.genre}</span>
+                <span class="w-28 shrink-0 text-ink-dim">{g.genre}</span>
                 <div class="flex-1 h-4 bg-panel-2 rounded overflow-hidden">
                   <div class="h-full bg-accent/70 rounded" style="width: {pct(g.count, maxGenre)}"></div>
                 </div>
@@ -168,7 +178,7 @@
         <div class="mb-2">
           <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">By release year</h2>
           <div class="bg-panel border border-edge rounded-lg p-3">
-            <div class="flex items-end gap-[3px] h-24">
+            <div class="flex items-end gap-[3px] h-24 overflow-x-auto">
               {#each stats.release_years as y (y.year)}
                 <div
                   class="flex-1 min-w-[3px] bg-accent/60 hover:bg-accent rounded-t transition-colors"

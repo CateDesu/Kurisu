@@ -1,7 +1,5 @@
 <script lang="ts">
-  // Modal for the Library's unmatched files. Pick a show on your list and bind
-  // this file or its whole folder to it. The binding is stored on the backend
-  // and wins over the recognizer on every future scan.
+  import Dialog from "$lib/Dialog.svelte";
   import { api } from "$lib/api";
   import { displayTitle, STATUS_LABEL, type ListEntry } from "$lib/types";
   import Img from "$lib/Img.svelte";
@@ -15,8 +13,7 @@
   }: {
     path: string;
     entries: ListEntry[];
-    /// Configured library root folders. A root is never offered for folder
-    /// binding. It would swallow every unmatched file in the library.
+    /// Never bind a library root to one show.
     roots: string[];
     onclose: () => void;
     onlinked: () => void;
@@ -26,12 +23,10 @@
   const fileName = $derived(sepIdx >= 0 ? path.slice(sepIdx + 1) : path);
   const dir = $derived(sepIdx > 0 ? path.slice(0, sepIdx) : "");
   const dirName = $derived(dir ? (dir.split(/[\\/]/).pop() ?? dir) : "");
-  // Trailing separators on configured roots must not defeat the root check.
   const folderAllowed = $derived(
     dir !== "" && !roots.some((r) => r.replace(/[\\/]+$/, "") === dir)
   );
 
-  // The user's radio pick, if any. Until then follow what the path allows.
   let scopeChoice = $state<"folder" | "file" | null>(null);
   const scope = $derived(
     scopeChoice === "folder" && !folderAllowed
@@ -43,16 +38,12 @@
   let q = $state("");
   let busy = $state<number | null>(null);
   let err = $state("");
-  // The binding already on the target, if any. Re-pointing one takes a
-  // second click so a path never silently moves to another show. Picks stay
-  // disabled until the lookup settles, or a fast click could bind over an
-  // existing link without the relink confirm.
+  // Wait for the existing binding before allowing a pick that might replace it.
   let currentBinding = $state<number | null>(null);
   let currentTitle = $state("");
   let pendingRelink = $state<number | null>(null);
   let bindingChecked = $state(false);
 
-  // Watching first since those are the likely targets. Then the rest in title order.
   const STATUS_ORDER: Record<string, number> = {
     CURRENT: 0,
     REPEATING: 1,
@@ -61,11 +52,7 @@
     DROPPED: 4,
     COMPLETED: 5,
   };
-  // One collator for the session. localeCompare with an options object builds a
-  // fresh Intl.Collator on every comparison.
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
-  // This picker is meant to be searched, not scrolled. Rendering all 1280 rows
-  // with their cover images on every keystroke is what made it stutter.
   const MAX_ROWS = 100;
   const candidates = $derived.by(() => {
     const needle = q.trim().toLowerCase();
@@ -102,7 +89,6 @@
           const media = await api.getMedia(id);
           if (!stale) currentTitle = displayTitle(media);
         } catch {
-          // The title is cosmetic. The relink guard works off the id alone.
         }
       })
       .catch(() => {})
@@ -116,7 +102,6 @@
 
   async function pick(e: ListEntry) {
     if (busy !== null || !bindingChecked || e.media_id === currentBinding) return;
-    // Re-pointing an existing binding needs a second explicit click.
     if (currentBinding !== null && pendingRelink !== e.media_id) {
       pendingRelink = e.media_id;
       return;
@@ -134,130 +119,106 @@
     }
   }
 
-  let dialog = $state<HTMLDivElement | null>(null);
-  /// Dismissal is refused while a binding write is in flight. Closing mid
-  /// write hid the error banner, so a failed link looked like a success.
   function tryClose() {
     if (busy !== null) return;
     onclose();
   }
-  function onWindowKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") tryClose();
-  }
-  $effect(() => dialog?.focus());
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
+<Dialog onclose={tryClose} busy={busy !== null} size="md">
+  <h3 class="font-semibold mb-1">Link to a show on your list</h3>
+  <p class="text-xs text-ink-dim font-mono truncate mb-3" title={path}>{fileName}</p>
 
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div
-  class="fixed inset-0 bg-black/60 grid place-items-center z-50 backdrop-blur-sm"
-  onclick={tryClose}
-  role="presentation"
->
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div
-    bind:this={dialog}
-    class="bg-panel border border-edge rounded-xl p-5 max-w-md w-full mx-4 shadow-2xl"
-    onclick={(e) => e.stopPropagation()}
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-  >
-    <h3 class="font-semibold mb-1">Link to a show on your list</h3>
-    <p class="text-xs text-ink-dim font-mono truncate mb-3" title={path}>{fileName}</p>
+  {#if currentBinding !== null}
+    <div
+      class="text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md p-2 mb-3"
+    >
+      {scope === "folder" ? "This folder" : "This file"} is linked to
+      <span class="font-medium">{currentTitle || `show #${currentBinding}`}</span>. Picking a
+      different show relinks it.
+    </div>
+  {/if}
 
-    {#if currentBinding !== null}
-      <div
-        class="text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md p-2 mb-3"
-      >
-        {scope === "folder" ? "This folder" : "This file"} is linked to
-        <span class="font-medium">{currentTitle || `show #${currentBinding}`}</span>. Picking a
-        different show relinks it.
-      </div>
-    {/if}
+  {#if err}
+    <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-3">
+      {err}
+    </div>
+  {/if}
 
-    {#if err}
-      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-3">
-        {err}
-      </div>
-    {/if}
-
-    <div class="flex gap-4 mb-3 text-sm">
-      {#if folderAllowed}
-        <label class="flex items-center gap-1.5 cursor-pointer min-w-0">
-          <input
-            type="radio"
-            name="link-scope"
-            checked={scope === "folder"}
-            onchange={() => (scopeChoice = "folder")}
-            class="accent-accent"
-          />
-          <span class="truncate" title={dir}>Whole folder <span class="text-ink-dim">({dirName})</span></span>
-        </label>
-      {/if}
-      <label class="flex items-center gap-1.5 cursor-pointer shrink-0">
+  <div class="flex gap-4 mb-3 text-sm">
+    {#if folderAllowed}
+      <label class="flex items-center gap-1.5 cursor-pointer min-w-0">
         <input
           type="radio"
           name="link-scope"
-          checked={scope === "file"}
-          onchange={() => (scopeChoice = "file")}
+          checked={scope === "folder"}
+          onchange={() => (scopeChoice = "folder")}
           class="accent-accent"
         />
-        <span>This file only</span>
+        <span class="truncate" title={dir}>Whole folder <span class="text-ink-dim">({dirName})</span></span>
       </label>
-    </div>
-
-    <input
-      bind:value={q}
-      placeholder="Search your list…"
-      class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent mb-2"
-    />
-
-    <div class="max-h-72 overflow-y-auto space-y-1 -mx-1 px-1">
-      {#if candidates.length === 0}
-        <div class="text-sm text-ink-dim py-6 text-center">No matches on your list.</div>
-      {:else}
-        {#each candidates as e (e.media_id)}
-          <button
-            type="button"
-            onclick={() => pick(e)}
-            disabled={busy !== null || !bindingChecked || e.media_id === currentBinding}
-            class="cv-row w-full text-left flex items-center gap-2.5 rounded-md p-1.5 hover:bg-panel-2/60 disabled:opacity-50"
-          >
-            {#if e.media?.cover_medium}
-              <Img src={e.media.cover_medium} class="w-8 h-11 object-cover rounded shrink-0" />
-            {:else}
-              <div class="w-8 h-11 bg-panel-2 rounded shrink-0"></div>
-            {/if}
-            <span class="flex-1 min-w-0 truncate text-sm">
-              {busy === e.media_id
-                ? "Linking…"
-                : pendingRelink === e.media_id
-                  ? `Relink to ${displayTitle(e.media)}`
-                  : displayTitle(e.media)}
-            </span>
-            <span class="shrink-0 text-xs text-ink-dim">
-              {e.media_id === currentBinding ? "Linked" : (STATUS_LABEL[e.status] ?? e.status)}
-            </span>
-          </button>
-        {/each}
-        {#if truncated}
-          <div class="text-xs text-ink-dim py-2 text-center">
-            Showing the first {MAX_ROWS}. Type to narrow it down.
-          </div>
-        {/if}
-      {/if}
-    </div>
-
-    <div class="flex justify-end pt-3">
-      <button
-        type="button"
-        onclick={tryClose}
-        class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
-      >
-        Cancel
-      </button>
-    </div>
+    {/if}
+    <label class="flex items-center gap-1.5 cursor-pointer shrink-0">
+      <input
+        type="radio"
+        name="link-scope"
+        checked={scope === "file"}
+        onchange={() => (scopeChoice = "file")}
+        class="accent-accent"
+      />
+      <span>This file only</span>
+    </label>
   </div>
-</div>
+
+  <input
+    bind:value={q}
+    placeholder="Search your list…"
+    class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent mb-2"
+  />
+
+  <div class="max-h-72 overflow-y-auto space-y-1 -mx-1 px-1">
+    {#if candidates.length === 0}
+      <div class="text-sm text-ink-dim py-6 text-center">No matches on your list.</div>
+    {:else}
+      {#each candidates as e (e.media_id)}
+        <button
+          type="button"
+          onclick={() => pick(e)}
+          disabled={busy !== null || !bindingChecked || e.media_id === currentBinding}
+          class="cv-row w-full text-left flex items-center gap-2.5 rounded-md p-1.5 hover:bg-panel-2/60 disabled:opacity-50"
+        >
+          {#if e.media?.cover_medium}
+            <Img src={e.media.cover_medium} class="w-8 h-11 object-cover rounded shrink-0" />
+          {:else}
+            <div class="w-8 h-11 bg-panel-2 rounded shrink-0"></div>
+          {/if}
+          <span class="flex-1 min-w-0 truncate text-sm">
+            {busy === e.media_id
+              ? "Linking…"
+              : pendingRelink === e.media_id
+                ? `Relink to ${displayTitle(e.media)}`
+                : displayTitle(e.media)}
+          </span>
+          <span class="shrink-0 text-xs text-ink-dim">
+            {e.media_id === currentBinding ? "Linked" : (STATUS_LABEL[e.status] ?? e.status)}
+          </span>
+        </button>
+      {/each}
+      {#if truncated}
+        <div class="text-xs text-ink-dim py-2 text-center">
+          Showing the first {MAX_ROWS}. Type to narrow it down.
+        </div>
+      {/if}
+    {/if}
+  </div>
+
+  <div class="flex justify-end pt-3">
+    <button
+      type="button"
+      onclick={tryClose}
+      class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+    >
+      Cancel
+    </button>
+  </div>
+</Dialog>

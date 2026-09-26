@@ -26,6 +26,7 @@
   import Login from "$lib/Login.svelte";
 
   const id = $derived(Number($page.params.id));
+  const loggedIn = $derived(auth.isLoggedIn);
 
   let detail = $state<MediaDetail | null>(null);
   let entry = $state<ListEntry | null>(null);
@@ -42,89 +43,78 @@
     { v: "COMPLETED", label: "Completed" },
   ];
 
-  // Navigating between relations reuses this component. Latest-wins per id.
   let loadId = 0;
+  let entryLoadId = 0;
+  let addId = 0;
   async function load(mediaId: number) {
     const reqId = ++loadId;
+    const entryReq = ++entryLoadId;
+    const epoch = auth.epoch;
+    const current = () => reqId === loadId && epoch === auth.epoch && auth.isLoggedIn && mediaId === id;
     loading = true;
     error = "";
-    editing = false;
-    // An add still in flight from the previous id never clears `adding`.
-    // Its finally fails the reqId check once loadId bumps, and the add
-    // buttons would stay disabled on this page.
-    adding = null;
-    expanded = false;
-    recs = [];
-    // Clear the PREVIOUS anime's data too. Leaving it in place kept the old
-    // title, cover and entry panel on screen under a new id. The stepper and
-    // status buttons then acted on a show the user was no longer looking at,
-    // and the `loading && !detail` placeholder below could never fire.
-    detail = null;
-    entry = null;
     try {
       const [d, e] = await Promise.all([api.getMediaDetail(mediaId), api.getEntry(mediaId)]);
-      if (reqId !== loadId) return;
+      if (!current()) return;
       detail = d;
-      entry = e ? { ...e, media: e.media ?? d.media } : null;
+      if (entryReq === entryLoadId) entry = e ? { ...e, media: e.media ?? d.media } : null;
     } catch (err) {
-      if (reqId === loadId) {
-        detail = null;
-        entry = null;
-        error = String(err);
-      }
+      if (current()) error = String(err);
     } finally {
-      if (reqId === loadId) loading = false;
+      if (current()) loading = false;
     }
-    // Recommendations load after the main content. Failures just hide the strip.
+    if (!current()) return;
     try {
       const r = await api.getRecommendations(mediaId);
-      if (reqId === loadId) recs = r;
+      if (current()) recs = r;
     } catch {
-      if (reqId === loadId) recs = [];
+      if (current()) recs = [];
     }
   }
 
   async function reloadEntry() {
-    const reqId = loadId;
+    if (!auth.isLoggedIn) return;
+    const reqId = ++entryLoadId;
+    const epoch = auth.epoch;
+    const mediaId = id;
     try {
-      const e = await api.getEntry(id);
-      if (reqId !== loadId) return;
+      const e = await api.getEntry(mediaId);
+      if (reqId !== entryLoadId || epoch !== auth.epoch || !auth.isLoggedIn || mediaId !== id) return;
       entry = e ? { ...e, media: e.media ?? detail?.media ?? null } : null;
     } catch {
-      // keep whatever we had
     }
   }
 
   async function add(status: string) {
-    // A full AniList round trip. The relation and recommendation cards stay
-    // clickable throughout, so navigating mid add must not land this entry on
-    // the next anime's page. Same latest-wins guard `load` uses.
-    const reqId = loadId;
+    if (!auth.isLoggedIn || adding) return;
+    const reqId = ++addId;
+    const epoch = auth.epoch;
+    const mediaId = id;
+    const current = () => reqId === addId && epoch === auth.epoch && auth.isLoggedIn && mediaId === id;
     adding = status;
     error = "";
     try {
-      const e = await api.updateEntry(id, status, 0, null, 0);
-      if (reqId !== loadId) return;
+      const e = await api.updateEntry(mediaId, status, 0, null, 0);
+      if (!current()) return;
+      entryLoadId++;
       entry = e;
     } catch (e) {
-      if (reqId === loadId) error = String(e);
+      if (current()) error = String(e);
     } finally {
-      if (reqId === loadId) adding = null;
+      if (current()) adding = null;
     }
   }
 
   function applyEntry(e: ListEntry) {
-    // A stepper flushing its buffered edit during relation to relation
-    // navigation reports the PREVIOUS anime. Don't let it clobber the new
-    // page's entry.
+    // A stepper may finish saving the previous anime during navigation.
     if (e.media_id !== id) return;
+    entryLoadId++;
     entry = { ...e, media: e.media ?? detail?.media ?? null };
   }
 
   const media = $derived(detail?.media ?? null);
   const desc = $derived(plainDescription(media?.description));
   const air = $derived(airingLabel(media));
-  // File for the next unwatched episode, from the last library scan.
   const nextFile = $derived(entry ? library.fileFor(id, entry.progress + 1) : undefined);
   const meta = $derived.by(() => {
     if (!media) return "";
@@ -146,11 +136,25 @@
   });
 
   $effect(() => {
+    auth.epoch;
+    loggedIn;
+    id;
+    detail = null;
+    entry = null;
+    editing = false;
+    adding = null;
+    expanded = false;
+    recs = [];
+    loading = false;
+    error = "";
+    return () => { loadId++; entryLoadId++; addId++; };
+  });
+
+  $effect(() => {
+    auth.epoch;
     const mediaId = id;
     if (!auth.isLoggedIn) return;
     if (!Number.isFinite(mediaId)) {
-      // A non-numeric id can never load. Show an error instead of
-      // spinning on Loading forever.
       detail = null;
       entry = null;
       loading = false;
@@ -161,14 +165,10 @@
   });
 
   $effect(() => {
+    const epoch = auth.epoch;
     if (auth.isLoggedIn) {
-      // The Play button reads files from the last scan, and nothing else on
-      // this route starts one. Same loadFolders plus scan guard as the Now
-      // page, with the catch so a backend failure is not an unhandled
-      // rejection.
       library.loadFolders().then(() => {
-        // scanning too: hasScan only flips when a scan finishes, so without
-        // it a visit during the Now page's scan queues a duplicate walk.
+        if (epoch !== auth.epoch || !auth.isLoggedIn) return;
         if (library.folders.length > 0 && !library.hasScan && !library.scanning)
           library.scan().catch((e) => console.error("library scan failed", e));
       });
@@ -183,7 +183,7 @@
 {:else if loading && !detail}
   <div class="text-ink-dim py-16 text-center">Loading…</div>
 {:else if !media}
-  <div class="p-5 max-w-3xl mx-auto">
+  <div class="page-content">
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-3 mt-6">
       {error || "This anime could not be loaded."}
     </div>
@@ -196,7 +196,7 @@
     </div>
   {/if}
 
-  <div class="max-w-4xl mx-auto px-5 pb-8 {media.banner_image ? '-mt-20 relative' : 'pt-5'}">
+  <div class="min-w-0 [overflow-wrap:anywhere] px-5 pb-8 {media.banner_image ? '-mt-20 relative' : 'pt-5'}">
     <div class="flex items-end gap-5 mb-4">
       {#if media.cover_large ?? media.cover_medium}
         <Img
@@ -208,7 +208,7 @@
       {/if}
       <div class="flex-1 min-w-0 pb-1">
         <div class="flex items-start gap-2">
-          <h1 class="text-2xl font-semibold leading-tight flex-1">{displayTitle(media)}</h1>
+          <h1 class="text-2xl font-semibold leading-tight flex-1 min-w-0">{displayTitle(media)}</h1>
           <button
             onclick={() => openUrl(`https://anilist.co/anime/${id}`)}
             title="Open on AniList"
@@ -218,7 +218,7 @@
           </button>
         </div>
         {#if media.title_romaji && media.title_romaji !== displayTitle(media)}
-          <div class="text-sm text-ink-dim truncate mt-0.5">{media.title_romaji}</div>
+          <div class="text-sm text-ink-dim mt-0.5">{media.title_romaji}</div>
         {/if}
         {#if meta}
           <div class="text-sm text-ink-dim mt-2">{meta}</div>
@@ -243,9 +243,7 @@
       </div>
     {/if}
 
-    <!-- Your list entry, or quick add. Keyed on the anime id. Navigating
-         between relations must destroy the stepper so its buffered edit
-         flushes against the OLD media id instead of leaking onto the new one. -->
+    <!-- Recreate the stepper so buffered edits flush against the previous anime ID. -->
     {#key id}
     <div class="bg-panel border border-edge rounded-lg p-3 mb-5 flex items-center gap-3 flex-wrap">
       {#if entry}
@@ -405,7 +403,7 @@
   </div>
 {/if}
 
-{#if editing && entry}
+{#if auth.isLoggedIn && editing && entry}
   <EditEntry
     entry={entry}
     scoreFormat={auth.user?.score_format ?? null}

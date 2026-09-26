@@ -1,6 +1,5 @@
 @import "tailwindcss";
 
-/* Dark anime-tracker theme. Tailwind v4 theme via @theme. */
 @theme {
   --color-base: #0f1115;
   --color-panel: #181b22;
@@ -21,14 +20,9 @@ html, body {
   height: 100%;
 }
 
-/* Tell the UA the whole app is dark so every NATIVE widget — <select> option
-   popups, number spinners, tooltips, scrollbars — renders dark instead of the
-   light system default (which made the closed select's text invisible and the
-   option list white). */
 :root { color-scheme: dark; }
 
-/* Belt-and-suspenders: force dark surfaces on form controls even where
-   color-scheme isn't fully honored. */
+/* Fallback for controls that ignore color-scheme. */
 select, option, optgroup {
   background-color: var(--color-panel-2);
   color: var(--color-ink);
@@ -37,14 +31,24 @@ input, textarea {
   color: var(--color-ink);
 }
 
-/* thin scrollbars to match a dense desktop app */
 * { scrollbar-width: thin; scrollbar-color: var(--color-edge) transparent; }
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-thumb { background: var(--color-edge); border-radius: 6px; }
 
-/* Scroll performance on long lists: skip layout/paint for rows and cards that
-   are offscreen. `auto <size>` remembers the real size once rendered, so the
-   scrollbar doesn't jump as they pop in. */
+.page-content {
+  width: 100%;
+  min-width: 0;
+  padding: 1.25rem;
+  overflow-wrap: anywhere;
+}
+
+.media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
+  gap: 0.75rem;
+}
+
+/* Remember rendered sizes so skipping offscreen content does not shift the scrollbar. */
 .cv-row {
   content-visibility: auto;
   contain-intrinsic-size: auto 64px;

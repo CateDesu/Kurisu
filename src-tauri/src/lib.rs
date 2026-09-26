@@ -1,7 +1,3 @@
-//! Tauri entrypoint. Builds the app state, AniList client plus SQLite cache,
-//! restores any saved token, registers all commands, and starts the
-//! playback watcher.
-
 mod anilist;
 mod commands;
 mod db;
@@ -20,25 +16,14 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tauri::Manager;
 
-/// Resolve the app data dir, migrate any ProjectDirs DB from before 1.0, and
-/// open the SQLite cache. String errors get surfaced in a startup dialog
-/// by the caller.
 fn open_database(app: &tauri::App) -> Result<db::Db, String> {
-    // All app data lives under Tauri's app data dir, derived from the
-    // bundle identifier, so backup or reset touches ONE path. Builds
-    // before 1.0 kept the DB under ProjectDirs, like ~/.local/share/kurisu.
-    // Migrate it over, but never clobber a real DB already at the new
-    // path. An empty placeholder left by an old WebKit run is fair game.
     let data_dir = app
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("no app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
-    // The DB holds the AniList token in plaintext. Keep the WHOLE data
-    // dir owner only. The -wal and -shm sidecars are created lazily at
-    // the first write with the process umask, so chmodding the db file
-    // at open time misses them for the entire session.
+    // Protect the whole directory because SQLite creates token-bearing sidecars lazily.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -56,29 +41,16 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
             .map(|m| m.len() > 0)
             .unwrap_or(false);
         if target_free && legacy_has_data {
-            migrate_legacy_db(&legacy, &db_path);
+            migrate_legacy_db(&legacy, &db_path)
+                .map_err(|e| format!("cannot migrate {}: {e}", legacy.display()))?;
         }
     }
     db::Db::open(&db_path).map_err(|e| format!("cannot open {}: {e}", db_path.display()))
 }
 
-/// Copy a pre 1.0 ProjectDirs database into place at db_path. Only
-/// called when the target is free, meaning missing or zero bytes, and
-/// the legacy file has data. A failed attempt cleans up everything it
-/// touched, destination included, so the next launch sees a free
-/// target and retries instead of trusting a half published state.
-fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) {
-    // Copy to a temp name and rename into place. A crash mid copy
-    // must not leave a truncated "real" DB. Its presence would
-    // block every future migration attempt. Sidecars ride along
-    // so writes sitting in a legacy WAL not yet checkpointed
-    // survive the move.
+fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) -> std::io::Result<()> {
+    // Publish only complete copies, including uncheckpointed WAL writes.
     let tmp = db_path.with_file_name(".kurisu-migrate.tmp");
-    // Stage EVERYTHING first, then publish the main database LAST.
-    // The sidecars used to be renamed into place before it. A
-    // failure after that point, or a crash, left a -wal/-shm pair
-    // belonging to a database that was not there. SQLite treats
-    // an orphaned WAL beside a fresh DB as corruption.
     let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     let result = (|| -> std::io::Result<()> {
         std::fs::copy(legacy, &tmp)?;
@@ -99,13 +71,7 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) {
                 staged.push((tmp_side, dst_side));
             }
         }
-        // Drop sidecars already sitting at the destination. Their
-        // content is abandoned either way since the rename below
-        // discards the database they belong to. Left in place, a
-        // self consistent foreign WAL gets REPLAYED over the migrated
-        // copy. SQLite validates frames by WAL internal salt and
-        // checksum only, nothing binds a WAL to its main file, so
-        // the replay reads as disk corruption on open.
+        // Remove foreign sidecars before SQLite can replay them over the migrated database.
         for suffix in ["-wal", "-shm"] {
             let mut dst_side = db_path.as_os_str().to_os_string();
             dst_side.push(suffix);
@@ -115,28 +81,19 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) {
                 Err(e) => return Err(e),
             }
         }
-        // Publish the database first, then its sidecars. If a
-        // sidecar rename fails now, the DB is still valid on its
-        // own. SQLite rebuilds a missing -shm and an absent -wal
-        // just means the tail not yet checkpointed is lost, not
-        // that the file is unreadable.
         std::fs::rename(&tmp, db_path)?;
         for (from, to) in &staged {
             std::fs::rename(from, to)?;
         }
         Ok(())
     })();
-    if let Err(e) = result {
+    if let Err(e) = &result {
         log::warn!("legacy DB migration failed: {e}");
         let _ = std::fs::remove_file(&tmp);
         for (from, _) in &staged {
             let _ = std::fs::remove_file(from);
         }
-        // Also drop whatever reached the destination, the published
-        // main file included. Leaving it behind makes the next launch
-        // see a non empty target, so the migration would never retry
-        // and the half published state would be permanent. The target
-        // was free when we started, nothing real is lost here.
+        // Leave the destination free so a failed migration can retry next launch.
         let _ = std::fs::remove_file(db_path);
         for suffix in ["-wal", "-shm"] {
             let mut dst_side = db_path.as_os_str().to_os_string();
@@ -144,29 +101,16 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) {
             let _ = std::fs::remove_file(std::path::PathBuf::from(dst_side));
         }
     }
+    result
 }
 
-/// Loopback address the running instance holds for its whole lifetime. A
-/// second launch fails to bind it, which is how it learns it is the
-/// second launch. Adjacent to the OAuth callback port 39417 so the two
-/// stay together.
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:39418";
 
-/// Byte the instance listener answers a poke with. Only that reply
-/// proves the port holder is another Kurisu and not some unrelated
-/// local service.
+/// Distinguish Kurisu from an unrelated service holding the port.
 const SINGLE_INSTANCE_ACK: u8 = b'k';
 
-/// The app handle for the instance ack thread, set during setup. The thread
-/// starts before the builder runs, when no handle exists yet, so a poke
-/// arriving during early startup is acknowledged but cannot raise the
-/// window. The next poke, or any poke after setup, can.
 static INSTANCE_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
-/// Ask the holder of the single instance port whether it is Kurisu.
-/// True only when it answers with the ack byte. A connect failure, a
-/// garbage reply, or a holder that accepts but never answers within two
-/// seconds all mean "not ours", carry on without the guard.
 fn poke_running_instance() -> bool {
     use std::io::Read;
     let Ok(mut stream) = std::net::TcpStream::connect(SINGLE_INSTANCE_ADDR) else {
@@ -179,46 +123,20 @@ fn poke_running_instance() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Logger for the log facade calls, playback tick diagnostics. Our
-    // crate at debug, deps at info. Override with RUST_LOG. Stderr lands
-    // in the systemd user journal on most desktops.
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("kurisu_lib=debug,info"),
     )
     .init();
 
-    // WebKit2GTK's DMA-BUF renderer crashes in Mesa/GBM teardown on exit
-    // on many Wayland setups. SIGSEGV in dri_gbm.so during process exit.
-    // The long standing workaround is to disable it and fall back to the
-    // stable path, at the cost of choppier scrolling, software raster.
-    // Set KURISU_DMABUF=1 to keep the hardware renderer for smooth
-    // scrolling, if your Mesa no longer crashes on exit.
+    // Disable DMA-BUF to avoid Mesa crashes on exit. KURISU_DMABUF opts back in.
     if std::env::var_os("KURISU_DMABUF").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
-    // Single instance. Two Kurisu processes share ONE SQLite file with
-    // separate in memory state and separate playback watchers, so they
-    // overwrite each other's writes and can push progress to AniList
-    // twice. Close to tray makes a second launch easy. The first
-    // process is alive but has no window, so clicking the launcher
-    // again looks like the app "did not start".
-    //
-    // The guard is a loopback bind rather than a lock file, no stale
-    // lock to clean up if the process is killed, and rather than a
-    // plugin, no new dependency. Same shape as the OAuth callback
-    // listener already here.
+    // One instance prevents duplicate trackers and competing writes to the same database.
     let instance_guard = match std::net::TcpListener::bind(SINGLE_INSTANCE_ADDR) {
         Ok(l) => Some(l),
         Err(_) => {
-            // Someone already holds it. Poke them so their window comes
-            // back, then exit quietly, but only when the holder answers
-            // with the ack byte. A missing or garbage reply means the
-            // port belongs to an unrelated process, in which case
-            // carrying on is better than refusing to start at all.
-            // Mixed version window: an old listener never sends an ack,
-            // so a new poker proceeds and two instances can coexist
-            // during a version transition.
             if poke_running_instance() {
                 eprintln!("kurisu: already running; raising the existing window");
                 return;
@@ -230,21 +148,11 @@ pub fn run() {
         }
     };
 
-    // Answer pokes from the moment the port is bound, BEFORE the database
-    // open, legacy migration, matcher build and tray setup that follow.
-    // The ack thread used to spawn at the end of setup, and a second launch
-    // inside that slow startup window got its 2s poke timeout, decided the
-    // holder was not Kurisu, and started anyway. Two processes then shared
-    // one SQLite file with separate state, or opened it mid migration copy.
-    // The window raise needs the app handle, which does not exist yet, so
-    // it goes through INSTANCE_HANDLE and simply no-ops until setup runs.
+    // Answer before database setup so another launch cannot mistake slow startup for a dead listener.
     if let Some(guard) = instance_guard {
         std::thread::spawn(move || {
             use std::io::Write;
             for stream in guard.incoming() {
-                // The ack tells the other launch that a Kurisu
-                // holds this port. The connection itself is
-                // still the whole message.
                 if let Ok(mut stream) = stream {
                     let _ = stream.write_all(&[SINGLE_INSTANCE_ACK]);
                 }
@@ -282,7 +190,6 @@ pub fn run() {
             commands::local_entries,
             commands::get_entry,
             commands::update_entry,
-            commands::increment_episode,
             commands::set_progress,
             commands::delete_entry_cmd,
             commands::get_notifications,
@@ -314,15 +221,9 @@ pub fn run() {
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             use tauri_plugin_dialog::DialogExt;
 
-            // Capture the exe path before anything can swap it. After a
-            // successful Linux in place update, /proc/self/exe follows
-            // the renamed inode and a current_exe() at apply time would
-            // point at the .kurisu-old backup.
             if let Err(e) = updater::init_install_path() {
                 log::warn!("updater: {e}");
             }
-            // Hand the handle to the instance ack thread and to the write
-            // paths that emit kurisu://auth-expired when a session dies.
             INSTANCE_HANDLE
                 .set(app.handle().clone())
                 .expect("instance handle set once");
@@ -331,9 +232,6 @@ pub fn run() {
             let db = match open_database(app) {
                 Ok(db) => db,
                 Err(e) => {
-                    // No DB, no app. Tell the user WHY. A bare panic
-                    // only shows on a console nobody watches. Then exit
-                    // cleanly.
                     eprintln!("kurisu: cannot start: {e}");
                     app.dialog()
                         .message(format!("Kurisu cannot start.\n\n{e}"))
@@ -344,14 +242,12 @@ pub fn run() {
                 }
             };
 
-            // Restore a saved token so the app starts logged in.
             let mut anilist = anilist::AniList::new();
             if let Ok(Some(token)) = db.get_setting("anilist_token") {
                 if !token.is_empty() {
                     anilist.set_token(Some(token));
                 }
             }
-            // Seed the recognizer matcher cache from the just opened DB.
             let matchers = recognize::build_matchers(&db);
             app.manage(AppState {
                 anilist: Mutex::new(anilist),
@@ -361,12 +257,7 @@ pub fn run() {
                 matchers: Mutex::new(Arc::new(matchers)),
             });
 
-            // Tray is best effort. A missing icon or a failed build used to
-            // abort startup through setup's `?`, and the panic only reached
-            // a console nobody watches, especially on Windows. The app still
-            // runs without it, the window close button just quits.
             let tray_result: Result<(), String> = (|| {
-                // tray gets its own cog art instead of the window icon
                 let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))
                     .map_err(|e| e.to_string())?;
                 let show = MenuItem::with_id(app, "show", "Show Kurisu", true, None::<&str>)
@@ -383,10 +274,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
-                                // unminimize FIRST. show() does not de-iconify,
-                                // and set_focus() is a no-op on a minimized
-                                // window, so a window minimized to the taskbar
-                                // could not be brought back from the tray at all.
+                                // Restore before focusing. A minimized window ignores focus requests.
                                 let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
@@ -396,7 +284,6 @@ pub fn run() {
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {
-                        // Left click toggles the window. Right click opens the menu.
                         if let TrayIconEvent::Click {
                             button: MouseButton::Left,
                             button_state: MouseButtonState::Up,
@@ -405,10 +292,7 @@ pub fn run() {
                         {
                             let app = tray.app_handle();
                             if let Some(w) = app.get_webview_window("main") {
-                                // A minimized window is still "visible" to Tauri,
-                                // so toggling one used to HIDE it to the tray
-                                // instead of restoring it. The click appeared to
-                                // do nothing.
+                                // Tauri still considers minimized windows visible.
                                 let minimized = w.is_minimized().unwrap_or(false);
                                 if w.is_visible().unwrap_or(false) && !minimized {
                                     let _ = w.hide();
@@ -424,14 +308,11 @@ pub fn run() {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             })();
+            let tray_available = tray_result.is_ok();
             if let Err(e) = tray_result {
                 log::warn!("tray unavailable, continuing without it: {e}");
             }
 
-            // The window close button quits by default, this being the
-            // only window, closing ends the app. The Settings toggle,
-            // close_to_tray = 1, makes it hide to the tray instead. Quit
-            // then lives in the tray menu.
             if let Some(main_window) = app.get_webview_window("main") {
                 let w = main_window.clone();
                 main_window.on_window_event(move |event| {
@@ -444,52 +325,28 @@ pub fn run() {
                             .flatten()
                             .map(|v| v == "1")
                             .unwrap_or(false);
-                        if close_to_tray {
+                        if tray_available && close_to_tray && w.hide().is_ok() {
                             api.prevent_close();
-                            let _ = w.hide();
                         }
                     }
                 });
             }
 
-            // Background MPRIS2 playback watcher. Runs for the app's
-            // lifetime. Every tick swallows its own errors, so a flaky
-            // player can not crash detection.
             playback::spawn(app.handle().clone());
 
-            // Startup update housekeeping runs on EVERY build. Manual
-            // installs work on non CI builds too, so a dev build that
-            // installed an update leaves the same leftover download and
-            // the same doubly failed swap marker behind. Only the
-            // automatic version CHECK stays CI gated. Locally compiled
-            // builds report the base version and would nag about every
-            // newer rolling build during development. Settings then
-            // Updates can turn the check off, default on. A manual check
-            // there works on any build. Emits kurisu://update-available
-            // when a newer release ships an asset this platform can
-            // install.
             {
                 use tauri::Emitter;
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    // The leftover sweep is blocking filesystem I/O. Keep
-                    // it off the async worker threads.
                     let sweep_handle = handle.clone();
                     let update_failed = tokio::task::spawn_blocking(move || {
                         if let Ok(dir) = sweep_handle.path().app_local_data_dir() {
                             updater::sweep_update_leftovers(&dir);
                         }
-                        // Sweep next to the exe and flag the swap marker
-                        // for a doubly failed swap if one exists. The
-                        // marker file stays on disk until the frontend
-                        // acknowledges the notice via take_update_failed.
-                        // The emit below is only a fast path and can fire
-                        // before the webview listens.
                         updater::sweep_install_dir()
                     })
                     .await
                     .unwrap_or(false);
-                    // Let the window settle before emitting or hitting the network.
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     if update_failed {
                         let _ = handle.emit(
@@ -499,8 +356,6 @@ pub fn run() {
                             }),
                         );
                     }
-                    // Source release builds auto check too, only the debug
-                    // dev loop stays quiet. See auto_check_eligible.
                     if !updater::auto_check_eligible() {
                         return;
                     }
@@ -527,14 +382,8 @@ pub fn run() {
                                 "html_url": rel.html_url,
                                 "body": rel.body,
                                 "current": updater::current_version(),
-                                // The TS type declares this non optional.
-                                // commands.rs includes it on the pull path,
-                                // this emit and the stash did not.
                                 "restart_pending": crate::updater::update_applied(),
                             });
-                            // Stash it for the frontend's pull on mount,
-                            // take_pending_update. The emit is a one shot
-                            // fast path a slow booting webview can miss.
                             updater::set_pending_update(payload.clone());
                             let _ = handle.emit("kurisu://update-available", payload);
                         }
@@ -561,9 +410,6 @@ mod tests {
         (base, legacy_dir, dest_dir)
     }
 
-    /// Legacy sidecars ride along, and foreign sidecars already sitting
-    /// at the destination are replaced, never replayed onto the
-    /// migrated copy.
     #[test]
     fn migration_replaces_foreign_sidecars() {
         let (base, legacy_dir, dest_dir) = test_dirs("foreign");
@@ -572,12 +418,11 @@ mod tests {
         std::fs::write(legacy_dir.join("kurisu.db-wal"), b"legacy wal").unwrap();
         std::fs::write(legacy_dir.join("kurisu.db-shm"), b"legacy shm").unwrap();
         let db_path = dest_dir.join("kurisu.db");
-        // Zero byte placeholder with sidecars from a dead database.
         std::fs::write(&db_path, b"").unwrap();
         std::fs::write(dest_dir.join("kurisu.db-wal"), b"foreign wal").unwrap();
         std::fs::write(dest_dir.join("kurisu.db-shm"), b"foreign shm").unwrap();
 
-        migrate_legacy_db(&legacy, &db_path);
+        migrate_legacy_db(&legacy, &db_path).unwrap();
 
         assert_eq!(std::fs::read(&db_path).unwrap(), b"legacy data");
         assert_eq!(
@@ -592,8 +437,6 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// A foreign WAL the legacy DB has no counterpart for is deleted,
-    /// not left to be replayed over the migrated copy.
     #[test]
     fn migration_drops_destination_sidecars_the_legacy_db_lacks() {
         let (base, legacy_dir, dest_dir) = test_dirs("orphan");
@@ -603,7 +446,7 @@ mod tests {
         std::fs::write(dest_dir.join("kurisu.db-wal"), b"foreign wal").unwrap();
         std::fs::write(dest_dir.join("kurisu.db-shm"), b"foreign shm").unwrap();
 
-        migrate_legacy_db(&legacy, &db_path);
+        migrate_legacy_db(&legacy, &db_path).unwrap();
 
         assert_eq!(std::fs::read(&db_path).unwrap(), b"legacy data");
         assert!(!dest_dir.join("kurisu.db-wal").exists());
@@ -611,8 +454,6 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// A failure mid migration removes whatever reached the destination,
-    /// so the next launch sees a free target and retries.
     #[test]
     fn failed_migration_leaves_a_free_target() {
         let (base, legacy_dir, dest_dir) = test_dirs("failure");
@@ -620,11 +461,9 @@ mod tests {
         std::fs::write(&legacy, b"legacy data").unwrap();
         std::fs::write(legacy_dir.join("kurisu.db-wal"), b"legacy wal").unwrap();
         let db_path = dest_dir.join("kurisu.db");
-        // A directory where the destination WAL belongs makes the
-        // pre-publish sidecar cleanup fail.
         std::fs::create_dir(dest_dir.join("kurisu.db-wal")).unwrap();
 
-        migrate_legacy_db(&legacy, &db_path);
+        assert!(migrate_legacy_db(&legacy, &db_path).is_err());
 
         assert!(!db_path.exists());
         assert!(!dest_dir.join(".kurisu-migrate.tmp").exists());

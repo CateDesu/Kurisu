@@ -1,9 +1,6 @@
-// Typed wrappers over every Tauri command. Centralizes the invoke calls so the UI
-// never builds the call strings by hand, and gives us one place to handle errors.
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AiringItem,
-  LibraryFile,
   ListEntry,
   Media,
   MediaDetail,
@@ -18,11 +15,6 @@ import type {
 } from "./types";
 
 export const api = {
-  getClientId: () => invoke<string | null>("get_client_id"),
-  setClientId: (id: string) => invoke<void>("set_client_id", { id }),
-  getRedirectUri: () => invoke<string | null>("get_redirect_uri"),
-  setRedirectUri: (uri: string) => invoke<void>("set_redirect_uri", { uri }),
-
   getTrackingConfig: () => invoke<TrackingConfig>("get_tracking_config"),
   setTrackingConfig: (
     mode: string,
@@ -74,8 +66,6 @@ export const api = {
     repeat: number | null
   ) =>
     invoke<ListEntry>("update_entry", { mediaId, status, progress, score, repeat }),
-  incrementEpisode: (mediaId: number) =>
-    invoke<ListEntry>("increment_episode", { mediaId }),
   setProgress: (mediaId: number, progress: number, expected?: number) =>
     invoke<ListEntry>("set_progress", { mediaId, progress, expected }),
   deleteEntry: (mediaId: number) =>
@@ -102,8 +92,8 @@ export const api = {
   fetchTorrents: () => invoke<TorrentFetch>("fetch_torrents"),
   markTorrentsSeen: (guids: string[]) =>
     invoke<void>("mark_torrents_seen", { guids }),
-  searchTorrents: (query: string) =>
-    invoke<TorrentItem[]>("search_torrents", { query }),
+  searchTorrents: (query: string, category = "1_0", filter = "0") =>
+    invoke<TorrentItem[]>("search_torrents", { query, category, filter }),
 
   getUserStats: () => invoke<UserStats>("get_user_stats"),
 

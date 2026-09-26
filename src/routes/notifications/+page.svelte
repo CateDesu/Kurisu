@@ -17,27 +17,29 @@
   let loading = $state(true);
   let error = $state("");
 
-  // Overlapping loads like login flip plus manual refresh. Latest wins.
   let loadId = 0;
+  let lastEpoch = -1;
   async function load() {
+    if (!auth.isLoggedIn) return;
     const id = ++loadId;
+    const epoch = auth.epoch;
+    const current = () => id === loadId && epoch === auth.epoch && auth.isLoggedIn;
     loading = true;
     error = "";
     try {
       const list = await api.getNotifications();
-      if (id !== loadId) return;
+      if (!current()) return;
       items = list;
     } catch (e) {
-      if (id === loadId) error = String(e);
+      if (current()) error = String(e);
     } finally {
-      if (id === loadId) loading = false;
+      if (current()) loading = false;
     }
   }
 
   async function open(n: Notification) {
-    // Anime notifications stay in app on the native detail page. Activity,
-    // thread and user pages need the browser's AniList session cookie, so
-    // those still open externally.
+    const epoch = auth.epoch;
+    // Activity, thread and profile pages need the browser's AniList session cookie.
     if (n.media_id) {
       goto(`/anime/${n.media_id}`);
       return;
@@ -45,12 +47,20 @@
     try {
       await openUrl(notificationUrl(n));
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     }
   }
 
   $effect(() => {
+    const epoch = auth.epoch;
+    if (epoch !== lastEpoch || !auth.isLoggedIn) {
+      items = [];
+      error = "";
+      loading = false;
+      lastEpoch = epoch;
+    }
     if (auth.isLoggedIn) load();
+    return () => { loadId++; };
   });
 </script>
 
@@ -59,8 +69,8 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-2xl mx-auto">
-    <div class="flex items-center gap-3 mb-4">
+  <div class="page-content">
+    <div class="flex flex-wrap items-center gap-3 mb-4">
       <h1 class="text-xl font-semibold flex-1">Notifications</h1>
       <button
         onclick={load}

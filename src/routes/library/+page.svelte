@@ -2,6 +2,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
+  import { listen } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
@@ -15,21 +16,12 @@
   let entries = $state<ListEntry[]>([]);
   let entriesLoaded = $state(false);
   let error = $state("");
-  /// Path of the unmatched file being manually linked.
   let linking = $state<string | null>(null);
-  /// Expanded show groups by media id. Empty means all collapsed. Keeps a
-  /// show with hundreds of episodes from burying the next series. Play
-  /// button stays in the header either way.
   let expanded = $state<Set<number>>(new Set());
-  /// Show awaiting confirmation of manual link removal.
   let unlinking = $state<Group | null>(null);
   let unlinkBusy = $state(false);
-  /// Folder path awaiting removal confirmation.
   let removingFolder = $state<string | null>(null);
-  /// Removals in flight by path. Guards the row button against a double fire.
   let removing = $state<Set<string>>(new Set());
-  /// Stamp and file count from the last manual scan. Drives the flash next
-  /// to Rescan, cleared a few seconds later.
   let scannedAt = $state(0);
   let scannedCount = $state(0);
 
@@ -72,15 +64,31 @@
     return { matched, unmatched };
   });
 
+  let entryLoadId = 0;
+  async function refreshEntries() {
+    const id = ++entryLoadId;
+    const epoch = auth.epoch;
+    try {
+      const fresh = await api.localEntries();
+      if (id !== entryLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      entries = fresh;
+      entriesLoaded = true;
+    } catch (e) {
+      if (id === entryLoadId && epoch === auth.epoch && auth.isLoggedIn) throw e;
+    }
+  }
+
   async function load() {
+    const epoch = auth.epoch;
     error = "";
     try {
-      entries = await api.localEntries();
-      entriesLoaded = true;
+      await refreshEntries();
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       await library.loadFolders();
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       if (library.folders.length > 0 && !library.hasScan) await library.scan();
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     }
   }
 
@@ -113,12 +121,13 @@
   }
 
   async function rescan() {
-    // With a scan already running, scan() only queues a follow up and
-    // returns at once. The flash would read the pre-scan file count.
+    // A queued scan returns immediately, before its new file count is available.
     if (library.scanning) return;
+    const epoch = auth.epoch;
     error = "";
     try {
-      await library.scan();
+      await Promise.all([library.scan(), refreshEntries()]);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       scannedCount = library.files.length;
       const stamp = Date.now();
       scannedAt = stamp;
@@ -126,7 +135,7 @@
         if (scannedAt === stamp) scannedAt = 0;
       }, 3000);
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     }
   }
 
@@ -152,7 +161,6 @@
     return path.split(/[\\/]/).pop() ?? path;
   }
 
-  /// First file at the next unwatched episode, progress plus one.
   function nextFile(g: Group): LibraryFile | undefined {
     const progress = g.entry?.progress ?? 0;
     return g.files.find((f) => f.episode === progress + 1);
@@ -166,7 +174,6 @@
     return g.entry?.media?.cover_medium ?? null;
   }
 
-  /// Whether any file got here via a manual link.
   function hasBound(g: Group): boolean {
     return g.files.some((f) => f.bound);
   }
@@ -187,7 +194,35 @@
   }
 
   $effect(() => {
-    if (auth.isLoggedIn) load();
+    const epoch = auth.epoch;
+    const loggedIn = auth.isLoggedIn;
+    entryLoadId++;
+    entries = [];
+    entriesLoaded = false;
+    if (!loggedIn) return;
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+    listen("kurisu://episode-updated", () => {
+      if (!alive || epoch !== auth.epoch) return;
+      refreshEntries().catch((e) => {
+        if (alive && epoch === auth.epoch) error = String(e);
+      });
+    }).then((u) => {
+      if (alive) {
+        unlisten = u;
+        void load();
+      } else u();
+    }).catch((e) => {
+      if (alive) {
+        error = String(e);
+        void load();
+      }
+    });
+    return () => {
+      alive = false;
+      entryLoadId++;
+      unlisten?.();
+    };
   });
 </script>
 
@@ -196,8 +231,8 @@
     <Login />
   </div>
 {:else}
-  <div class="p-5 max-w-5xl mx-auto">
-    <div class="flex items-center gap-3 mb-4">
+  <div class="page-content">
+    <div class="flex flex-wrap items-center gap-3 mb-4">
       <h1 class="text-xl font-semibold flex-1">Library</h1>
       {#if scannedAt}
         <span class="text-xs text-accent">
@@ -227,13 +262,12 @@
         {library.unreadable.length === 1 ? "it are" : "them are"} missing from this scan.
         <ul class="mt-1 space-y-0.5">
           {#each library.unreadable as u (u.path)}
-            <li class="truncate text-xs" title={u.error}>{u.path}: {u.error}</li>
+            <li class="text-xs" title={u.error}>{u.path}: {u.error}</li>
           {/each}
         </ul>
       </div>
     {/if}
 
-    <!-- Folders being scanned -->
     <div class="mb-5">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Folders</h2>
       {#if library.foldersFailed}
@@ -248,7 +282,7 @@
         <div class="space-y-1 mb-2">
           {#each library.folders as folder (folder)}
             <div class="flex items-center gap-2 bg-panel border border-edge rounded-md px-3 py-1.5">
-              <span class="text-sm truncate flex-1 font-mono">{folder}</span>
+              <span class="text-sm min-w-0 flex-1 font-mono">{folder}</span>
               <button
                 onclick={() => (removingFolder = folder)}
                 disabled={removing.has(folder)}
@@ -324,13 +358,11 @@
                     goto(`/anime/${g.mediaId}`);
                   }}
                   title="Open details"
-                  class="block max-w-full truncate font-medium text-left hover:text-accent transition-colors"
+                  class="block max-w-full font-medium text-left hover:text-accent transition-colors"
                 >
                   {g.entry ? displayTitle(g.entry.media) : g.title}
                 </button>
                 <div class="text-xs text-ink-dim">
-                  <!-- entries land after the groups paint. Until then show
-                       no label, else every mount flashes Not on your list. -->
                   {#if g.entry}
                     Ep {g.entry.progress}{g.entry.media?.episodes ? `/${g.entry.media.episodes}` : ""} watched ·
                   {:else if entriesLoaded}
@@ -375,9 +407,7 @@
                     title={`Play ${basename(f.path)}`}
                     onclick={() => play(f.path)}
                     onkeydown={(ev) => {
-                      // Inner buttons, like reveal in file manager, must keep
-                      // their own keyboard activation. Without the target
-                      // check Enter on the reveal button played the file.
+                      // Let nested buttons handle their own keyboard activation.
                       if (ev.currentTarget !== ev.target) return;
                       if (ev.key === "Enter" || ev.key === " ") {
                         ev.preventDefault();
@@ -388,7 +418,7 @@
                     <span class="w-14 shrink-0 text-ink-dim">
                       {f.episode != null ? `Ep ${f.episode}` : "—"}
                     </span>
-                    <span class="flex-1 min-w-0 truncate {isWatched(g, f) ? 'text-ink-dim' : ''}">
+                    <span class="flex-1 min-w-0 {isWatched(g, f) ? 'text-ink-dim' : ''}">
                       {basename(f.path)}
                     </span>
                     {#if isWatched(g, f)}
@@ -420,7 +450,7 @@
             <div class="divide-y divide-edge/60">
               {#each groups.unmatched as f (f.path)}
                 <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
-                  <span class="flex-1 min-w-0 truncate text-ink-dim">{basename(f.path)}</span>
+                  <span class="flex-1 min-w-0 text-ink-dim">{basename(f.path)}</span>
                   <button
                     onclick={() => (linking = f.path)}
                     title="Link to a show on your list"

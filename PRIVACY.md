@@ -1,16 +1,14 @@
 # Privacy Policy
 
-Kurisu collects nothing. There is no telemetry, no analytics, no crash reporting, and no data is ever sent to the program's author.
+Kurisu has no telemetry, analytics, or crash reporting and sends no data to its author.
 
-## What the program talks to
+The program connects to:
 
-- **AniList** - your OAuth token and list data go to anilist.co to sync your library. Governed by AniList's own privacy policy.
-- **Discord** - if Rich Presence is enabled, the program hands your current show and episode to your local Discord client over its IPC socket. Nothing goes to Discord directly from the program; your client broadcasts the presence under your own Discord settings and Discord's privacy policy.
-- **GitHub** - the update checker makes a plain HTTPS request to this repository's releases. GitHub sees the request like any website visit.
-- **Torrent feeds** - enabled feeds are fetched over HTTPS from their respective sites, and the torrent search sends your search text to nyaa.si over HTTPS.
+- **AniList** for account and list sync using your OAuth token.
+- **Your local Discord client**, if Rich Presence is enabled, to share the current show and episode. Your client publishes it under your Discord settings.
+- **GitHub** for update checks and downloads. GitHub receives these requests like website visits.
+- **Configured torrent feeds** for RSS, and **nyaa.si** for searches, including your search text. Remote feeds and searches use HTTPS.
 
-## What is stored locally
+These services apply their own privacy policies.
 
-Your AniList token, list cache, and settings live in a local SQLite database (`kurisu.db`) in the program's config directory. The token is stored in plaintext. None of it leaves your machine except through the connections listed above.
-
-Delete the config directory and everything the program knows about you is gone.
+Your token, list cache, and settings are stored locally in `kurisu.db`. The token is plaintext. Data leaves the machine only through the connections above. Delete the program's data directory to remove its local database and settings.

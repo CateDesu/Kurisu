@@ -1,7 +1,7 @@
 {
   "name": "kurisu",
   "version": "1.0.0",
-  "description": "A Taiga-style anime tracker for Linux — AniList sync, playback detection, library recognition",
+  "description": "An anime tracking program for Linux and Windows with AniList sync",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
