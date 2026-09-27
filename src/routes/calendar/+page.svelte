@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
@@ -193,9 +194,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <div class="flex items-center gap-3 mb-4 flex-wrap">
-      <h1 class="text-xl font-semibold">Calendar</h1>
-      <span class="text-sm text-ink-dim flex-1">{rangeLabel}</span>
+    <PageHeading index="06" section="On the air" title="Calendar" description={rangeLabel}>
       <div class="flex rounded-md border border-edge overflow-hidden text-sm">
         <button
           onclick={() => setWatchingOnly(true)}
@@ -237,7 +236,7 @@
           →
         </button>
       </div>
-    </div>
+    </PageHeading>
 
     {#if error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">

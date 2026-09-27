@@ -12,6 +12,7 @@
 </script>
 
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
@@ -42,6 +43,12 @@
   const loggedIn = $derived(auth.isLoggedIn);
 
   const statuses = ["CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"];
+  const statusColors: Record<string, string> = {
+    CURRENT: "var(--color-sage)", PLANNING: "var(--color-blue)",
+    COMPLETED: "var(--color-ochre)", PAUSED: "var(--color-accent)",
+    DROPPED: "#b18992", REPEATING: "#aa98bd",
+  };
+  const watchedEpisodes = $derived(entries.reduce((sum, entry) => sum + entry.progress, 0));
 
   type SortKey = "title" | "score" | "progress" | "updated" | "airing";
   const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
@@ -286,34 +293,34 @@
     <Login />
   </div>
 {:else}
-  <div class="page-content">
-    <div class="flex items-center gap-2 mb-4 flex-wrap">
-      <h1 class="text-xl font-semibold flex-1">My List</h1>
+  <div class="page-content collection-page">
+    <PageHeading index="01" section="Your collection" title="My List" description={`${entries.length} titles on the shelf · ${watchedEpisodes.toLocaleString()} episodes tracked`} />
+    <div class="collection-toolbar">
+      <label class="list-search">
+        <Icon name="search" size={15} />
+        <span class="sr-only">Filter your list</span>
       <input
         bind:value={q}
-        placeholder="Filter…"
-        class="w-40 bg-panel border border-edge rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-accent"
+        placeholder="Find a title on your shelf…"
+        class="min-w-0 w-full bg-transparent text-sm focus:outline-none"
       />
+      </label>
+      <span class="eyebrow sort-label">Sort by</span>
       <Select bind:value={sortKey} options={SORT_OPTIONS} class="w-36" onchange={pickSort} />
       <button
         onclick={flipDir}
         title={sortDesc ? "Descending — click for ascending" : "Ascending — click for descending"}
-        class="px-2.5 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"
+        class="toolbar-button"
       >
         {sortDesc ? "↓" : "↑"}
       </button>
       <button
         onclick={() => sync()}
         disabled={syncing}
-        class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50 flex items-center gap-1.5"
+        class="toolbar-button sync-button disabled:opacity-50 flex items-center gap-1.5"
       >
         {#if syncing}Syncing…{:else}<Icon name="refresh" size={14} /> Sync{/if}
       </button>
-      {#if syncedFlash}
-        <span class="text-xs text-accent">Synced ✓</span>
-      {:else if syncLabel}
-        <span class="text-xs text-ink-dim">{syncLabel}</span>
-      {/if}
     </div>
 
     {#if error}
@@ -331,15 +338,17 @@
       </div>
     {/if}
 
-    <div class="flex flex-wrap gap-1 mb-5 border-b border-edge">
+    <div class="status-tabs" aria-label="List status">
       {#each statuses as s}
         {@const count = entries.filter((e) => e.status === s).length}
         <button
           onclick={() => (filter = s)}
-          class="px-3 py-2 text-sm border-b-2 -mb-px transition-colors
-            {filter === s ? 'border-accent text-ink' : 'border-transparent text-ink-dim hover:text-ink'}"
+          aria-pressed={filter === s}
+          style:--status-color={statusColors[s]}
+          class="status-tab {filter === s ? 'selected' : ''}"
         >
-          {STATUS_LABEL[s]} <span class="opacity-50">{count}</span>
+          <span class="status-dot" aria-hidden="true"></span>
+          {STATUS_LABEL[s]} <span class="status-count">{count}</span>
         </button>
       {/each}
     </div>
@@ -347,10 +356,15 @@
     {#if loading && entries.length === 0}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
     {:else if visible.length === 0}
-      <div class="text-ink-dim py-10 text-center">{q.trim() ? "No matches." : "Nothing here yet."}</div>
+      <div class="empty-shelf">
+        <span class="eyebrow">{q.trim() ? "No matching titles" : "A little room on the shelf"}</span>
+        <p>{q.trim() ? "Try another title." : "Your next story is still out there."}</p>
+        {#if !q.trim()}<a href="/search">Find something to watch <span aria-hidden="true">↗</span></a>{/if}
+      </div>
     {:else}
-      <div class="grid grid-cols-1 gap-2">
-        {#each visible as e (e.media_id)}
+      <div class="list-columns eyebrow" aria-hidden="true"><span>Title / {STATUS_LABEL[filter]}</span><span>Episode progress</span></div>
+      <div class="collection-rows">
+        {#each visible as e, index (e.media_id)}
           {@const air = airingLabel(e.media)}
           {@const sc = scoreLabel(e.score, auth.user?.score_format)}
           <div
@@ -365,8 +379,9 @@
             }}
             role="button"
             tabindex="0"
-            class="cv-row flex items-center gap-3 bg-panel border border-edge rounded-lg p-2.5 hover:bg-panel-2/60 cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
+            class="cv-row collection-row cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
           >
+            <span class="row-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
             {#if e.media?.cover_medium}
               <button
                 type="button"
@@ -377,21 +392,21 @@
                 title="Open details"
                 class="shrink-0"
               >
-                <Img src={e.media.cover_medium} class="w-10 h-14 object-cover rounded" />
+                <Img src={e.media.cover_medium} class="list-cover object-cover" />
               </button>
             {:else}
-              <div class="w-10 h-14 bg-panel-2 rounded shrink-0"></div>
+              <div class="list-cover empty-cover shrink-0" aria-hidden="true">ク</div>
             {/if}
             <div class="flex-1 min-w-0">
-              <div class="font-medium">{displayTitle(e.media)}</div>
-              <div class="text-xs text-ink-dim flex flex-wrap items-center gap-1.5">
-                {#if air}<span>{air}</span>{/if}
-                {#if air && sc}<span class="opacity-40">·</span>{/if}
-                {#if sc}<span>{sc}</span>{/if}
-                {#if !air && !sc}<span class="opacity-50">Ep {e.progress}</span>{/if}
+              <div class="row-title">{displayTitle(e.media)}</div>
+              <div class="row-meta flex flex-wrap items-center gap-x-2 gap-y-1">
+                {#if e.media?.format}<span>{e.media.format.replaceAll('_', ' ')}</span>{/if}
+                {#if e.media?.season_year}<span>{e.media.season_year}</span>{/if}
+                {#if sc}<span class="row-score">{sc}</span>{/if}
+                {#if air}<span class="row-airing">{air}</span>{/if}
               </div>
             </div>
-            <div class="shrink-0">
+            <div class="row-progress shrink-0">
               <EpisodeStepper
                 mediaId={e.media_id}
                 progress={e.progress}
@@ -399,13 +414,64 @@
                 onchange={(entry) => { stepError = ""; applyEntry(entry); }}
                 onerror={(msg) => { stepError = msg; }}
               />
+              {#if e.media?.episodes && e.media.episodes > 0}
+                <div class="episode-track" aria-hidden="true"><span style:width="{Math.min(100, e.progress / e.media.episodes * 100)}%" style:background={statusColors[filter]}></span></div>
+              {/if}
             </div>
           </div>
         {/each}
       </div>
     {/if}
+    <footer class="collection-footer eyebrow">
+      <span>{visible.length} {visible.length === 1 ? 'title' : 'titles'} / {STATUS_LABEL[filter]}</span>
+      <span aria-live="polite">{syncedFlash ? 'Synced ✓' : syncLabel || 'Cached on this device'}</span>
+    </footer>
   </div>
 {/if}
+
+<style>
+  .collection-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 22px; }
+  .list-search { display: flex; align-items: center; gap: 10px; min-width: 160px; flex: 1; color: var(--color-ink-dim); padding: 10px 12px; border: 1px solid var(--color-edge); background: var(--color-panel); }
+  .list-search:focus-within { border-color: var(--color-accent); }
+  .list-search input { font-size: 15px; }
+  .sort-label { margin-left: 12px; font-size: 12px; }
+  .toolbar-button { height: 42px; padding: 0 13px; border: 1px solid var(--color-edge); background: transparent; color: var(--color-ink-dim); font-size: 15px; }
+  .toolbar-button:hover { background: var(--color-panel-2); color: var(--color-ink); }
+  .sync-button { color: var(--color-accent); }
+  .status-tabs { display: flex; flex-wrap: wrap; gap: 0 16px; border-bottom: 1px solid var(--color-edge); margin-bottom: 16px; }
+  .status-tab { display: flex; align-items: baseline; gap: 6px; padding: 10px 0 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; font-size: 14px; color: var(--color-ink-dim); white-space: nowrap; }
+  .status-tab:hover, .status-tab.selected { color: var(--color-ink); }
+  .status-tab.selected { border-bottom-color: var(--status-color); }
+  .status-dot { align-self: center; width: 5px; height: 5px; border: 1px solid var(--status-color); border-radius: 50%; }
+  .selected .status-dot { background: var(--status-color); }
+  .status-count { font: 13px var(--font-mono); color: var(--status-color); padding-left: 3px; }
+  .list-columns { display: flex; justify-content: space-between; padding: 4px 16px 12px 38px; font-size: 12px; }
+  .collection-rows { border-top: 1px solid var(--color-edge); }
+  .collection-row { display: flex; align-items: center; gap: 15px; min-height: 90px; padding: 11px 13px 11px 0; border-bottom: 1px solid var(--color-edge); }
+  .collection-row:hover { background: var(--color-panel-2); }
+  .row-number { width: 23px; flex-shrink: 0; font: 12px var(--font-mono); color: var(--color-ink-dim); text-align: center; }
+  .collection-row :global(.list-cover) { width: 46px; height: 63px; border: 1px solid var(--color-edge); }
+  .empty-cover { display: grid; place-items: center; background: var(--color-panel-2); color: var(--color-sage); font-size: 24px; }
+  .row-title { font-size: 15px; line-height: 1.4; color: var(--color-ink); }
+  .row-meta { margin-top: 7px; font: 13px var(--font-mono); color: var(--color-ink-dim); }
+  .row-meta > span + span::before { content: '/'; margin-right: 8px; color: var(--color-ink-dim); }
+  .row-score { color: var(--color-ochre); }
+  .row-airing { color: var(--color-blue); }
+  .row-progress { width: 150px; }
+  .episode-track { height: 2px; background: var(--color-edge); margin: 9px 0 0 16px; }
+  .episode-track span { display: block; height: 100%; }
+  .collection-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding: 18px 0; font-size: 12px; letter-spacing: .06em; }
+  .empty-shelf { padding: 50px 15px; text-align: center; border-bottom: 1px solid var(--color-edge); }
+  .empty-shelf p { font: 24px var(--font-serif); margin: 13px 0 20px; }
+  .empty-shelf a { color: var(--color-accent); font-size: 15px; }
+  @media (max-width: 960px) {
+    .sort-label { display: none; }
+    .status-tabs { gap: 0 12px; }
+    .collection-row { gap: 10px; }
+    .row-number { width: 18px; }
+    .row-progress { width: 145px; }
+  }
+</style>
 
 {#if editing}
   <EditEntry

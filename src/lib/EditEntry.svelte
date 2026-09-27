@@ -176,7 +176,7 @@
           goto(`/anime/${entry.media_id}`);
         }}
         title="Open details"
-        class="block max-w-full font-semibold truncate text-left hover:text-accent transition-colors"
+        class="entry-title block max-w-full truncate text-left hover:text-accent transition-colors"
       >
         {displayTitle(entry.media)}
       </button>
@@ -213,7 +213,12 @@
   >
     <div>
       <label class="block text-sm mb-1" for="ed-status">Status</label>
-      <Select id="ed-status" bind:value={status} options={statusOptions} />
+      <Select
+        id="ed-status"
+        bind:value={status}
+        options={statusOptions}
+        onchange={(value) => { if (value === "COMPLETED" && total != null) progress = total; }}
+      />
     </div>
 
     <div class="flex gap-3">
@@ -295,14 +300,14 @@
             onclick={() => addRec(r)}
             disabled={addingRec === r.id || addedRecs.includes(r.id)}
             title="{displayTitle(r)} — add to Plan to Watch"
-            class="w-16 shrink-0 text-left group disabled:opacity-60"
+            class="w-24 shrink-0 self-start text-left group disabled:opacity-60"
           >
             {#if r.cover_medium}
-              <Img src={r.cover_medium} class="w-16 h-[5.5rem] object-cover rounded" />
+              <Img src={r.cover_medium} class="w-24 h-32 object-cover rounded" />
             {:else}
-              <div class="w-16 h-[5.5rem] bg-panel-2 rounded"></div>
+              <div class="w-24 h-32 bg-panel-2 rounded"></div>
             {/if}
-            <span class="block text-[11px] leading-tight line-clamp-2 mt-1 text-ink-dim group-hover:text-ink">
+            <span class="text-xs leading-tight line-clamp-2 mt-1 text-ink-dim group-hover:text-ink">
               {addedRecs.includes(r.id) ? "✓ Added" : displayTitle(r)}
             </span>
           </button>

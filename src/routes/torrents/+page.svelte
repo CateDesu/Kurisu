@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { goto } from "$app/navigation";
   import { listen } from "@tauri-apps/api/event";
   import { openUrl } from "@tauri-apps/plugin-opener";
@@ -399,9 +400,9 @@
   </div>
 {:else}
   <div class="page-content">
-    <div class="sticky top-0 z-10 -mt-5 mb-4 bg-base pt-5 pb-4 border-b border-edge">
+    <PageHeading index="04" section="Releases" title="Torrents" description="New releases and your saved feeds" />
+    <div class="sticky top-0 z-10 mb-4 bg-base pt-4 pb-4 border-b border-edge">
       <div class="flex items-center gap-2 mb-4 flex-wrap">
-        <h1 class="text-xl font-semibold">Torrents</h1>
         {#if newCount > 0}
           <span class="text-xs px-2 py-0.5 rounded-full bg-accent/15 text-accent">{newCount} new</span>
         {/if}

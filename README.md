@@ -13,7 +13,7 @@ Kurisu is an anime tracking program inspired by [Taiga](https://taiga.moe). It s
 - Local library scanning, manual file links, and next episode playback.
 - Playback detection through Linux MPRIS2, Windows GSMTC, or MPV IPC, with progress prompts or automatic updates and optional Discord Rich Presence.
 - Torrent RSS feeds matched to your list, nyaa search, and magnet or torrent links opened in your client.
-- Dark window controls, system tray, and self-updates on Linux and Windows. Updates require a matching SHA-256 sidecar and can be disabled in Settings.
+- Custom window controls, system tray, and self-updates on Linux and Windows. Updates require a matching SHA-256 sidecar and can be disabled in Settings.
 
 AniList tokens are stored locally in plaintext. See [Privacy](PRIVACY.md) and [Terms](TERMS.md).
 

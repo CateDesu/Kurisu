@@ -57,7 +57,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
-  class="fixed inset-0 bg-black/60 grid place-items-center backdrop-blur-sm"
+  class="fixed inset-0 bg-black/70 grid place-items-center"
   style:z-index={layer}
   onclick={() => { if (closeOnBackdrop) dismiss(); }}
   role="presentation"
@@ -65,7 +65,7 @@
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     bind:this={dialog}
-    class="bg-panel border border-edge rounded-xl p-5 w-full mx-4 shadow-2xl {size === 'md' ? 'max-w-md' : 'max-w-sm'}"
+    class="dialog-sheet bg-panel border border-edge rounded-xl p-6 w-full mx-4 shadow-2xl {size === 'md' ? 'max-w-lg' : 'max-w-md'}"
     onclick={(event) => event.stopPropagation()}
     role="dialog"
     aria-modal="true"
@@ -74,3 +74,7 @@
     {@render children()}
   </div>
 </div>
+
+<style>
+  .dialog-sheet { border-top: 2px solid var(--color-rust); max-height: calc(100vh - 32px); overflow-y: auto; }
+</style>

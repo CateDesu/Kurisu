@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
   import { listen, emit } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
@@ -193,7 +194,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <h1 class="text-xl font-semibold mb-4">Currently Watching</h1>
+    <PageHeading index="02" section="Now playing" title="Currently Watching" description="Playback and your current shows" />
 
     {#if np && np.active}
       {@const detectedEp = np.episode}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { onDestroy, untrack } from "svelte";
   import { afterNavigate } from "$app/navigation";
   import { api } from "$lib/api";
@@ -171,10 +172,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <div class="flex flex-wrap items-center gap-3 mb-5">
-      <h1 class="text-xl font-semibold flex-1">
-        {SEASON_LABEL[season]} {year}
-      </h1>
+    <PageHeading index="05" section="Seasons" title={`${SEASON_LABEL[season]} ${year}`} description="Browse the season">
       <button
         onclick={() => shift(-1)}
         disabled={loading}
@@ -191,7 +189,7 @@
       >
         Next →
       </button>
-    </div>
+    </PageHeading>
 
     {#if error || entriesError}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">

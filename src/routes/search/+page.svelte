@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { onDestroy, untrack } from "svelte";
   import { afterNavigate } from "$app/navigation";
   import { api } from "$lib/api";
@@ -122,18 +123,19 @@
   </div>
 {:else}
 <div class="page-content">
-  <h1 class="text-xl font-semibold mb-4">Search</h1>
-
-  <form onsubmit={run} class="flex gap-2 mb-5">
-    <input
-      bind:value={query}
-      placeholder="Anime title…"
-      class="flex-1 min-w-0 bg-panel border border-edge rounded-md px-3 py-2 focus:outline-none focus:border-accent"
-    />
-    <button class="px-4 py-2 rounded-md bg-accent hover:bg-accent-2 text-white" disabled={searching}>
-      {searching ? "…" : "Search"}
-    </button>
-  </form>
+  <PageHeading index="07" section="Discover" title="Search" description="Find your next anime">
+    <form onsubmit={run} class="flex w-72 max-w-full gap-2">
+      <input
+        bind:value={query}
+        aria-label="Anime title"
+        placeholder="Anime title…"
+        class="flex-1 min-w-0 bg-panel border border-edge rounded-md px-3 py-2 focus:outline-none focus:border-accent"
+      />
+      <button class="px-4 py-2 rounded-md bg-accent hover:bg-accent-2 text-white" disabled={searching}>
+        {searching ? "…" : "Search"}
+      </button>
+    </form>
+  </PageHeading>
 
   {#if error}
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">

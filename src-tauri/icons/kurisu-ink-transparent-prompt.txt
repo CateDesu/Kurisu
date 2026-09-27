@@ -1,0 +1,7 @@
+Edited with the built-in imagegen tool
+Source: kurisu-ink-source.png
+
+Use case: background-extraction.
+Asset type: transparent PNG desktop icon.
+Input image 1 is the edit target: the current Kurisu program icon, which the user likes.
+Change ONLY the surrounding black charcoal textured background into genuine transparent alpha. Carefully isolate the existing portrait of Kurisu and the distressed cream gear behind her. Remove the empty charcoal field outside their silhouettes and within open gear holes. Preserve the black ink outlines, all black shadow and texture inside her hair and clothing, the exact facial expression, blue eyes, auburn hair, cream skin and shirt, olive jacket, tie, pose, framing, rough matte print texture, and all original colors. Preserve the existing gear shape and placement. Do not redesign, repaint, simplify, smooth, brighten, change proportions, add a border, or add a drop shadow. Keep the same square crop. This is a faithful background removal of the supplied artwork, not a new illustration. Output PNG with an actual alpha channel and a fully transparent background, not a checkerboard drawn into the image and not a solid color background.

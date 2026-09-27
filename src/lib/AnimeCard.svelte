@@ -27,7 +27,7 @@
   });
 </script>
 
-<div class="cv-card bg-panel border border-edge rounded-lg overflow-hidden flex flex-col">
+<div class="anime-card cv-card bg-panel border border-edge overflow-hidden flex flex-col">
   <button type="button" onclick={() => goto(`/anime/${media.id}`)} title="Open details" class="block">
     {#if media.cover_large}
       <Img src={media.cover_large} class="w-full h-44 object-cover" />
@@ -76,3 +76,9 @@
     </div>
   </div>
 </div>
+
+<style>
+  .anime-card { border-bottom: 2px solid var(--color-rust); }
+  .anime-card:hover { border-color: var(--color-accent); }
+  .anime-card > button { border-bottom: 1px solid var(--color-edge); }
+</style>

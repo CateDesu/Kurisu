@@ -1,5 +1,6 @@
 <script lang="ts">
   import { auth } from "$lib/auth.svelte";
+  import Gearwork from "$lib/Gearwork.svelte";
 
   let token = $state("");
   let busy = $state(false);
@@ -31,10 +32,11 @@
   }
 </script>
 
-<div class="w-[420px] max-w-[90vw] bg-panel border border-edge rounded-xl p-7">
-  <div class="flex items-center gap-3 mb-1">
-    <span class="text-accent text-3xl leading-none">ク</span>
-    <h1 class="text-xl font-semibold">Kurisu</h1>
+<div class="login-sheet">
+  <div class="login-art"><Gearwork /></div>
+  <div class="eyebrow">Your own little anime archive</div>
+  <div class="mb-4 mt-4">
+    <h1>Welcome to<br />Kurisu<span>.</span></h1>
   </div>
   <p class="text-ink-dim text-sm mb-6">Connect your AniList account to start tracking.</p>
 
@@ -71,3 +73,11 @@
     </p>
   </details>
 </div>
+
+<style>
+  .login-sheet { position: relative; width: 460px; max-width: 100%; border: 1px solid var(--color-edge); border-top: 2px solid var(--color-rust); background: var(--color-panel); padding: 35px; margin-top: 50px; }
+  .login-art { position: absolute; width: 215px; top: -112px; right: -12px; opacity: .48; pointer-events: none; }
+  h1 { font: 32px/1.1 var(--font-serif); letter-spacing: -.5px; }
+  h1 span { color: var(--color-accent); }
+  .login-art :global(.gearwork) { color: var(--color-rust); }
+</style>

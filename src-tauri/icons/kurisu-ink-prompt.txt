@@ -1,0 +1,9 @@
+Generated with the built-in imagegen tool
+Style reference: /home/cate/Media/Screenshots/Screenshot001.png
+
+Use case: stylized-concept.
+Asset type: square desktop program icon for Kurisu, used at 32, 48, 64 and 256 pixels.
+Create a new distinctive icon illustration of Makise Kurisu from Steins;Gate. Reference image 1 is STYLE GUIDANCE ONLY: its rough dark ink, printed imperfections, weathered linework and restrained graphic composition. Do not reproduce its lettering. This is an icon, not a screenshot or interface.
+Subject: recognizable close portrait of Kurisu, long reddish auburn hair, characteristic parted bangs, muted blue eyes, serious thoughtful expression, white collared shirt, narrow red tie, loose khaki jacket shoulders. Face and hair dominate, cropped around upper shoulders, substantial and legible at tiny size. Not chibi. One restrained broken gear outline partly behind her head, integrated into the silhouette rather than a busy backdrop.
+Style: expressive hand drawn ink lineart and flat, muted colored areas with sparse rough hatching and subtle distressed print texture. Slightly irregular lines, very matte, an unusual hand printed illustration. Dark charcoal field, dusty brick red hair, warm pale paper skin and shirt, faded slate blue eyes and muted olive accents. Still colorful but subdued. Dark ink contours with clear silhouette. A compact asymmetrical portrait composition, face kept large, a narrow margin around the outer silhouette.
+Square 1024 x 1024 image. Flat dark charcoal background extending to all four edges. No lettering, no words, no typography, no UI, no shiny badge, no gradients, no gloss, no glow, no glass, no metallic finish, no polished digital painting, no 3D rendering, no rounded app tile frame.

@@ -24,13 +24,13 @@
 
 <div
   data-tauri-drag-region
-  class="relative h-9 shrink-0 flex items-center justify-end bg-base border-b border-edge select-none"
+  class="titlebar relative h-8 shrink-0 flex items-center justify-end border-b border-edge select-none"
 >
   <div
-    class="absolute left-1/2 -translate-x-1/2 flex items-center gap-2 text-sm font-medium pointer-events-none"
+    class="absolute left-5 flex items-center gap-2 pointer-events-none eyebrow"
   >
-    <span class="text-accent text-base leading-none">ク</span>
-    <span class="tracking-wide">Kurisu</span>
+    <span class="text-accent">＋</span>
+    <span>Kurisu <span class="titlebar-caption"> / Anime Tracker</span></span>
   </div>
   <div class="flex items-center h-full">
     <button class="tb-btn" title="Minimize" onclick={() => appWindow.minimize()}>
@@ -62,6 +62,8 @@
 </div>
 
 <style>
+  .titlebar { background: #020202; }
+  .titlebar-caption { color: var(--color-ink-dim); text-transform: none; letter-spacing: .04em; }
   .tb-btn {
     width: 42px;
     height: 100%;
@@ -78,7 +80,7 @@
     color: var(--color-ink);
   }
   .tb-close:hover {
-    background: #e23c3c;
-    color: #fff;
+    background: #8e4943;
+    color: var(--color-ink);
   }
 </style>

@@ -13,6 +13,7 @@
   import Confirm from "$lib/Confirm.svelte";
   import Icon from "$lib/Icon.svelte";
   import Img from "$lib/Img.svelte";
+  import Gearwork from "$lib/Gearwork.svelte";
   let { children } = $props();
 
   $effect(() => runClock());
@@ -84,7 +85,7 @@
   }
 </script>
 
-<div class="relative flex flex-col h-screen border border-edge">
+<div class="program-shell relative flex flex-col h-screen border border-edge">
   <TitleBar />
 
   {#if !auth.ready}
@@ -95,42 +96,47 @@
     <Tracking />
     <Updater />
     <div class="flex flex-1 overflow-hidden">
-      <aside class="w-56 shrink-0 border-r border-edge bg-panel flex flex-col">
-        <div class="px-4 py-4 flex items-center gap-2">
-          <div class="flex items-center gap-2.5 flex-1 min-w-0">
-            <span class="text-accent text-3xl leading-none">ク</span>
-            <span class="text-xl font-semibold tracking-wide truncate">Kurisu</span>
+      <aside class="sidebar shrink-0 border-r border-edge flex flex-col">
+        <div class="brand-block">
+          <div class="eyebrow brand-caption">アニメの記録 <span>クリス</span></div>
+          <div class="wordmark" aria-label="Kurisu">
+            <span class="wordmark-k" aria-hidden="true">K</span><span aria-hidden="true">urisu<span class="wordmark-dot">.</span></span>
           </div>
           <button
             onclick={back}
             title="Back"
             aria-label="Back"
-            class="w-8 h-8 grid place-items-center rounded-md text-ink-dim hover:text-ink hover:bg-panel-2/60"
+            class="back-button w-7 h-7 grid place-items-center text-ink-dim hover:text-ink hover:bg-panel-2/60"
           >
             <Icon name="back" />
           </button>
         </div>
-        <nav class="flex-1 px-2 py-2 space-y-1 overflow-auto">
-          {#each nav as item}
+        <nav class="sidebar-nav flex-1 overflow-auto" aria-label="Main navigation">
+          {#each nav as item, index}
+            {#if index === 0 || index === 4 || index === 8}
+              <div class="nav-heading eyebrow">{index === 0 ? 'Your shelf' : index === 4 ? 'Discover' : 'Program'}</div>
+            {/if}
             {@const active = $pageStore.url.pathname === item.href}
             <a
               href={item.href}
-              class="flex items-center gap-3 px-3 py-2.5 rounded-md text-[15px] transition-colors
-                {active ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink hover:bg-panel-2/60'}"
+              aria-current={active ? 'page' : undefined}
+              class="nav-link {active ? 'active' : ''}"
             >
               <span class="w-6 grid place-items-center {active ? 'opacity-100' : 'opacity-90'}">
                 <Icon name={item.icon} />
               </span>
               <span class="truncate">{item.label}</span>
+              <span class="nav-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
             </a>
           {/each}
         </nav>
+        <div class="sidebar-drawing" aria-hidden="true"><Gearwork /><span class="eyebrow">Anime / Personal archive</span></div>
         {#if auth.user}
-          <div class="px-4 py-4 border-t border-edge flex items-center gap-3.5">
+          <div class="profile-block px-4 py-4 border-t border-edge flex items-center gap-3">
             {#if auth.user.avatar}
-              <Img src={auth.user.avatar} class="w-12 h-12 rounded-full shrink-0 object-cover" />
+              <Img src={auth.user.avatar} class="w-9 h-9 border border-edge shrink-0 object-cover" />
             {:else}
-              <div class="w-12 h-12 rounded-full bg-panel-2 shrink-0"></div>
+              <div class="w-9 h-9 border border-edge bg-panel-2 shrink-0"></div>
             {/if}
             <button
               onclick={openProfile}
@@ -138,7 +144,7 @@
               class="flex-1 min-w-0 text-left transition-colors hover:opacity-90"
             >
               <div class="text-sm font-semibold text-ink truncate">{auth.user.name}</div>
-              <div class="text-xs text-ink-dim truncate">View AniList</div>
+              <div class="text-xs text-ink-dim truncate">AniList profile ↗</div>
             </button>
             <button
               onclick={() => (confirmingLogout = true)}
@@ -149,7 +155,7 @@
             </button>
           </div>
         {:else}
-          <div class="px-4 py-5 border-t border-edge text-[13px] text-ink-dim/50">
+          <div class="px-4 py-5 border-t border-edge text-sm text-ink-dim">
             Not signed in
             {#if logoutErr}
               <p class="text-red-400 mt-1">Log out failed: {logoutErr}</p>
@@ -191,3 +197,42 @@
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div class="absolute bottom-0 right-0 w-2 h-2 cursor-se-resize z-50" onpointerdown={() => resize("SouthEast")}></div>
 </div>
+
+<style>
+  .sidebar { width: 244px; background: #040303; }
+  .brand-block { position: relative; padding: 25px 22px 23px; border-bottom: 1px solid var(--color-edge); }
+  .brand-caption { display: flex; justify-content: space-between; letter-spacing: .14em; font-size: 12px; }
+  .brand-caption span { color: var(--color-accent); }
+  .wordmark { display: flex; align-items: baseline; margin-top: 15px; font: 48px/.95 var(--font-serif); letter-spacing: -3px; color: var(--color-ink); }
+  .wordmark-k { display: inline-block; padding: 0 4px 4px; margin-right: 1px; background: var(--color-ink); color: var(--color-base); transform: rotate(-3deg); }
+  .wordmark-dot { color: var(--color-accent); }
+  .back-button { position: absolute; right: 14px; bottom: 15px; }
+  .sidebar-nav { padding: 7px 12px 12px; }
+  .nav-heading { padding: 18px 12px 9px; font-size: 11px; color: var(--color-ink-dim); }
+  .nav-link { display: flex; align-items: center; gap: 8px; position: relative; padding: 9px 9px; margin-bottom: 2px; color: var(--color-ink-dim); font-size: 15px; line-height: 1.35; border: 1px solid transparent; }
+  .nav-link:hover { color: var(--color-ink); background: var(--color-panel-2); }
+  .nav-link.active { color: var(--color-ink); background: #160d08; border-color: #82543d; }
+  .nav-link.active::before { content: ''; position: absolute; left: -1px; top: 7px; bottom: 7px; width: 2px; background: var(--color-accent); }
+  .nav-link.active :global(svg) { color: var(--color-accent); }
+  .nav-number { margin-left: auto; font: 11px var(--font-mono); opacity: .8; }
+  .sidebar-drawing { position: relative; height: 130px; margin: 0 18px 14px; overflow: hidden; flex-shrink: 1; min-height: 0; }
+  .sidebar-drawing :global(svg) { width: 210px; position: absolute; top: -8px; left: -5px; opacity: .27; }
+  .sidebar-drawing span { position: absolute; bottom: 0; font-size: 11px; letter-spacing: .06em; }
+  @media (max-height: 940px) { .sidebar-drawing { display: none; } }
+  @media (max-height: 800px) {
+    .nav-heading { padding-top: 9px; padding-bottom: 5px; }
+    .nav-link { padding-top: 6px; padding-bottom: 6px; }
+  }
+  @media (max-height: 700px) {
+    .brand-block { padding-top: 12px; padding-bottom: 12px; }
+    .wordmark { font-size: 38px; margin-top: 8px; }
+    .nav-heading { padding-top: 6px; padding-bottom: 3px; }
+    .nav-link { padding-top: 2px; padding-bottom: 2px; }
+  }
+  @media (max-width: 960px) {
+    .sidebar { width: 216px; }
+    .brand-block { padding-left: 17px; padding-right: 17px; }
+    .nav-link { padding-left: 5px; padding-right: 5px; gap: 5px; }
+    .nav-number { display: none; }
+  }
+</style>

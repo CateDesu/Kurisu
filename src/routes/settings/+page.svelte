@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
@@ -165,9 +166,9 @@
   load();
 </script>
 
-<div class="page-content space-y-8">
+<div class="page-content space-y-5">
   <div>
-    <h1 class="text-xl font-semibold mb-1">Settings</h1>
+    <PageHeading index="10" section="Program" title="Settings" description="Make Kurisu your own" />
     {#if loadError}
       <p class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-2">
         Couldn't load settings: {loadError}

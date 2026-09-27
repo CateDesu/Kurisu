@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
@@ -181,9 +182,13 @@
     <Login />
   </div>
 {:else if loading && !detail}
-  <div class="text-ink-dim py-16 text-center">Loading…</div>
+  <div class="page-content">
+    <PageHeading index="↗" section="Your collection" title="Anime details" />
+    <div class="text-ink-dim py-16 text-center">Loading…</div>
+  </div>
 {:else if !media}
   <div class="page-content">
+    <PageHeading index="↗" section="Your collection" title="Anime details" />
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-3 mt-6">
       {error || "This anime could not be loaded."}
     </div>
@@ -196,8 +201,8 @@
     </div>
   {/if}
 
-  <div class="min-w-0 [overflow-wrap:anywhere] px-5 pb-8 {media.banner_image ? '-mt-20 relative' : 'pt-5'}">
-    <div class="flex items-end gap-5 mb-4">
+  <div class="page-content {media.banner_image ? '-mt-20 relative' : ''}">
+    <div class="flex items-start gap-5 mb-4">
       {#if media.cover_large ?? media.cover_medium}
         <Img
           src={media.cover_large ?? media.cover_medium ?? ""}
@@ -207,16 +212,16 @@
         <div class="w-32 h-[11.5rem] bg-panel-2 rounded-lg border border-edge shrink-0"></div>
       {/if}
       <div class="flex-1 min-w-0 pb-1">
-        <div class="flex items-start gap-2">
-          <h1 class="text-2xl font-semibold leading-tight flex-1 min-w-0">{displayTitle(media)}</h1>
+        <PageHeading index="↗" section="Anime details" title={displayTitle(media)} compact>
           <button
             onclick={() => openUrl(`https://anilist.co/anime/${id}`)}
             title="Open on AniList"
-            class="shrink-0 w-8 h-8 grid place-items-center rounded-md text-ink-dim hover:text-ink hover:bg-panel-2/60 mt-0.5"
+            class="flex items-center gap-2 text-sm text-accent hover:text-ink"
           >
+            Open on AniList
             <Icon name="external" size={15} />
           </button>
-        </div>
+        </PageHeading>
         {#if media.title_romaji && media.title_romaji !== displayTitle(media)}
           <div class="text-sm text-ink-dim mt-0.5">{media.title_romaji}</div>
         {/if}
@@ -314,17 +319,17 @@
             <button
               onclick={() => goto(`/anime/${r.media.id}`)}
               title={displayTitle(r.media)}
-              class="w-24 shrink-0 text-left group"
+              class="w-28 shrink-0 self-start text-left group"
             >
               {#if r.media.cover_medium}
-                <Img src={r.media.cover_medium} class="w-24 h-32 object-cover rounded" />
+                <Img src={r.media.cover_medium} class="w-28 h-40 object-cover rounded" />
               {:else}
-                <div class="w-24 h-32 bg-panel-2 rounded"></div>
+                <div class="w-28 h-40 bg-panel-2 rounded"></div>
               {/if}
-              <span class="block text-[10px] uppercase tracking-wide text-accent mt-1">
+              <span class="block text-xs uppercase tracking-wide text-accent mt-1">
                 {RELATION_LABEL[r.relation] ?? r.relation}
               </span>
-              <span class="block text-[11px] leading-tight line-clamp-2 text-ink-dim group-hover:text-ink">
+              <span class="text-xs leading-tight line-clamp-2 text-ink-dim group-hover:text-ink">
                 {displayTitle(r.media)}
               </span>
             </button>
@@ -338,15 +343,15 @@
         <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">Characters</h2>
         <div class="flex gap-2.5 overflow-x-auto pb-1">
           {#each detail.characters as c, i (`${c.name}-${i}`)}
-            <div class="w-20 shrink-0" title={c.va_name ? `${c.name} — CV: ${c.va_name}` : c.name}>
+            <div class="w-28 shrink-0" title={c.va_name ? `${c.name} — CV: ${c.va_name}` : c.name}>
               {#if c.image}
-                <Img src={c.image} class="w-20 h-28 object-cover rounded" />
+                <Img src={c.image} class="w-28 h-40 object-cover rounded" />
               {:else}
-                <div class="w-20 h-28 bg-panel-2 rounded"></div>
+                <div class="w-28 h-40 bg-panel-2 rounded"></div>
               {/if}
-              <span class="block text-[11px] leading-tight line-clamp-2 mt-1">{c.name}</span>
+              <span class="text-xs leading-tight line-clamp-2 mt-1">{c.name}</span>
               {#if c.va_name}
-                <span class="block text-[10px] text-ink-dim line-clamp-1">{c.va_name}</span>
+                <span class="text-xs text-ink-dim line-clamp-1">{c.va_name}</span>
               {/if}
             </div>
           {/each}
@@ -359,15 +364,15 @@
         <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">Staff</h2>
         <div class="flex gap-2.5 overflow-x-auto pb-1">
           {#each detail.staff as s, i (`${s.name}-${i}`)}
-            <div class="w-20 shrink-0" title="{s.name}{s.role ? ` — ${s.role}` : ''}">
+            <div class="w-28 shrink-0" title="{s.name}{s.role ? ` — ${s.role}` : ''}">
               {#if s.image}
-                <Img src={s.image} class="w-20 h-28 object-cover rounded" />
+                <Img src={s.image} class="w-28 h-40 object-cover rounded" />
               {:else}
-                <div class="w-20 h-28 bg-panel-2 rounded"></div>
+                <div class="w-28 h-40 bg-panel-2 rounded"></div>
               {/if}
-              <span class="block text-[11px] leading-tight line-clamp-2 mt-1">{s.name}</span>
+              <span class="text-xs leading-tight line-clamp-2 mt-1">{s.name}</span>
               {#if s.role}
-                <span class="block text-[10px] text-ink-dim line-clamp-1">{s.role}</span>
+                <span class="text-xs text-ink-dim line-clamp-1">{s.role}</span>
               {/if}
             </div>
           {/each}
@@ -385,14 +390,14 @@
             <button
               onclick={() => goto(`/anime/${r.id}`)}
               title={displayTitle(r)}
-              class="w-24 shrink-0 text-left group"
+              class="w-28 shrink-0 self-start text-left group"
             >
               {#if r.cover_medium}
-                <Img src={r.cover_medium} class="w-24 h-32 object-cover rounded" />
+                <Img src={r.cover_medium} class="w-28 h-40 object-cover rounded" />
               {:else}
-                <div class="w-24 h-32 bg-panel-2 rounded"></div>
+                <div class="w-28 h-40 bg-panel-2 rounded"></div>
               {/if}
-              <span class="block text-[11px] leading-tight line-clamp-2 mt-1 text-ink-dim group-hover:text-ink">
+              <span class="text-xs leading-tight line-clamp-2 mt-1 text-ink-dim group-hover:text-ink">
                 {displayTitle(r)}
               </span>
             </button>

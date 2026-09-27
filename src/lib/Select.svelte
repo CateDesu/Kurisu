@@ -1,5 +1,5 @@
 <script lang="ts" generics="T extends string">
-  // Custom controls keep WebKit2GTK popups dark.
+  // Keep popups consistent in WebKit.
   let {
     value = $bindable(),
     options,

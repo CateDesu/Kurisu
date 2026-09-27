@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { open } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
@@ -232,8 +233,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <div class="flex flex-wrap items-center gap-3 mb-4">
-      <h1 class="text-xl font-semibold flex-1">Library</h1>
+    <PageHeading index="03" section="Your collection" title="Library" description="Anime on your device">
       {#if scannedAt}
         <span class="text-xs text-accent">
           Scan finished · {scannedCount} file{scannedCount === 1 ? "" : "s"}
@@ -246,7 +246,7 @@
       >
         {#if library.scanning}Scanning…{:else}↻ Rescan{/if}
       </button>
-    </div>
+    </PageHeading>
 
     {#if error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageHeading from "$lib/PageHeading.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
   import { api } from "$lib/api";
@@ -70,8 +71,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <div class="flex flex-wrap items-center gap-3 mb-4">
-      <h1 class="text-xl font-semibold flex-1">Notifications</h1>
+    <PageHeading index="09" section="AniList updates" title="Notifications" description="The latest from your account">
       <button
         onclick={load}
         disabled={loading}
@@ -79,7 +79,7 @@
       >
         {loading ? "Loading…" : "↻ Refresh"}
       </button>
-    </div>
+    </PageHeading>
 
     {#if error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
