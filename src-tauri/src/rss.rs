@@ -3,6 +3,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use crate::db::Db;
+use crate::models::FeedFailure;
 
 const FEEDS_KEY: &str = "rss_feeds";
 const DEFAULT_FEEDS: &[&str] = &["https://nyaa.si/?page=rss&c=1_2&f=0"];
@@ -88,11 +89,6 @@ pub struct FeedFetch {
     pub failures: Vec<FeedFailure>,
 }
 
-pub struct FeedFailure {
-    pub url: String,
-    pub error: String,
-}
-
 pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let http = reqwest::Client::builder()
         .user_agent("Kurisu")
@@ -149,8 +145,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 let parsed = parse_rss_checked(&xml);
                 let items = parsed.items;
                 // Distinguish an empty RSS feed from an error page returned with HTTP 200.
-                let lower = xml.to_lowercase();
-                if items.is_empty() && !lower.contains("<rss") && !lower.contains("<channel") {
+                if !parsed.is_rss {
                     let msg = format!("{feed}: response was not an RSS feed");
                     log::warn!("{msg}");
                     failures.push(FeedFailure {
@@ -229,6 +224,7 @@ pub async fn search(query: &str, category: &str, filter: &str) -> Result<Vec<Raw
 
 pub(crate) struct ParsedFeed {
     pub items: Vec<RawItem>,
+    pub is_rss: bool,
     /// Keep recovered items, but report a truncated document.
     pub error: Option<String>,
 }
@@ -247,6 +243,10 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
     let mut field_depth = 0usize;
     let mut depth = 0usize;
     let mut document_depth = 0usize;
+    let mut saw_root = false;
+    let mut rss_root = false;
+    let mut saw_channel = false;
+    let mut in_channel = false;
     let mut buf = String::new();
     let mut error = None;
     loop {
@@ -254,7 +254,19 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
             Ok(Event::Start(e)) => {
                 document_depth += 1;
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "item" {
+                if document_depth == 1 {
+                    if saw_root {
+                        error = Some("multiple XML roots".to_string());
+                        break;
+                    }
+                    saw_root = true;
+                    rss_root = name == "rss";
+                }
+                if rss_root && document_depth == 2 && name == "channel" {
+                    saw_channel = true;
+                    in_channel = true;
+                }
+                if in_channel && document_depth == 3 && name == "item" {
                     item = Some(RawItem::default());
                     field = None;
                     depth = 0;
@@ -267,9 +279,25 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
                     depth += 1;
                 }
             }
+            Ok(Event::Empty(e)) => {
+                if document_depth == 0 {
+                    if saw_root {
+                        error = Some("multiple XML roots".to_string());
+                        break;
+                    }
+                    saw_root = true;
+                } else if rss_root && document_depth == 1 && e.name().as_ref() == b"channel" {
+                    saw_channel = true;
+                }
+            }
             Ok(Event::Text(t)) => {
                 if item.is_some() && field.is_some() {
-                    buf.push_str(&decode_text(&t));
+                    buf.push_str(&String::from_utf8_lossy(t.as_ref()));
+                }
+            }
+            Ok(Event::GeneralRef(t)) => {
+                if item.is_some() && field.is_some() {
+                    buf.push_str(&decode_reference(&t));
                 }
             }
             Ok(Event::CData(t)) => {
@@ -278,9 +306,8 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
                 }
             }
             Ok(Event::End(e)) => {
-                document_depth = document_depth.saturating_sub(1);
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "item" {
+                if document_depth == 3 && name == "item" && in_channel {
                     if let Some(it) = item.take() {
                         if !it.title.is_empty() && !it.link.is_empty() {
                             out.push(finish_item(it));
@@ -317,6 +344,10 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
                         }
                     }
                 }
+                if document_depth == 2 && name == "channel" {
+                    in_channel = false;
+                }
+                document_depth = document_depth.saturating_sub(1);
             }
             Ok(Event::Eof) => {
                 if document_depth != 0 {
@@ -332,7 +363,11 @@ pub fn parse_rss_checked(xml: &str) -> ParsedFeed {
             _ => {}
         }
     }
-    ParsedFeed { items: out, error }
+    ParsedFeed {
+        items: out,
+        is_rss: rss_root && saw_channel,
+        error,
+    }
 }
 
 fn parse_flag(value: &str) -> Option<bool> {
@@ -344,8 +379,9 @@ fn parse_flag(value: &str) -> Option<bool> {
 }
 
 /// Preserve unknown entities instead of discarding the entire text node.
-fn decode_text(t: &quick_xml::events::BytesText) -> String {
-    t.unescape_with(|name| {
+fn decode_reference(t: &quick_xml::events::BytesRef) -> String {
+    let escaped = format!("&{};", String::from_utf8_lossy(t.as_ref()));
+    quick_xml::escape::unescape_with(&escaped, |name| {
         Some(match name {
             "amp" => "&",
             "lt" => "<",
@@ -368,7 +404,7 @@ fn decode_text(t: &quick_xml::events::BytesText) -> String {
         })
     })
     .map(|c| c.into_owned())
-    .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned())
+    .unwrap_or(escaped)
 }
 
 /// Dates without a timezone use UTC.
@@ -398,26 +434,35 @@ fn finish_item(mut it: RawItem) -> RawItem {
 }
 
 /// Validate the hash before embedding it so feed text cannot inject magnet parameters.
-pub fn magnet_for(info_hash: &str, title: &str) -> String {
+pub fn magnet_for(info_hash: &str, title: &str) -> Option<String> {
     let h = info_hash.trim();
     let valid = (h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
         || (h.len() == 32
             && h.chars()
                 .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')));
     if valid {
-        format!(
+        Some(format!(
             "magnet:?xt=urn:btih:{h}&dn={}",
             crate::anilist::urlencoding::encode(title)
-        )
+        ))
     } else {
         log::warn!("feed item carried a malformed info hash: {h:?}");
-        format!("magnet:?dn={}", crate::anilist::urlencoding::encode(title))
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_feed_hash_does_not_offer_a_magnet() {
+        for hash in ["", "not-a-hash", "abcdef&tr=https://example.com"] {
+            assert!(serde_json::to_value(magnet_for(hash, "Some Show - 05"))
+                .unwrap()
+                .is_null());
+        }
+    }
 
     #[tokio::test]
     async fn truncated_xml_reports_recovered_items() {
@@ -531,7 +576,8 @@ mod tests {
         let query = r#""進撃の巨人"|"Attack on Titan" -1080p &c=0_0"#;
         for category in ["1_0", "1_1", "1_2", "1_3", "1_4"] {
             for filter in ["0", "1", "2"] {
-                let url = reqwest::Url::parse(&search_url(query, category, filter).unwrap()).unwrap();
+                let url =
+                    reqwest::Url::parse(&search_url(query, category, filter).unwrap()).unwrap();
                 let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
                 assert_eq!(url.host_str(), Some("nyaa.si"));
                 assert_eq!(pairs.len(), 4);
@@ -551,25 +597,17 @@ mod tests {
         let m = magnet_for(hash, "My Show - 05");
         assert_eq!(
             m,
-            format!("magnet:?xt=urn:btih:{hash}&dn=My%20Show%20-%2005")
+            Some(format!("magnet:?xt=urn:btih:{hash}&dn=My%20Show%20-%2005"))
         );
-        assert!(
-            magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t").starts_with("magnet:?xt=urn:btih:")
-        );
+        assert!(magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t")
+            .unwrap()
+            .starts_with("magnet:?xt=urn:btih:"));
     }
 
     #[test]
     fn magnet_rejects_malformed_info_hash() {
         let m = magnet_for("abc&tr=http://evil/announce", "My Show");
-        assert!(
-            !m.contains("urn:btih"),
-            "malformed hash must not reach xt: {m}"
-        );
-        assert!(
-            !m.contains("evil"),
-            "no injected parameters may survive: {m}"
-        );
-        assert!(m.starts_with("magnet:?dn="));
+        assert_eq!(m, None);
     }
 
     struct Capture;
@@ -605,6 +643,16 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "Show\u{a0}Name & Friends - 01");
         assert_eq!(items[1].title, "Odd &bogus; Entity - 02");
+    }
+
+    #[test]
+    fn feed_entities_decode_once_and_preserve_unknown_names() {
+        let items = parse_rss(
+            "<rss><channel><item><title>A &amp; &bogus; &#x65E5;&#26412; &amp;lt;</title>\
+             <link>https://example.com/?a=1&amp;b=2</link></item></channel></rss>",
+        );
+        assert_eq!(items[0].title, "A & &bogus; 日本 &lt;");
+        assert_eq!(items[0].link, "https://example.com/?a=1&b=2");
     }
 
     #[test]
@@ -745,6 +793,47 @@ mod tests {
         assert!(f.items.is_empty());
         assert_eq!(f.failures.len(), 1);
         assert!(f.failures[0].error.contains("not an RSS feed"));
+    }
+
+    #[tokio::test]
+    async fn rss_words_in_an_error_page_do_not_make_it_a_feed() {
+        for body in [
+            "<html><body><!-- <rss> --><p>Feed unavailable</p></body></html>",
+            "<rssError>Feed unavailable</rssError>",
+            "<channelError>Feed unavailable</channelError>",
+        ] {
+            let fetched = fetch_full(serve_body(body)).await;
+            assert_eq!(fetched.failures.len(), 1, "{body}");
+            assert!(fetched.items.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn non_feed_items_are_not_downloads() {
+        let body = "<html><body><item><title>Error</title><link>https://example.com/error</link></item></body></html>";
+        let fetched = fetch_full(serve_body(body)).await;
+        assert_eq!(fetched.failures.len(), 1);
+        assert!(fetched.items.is_empty());
+    }
+
+    #[test]
+    fn feed_structure_keeps_empty_channels_and_ignores_nested_items() {
+        let empty = parse_rss_checked("<rss><channel/></rss>");
+        assert!(empty.is_rss);
+        assert!(empty.error.is_none());
+        assert!(empty.items.is_empty());
+        assert!(!parse_rss_checked("<rssError><channel/></rssError>").is_rss);
+        assert!(!parse_rss_checked("<rss/>").is_rss);
+
+        let nested = parse_rss_checked(
+            "<rss><channel><description><item><title>Not a release</title>\
+             <link>https://example.com/error</link></item></description>\
+             <item><title>Show 01</title><link>https://example.com/1</link></item>\
+             </channel></rss>",
+        );
+        assert!(nested.is_rss);
+        assert_eq!(nested.items.len(), 1);
+        assert_eq!(nested.items[0].title, "Show 01");
     }
 
     #[tokio::test]

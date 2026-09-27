@@ -66,7 +66,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="08" section="Your activity" title="Stats" description="Your watching history in numbers">
+    <PageHeading section="Your activity" title="Stats" description="Your watching history in numbers">
       <button
         onclick={load}
         disabled={loading}

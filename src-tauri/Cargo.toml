@@ -13,6 +13,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
@@ -32,11 +35,14 @@ env_logger = "0.11"
 parking_lot = "0.12"
 ring = "0.17"
 sha2 = "0.10"
-quick-xml = "0.37"
+quick-xml = "0.41"
 discord-rich-presence = "1.1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

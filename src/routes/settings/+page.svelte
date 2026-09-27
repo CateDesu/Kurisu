@@ -2,7 +2,7 @@
   import PageHeading from "$lib/PageHeading.svelte";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
-  import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
+  import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "$lib/update.svelte";
   import Confirm from "$lib/Confirm.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "$lib/types";
@@ -16,8 +16,11 @@
   let closeToTray = $state(false);
 
   let autoUpdate = $state(true);
-  let toggleError = $state("");
-  let toggleErrorKey = $state("");
+  type ToggleKey = "close_to_tray" | "auto_update";
+  const toggles = $state({
+    close_to_tray: { loaded: false, loading: false, saving: false, error: "" },
+    auto_update: { loaded: false, loading: false, saving: false, error: "" },
+  });
   let update = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
   let updateError = $state("");
@@ -38,11 +41,26 @@
   async function load() {
     try {
       cfg = await api.getTrackingConfig();
-      closeToTray = (await api.getAppSetting("close_to_tray")) === "1";
-      autoUpdate = (await api.getAppSetting("auto_update")) !== "0";
       trackingLoaded = true;
     } catch (e) {
       loadError = String(e);
+    }
+  }
+
+  async function loadToggle(key: ToggleKey) {
+    const state = toggles[key];
+    if (state.loading || state.loaded) return;
+    state.loading = true;
+    state.error = "";
+    try {
+      const value = await api.getAppSetting(key);
+      if (key === "close_to_tray") closeToTray = value === "1";
+      else autoUpdate = value !== "0";
+      state.loaded = true;
+    } catch (e) {
+      state.error = String(e);
+    } finally {
+      state.loading = false;
     }
   }
   async function signIn() {
@@ -74,7 +92,7 @@
     if (!auth.user) confirmingLogout = false;
   });
   async function saveTracking() {
-    if (trackingSaving) return;
+    if (!trackingLoaded || trackingSaving) return;
     trackingSaving = true;
     trackingError = "";
     // Normalize empty and fractional inputs before sending Rust integer parameters.
@@ -105,39 +123,28 @@
         cfg.discord_enabled === snap.discord_enabled
       ) {
         cfg = saved;
+        trackingSavedAt = Date.now();
       }
-      trackingSavedAt = Date.now();
     } catch (e) {
       trackingError = String(e);
     } finally {
       trackingSaving = false;
     }
   }
-  async function toggleCloseToTray() {
-    // Binding updates before the handler, so the previous value is the inverse.
-    const prev = !closeToTray;
-    toggleError = "";
-    toggleErrorKey = "";
+  async function toggleSetting(key: ToggleKey) {
+    const state = toggles[key];
+    if (!state.loaded || state.saving) return;
+    const value = key === "close_to_tray" ? closeToTray : autoUpdate;
+    state.saving = true;
+    state.error = "";
     try {
-      await api.setAppSetting("close_to_tray", closeToTray ? "1" : "0");
+      await api.setAppSetting(key, value ? "1" : "0");
     } catch (e) {
-      closeToTray = prev;
-      toggleError = String(e);
-      toggleErrorKey = "close_to_tray";
-      console.error("failed to save close_to_tray", e);
-    }
-  }
-  async function toggleAutoUpdate() {
-    const prev = !autoUpdate;
-    toggleError = "";
-    toggleErrorKey = "";
-    try {
-      await api.setAppSetting("auto_update", autoUpdate ? "1" : "0");
-    } catch (e) {
-      autoUpdate = prev;
-      toggleError = String(e);
-      toggleErrorKey = "auto_update";
-      console.error("failed to save auto_update", e);
+      if (key === "close_to_tray") closeToTray = !value;
+      else autoUpdate = !value;
+      state.error = String(e);
+    } finally {
+      state.saving = false;
     }
   }
   async function checkForUpdate() {
@@ -147,6 +154,7 @@
     update = null;
     try {
       update = await api.checkUpdate();
+      notePendingRestart(update.restart_pending);
     } catch (e) {
       updateError = String(e);
     } finally {
@@ -164,11 +172,13 @@
     }
   }
   load();
+  void loadToggle("close_to_tray");
+  void loadToggle("auto_update");
 </script>
 
 <div class="page-content space-y-5">
   <div>
-    <PageHeading index="10" section="Program" title="Settings" description="Make Kurisu your own" />
+    <PageHeading section="Program" title="Settings" description="El Psy Congroo" />
     {#if loadError}
       <p class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-2">
         Couldn't load settings: {loadError}
@@ -209,6 +219,7 @@
       Detect playback in MPV/VLC/Celluloid (any MPRIS2 player) and update your list.
       Bare MPV is detected through its IPC socket.
     </p>
+    <fieldset disabled={!trackingLoaded} class="min-w-0">
     <div class="space-y-2 mb-4">
       {#each modes as [val, label]}
         <label class="flex items-center gap-2 text-sm cursor-pointer">
@@ -308,6 +319,7 @@
         <p class="text-xs text-red-400 mt-2">Save failed: {trackingError}</p>
       {/if}
     </div>
+    </fieldset>
   </section>
 
   <section class="pt-4 border-t border-edge">
@@ -316,7 +328,8 @@
       <input
         type="checkbox"
         bind:checked={closeToTray}
-        onchange={toggleCloseToTray}
+        disabled={!toggles.close_to_tray.loaded || toggles.close_to_tray.saving}
+        onchange={() => toggleSetting("close_to_tray")}
         class="accent-accent"
       />
       Hide to system tray when closing the window
@@ -325,9 +338,12 @@
       Off by default — the close button quits Kurisu outright. Turn this on to keep
       it running in the tray instead (Quit is always available in the tray menu).
     </p>
-    {#if toggleErrorKey === "close_to_tray"}
+    {#if toggles.close_to_tray.error}
       <p class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-2">
-        Couldn't save setting: {toggleError}
+        Window setting: {toggles.close_to_tray.error}
+        {#if !toggles.close_to_tray.loaded}
+          <button onclick={() => loadToggle("close_to_tray")} disabled={toggles.close_to_tray.loading} class="underline ml-2">Retry</button>
+        {/if}
       </p>
     {/if}
   </section>
@@ -338,17 +354,21 @@
       <input
         type="checkbox"
         bind:checked={autoUpdate}
-        onchange={toggleAutoUpdate}
+        disabled={!toggles.auto_update.loaded || toggles.auto_update.saving}
+        onchange={() => toggleSetting("auto_update")}
         class="accent-accent"
       />
-      Automatically check for updates on startup
+      Automatically check for updates
     </label>
     <p class="text-xs text-ink-dim mt-1 mb-3">
-      On by default. Checks GitHub for a newer build and offers to install it.
+      On by default. Checks on startup and every hour while Kurisu is running. You choose when to install.
     </p>
-    {#if toggleErrorKey === "auto_update"}
+    {#if toggles.auto_update.error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-3">
-        Couldn't save setting: {toggleError}
+        Update setting: {toggles.auto_update.error}
+        {#if !toggles.auto_update.loaded}
+          <button onclick={() => loadToggle("auto_update")} disabled={toggles.auto_update.loading} class="underline ml-2">Retry</button>
+        {/if}
       </div>
     {/if}
     <div class="flex flex-wrap items-center gap-2">
@@ -359,7 +379,7 @@
       >
         {updateChecking ? "Checking…" : "Check for updates"}
       </button>
-      {#if update?.available && update.can_install && !updateStatus}
+      {#if update?.available && update.can_install && !updateStatus && !updateNeedsRestart()}
         <button
           onclick={installUpdate}
           disabled={installInFlight()}
@@ -373,7 +393,7 @@
       {#if update.available}
         <p class="text-xs text-accent mt-2">
           Version {update.version} is available (you're on {update.current}).
-          {#if update.restart_pending}
+          {#if updateNeedsRestart()}
             — installed, restart Kurisu to finish.
           {:else if !update.can_install}
             <button

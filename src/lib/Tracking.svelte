@@ -3,6 +3,7 @@
   import { listen, emit } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
   import { api } from "$lib/api";
+  import { auth } from "$lib/auth.svelte";
   import { nowPlaying } from "$lib/nowplaying.svelte";
   import Icon from "$lib/Icon.svelte";
   import type { TrackingPrompt } from "$lib/types";
@@ -33,17 +34,23 @@
   }
 
   $effect(() => {
+    const epoch = auth.epoch;
+    prompt = null;
+    queued = [];
+    busy = false;
+    err = "";
+    if (!auth.isLoggedIn) return;
     let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
     listen<TrackingPrompt>("kurisu://tracking-prompt", (e) => {
-      if (!alive) return;
+      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       const p = e.payload;
       if (!p) return;
       presentPrompt(p);
     }).then((u) => (alive ? (un1 = u) : u()));
     listen<TrackingPrompt>("kurisu://tracking-ask", (e) => {
-      if (!alive) return;
+      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       const p = e.payload;
       if (!p) return;
       goto("/now");
@@ -57,13 +64,16 @@
   });
 
   async function confirm() {
-    if (!prompt || busy) return;
+    if (!prompt || busy || !auth.isLoggedIn) return;
     const p = prompt;
+    const epoch = auth.epoch;
+    const current = () => epoch === auth.epoch && auth.isLoggedIn && prompt === p;
     busy = true;
     err = "";
     try {
       // Progress may have moved while the prompt was open. Never rewind.
       const fresh = await api.getEntry(p.media_id);
+      if (!current()) return;
       if (!fresh) {
         if (prompt === p) dismiss();
         return;
@@ -74,12 +84,13 @@
       }
       // Pass the fresh baseline so a concurrent edit cannot be overwritten.
       const entry = await api.setProgress(p.media_id, p.episode, fresh.progress);
+      if (!current()) return;
       await emit("kurisu://episode-updated", entry);
       if (prompt === p) dismiss();
     } catch (e) {
-      if (prompt === p) err = String(e);
+      if (current()) err = String(e);
     } finally {
-      busy = false;
+      if (epoch === auth.epoch) busy = false;
     }
   }
 

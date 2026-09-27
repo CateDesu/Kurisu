@@ -7,7 +7,7 @@
   import type { ListEntry, Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import AnimeCard from "$lib/AnimeCard.svelte";
-  import { addToList } from "$lib/list";
+  import { createListActions } from "$lib/list.svelte";
   import type { Snapshot } from "./$types";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;
@@ -30,7 +30,7 @@
   let loading = $state(false);
   let error = $state("");
   let entriesError = $state("");
-  let adding = $state<number | null>(null);
+  const actions = createListActions();
   const loggedIn = $derived(auth.isLoggedIn);
 
   const onList = $derived(new Map(entries.map((e) => [e.media_id, e])));
@@ -54,7 +54,6 @@
 
   let loadId = 0;
   let entriesLoadId = 0;
-  let addId = 0;
   let loadedOnce = false;
   let navigationReady = false;
   let alive = true;
@@ -109,21 +108,11 @@
   }
 
   async function add(m: Media, status: string) {
-    const id = ++addId;
-    const epoch = auth.epoch;
-    const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
-    adding = m.id;
     error = "";
-    try {
-      const entry = await addToList(m, status);
-      if (!current()) return;
-      entries = [...entries.filter((e) => e.media_id !== m.id), entry];
-      void refreshEntries();
-    } catch (e) {
-      if (current() && id === addId) error = String(e);
-    } finally {
-      if (current() && id === addId) adding = null;
-    }
+    const entry = await actions.add(m, status);
+    if (!entry || !alive) return;
+    entries = [...entries.filter((e) => e.media_id !== m.id), entry];
+    void refreshEntries();
   }
 
   $effect(() => {
@@ -132,11 +121,10 @@
     untrack(() => {
       loadId++;
       entriesLoadId++;
-      addId++;
+      actions.reset();
       if (loading) loadedOnce = false;
       entries = [];
       loading = false;
-      adding = null;
       error = "";
       entriesError = "";
     });
@@ -163,7 +151,7 @@
     });
   });
 
-  onDestroy(() => { alive = false; });
+  onDestroy(() => { alive = false; actions.reset(); });
 </script>
 
 {#if !auth.isLoggedIn}
@@ -172,7 +160,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="05" section="Seasons" title={`${SEASON_LABEL[season]} ${year}`} description="Browse the season">
+    <PageHeading section="Seasons" title={`${SEASON_LABEL[season]} ${year}`} description="Browse the season">
       <button
         onclick={() => shift(-1)}
         disabled={loading}
@@ -191,9 +179,9 @@
       </button>
     </PageHeading>
 
-    {#if error || entriesError}
+    {#if error || entriesError || actions.error}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
-        {error || entriesError}
+        {error || entriesError || actions.error}
       </div>
     {/if}
 
@@ -206,7 +194,7 @@
     {:else}
       <div class="media-grid">
         {#each media as m (m.id)}
-          <AnimeCard media={m} entry={onList.get(m.id)} adding={adding === m.id} onadd={add} />
+          <AnimeCard media={m} entry={onList.get(m.id)} adding={actions.pending(m.id)} onadd={add} />
         {/each}
       </div>
     {/if}

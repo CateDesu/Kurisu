@@ -2,16 +2,11 @@ use anyhow::{anyhow, Result};
 
 use crate::db::Db;
 use crate::models::{LibraryFile, LibraryScan, UnreadableFolder};
-use crate::recognize::{basename, match_title, resolve_episode, Matcher};
+use crate::recognize::{basename, match_title, resolve_episode, Matcher, VIDEO_EXTS};
 
 const FOLDERS_KEY: &str = "library_folders";
 const BINDINGS_KEY: &str = "library_bindings";
 const MAX_DEPTH: usize = 8;
-/// Keep these extensions in sync with the opener scope.
-const VIDEO_EXTS: &[&str] = &[
-    "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv", "mpg", "mpeg", "m2ts",
-    "vob", "ogv", "3gp", "rmvb", "asf", "divx",
-];
 static FOLDERS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 static BINDINGS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -73,6 +68,8 @@ pub fn get_bindings(db: &Db) -> std::collections::HashMap<String, i64> {
 pub fn bind_path(db: &Db, path: &str, media_id: i64) -> Result<()> {
     let _guard = BINDINGS_LOCK.lock();
     let mut bindings = get_bindings(db);
+    let resolved = resolved_path(path);
+    bindings.retain(|saved, _| resolved_path(saved) != resolved);
     bindings.insert(path.to_string(), media_id);
     db.set_setting(BINDINGS_KEY, &serde_json::to_string(&bindings)?)
 }
@@ -85,29 +82,79 @@ pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
 }
 
 pub fn binding_for_exact(db: &Db, path: &str) -> Option<i64> {
-    get_bindings(db).get(path).copied()
+    let resolved = resolved_path(path);
+    let local = local_path(path);
+    binding_paths(&get_bindings(db))
+        .into_iter()
+        .filter(|(_, saved, _)| *saved == resolved)
+        .max_by_key(|(saved, _, _)| (local_path(saved) == local, std::cmp::Reverse(saved.clone())))
+        .map(|(_, _, id)| id)
 }
 
+type BindingPath = (String, std::path::PathBuf, i64);
+
+fn resolved_path(path: &str) -> std::path::PathBuf {
+    let path = local_path(path);
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn local_path(path: &str) -> std::path::PathBuf {
+    reqwest::Url::parse(path)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from(path))
+}
+
+fn binding_paths(bindings: &std::collections::HashMap<String, i64>) -> Vec<BindingPath> {
+    bindings
+        .iter()
+        .map(|(path, id)| (path.clone(), resolved_path(path), *id))
+        .collect()
+}
+
+#[cfg(test)]
 fn bound_live(
     bindings: &std::collections::HashMap<String, i64>,
     path: &str,
     live: impl Fn(i64) -> bool,
 ) -> Option<i64> {
-    if let Some(id) = bindings.get(path) {
-        if live(*id) {
-            return Some(*id);
-        }
-    }
-    let mut dirs: Vec<_> = bindings
+    bound_path_id(&binding_paths(bindings), path, live)
+}
+
+fn bound_path_id(bindings: &[BindingPath], path: &str, live: impl Fn(i64) -> bool) -> Option<i64> {
+    let resolved = resolved_path(path);
+    let local = local_path(path);
+    bindings
         .iter()
-        .filter(|(prefix, _)| {
-            path.len() > prefix.len()
-                && path.starts_with(prefix.as_str())
-                && matches!(path.as_bytes()[prefix.len()], b'/' | b'\\')
+        .filter(|(_, prefix, id)| resolved.starts_with(prefix) && live(*id))
+        .max_by_key(|(source, prefix, _)| {
+            (
+                prefix.components().count(),
+                local.starts_with(local_path(source)),
+                std::cmp::Reverse(source.as_str()),
+            )
         })
-        .collect();
-    dirs.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
-    dirs.into_iter().map(|(_, id)| *id).find(|id| live(*id))
+        .map(|(_, _, id)| *id)
+}
+
+pub(crate) fn bound_match<'a>(
+    matchers: &'a [Matcher],
+    bindings: &std::collections::HashMap<String, i64>,
+    path: &str,
+) -> Option<&'a Matcher> {
+    match_bound_path(matchers, &binding_paths(bindings), path)
+}
+
+fn match_bound_path<'a>(
+    matchers: &'a [Matcher],
+    bindings: &[BindingPath],
+    path: &str,
+) -> Option<&'a Matcher> {
+    bound_path_id(bindings, path, |id| {
+        matchers.iter().any(|m| m.media_id == id)
+    })
+    .and_then(|id| matchers.iter().find(|m| m.media_id == id))
 }
 
 /// Call from spawn_blocking.
@@ -136,15 +183,13 @@ pub fn scan_paths(
         seen.insert(key)
     });
     paths.sort();
+    let bindings = binding_paths(bindings);
 
     let files = paths
         .into_iter()
         .map(|path| {
             let base = basename(&path);
-            let bound = bound_live(bindings, &path, |id| {
-                matchers.iter().any(|m| m.media_id == id)
-            })
-            .and_then(|id| matchers.iter().find(|m| m.media_id == id));
+            let bound = match_bound_path(matchers, &bindings, &path);
             let matched = bound.or_else(|| match_title(matchers, "", &path));
             let episode = matched.and_then(|m| resolve_episode(m, &[base.as_str()]));
             LibraryFile {
@@ -160,39 +205,48 @@ pub fn scan_paths(
 }
 
 fn collect_videos(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
-    if depth > MAX_DEPTH {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
+    let mut pending = std::collections::VecDeque::from([(dir.to_path_buf(), depth)]);
+    let mut visited = std::collections::HashSet::new();
+    while let Some((dir, depth)) = pending.pop_front() {
+        if depth > MAX_DEPTH {
             continue;
         }
-        let path = entry.path();
-        // Follow symlinks. MAX_DEPTH bounds cycles.
-        let Ok(meta) = std::fs::metadata(&path) else {
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
-        if meta.is_dir() {
-            collect_videos(&path, depth + 1, out);
-        } else if meta.is_file()
-            && path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| VIDEO_EXTS.contains(&e.to_lowercase().as_str()))
-                .unwrap_or(false)
-        {
-            // Lossy paths cannot be reopened reliably and may collide.
-            match path.to_str() {
-                Some(p) => out.push(p.to_owned()),
-                None => log::warn!(
-                    "library scan skipping non UTF-8 file: {}",
-                    path.to_string_lossy()
-                ),
+        let mut entries = read.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push_back((path, depth + 1));
+            } else if meta.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| VIDEO_EXTS.contains(&e.to_lowercase().as_str()))
+                    .unwrap_or(false)
+            {
+                // Lossy paths cannot be reopened reliably and may collide.
+                match path.to_str() {
+                    Some(p) => out.push(p.to_owned()),
+                    None => log::warn!(
+                        "library scan skipping non UTF-8 file: {}",
+                        path.to_string_lossy()
+                    ),
+                }
             }
         }
     }
@@ -215,8 +269,42 @@ mod tests {
         assert_eq!(bound_live(&b, "/a/Show/ep01.mkv", live), Some(1));
         assert_eq!(bound_live(&b, "/a/Show/Specials/sp1.mkv", live), Some(2));
         assert_eq!(bound_live(&b, "/a/Show 2/ep01.mkv", live), None);
+        #[cfg(windows)]
         assert_eq!(bound_live(&b, "/a/Show\\ep01.mkv", live), Some(1));
+        #[cfg(unix)]
+        assert_eq!(bound_live(&b, "/a/Show\\ep01.mkv", live), None);
         assert_eq!(bound_live(&b, "/other/x.mkv", live), None);
+    }
+
+    #[test]
+    fn playback_bindings_accept_file_urls_and_plain_paths() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&crate::models::Media {
+            id: 1,
+            title_english: Some("Some Show".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&crate::models::ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let matchers = crate::recognize::build_matchers(&db);
+        let folder = std::env::temp_dir().join("kurisu-bound-show");
+        let file = folder.join("ep05.mkv");
+        let url = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        let bindings = HashMap::from([(folder.to_str().unwrap().to_string(), 1)]);
+        for path in [file.to_str().unwrap(), url.as_str()] {
+            let matched = super::bound_match(&matchers, &bindings, path).unwrap();
+            assert_eq!(matched.media_id, 1);
+            assert_eq!(
+                crate::recognize::resolve_episode(matched, &[&crate::recognize::basename(path)]),
+                Some(5)
+            );
+        }
+        assert!(super::bound_match(&[], &bindings, &url).is_none());
     }
 
     #[test]
@@ -304,6 +392,78 @@ mod tests {
         assert_eq!(scan.files.len(), 1);
         assert!(scan.files[0].path.ends_with("ep01.mkv"));
         assert!(scan.unreadable.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bindings_follow_directory_aliases() {
+        let dir = std::env::temp_dir().join(format!("kurisu-binding-alias-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("ep05.mkv"), []).unwrap();
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let bindings = HashMap::from([(real.to_str().unwrap().to_string(), 1)]);
+        let found = bound_live(&bindings, alias.join("ep05.mkv").to_str().unwrap(), |_| {
+            true
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_bindings_keep_file_precedence_and_replace_aliases() {
+        let dir =
+            std::env::temp_dir().join(format!("kurisu-binding-replace-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let file = real.join("ep05.mkv");
+        std::fs::write(&file, []).unwrap();
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let alias_file = alias.join("ep05.mkv");
+        let text = |path: &std::path::Path| path.to_str().unwrap().to_string();
+        let bindings = HashMap::from([(text(&alias), 1), (text(&file), 2)]);
+        assert_eq!(bound_live(&bindings, &text(&alias_file), |_| true), Some(2));
+
+        let legacy = HashMap::from([(text(&file), 2), (text(&alias_file), 3)]);
+        assert_eq!(bound_live(&legacy, &text(&file), |_| true), Some(2));
+        assert_eq!(bound_live(&legacy, &text(&alias_file), |_| true), Some(3));
+        let url = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        assert_eq!(bound_live(&legacy, &url, |_| true), Some(2));
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        super::bind_path(&db, &text(&real), 1).unwrap();
+        super::bind_path(&db, &text(&file), 2).unwrap();
+        assert_eq!(super::binding_for_exact(&db, &text(&alias_file)), Some(2));
+        super::bind_path(&db, &text(&alias_file), 3).unwrap();
+        assert_eq!(super::binding_for_exact(&db, &text(&file)), Some(3));
+        assert_eq!(super::get_bindings(&db).len(), 2);
+        super::bind_path(&db, &text(&alias), 4).unwrap();
+        assert_eq!(super::binding_for_exact(&db, &text(&real)), Some(4));
+        assert_eq!(super::get_bindings(&db).len(), 2);
+        assert_eq!(
+            bound_live(&super::get_bindings(&db), &text(&file), |_| true),
+            Some(3)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_cycles_are_skipped_before_collecting_files() {
+        let dir = std::env::temp_dir().join(format!("kurisu-scan-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ep05.mkv"), []).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        let mut paths = Vec::new();
+        super::collect_videos(&dir, 0, &mut paths);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            paths,
+            vec![dir.join("ep05.mkv").to_str().unwrap().to_string()]
+        );
     }
 
     #[cfg(unix)]

@@ -1,6 +1,8 @@
 <script lang="ts">
   import Dialog from "$lib/Dialog.svelte";
   import { api } from "$lib/api";
+  import { auth } from "$lib/auth.svelte";
+  import { onDestroy, untrack } from "svelte";
   import { displayTitle, STATUS_LABEL, type ListEntry } from "$lib/types";
   import Img from "$lib/Img.svelte";
 
@@ -43,6 +45,12 @@
   let currentTitle = $state("");
   let pendingRelink = $state<number | null>(null);
   let bindingChecked = $state(false);
+  let bindingAttempt = $state(0);
+  let bindingError = $state("");
+  const epoch = untrack(() => auth.epoch);
+  let alive = true;
+  onDestroy(() => { alive = false; });
+  const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
 
   const STATUS_ORDER: Record<string, number> = {
     CURRENT: 0,
@@ -74,16 +82,20 @@
   const truncated = $derived(entries.length > candidates.length && candidates.length === MAX_ROWS);
 
   $effect(() => {
+    bindingAttempt;
     const target = bindTarget;
     currentBinding = null;
     currentTitle = "";
     pendingRelink = null;
     bindingChecked = false;
+    bindingError = "";
     let stale = false;
     api
       .getLibraryBinding(target)
       .then(async (id) => {
-        if (stale || id === null) return;
+        if (stale || !current()) return;
+        bindingChecked = true;
+        if (id === null) return;
         currentBinding = id;
         try {
           const media = await api.getMedia(id);
@@ -91,9 +103,8 @@
         } catch {
         }
       })
-      .catch(() => {})
-      .finally(() => {
-        if (!stale) bindingChecked = true;
+      .catch((e) => {
+        if (!stale && current()) bindingError = String(e);
       });
     return () => {
       stale = true;
@@ -101,7 +112,7 @@
   });
 
   async function pick(e: ListEntry) {
-    if (busy !== null || !bindingChecked || e.media_id === currentBinding) return;
+    if (!current() || busy !== null || !bindingChecked || e.media_id === currentBinding) return;
     if (currentBinding !== null && pendingRelink !== e.media_id) {
       pendingRelink = e.media_id;
       return;
@@ -110,6 +121,7 @@
     err = "";
     try {
       await api.bindLibraryPath(bindTarget, e.media_id);
+      if (!current()) return;
       onlinked();
       onclose();
     } catch (ex) {
@@ -145,11 +157,19 @@
     </div>
   {/if}
 
+  {#if bindingError}
+    <div class="text-sm text-red-400 mb-3">
+      Could not check the existing link: {bindingError}
+      <button type="button" onclick={() => bindingAttempt++} class="underline ml-2">Retry</button>
+    </div>
+  {/if}
+
   <div class="flex gap-4 mb-3 text-sm">
     {#if folderAllowed}
       <label class="flex items-center gap-1.5 cursor-pointer min-w-0">
         <input
           type="radio"
+          disabled={busy !== null}
           name="link-scope"
           checked={scope === "folder"}
           onchange={() => (scopeChoice = "folder")}
@@ -161,6 +181,7 @@
     <label class="flex items-center gap-1.5 cursor-pointer shrink-0">
       <input
         type="radio"
+        disabled={busy !== null}
         name="link-scope"
         checked={scope === "file"}
         onchange={() => (scopeChoice = "file")}

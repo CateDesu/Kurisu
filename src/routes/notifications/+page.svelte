@@ -71,7 +71,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="09" section="AniList updates" title="Notifications" description="The latest from your account">
+    <PageHeading section="AniList updates" title="Notifications" description="The latest from your account">
       <button
         onclick={load}
         disabled={loading}

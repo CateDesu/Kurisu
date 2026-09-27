@@ -1,12 +1,14 @@
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { openPath, openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
+  import { addToList } from "$lib/list.svelte";
   import {
     airingLabel,
     displayTitle,
@@ -87,7 +89,7 @@
   }
 
   async function add(status: string) {
-    if (!auth.isLoggedIn || adding) return;
+    if (!auth.isLoggedIn || adding || !detail) return;
     const reqId = ++addId;
     const epoch = auth.epoch;
     const mediaId = id;
@@ -95,7 +97,7 @@
     adding = status;
     error = "";
     try {
-      const e = await api.updateEntry(mediaId, status, 0, null, 0);
+      const e = await addToList(detail.media, status);
       if (!current()) return;
       entryLoadId++;
       entry = e;
@@ -167,13 +169,19 @@
 
   $effect(() => {
     const epoch = auth.epoch;
-    if (auth.isLoggedIn) {
-      library.loadFolders().then(() => {
-        if (epoch !== auth.epoch || !auth.isLoggedIn) return;
-        if (library.folders.length > 0 && !library.hasScan && !library.scanning)
-          library.scan().catch((e) => console.error("library scan failed", e));
-      });
-    }
+    const mediaId = id;
+    if (!auth.isLoggedIn) return;
+    let alive = true;
+    let stop: (() => void) | undefined;
+    listen("kurisu://episode-updated", () => {
+      if (alive && epoch === auth.epoch && mediaId === id) void reloadEntry();
+    }).then((unlisten) => alive ? (stop = unlisten) : unlisten()).catch(console.error);
+    return () => { alive = false; stop?.(); };
+  });
+
+  $effect(() => {
+    auth.epoch;
+    if (auth.isLoggedIn) void library.ensureScan().catch((e) => console.error("library scan failed", e));
   });
 </script>
 
@@ -183,12 +191,12 @@
   </div>
 {:else if loading && !detail}
   <div class="page-content">
-    <PageHeading index="↗" section="Your collection" title="Anime details" />
+    <PageHeading section="Your collection" title="Anime details" />
     <div class="text-ink-dim py-16 text-center">Loading…</div>
   </div>
 {:else if !media}
   <div class="page-content">
-    <PageHeading index="↗" section="Your collection" title="Anime details" />
+    <PageHeading section="Your collection" title="Anime details" />
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-3 mt-6">
       {error || "This anime could not be loaded."}
     </div>
@@ -212,7 +220,7 @@
         <div class="w-32 h-[11.5rem] bg-panel-2 rounded-lg border border-edge shrink-0"></div>
       {/if}
       <div class="flex-1 min-w-0 pb-1">
-        <PageHeading index="↗" section="Anime details" title={displayTitle(media)} compact>
+        <PageHeading section="Anime details" title={displayTitle(media)} compact>
           <button
             onclick={() => openUrl(`https://anilist.co/anime/${id}`)}
             title="Open on AniList"

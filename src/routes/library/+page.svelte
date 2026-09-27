@@ -85,44 +85,46 @@
     try {
       await refreshEntries();
       if (epoch !== auth.epoch || !auth.isLoggedIn) return;
-      await library.loadFolders();
-      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
-      if (library.folders.length > 0 && !library.hasScan) await library.scan();
+      await library.ensureScan();
     } catch (e) {
       if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     }
   }
 
   async function pickFolder() {
+    const epoch = auth.epoch;
     const chosen = await open({ directory: true, multiple: false });
-    if (typeof chosen !== "string") return;
+    if (typeof chosen !== "string" || epoch !== auth.epoch || !auth.isLoggedIn) return;
     error = "";
     try {
       await library.addFolder(chosen);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       await library.scan();
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     }
   }
 
   async function removeFolder(path: string) {
-    if (removing.has(path)) return;
+    if (removing.has(path) || !auth.isLoggedIn) return;
+    const epoch = auth.epoch;
     error = "";
     removing = new Set(removing).add(path);
     try {
       await library.removeFolder(path);
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     } finally {
-      const next = new Set(removing);
-      next.delete(path);
-      removing = next;
-      removingFolder = null;
+      if (epoch === auth.epoch) {
+        const next = new Set(removing);
+        next.delete(path);
+        removing = next;
+        removingFolder = null;
+      }
     }
   }
 
   async function rescan() {
-    // A queued scan returns immediately, before its new file count is available.
     if (library.scanning) return;
     const epoch = auth.epoch;
     error = "";
@@ -180,17 +182,21 @@
   }
 
   async function unlink(g: Group) {
-    if (unlinkBusy) return;
+    if (unlinkBusy || !auth.isLoggedIn) return;
+    const epoch = auth.epoch;
     error = "";
     unlinkBusy = true;
     try {
       await api.unbindLibraryMedia(g.mediaId);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       await library.scan();
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     } finally {
-      unlinkBusy = false;
-      unlinking = null;
+      if (epoch === auth.epoch) {
+        unlinkBusy = false;
+        unlinking = null;
+      }
     }
   }
 
@@ -200,6 +206,14 @@
     entryLoadId++;
     entries = [];
     entriesLoaded = false;
+    linking = null;
+    unlinking = null;
+    removingFolder = null;
+    removing = new Set();
+    unlinkBusy = false;
+    expanded = new Set();
+    error = "";
+    scannedAt = 0;
     if (!loggedIn) return;
     let alive = true;
     let unlisten: (() => void) | undefined;
@@ -233,7 +247,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="03" section="Your collection" title="Library" description="Anime on your device">
+    <PageHeading section="Your collection" title="Library" description="Anime on your device">
       {#if scannedAt}
         <span class="text-xs text-accent">
           Scan finished · {scannedCount} file{scannedCount === 1 ? "" : "s"}
@@ -512,6 +526,6 @@
     {entries}
     roots={library.folders}
     onclose={() => (linking = null)}
-    onlinked={() => library.scan()}
+    onlinked={() => library.scan().catch((e) => { error = String(e); })}
   />
 {/if}

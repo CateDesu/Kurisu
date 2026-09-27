@@ -294,7 +294,7 @@
   </div>
 {:else}
   <div class="page-content collection-page">
-    <PageHeading index="01" section="Your collection" title="My List" description={`${entries.length} titles on the shelf · ${watchedEpisodes.toLocaleString()} episodes tracked`} />
+    <PageHeading section="Your collection" title="My List" description={`${entries.length.toLocaleString()} Titles · ${watchedEpisodes.toLocaleString()} Episodes Tracked`} />
     <div class="collection-toolbar">
       <label class="list-search">
         <Icon name="search" size={15} />

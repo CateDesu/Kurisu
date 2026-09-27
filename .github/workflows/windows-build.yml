@@ -1,4 +1,4 @@
-# Main pushes publish v<base>.<commit_count>. Tags publish named releases.
+# Main pushes advance the rolling version. Tags publish named releases.
 # Keep releases as drafts until both platforms finish. Clean orphan drafts manually.
 name: Release build
 
@@ -41,6 +41,12 @@ jobs:
       - name: Frontend typecheck
         run: npm run check
 
+      - name: Frontend regression tests
+        run: npm test
+
+      - name: Release version tests
+        run: node --test .github/release-version.test.mjs
+
   meta:
     needs: test
     runs-on: ubuntu-latest
@@ -65,21 +71,25 @@ jobs:
             exit 1
           fi
 
-      # Commit counts survive workflow renames. Run numbers reset and can regress versions.
-      # Pass ref names through env to prevent shell injection.
+      # Published versions survive amended commits and squashed history.
       - id: v
         shell: bash
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "$REF_TYPE" = "tag" ]; then
             TAG="$REF_NAME"
             ROLL=false
           else
-            BASE=$(sed -n 's/.*"version": "\([0-9.]*\)".*/\1/p' src-tauri/tauri.conf.json | head -1)
-            if [ -z "$BASE" ]; then echo "::error::no version in tauri.conf.json"; exit 1; fi
-            TAG="v${BASE}.$(git rev-list --count HEAD)"
+            git fetch origin +refs/heads/main:refs/remotes/origin/main
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+              echo "::error::rolling releases must build the current main commit"
+              exit 1
+            fi
+            TAG=$(gh release list --limit 100 --json tagName,isDraft,isPrerelease \
+              | node .github/release-version.mjs "$(git rev-list --count HEAD)")
             ROLL=true
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -87,29 +97,17 @@ jobs:
           echo "rolling=$ROLL" >> "$GITHUB_OUTPUT"
           echo "Building tag=$TAG rolling=$ROLL"
 
-      - name: Refuse to regress the rolling channel
-        if: steps.v.outputs.rolling == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.v.outputs.tag }}
-        run: |
-          LATEST=$(gh release list -R "${{ github.repository }}" --limit 100 --json tagName,isDraft,isPrerelease \
-            --jq '.[] | select(.isDraft | not) | select(.isPrerelease | not) | .tagName' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
-          if [ -z "$LATEST" ]; then
-            echo "No published rolling release yet; $TAG is the first"
-          elif [ "$TAG" = "$LATEST" ] || [ "$(printf '%s\n%s\n' "${TAG#v}" "${LATEST#v}" | sort -V | tail -1)" != "${TAG#v}" ]; then
-            echo "::error::$TAG is not newer than the current latest rolling release $LATEST; refusing to regress the channel (re-run of an old run?)"
-            exit 1
-          else
-            echo "$TAG sorts above current latest $LATEST"
-          fi
-
       - name: Create the release (draft)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.v.outputs.tag }}
+          BUILD_SHA: ${{ github.sha }}
         run: |
+          TAG_COMMIT=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)
+          if [ -n "$TAG_COMMIT" ] && [ "$TAG_COMMIT" != "$BUILD_SHA" ]; then
+            echo "::error::release tag $TAG points to another commit"
+            exit 1
+          fi
           # Only overwrite draft assets. A failed rerun must not damage a published release.
           if STATE=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$STATE" != "true" ]; then
@@ -118,8 +116,9 @@ jobs:
               exit 1
             fi
             echo "Reusing existing draft $TAG"
+            gh release edit "$TAG" --target "$BUILD_SHA"
           else
-            gh release create "$TAG" --target "${{ github.sha }}" --title "$TAG" --generate-notes --draft
+            gh release create "$TAG" --target "$BUILD_SHA" --title "$TAG" --generate-notes --draft
           fi
 
   build-windows:

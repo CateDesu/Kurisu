@@ -72,6 +72,7 @@
     const id = ++loadId;
     const epoch = auth.epoch;
     loading = true;
+    items = [];
     error = "";
     try {
       const { start, end } = range(weekOffset);
@@ -182,9 +183,9 @@
   });
 
   $effect(() => {
-    if (!auth.isLoggedIn || loadedOnce) return;
-    if (items.length > 0) return;
-    untrack(() => load());
+    auth.epoch;
+    if (!auth.isLoggedIn) return;
+    untrack(() => { if (!loadedOnce) void load(); });
   });
 </script>
 
@@ -194,7 +195,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="06" section="On the air" title="Calendar" description={rangeLabel}>
+    <PageHeading section="On the air" title="Calendar" description={rangeLabel}>
       <div class="flex rounded-md border border-edge overflow-hidden text-sm">
         <button
           onclick={() => setWatchingOnly(true)}
@@ -257,7 +258,7 @@
       {/if}
     {:else if loading && items.length === 0}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
-    {:else if days.length === 0}
+    {:else if days.length === 0 && !error}
       <div class="text-ink-dim py-10 text-center">
         {watchingOnly ? "None of your Watching shows air this week." : "Nothing airing this week."}
       </div>

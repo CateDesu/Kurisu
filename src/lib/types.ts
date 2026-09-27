@@ -135,6 +135,7 @@ export interface User {
   name: string;
   avatar?: string | null;
   score_format?: string | null;
+  offline?: boolean;
 }
 
 export function displayTitle(m: Media | null | undefined): string {

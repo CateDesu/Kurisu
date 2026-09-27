@@ -2,8 +2,7 @@
   import type { Snippet } from "svelte";
   import Gearwork from "$lib/Gearwork.svelte";
 
-  let { index, section, title, description = "", compact = false, children }: {
-    index: string;
+  let { section, title, description = "", compact = false, children }: {
     section: string;
     title: string;
     description?: string;
@@ -15,7 +14,7 @@
 <header class="page-heading" class:compact>
   <div class="heading-main">
     <div class="heading-copy">
-      <div class="eyebrow"><span class="text-accent">{index}</span> / {section}</div>
+      <div class="eyebrow">{section}</div>
       <h1>{title}<span class="heading-dot" aria-hidden="true">.</span></h1>
       {#if description}<p>{description}</p>{/if}
     </div>

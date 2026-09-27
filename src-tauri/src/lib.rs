@@ -253,6 +253,7 @@ pub fn run() {
                 anilist: Mutex::new(anilist),
                 db: std::sync::Arc::new(db),
                 user: Mutex::new(None),
+                auth_intent: tokio::sync::watch::channel(0).0,
                 entry_lock: tokio::sync::Mutex::new(()),
                 matchers: Mutex::new(Arc::new(matchers)),
             });
@@ -359,35 +360,21 @@ pub fn run() {
                     if !updater::auto_check_eligible() {
                         return;
                     }
-                    let enabled = handle
-                        .state::<AppState>()
-                        .db
-                        .get_setting("auto_update")
-                        .ok()
-                        .flatten()
-                        .map(|v| v != "0")
-                        .unwrap_or(true);
-                    if !enabled {
-                        return;
-                    }
-                    if let Ok(rel) = updater::fetch_latest_release().await {
-                        if updater::platform_asset(&rel).is_some()
-                            && updater::is_newer(&rel.version, updater::current_version())
-                        {
-                            let payload = serde_json::json!({
-                                "available": true,
-                                "can_install": true,
-                                "version": rel.version,
-                                "tag": rel.tag,
-                                "html_url": rel.html_url,
-                                "body": rel.body,
-                                "current": updater::current_version(),
-                                "restart_pending": crate::updater::update_applied(),
-                            });
-                            updater::set_pending_update(payload.clone());
-                            let _ = handle.emit("kurisu://update-available", payload);
-                        }
-                    }
+                    let enabled = || {
+                        handle
+                            .state::<AppState>()
+                            .db
+                            .get_setting("auto_update")
+                            .ok()
+                            .flatten()
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
+                    };
+                    updater::watch_updates(enabled, |payload| {
+                        updater::set_pending_update(payload.clone());
+                        let _ = handle.emit("kurisu://update-available", payload);
+                    })
+                    .await;
                 });
             }
             Ok(())

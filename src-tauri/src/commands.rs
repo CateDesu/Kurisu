@@ -8,8 +8,8 @@ use crate::anilist::{self, AniList};
 use crate::db::Db;
 use crate::library;
 use crate::models::{
-    AiringItem, FeedFailure, LibraryScan, ListEntry, ListStatus, Media, MediaDetail, Notification,
-    TorrentFetch, TorrentItem, User, UserStats,
+    AiringItem, LibraryScan, ListEntry, ListStatus, Media, MediaDetail, Notification, TorrentFetch,
+    TorrentItem, User, UserStats,
 };
 use crate::recognize;
 use crate::rss;
@@ -19,6 +19,7 @@ const CLIENT_ID_KEY: &str = "anilist_client_id";
 const REDIRECT_URI_KEY: &str = "anilist_redirect_uri";
 const USERNAME_KEY: &str = "anilist_username";
 const USER_ID_KEY: &str = "anilist_user_id";
+const PROFILE_KEY: &str = "anilist_profile";
 
 const DEFAULT_CLIENT_ID: &str = "45266";
 /// Must exactly match the redirect URI registered with AniList.
@@ -29,6 +30,7 @@ pub struct AppState {
     pub anilist: Mutex<AniList>,
     pub db: std::sync::Arc<Db>,
     pub user: Mutex<Option<User>>,
+    pub auth_intent: tokio::sync::watch::Sender<u64>,
     /// Hold across entry reads and remote writes to serialize clicks, tracking and session changes.
     pub entry_lock: tokio::sync::Mutex<()>,
     /// Rebuild after list changes that affect recognition.
@@ -38,6 +40,28 @@ pub struct AppState {
 impl AppState {
     pub fn refresh_matchers(&self) {
         *self.matchers.lock() = Arc::new(recognize::build_matchers(&self.db));
+    }
+
+    fn begin_auth_intent(&self) -> u64 {
+        let mut intent = 0;
+        self.auth_intent.send_modify(|current| {
+            *current = current.wrapping_add(1);
+            intent = *current;
+        });
+        intent
+    }
+
+    fn check_auth_intent(&self, intent: u64) -> Result<(), String> {
+        if *self.auth_intent.borrow() == intent {
+            Ok(())
+        } else {
+            Err(AUTH_REPLACED.into())
+        }
+    }
+
+    async fn auth_intent_changed(&self, intent: u64) {
+        let mut changes = self.auth_intent.subscribe();
+        let _ = changes.wait_for(|current| *current != intent).await;
     }
 }
 
@@ -55,6 +79,14 @@ fn emit_auth_expired() {
 }
 
 const SESSION_EXPIRED: &str = "Your AniList session expired or was revoked. Please sign in again.";
+const AUTH_REPLACED: &str = "A newer sign-in or sign-out replaced this attempt.";
+
+fn check_write_session(state: &AppState, expected_token: &Option<String>) -> Result<(), String> {
+    if state.anilist.lock().token() != *expected_token {
+        return Err("Your AniList account changed. Try again.".into());
+    }
+    Ok(())
+}
 
 /// Caller must hold entry_lock to prevent writes restoring the cleared session.
 fn clear_rejected_session(state: &AppState) {
@@ -68,6 +100,9 @@ fn clear_rejected_session(state: &AppState) {
     }
     if let Err(e) = state.db.delete_setting(USER_ID_KEY) {
         log::warn!("failed to drop rejected user ID from db: {e}");
+    }
+    if let Err(e) = state.db.delete_setting(PROFILE_KEY) {
+        log::warn!("failed to drop rejected profile from db: {e}");
     }
     if let Err(e) = state.db.clear_entries() {
         log::warn!("failed to clear the cached list of the rejected session: {e}");
@@ -310,11 +345,28 @@ pub fn set_app_setting(
 
 #[tauri::command]
 pub async fn login_with_token(token: String, state: State<'_, AppState>) -> Result<User, String> {
+    let intent = state.begin_auth_intent();
+    login_with_token_inner(token, state.inner(), intent).await
+}
+
+async fn login_with_token_inner(
+    token: String,
+    state: &AppState,
+    intent: u64,
+) -> Result<User, String> {
+    state.check_auth_intent(intent)?;
     // Keep the current token until the replacement passes verification.
     let mut probe = state.anilist.lock().clone();
     probe.set_token(Some(token.clone()));
-    let user = probe.viewer().await.map_err(|e| e.to_string())?;
+    let user = tokio::select! {
+        result = probe.viewer() => result.map_err(|e| e.to_string())?,
+        _ = state.auth_intent_changed(intent) => return Err(AUTH_REPLACED.into()),
+    };
     let _write = state.entry_lock.lock().await;
+    let current_intent = state.auth_intent.borrow();
+    if *current_intent != intent {
+        return Err(AUTH_REPLACED.into());
+    }
     let account_changed = state
         .db
         .replace_account(&token, &user)
@@ -332,6 +384,7 @@ pub async fn login_oauth(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<User, String> {
+    let intent = state.begin_auth_intent();
     let client_id = state
         .db
         .get_setting(CLIENT_ID_KEY)
@@ -344,21 +397,67 @@ pub async fn login_oauth(
         .map_err(|e| e.to_string())?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
-    let (oauth_state, rx) = anilist::start_callback_server().map_err(|e| e.to_string())?;
+    let (oauth_state, _, rx) =
+        start_oauth_callback(state.inner(), intent, anilist::OAUTH_PORT).await?;
     let url = anilist::authorize_url(&client_id, &redirect_uri, &oauth_state);
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())?;
-    let token = tokio::time::timeout(std::time::Duration::from_secs(300), rx)
-        .await
-        .map_err(|_| "Timed out waiting for AniList to redirect.".to_string())?
-        .map_err(|_| "OAuth callback channel closed.".to_string())?;
-    login_with_token(token, state).await
+    let token = wait_for_oauth_token(state.inner(), intent, rx).await?;
+    login_with_token_inner(token, state.inner(), intent).await
+}
+
+async fn start_oauth_callback(
+    state: &AppState,
+    intent: u64,
+    port: u16,
+) -> Result<(String, u16, anilist::OAuthReceiver), String> {
+    for attempt in 0..20 {
+        state.check_auth_intent(intent)?;
+        match anilist::start_callback_server_on(port) {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if attempt < 19
+                    && error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse) =>
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                    _ = state.auth_intent_changed(intent) => return Err(AUTH_REPLACED.into()),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    unreachable!()
+}
+
+async fn wait_for_oauth_token(
+    state: &AppState,
+    intent: u64,
+    receiver: anilist::OAuthReceiver,
+) -> Result<String, String> {
+    state.check_auth_intent(intent)?;
+    let token = tokio::select! {
+        result = tokio::time::timeout(std::time::Duration::from_secs(300), receiver) => result
+            .map_err(|_| "Timed out waiting for AniList to redirect.".to_string())?
+            .map_err(|_| "OAuth callback channel closed.".to_string())?,
+        _ = state.auth_intent_changed(intent) => Err(AUTH_REPLACED.into()),
+    }?;
+    state.check_auth_intent(intent)?;
+    Ok(token)
 }
 
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    let intent = state.begin_auth_intent();
+    logout_inner(state.inner(), intent).await
+}
+
+async fn logout_inner(state: &AppState, intent: u64) -> Result<(), String> {
     let _write = state.entry_lock.lock().await;
+    state.check_auth_intent(intent)?;
     state.anilist.lock().set_token(None);
     *state.user.lock() = None;
     let db = state.db.clone();
@@ -382,6 +481,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
         .db
         .delete_setting(USER_ID_KEY)
         .map_err(|e| e.to_string())?;
+    state
+        .db
+        .delete_setting(PROFILE_KEY)
+        .map_err(|e| e.to_string())?;
     state.refresh_matchers();
     if let Some(e) = scrub_failure {
         return Err(format!(
@@ -393,6 +496,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, String> {
+    current_user_inner(state.inner()).await
+}
+
+async fn current_user_inner(state: &AppState) -> Result<Option<User>, String> {
     let al = {
         let _write = state.entry_lock.lock().await;
         let al = state.anilist.lock().clone();
@@ -415,19 +522,19 @@ pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, St
     }
     let u = match result {
         Ok(u) => {
-            // AniList list queries use the username, which can change after login.
-            if !u.name.is_empty()
-                && state.db.get_setting(USERNAME_KEY).ok().flatten().as_deref()
-                    != Some(u.name.as_str())
+            if state
+                .db
+                .replace_account(token_used.as_deref().unwrap(), &u)
+                .map_err(|e| e.to_string())?
             {
-                let _ = state.db.set_setting(USERNAME_KEY, &u.name);
+                state.refresh_matchers();
             }
             u
         }
         // Keep cached data accessible during an outage.
         Err(e) => {
             if anilist::is_auth_rejection(&e) {
-                clear_rejected_session(state.inner());
+                clear_rejected_session(state);
                 return Ok(None);
             }
             let name = state
@@ -436,11 +543,16 @@ pub async fn current_user(state: State<'_, AppState>) -> Result<Option<User>, St
                 .map_err(|e| e.to_string())?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| e.to_string())?;
-            // Do not cache the offline placeholder. Retry the real profile when connectivity returns.
-            return Ok(Some(User {
-                name,
-                ..Default::default()
-            }));
+            let mut user = state
+                .db
+                .cached_user()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(User {
+                    name,
+                    ..Default::default()
+                });
+            user.offline = true;
+            return Ok(Some(user));
         }
     };
     *state.user.lock() = Some(u.clone());
@@ -566,6 +678,10 @@ pub async fn get_airing_schedule(
 
 #[tauri::command]
 pub async fn sync_my_list(state: State<'_, AppState>) -> Result<Vec<ListEntry>, String> {
+    sync_my_list_inner(state.inner()).await
+}
+
+async fn sync_my_list_inner(state: &AppState) -> Result<Vec<ListEntry>, String> {
     let _write = state.entry_lock.lock().await;
     let al = state.anilist.lock().clone();
     if !al.has_token() {
@@ -579,7 +695,7 @@ pub async fn sync_my_list(state: State<'_, AppState>) -> Result<Vec<ListEntry>, 
     // Hold the lock through the fetch so an older snapshot cannot overwrite a newer save.
     let entries = match al.user_list(&user_name).await {
         Ok(v) => v,
-        Err(e) => return Err(write_err(state.inner(), &e)),
+        Err(e) => return Err(write_err(state, &e)),
     };
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.replace_list_snapshot(&entries))
@@ -633,7 +749,9 @@ pub async fn save_entry_inner(
     score: Option<f64>,
     repeat: Option<i64>,
 ) -> Result<ListEntry, String> {
+    let expected_token = state.anilist.lock().token();
     let _write = state.entry_lock.lock().await;
+    check_write_session(state, &expected_token)?;
     let st = status.as_deref().map(parse_status).transpose()?;
     if status.is_none() && progress.is_none() && score.is_none() && repeat.is_none() {
         return Err("nothing to update".to_string());
@@ -651,15 +769,13 @@ pub async fn save_entry_inner(
     if let (Some(t), Some(p)) = (total, progress.as_mut()) {
         *p = (*p).min(t);
     }
-    let mut filled_to_total = false;
     if st == Some(ListStatus::Completed) {
         if let Some(t) = total {
             progress = Some(progress.map_or(t, |p| p.max(t)));
-            filled_to_total = true;
         }
     }
     let al = state.anilist.lock().clone();
-    // A cache miss may already exist remotely. Preserve its progress, score and repeat count.
+    // A cache miss may already exist remotely.
     if before.is_none() {
         match al.entry_by_media_id(media_id).await {
             Ok(Some(remote)) => {
@@ -668,13 +784,9 @@ pub async fn save_entry_inner(
                     state,
                     media_id,
                     status,
-                    if remote_rewatch {
-                        Some(0)
-                    } else {
-                        filled_to_total.then_some(progress).flatten()
-                    },
-                    None,
-                    None,
+                    if remote_rewatch { Some(0) } else { progress },
+                    score,
+                    repeat,
                 )
                 .await;
             }
@@ -684,7 +796,7 @@ pub async fn save_entry_inner(
                 state.refresh_matchers();
                 return Err(MEDIA_GONE.to_string());
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(write_err(state, &e)),
         }
     }
     save_entry_unlocked(state, media_id, status, progress, score, repeat).await
@@ -749,7 +861,9 @@ pub async fn set_progress_inner(
     progress: i64,
     expected: Option<i64>,
 ) -> Result<ListEntry, String> {
+    let expected_token = state.anilist.lock().token();
     let _write = state.entry_lock.lock().await;
+    check_write_session(state, &expected_token)?;
     if let Some(exp) = expected {
         let cur = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
         // A missing row was deleted. Never recreate it from a buffered edit.
@@ -787,8 +901,12 @@ pub async fn watcher_set_progress(
     state: &AppState,
     media_id: i64,
     episode: i64,
+    expected_token: Option<&str>,
 ) -> Result<Option<ListEntry>, String> {
     let _write = state.entry_lock.lock().await;
+    if expected_token.is_none() || state.anilist.lock().token().as_deref() != expected_token {
+        return Ok(None);
+    }
     let Some(cur) = state.db.get_entry(media_id).map_err(|e| e.to_string())? else {
         return Ok(None);
     };
@@ -869,24 +987,31 @@ fn compute_set_progress(
 
 #[tauri::command]
 pub async fn delete_entry_cmd(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    delete_entry_inner(media_id, state.inner()).await
+}
+
+async fn delete_entry_inner(media_id: i64, state: &AppState) -> Result<(), String> {
+    let expected_token = state.anilist.lock().token();
     let _write = state.entry_lock.lock().await;
+    check_write_session(state, &expected_token)?;
     if let Some(entry) = state.db.get_entry(media_id).map_err(|e| e.to_string())? {
         if let Some(id) = entry.id {
             let al = state.anilist.lock().clone();
             let deleted = al
                 .delete_entry(id)
                 .await
-                .map_err(|e| write_err(state.inner(), &e))?;
+                .map_err(|e| write_err(state, &e))?;
             if !deleted {
                 // A deleted and re-added entry has a new ID. Find and delete the live copy too.
                 match al.entry_by_media_id(media_id).await {
                     Ok(Some(live)) => {
                         al.delete_entry(live.id)
                             .await
-                            .map_err(|e| write_err(state.inner(), &e))?;
+                            .map_err(|e| write_err(state, &e))?;
                     }
                     Ok(None) => {}
-                    Err(e) => return Err(write_err(state.inner(), &e)),
+                    Err(e) if anilist::media_not_found(&e) => {}
+                    Err(e) => return Err(write_err(state, &e)),
                 }
             }
         }
@@ -973,14 +1098,7 @@ pub async fn fetch_torrents(state: State<'_, AppState>) -> Result<TorrentFetch, 
         return Ok(TorrentFetch::default());
     }
     let fetched = rss::fetch_all(&feeds).await.map_err(|e| e.to_string())?;
-    let failures: Vec<FeedFailure> = fetched
-        .failures
-        .into_iter()
-        .map(|f| FeedFailure {
-            url: f.url,
-            error: f.error,
-        })
-        .collect();
+    let failures = fetched.failures;
     let raw = fetched.items;
     let seen = state.db.rss_seen_set().map_err(|e| e.to_string())?;
     let matchers = state.matchers.lock().clone();
@@ -1020,7 +1138,10 @@ pub async fn fetch_torrents(state: State<'_, AppState>) -> Result<TorrentFetch, 
                 && within_total
                 && matches!((episode, progress), (Some(ep), Some(p)) if ep > p);
             TorrentItem {
-                magnet: r.info_hash.as_deref().map(|h| rss::magnet_for(h, &r.title)),
+                magnet: r
+                    .info_hash
+                    .as_deref()
+                    .and_then(|h| rss::magnet_for(h, &r.title)),
                 title: r.title,
                 link: r.link,
                 guid: r.guid,
@@ -1072,7 +1193,10 @@ pub async fn search_torrents(
     Ok(raw
         .into_iter()
         .map(|r| TorrentItem {
-            magnet: r.info_hash.as_deref().map(|h| rss::magnet_for(h, &r.title)),
+            magnet: r
+                .info_hash
+                .as_deref()
+                .and_then(|h| rss::magnet_for(h, &r.title)),
             title: r.title,
             link: r.link,
             guid: r.guid,
@@ -1117,18 +1241,7 @@ static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[tauri::command]
 pub async fn check_update() -> Result<serde_json::Value, String> {
     let rel = crate::updater::fetch_latest_release().await?;
-    let available = crate::updater::is_newer(&rel.version, crate::updater::current_version());
-    let can_install = crate::updater::platform_asset(&rel).is_some();
-    Ok(serde_json::json!({
-        "available": available,
-        "can_install": can_install,
-        "restart_pending": crate::updater::update_applied(),
-        "version": rel.version,
-        "tag": rel.tag,
-        "html_url": rel.html_url,
-        "body": rel.body,
-        "current": crate::updater::current_version(),
-    }))
+    Ok(crate::updater::update_info(&rel))
 }
 
 #[tauri::command]
@@ -1252,6 +1365,7 @@ mod tests {
             anilist: Mutex::new(AniList::new()),
             db: Arc::new(Db::open(std::path::Path::new(":memory:")).expect("in-memory db")),
             user: Mutex::new(None),
+            auth_intent: tokio::sync::watch::channel(0).0,
             entry_lock: tokio::sync::Mutex::new(()),
             matchers: Mutex::new(Arc::new(vec![])),
         }
@@ -1370,5 +1484,505 @@ mod tests {
         assert!(at_last_episode(Some(12), 12));
         assert!(!at_last_episode(Some(12), 11));
         assert!(!at_last_episode(None, 3));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn state_with_api(api: AniList) -> AppState {
+        AppState {
+            anilist: Mutex::new(api),
+            db: Arc::new(Db::open(std::path::Path::new(":memory:")).unwrap()),
+            user: Mutex::new(None),
+            auth_intent: tokio::sync::watch::channel(0).0,
+            entry_lock: tokio::sync::Mutex::new(()),
+            matchers: Mutex::new(Arc::new(vec![])),
+        }
+    }
+
+    fn viewer_response(id: i64, name: &str) -> serde_json::Value {
+        json!({"data": {"Viewer": {"id": id, "name": name, "avatar": null,
+            "mediaListOptions": {"scoreFormat": "POINT_5"}}}})
+    }
+
+    #[tokio::test]
+    async fn the_latest_login_intent_owns_the_persisted_account() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, viewer_response(7, "Earlier")),
+            (200, viewer_response(8, "Latest")),
+        ])
+        .await;
+        let state = Arc::new(state_with_api(api));
+        let guard = state.entry_lock.lock().await;
+        let first_intent = state.begin_auth_intent();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            login_with_token_inner("earlier-token".into(), &first_state, first_intent).await
+        });
+        requests.recv().await.unwrap();
+        let latest_intent = state.begin_auth_intent();
+        let latest_state = state.clone();
+        let latest = tokio::spawn(async move {
+            login_with_token_inner("latest-token".into(), &latest_state, latest_intent).await
+        });
+        requests.recv().await.unwrap();
+        drop(guard);
+        assert_eq!(first.await.unwrap().unwrap_err(), AUTH_REPLACED);
+        assert_eq!(latest.await.unwrap().unwrap().id, 8);
+        assert_eq!(state.db.cached_user().unwrap().unwrap().id, 8);
+        assert_eq!(
+            state.anilist.lock().token().as_deref(),
+            Some("latest-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_cancels_a_login_waiting_to_commit() {
+        let (api, mut requests) =
+            anilist::mock_api(vec![(200, viewer_response(7, "Earlier"))]).await;
+        let state = Arc::new(state_with_api(api));
+        let guard = state.entry_lock.lock().await;
+        let first_intent = state.begin_auth_intent();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            login_with_token_inner("earlier-token".into(), &first_state, first_intent).await
+        });
+        requests.recv().await.unwrap();
+        let logout_intent = state.begin_auth_intent();
+        drop(guard);
+        logout_inner(&state, logout_intent).await.unwrap();
+        assert_eq!(first.await.unwrap().unwrap_err(), AUTH_REPLACED);
+        assert!(!state.anilist.lock().has_token());
+        assert!(state.db.cached_user().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_oauth_attempt_releases_a_superseded_preconnection() {
+        use tokio::io::AsyncWriteExt;
+        let state = Arc::new(state_with_api(AniList::new()));
+        let first_intent = state.begin_auth_intent();
+        let (_, port, receiver) = start_oauth_callback(&state, first_intent, 0).await.unwrap();
+        let mut preconnect = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        preconnect.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            wait_for_oauth_token(&first_state, first_intent, receiver).await
+        });
+        let latest_intent = state.begin_auth_intent();
+        let (_, replacement_port, receiver) = start_oauth_callback(&state, latest_intent, port)
+            .await
+            .unwrap();
+        assert_eq!(replacement_port, port);
+        assert_eq!(first.await.unwrap().unwrap_err(), AUTH_REPLACED);
+        drop(receiver);
+    }
+
+    #[tokio::test]
+    async fn a_stale_oauth_callback_cannot_start_token_verification() {
+        let (api, mut requests) = anilist::mock_api(vec![]).await;
+        let state = state_with_api(api);
+        let old_intent = state.begin_auth_intent();
+        state.begin_auth_intent();
+        assert_eq!(
+            login_with_token_inner("old-token".into(), &state, old_intent)
+                .await
+                .unwrap_err(),
+            AUTH_REPLACED
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn anilist_maintenance_keeps_the_offline_account_and_list() {
+        let outage = json!({"errors": [{
+            "message": "The AniList API has been temporarily disabled due to severe stability issues. Please check the official AniList Discord for more information.",
+            "status": 403
+        }], "data": null});
+        for operation in ["profile", "sync", "save"] {
+            let (api, _) = anilist::mock_api(vec![(403, outage.clone())]).await;
+            let state = state_with_api(api);
+            state
+                .db
+                .replace_account(
+                    "test-session",
+                    &User {
+                        id: 7,
+                        name: "Tester".into(),
+                        score_format: Some("POINT_5".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            state
+                .db
+                .upsert_entry(&ListEntry {
+                    id: Some(11),
+                    media_id: 1,
+                    progress: 4,
+                    ..Default::default()
+                })
+                .unwrap();
+            match operation {
+                "profile" => {
+                    let user = current_user_inner(&state).await.unwrap();
+                    assert!(user.is_some_and(|user| user.offline && user.id == 7));
+                }
+                "sync" => assert!(sync_my_list_inner(&state).await.is_err()),
+                _ => assert!(
+                    save_entry_inner(&state, 1, Some("PAUSED".into()), None, None, None)
+                        .await
+                        .is_err()
+                ),
+            }
+            assert!(state.anilist.lock().has_token());
+            assert_eq!(state.db.cached_user().unwrap().unwrap().id, 7);
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offline_start_keeps_the_validated_score_format() {
+        let (api, _) = anilist::mock_api(vec![
+            (503, json!({"errors": [{"message": "Service unavailable"}]})),
+            (200, json!({"data": {"Viewer": {"id": 7, "name": "Renamed", "avatar": null, "mediaListOptions": {"scoreFormat": "POINT_5"}}}})),
+        ]).await;
+        let state = state_with_api(api);
+        let user = User {
+            id: 7,
+            name: "Tester".into(),
+            score_format: Some("POINT_10_DECIMAL".into()),
+            ..Default::default()
+        };
+        state.db.replace_account("test-session", &user).unwrap();
+        let offline = current_user_inner(&state).await.unwrap().unwrap();
+        assert_eq!(offline.id, user.id);
+        assert_eq!(offline.score_format, user.score_format);
+        assert_eq!(serde_json::to_value(offline).unwrap()["offline"], true);
+        assert!(state.user.lock().is_none());
+        let online = current_user_inner(&state).await.unwrap().unwrap();
+        assert!(!online.offline);
+        assert_eq!(online.score_format.as_deref(), Some("POINT_5"));
+        assert_eq!(state.db.cached_user().unwrap().unwrap().name, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_offline_profile_is_marked_unavailable() {
+        let (api, _) = anilist::mock_api(vec![(
+            503,
+            json!({"errors": [{"message": "Service unavailable"}]}),
+        )])
+        .await;
+        let state = state_with_api(api);
+        state.db.set_setting(USERNAME_KEY, "Tester").unwrap();
+        let offline = current_user_inner(&state).await.unwrap().unwrap();
+        assert!(offline.offline);
+        assert!(offline.score_format.is_none());
+        assert_eq!(offline.name, "Tester");
+    }
+
+    #[tokio::test]
+    async fn explicit_edits_survive_a_local_cache_miss() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"data": {
+                "Media": {"mediaListEntry": {"id": 22, "status": "CURRENT", "progress": 3}},
+                "MediaList": {"id": 22, "status": "CURRENT", "progress": 3}
+            }})),
+            (200, json!({"data": {"SaveMediaListEntry": {"id": 22, "status": "CURRENT", "progress": 4, "score": 8.5, "repeat": 2}}})),
+        ]).await;
+        let state = state_with_api(api);
+        state
+            .db
+            .upsert_media(&Media {
+                id: 1,
+                episodes: Some(12),
+                ..Default::default()
+            })
+            .unwrap();
+        save_entry_inner(&state, 1, None, Some(4), Some(8.5), Some(2))
+            .await
+            .unwrap();
+        requests.recv().await.unwrap();
+        let write = requests.recv().await.unwrap();
+        assert_eq!(write["variables"]["progress"], 4);
+        assert_eq!(write["variables"]["score"], 8.5);
+        assert_eq!(write["variables"]["repeat"], 2);
+    }
+
+    #[tokio::test]
+    async fn adding_a_remote_entry_preserves_omitted_fields() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"data": {"Media": {"mediaListEntry": {"id": 22, "status": "CURRENT", "progress": 4, "score": 8.5, "repeat": 2}}}})),
+            (200, json!({"data": {"SaveMediaListEntry": {"id": 22, "status": "PAUSED", "progress": 4, "score": 8.5, "repeat": 2}}})),
+        ]).await;
+        let state = state_with_api(api);
+        let saved = save_entry_inner(&state, 1, Some("PAUSED".into()), None, None, None)
+            .await
+            .unwrap();
+        requests.recv().await.unwrap();
+        let write = requests.recv().await.unwrap();
+        assert_eq!(
+            write["variables"],
+            json!({"mediaId": 1, "status": "PAUSED"})
+        );
+        assert_eq!(
+            (saved.progress, saved.score, saved.repeat),
+            (4, Some(8.5), 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_always_sends_the_known_total() {
+        for requested in [None, Some(0), Some(5), Some(99)] {
+            let (api, mut requests) = anilist::mock_api(vec![
+                (200, json!({"data": {"Media": {"mediaListEntry": null}}})),
+                (200, json!({"data": {"SaveMediaListEntry": {"id": 22, "status": "COMPLETED", "progress": 12}}})),
+            ]).await;
+            let state = state_with_api(api);
+            state
+                .db
+                .upsert_media(&Media {
+                    id: 1,
+                    episodes: Some(12),
+                    ..Default::default()
+                })
+                .unwrap();
+            let saved =
+                save_entry_inner(&state, 1, Some("COMPLETED".into()), requested, None, None)
+                    .await
+                    .unwrap();
+            requests.recv().await.unwrap();
+            assert_eq!(requests.recv().await.unwrap()["variables"]["progress"], 12);
+            assert_eq!(saved.progress, 12);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_completed_entry_starts_rewatching_at_zero() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"data": {"Media": {"mediaListEntry": {"id": 22, "status": "COMPLETED", "progress": 12, "repeat": 2}}}})),
+            (200, json!({"data": {"SaveMediaListEntry": {"id": 22, "status": "REPEATING", "progress": 0, "repeat": 2}}})),
+        ]).await;
+        let state = state_with_api(api);
+        save_entry_inner(&state, 1, Some("REPEATING".into()), None, None, None)
+            .await
+            .unwrap();
+        requests.recv().await.unwrap();
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"],
+            json!({"mediaId": 1, "status": "REPEATING", "progress": 0})
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_sync_keeps_the_cached_list() {
+        for lists in [
+            json!(null),
+            json!([{"entries": null}]),
+            json!([{"entries": [null]}]),
+        ] {
+            let (api, _) = anilist::mock_api(vec![(
+                200,
+                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+            )])
+            .await;
+            let state = state_with_api(api);
+            state
+                .db
+                .replace_account(
+                    "test-session",
+                    &User {
+                        id: 7,
+                        name: "Tester".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            state
+                .db
+                .upsert_entry(&ListEntry {
+                    media_id: 1,
+                    progress: 4,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(sync_my_list_inner(&state).await.is_err());
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_recreated_entry_uses_the_authenticated_owner() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (404, json!({"errors": [{"message": "Not Found."}]})),
+            (
+                200,
+                json!({"data": {
+                    "Media": {"mediaListEntry": {"id": 22}},
+                    "MediaList": {"id": 999}
+                }}),
+            ),
+            (
+                200,
+                json!({"data": {"DeleteMediaListEntry": {"deleted": true}}}),
+            ),
+        ])
+        .await;
+        let state = state_with_api(api);
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(11),
+                media_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        delete_entry_inner(1, &state).await.unwrap();
+        assert_eq!(requests.recv().await.unwrap()["variables"]["id"], 11);
+        requests.recv().await.unwrap();
+        assert_eq!(requests.recv().await.unwrap()["variables"]["id"], 22);
+        assert!(state.db.get_entry(1).unwrap().is_none());
+        assert!(state.anilist.lock().has_token());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_gone_anime_removes_the_stale_list_row() {
+        let missing = json!({"errors": [{"message": "Not Found."}]});
+        let (api, _) = anilist::mock_api(vec![(404, missing.clone()), (404, missing)]).await;
+        let state = state_with_api(api);
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(11),
+                media_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        delete_entry_inner(1, &state).await.unwrap();
+        assert!(state.db.get_entry(1).unwrap().is_none());
+        assert!(state.anilist.lock().has_token());
+    }
+
+    #[tokio::test]
+    async fn an_old_playback_session_cannot_write_after_account_change() {
+        let (api, mut requests) = anilist::mock_api(vec![]).await;
+        let state = Arc::new(state_with_api(api));
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                media_id: 1,
+                progress: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        let guard = state.entry_lock.lock().await;
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move {
+            watcher_set_progress(&worker_state, 1, 5, Some("test-session")).await
+        });
+        tokio::task::yield_now().await;
+        state
+            .anilist
+            .lock()
+            .set_token(Some("another-session".into()));
+        drop(guard);
+        assert!(worker.await.unwrap().unwrap().is_none());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_ui_writes_cannot_follow_an_account_change() {
+        for operation in ["save", "progress", "delete"] {
+            let (api, mut requests) = anilist::mock_api(vec![]).await;
+            let state = Arc::new(state_with_api(api));
+            state
+                .db
+                .upsert_entry(&ListEntry {
+                    id: Some(22),
+                    media_id: 1,
+                    progress: 4,
+                    ..Default::default()
+                })
+                .unwrap();
+            let guard = state.entry_lock.lock().await;
+            let worker_state = state.clone();
+            let worker = tokio::spawn(async move {
+                match operation {
+                    "save" => {
+                        save_entry_inner(&worker_state, 1, Some("PAUSED".into()), None, None, None)
+                            .await
+                            .map(|_| ())
+                    }
+                    "progress" => set_progress_inner(&worker_state, 1, 5, Some(4))
+                        .await
+                        .map(|_| ()),
+                    _ => delete_entry_inner(1, &worker_state).await,
+                }
+            });
+            tokio::task::yield_now().await;
+            state
+                .db
+                .replace_account(
+                    "another-session",
+                    &User {
+                        id: 8,
+                        name: "Another".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            state
+                .anilist
+                .lock()
+                .set_token(Some("another-session".into()));
+            state
+                .db
+                .upsert_entry(&ListEntry {
+                    id: Some(33),
+                    media_id: 1,
+                    progress: 4,
+                    ..Default::default()
+                })
+                .unwrap();
+            drop(guard);
+            assert_eq!(
+                worker.await.unwrap().unwrap_err(),
+                "Your AniList account changed. Try again."
+            );
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().id, Some(33));
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_miss_auth_rejection_clears_the_cached_profile() {
+        let (api, _) = anilist::mock_api(vec![(
+            401,
+            json!({"errors": [{"message": "Invalid Token"}]}),
+        )])
+        .await;
+        let state = state_with_api(api);
+        state
+            .db
+            .replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    name: "Tester".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let error = save_entry_inner(&state, 1, Some("PLANNING".into()), None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, SESSION_EXPIRED);
+        assert!(!state.anilist.lock().has_token());
+        assert!(state.db.get_setting(PROFILE_KEY).unwrap().is_none());
     }
 }

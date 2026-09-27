@@ -32,6 +32,7 @@
   }));
   const epoch = untrack(() => auth.epoch);
   const current = () => epoch === auth.epoch && auth.isLoggedIn;
+  const scoreAvailable = $derived(!auth.offline || Boolean(scoreFormat));
   let status = $state(untrack(() => entry.status));
   let progress = $state(untrack(() => entry.progress));
   let score = $state<number | null>(untrack(() => entry.score ?? null));
@@ -43,7 +44,7 @@
   let removeTimer: ReturnType<typeof setTimeout> | null = null;
 
   let recs = $state<Media[]>([]);
-  let addingRec = $state<number | null>(null);
+  let addingRecs = $state(new Set<number>());
   let addedRecs = $state<number[]>([]);
   let recErr = $state("");
 
@@ -83,20 +84,22 @@
   loadRecs();
 
   async function addRec(m: Media) {
-    if (!current()) return;
-    addingRec = m.id;
+    if (!current() || addingRecs.has(m.id) || addedRecs.includes(m.id)) return;
+    addingRecs = new Set(addingRecs).add(m.id);
     recErr = "";
     try {
       if (!(await api.getEntry(m.id))) {
         if (!current()) return;
-        await api.updateEntry(m.id, "PLANNING", 0, null, 0);
+        await api.updateEntry(m.id, "PLANNING", null, null, null);
       }
       if (!current()) return;
       addedRecs.push(m.id);
     } catch (e) {
       if (current()) recErr = String(e);
     } finally {
-      addingRec = null;
+      const next = new Set(addingRecs);
+      next.delete(m.id);
+      addingRecs = next;
     }
   }
 
@@ -126,7 +129,7 @@
         status !== snap.status ? status : null,
         progressTouched ? (progress ?? snap.progress) : null,
         // Zero clears a score. Null leaves the remote score unchanged.
-        score !== snap.score ? (score ?? 0) : null,
+        scoreAvailable && score !== snap.score ? (score ?? 0) : null,
         repeatTouched ? (repeat ?? snap.repeat) : null
       );
       if (current()) onclose();
@@ -236,7 +239,11 @@
       </div>
       <div class="flex-1">
         <label class="block text-sm mb-1" for="ed-score">Score <span class="text-ink-dim">{scoreUnit}</span></label>
-        <ScoreInput id="ed-score" bind:value={score} format={scoreFormat} />
+        {#if scoreAvailable}
+          <ScoreInput id="ed-score" bind:value={score} format={scoreFormat} />
+        {:else}
+          <p class="text-xs text-ink-dim">Reconnect to AniList to load your score format.</p>
+        {/if}
       </div>
       <div class="w-24 shrink-0">
         <label class="block text-sm mb-1" for="ed-repeat" title="How many times you've finished this show">Rewatches</label>
@@ -298,7 +305,7 @@
           <button
             type="button"
             onclick={() => addRec(r)}
-            disabled={addingRec === r.id || addedRecs.includes(r.id)}
+            disabled={addingRecs.has(r.id) || addedRecs.includes(r.id)}
             title="{displayTitle(r)} — add to Plan to Watch"
             class="w-24 shrink-0 self-start text-left group disabled:opacity-60"
           >

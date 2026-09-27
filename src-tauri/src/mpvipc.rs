@@ -6,6 +6,7 @@ use std::time::Duration;
 
 /// Bound the whole exchange, including peers that trickle incomplete replies.
 const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+const MAX_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Skip timed out pipes for the session. Retrying would leak another blocked thread each tick.
 #[cfg(windows)]
@@ -41,6 +42,7 @@ pub(crate) struct MpvSnapshot {
 }
 
 pub(crate) fn probe(paths: &[String]) -> Option<MpvSnapshot> {
+    let mut paused = None;
     for p in paths {
         #[cfg(unix)]
         if std::fs::metadata(p).is_err() {
@@ -51,16 +53,26 @@ pub(crate) fn probe(paths: &[String]) -> Option<MpvSnapshot> {
             continue;
         }
         if let Some(s) = probe_one(p) {
-            return Some(s);
+            if s.playing {
+                return Some(s);
+            }
+            if paused.is_none() {
+                paused = Some(s);
+            }
         }
     }
-    None
+    paused
 }
 
 #[cfg(unix)]
 fn probe_one(path: &str) -> Option<MpvSnapshot> {
+    use socket2::{Domain, SockAddr, Socket, Type};
     use std::os::unix::net::UnixStream;
-    let stream = UnixStream::connect(path).ok()?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None).ok()?;
+    socket
+        .connect_timeout(&SockAddr::unix(path).ok()?, IO_TIMEOUT)
+        .ok()?;
+    let stream: UnixStream = socket.into();
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let writer = stream.try_clone().ok()?;
@@ -115,18 +127,14 @@ fn query<R: BufRead, W: Write>(
     writer.flush().ok()?;
 
     let mut vals: Vec<Option<serde_json::Value>> = vec![None; PROPS.len() + 1];
+    let mut received = [false; PROPS.len() + 1];
     let mut answered = 0;
     loop {
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return None,
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let line = read_reply(&mut reader, deadline)?;
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         if v.get("event").is_some() {
@@ -135,14 +143,38 @@ fn query<R: BufRead, W: Write>(
         let Some(rid) = v.get("request_id").and_then(|x| x.as_u64()) else {
             continue;
         };
-        if rid == 0 || rid as usize >= vals.len() || vals[rid as usize].is_some() {
+        if rid == 0 || rid >= vals.len() as u64 || received[rid as usize] {
             continue;
         }
+        received[rid as usize] = true;
         let ok = v.get("error").and_then(|e| e.as_str()) == Some("success");
         vals[rid as usize] = ok.then(|| v.get("data").cloned()).flatten();
         answered += 1;
         if answered == PROPS.len() {
             return build_snapshot(&vals);
+        }
+    }
+}
+
+fn read_reply(reader: &mut impl BufRead, deadline: std::time::Instant) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let bytes = reader.fill_buf().ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let newline = bytes.iter().position(|b| *b == b'\n');
+        let count = newline.map_or(bytes.len(), |n| n + 1);
+        if line.len() + count > MAX_REPLY_BYTES {
+            return None;
+        }
+        line.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return Some(line);
         }
     }
 }
@@ -246,6 +278,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incomplete_lines_still_hit_the_deadline() {
+        struct PartialLine {
+            chunks: usize,
+        }
+        impl std::io::Read for PartialLine {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let chunk = self.fill_buf()?;
+                if chunk.is_empty() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = chunk[0];
+                self.consume(1);
+                Ok(1)
+            }
+        }
+        impl BufRead for PartialLine {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(if self.chunks > 0 { b" " } else { b"" })
+            }
+            fn consume(&mut self, count: usize) {
+                self.chunks -= count;
+            }
+        }
+        let started = std::time::Instant::now();
+        let snap = query(
+            PartialLine { chunks: 100 },
+            Vec::new(),
+            started + Duration::from_millis(100),
+        );
+        assert!(snap.is_none());
+        assert!(started.elapsed() < Duration::from_millis(800));
+    }
+
+    #[test]
+    fn oversized_reply_lines_are_rejected() {
+        let line = " ".repeat(MAX_REPLY_BYTES + 1) + "\n";
+        assert!(query_lines(&line).0.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_full_socket_backlog_cannot_block_the_probe() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let path = std::env::temp_dir().join(format!("kurisu-mpv-backlog-{}", std::process::id()));
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let clients = [
+            std::os::unix::net::UnixStream::connect(&path).unwrap(),
+            std::os::unix::net::UnixStream::connect(&path).unwrap(),
+        ];
+        let (release, wait) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+            drop(listener);
+        });
+        let started = std::time::Instant::now();
+        assert!(probe_one(path.to_str().unwrap()).is_none());
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        closer.join().unwrap();
+        drop(clients);
+        std::fs::remove_file(path).unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
     fn ok(id: usize, data: &str) -> String {
         format!("{{\"data\":{data},\"request_id\":{id},\"error\":\"success\"}}\n")
     }
@@ -335,6 +435,62 @@ mod tests {
         lines.push_str(&ok(IDX_POSITION, "10"));
         let (snap, _) = query_lines(&lines);
         assert!(snap.is_some());
+    }
+
+    #[test]
+    fn duplicate_failed_properties_do_not_finish_the_query_early() {
+        let failed = "{\"request_id\":3,\"error\":\"property unavailable\"}\n";
+        let lines = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, "\"/f.mkv\""),
+            failed.into(),
+            failed.into(),
+            ok(IDX_FILENAME, "\"f.mkv\""),
+            ok(IDX_DURATION, "60"),
+            ok(IDX_POSITION, "10"),
+        ]
+        .concat();
+        let snap = query_lines(&lines).0.unwrap();
+        assert_eq!(snap.position_us, 10_000_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_playing_socket_outranks_an_earlier_paused_socket() {
+        use std::os::unix::net::UnixListener;
+        let mut paths = Vec::new();
+        let mut servers = Vec::new();
+        for paused in [true, false] {
+            let path = std::env::temp_dir()
+                .join(format!("kurisu-mpv-choice-{}-{paused}", std::process::id()));
+            let listener = UnixListener::bind(&path).unwrap();
+            paths.push(path.to_str().unwrap().to_string());
+            servers.push(std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                for _ in PROPS {
+                    reader.read_line(&mut String::new()).unwrap();
+                }
+                let lines = [
+                    ok(IDX_PAUSE, if paused { "true" } else { "false" }),
+                    ok(IDX_PATH, "\"/f.mkv\""),
+                    ok(IDX_TITLE, "\"f\""),
+                    ok(IDX_FILENAME, "\"f.mkv\""),
+                    ok(IDX_DURATION, "60"),
+                    ok(IDX_POSITION, "10"),
+                ]
+                .concat();
+                (&stream).write_all(lines.as_bytes()).unwrap();
+            }));
+        }
+        let snap = probe(&paths).unwrap();
+        for server in servers {
+            server.join().unwrap();
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(snap.playing);
     }
 
     /// Requires MPV. Run with cargo test --lib mpv -- --ignored --nocapture

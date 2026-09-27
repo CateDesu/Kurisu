@@ -7,25 +7,59 @@ let folders = $state<string[]>([]);
 let foldersFailed = $state(false);
 let scanning = $state(false);
 let lastScanAt = $state(0);
-let pendingScan = false;
+let pendingScan: { promise: Promise<void>; resolve: () => void; reject: (reason: unknown) => void } | null = null;
 // Discard scan results from an account that has since logged out.
 let scanGen = 0;
+let folderRequest = 0;
+let folderGeneration = 0;
+let folderQueue = Promise.resolve();
 
 async function loadFolders() {
+  const request = ++folderRequest;
   try {
-    folders = await api.getLibraryFolders();
+    const result = await api.getLibraryFolders();
+    if (request !== folderRequest) return;
+    folders = result;
     foldersFailed = false;
   } catch (e) {
+    if (request !== folderRequest) return;
     folders = [];
     foldersFailed = true;
     console.error("could not read library folders", e);
   }
 }
 
+async function changeFolders(change: () => Promise<string[]>) {
+  const generation = folderGeneration;
+  const task = folderQueue.then(async () => {
+    if (generation !== folderGeneration) return false;
+    folderRequest++;
+    const result = await change();
+    if (generation !== folderGeneration) return false;
+    folderRequest++;
+    folders = result;
+    foldersFailed = false;
+    return true;
+  });
+  folderQueue = task.then(() => {}, () => {});
+  return task;
+}
+
+async function ensureScan() {
+  const gen = scanGen;
+  await loadFolders();
+  if (gen === scanGen && folders.length > 0 && lastScanAt === 0) await scan();
+}
+
 async function scan() {
   if (scanning) {
-    pendingScan = true;
-    return;
+    if (!pendingScan) {
+      let resolve!: () => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+      pendingScan = { promise, resolve, reject };
+    }
+    return pendingScan.promise;
   }
   scanning = true;
   const gen = scanGen;
@@ -38,8 +72,9 @@ async function scan() {
   } finally {
     scanning = false;
     if (pendingScan) {
-      pendingScan = false;
-      await scan();
+      const queued = pendingScan;
+      pendingScan = null;
+      void scan().then(queued.resolve, queued.reject);
     }
   }
 }
@@ -70,21 +105,30 @@ export const library = {
     return files.find((f) => f.media_id === mediaId && f.episode === episode);
   },
   loadFolders,
+  ensureScan,
   scan,
   reset() {
     scanGen++;
+    folderRequest++;
+    folderGeneration++;
     files = [];
     folders = [];
     unreadable = [];
     foldersFailed = false;
     lastScanAt = 0;
-    pendingScan = false;
+    pendingScan?.resolve();
+    pendingScan = null;
   },
   async addFolder(path: string) {
-    folders = await api.addLibraryFolder(path);
+    await changeFolders(() => api.addLibraryFolder(path));
   },
   async removeFolder(path: string) {
-    folders = await api.removeLibraryFolder(path);
-    if (lastScanAt > 0) await scan();
+    if (!(await changeFolders(() => api.removeLibraryFolder(path)))) return;
+    const refresh = lastScanAt > 0 || scanning;
+    scanGen++;
+    files = [];
+    unreadable = [];
+    lastScanAt = 0;
+    if (refresh || folders.length > 0) await scan();
   },
 };

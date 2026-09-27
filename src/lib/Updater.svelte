@@ -1,23 +1,23 @@
 <script lang="ts">
   import Dialog from "$lib/Dialog.svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
-  import { installInFlight, runInstallUpdate } from "$lib/update.svelte";
+  import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "$lib/update.svelte";
   import type { UpdateInfo } from "$lib/types";
 
   let update = $state<UpdateInfo | null>(null);
   let err = $state("");
-  let installed = $state(false);
   let failedMsg = $state("");
   // The event and startup pull can deliver the same release twice.
   let dismissedTag = "";
   let failedSeen = false;
 
   function showUpdate(info: UpdateInfo) {
+    if (info) notePendingRestart(info.restart_pending);
     if (!info?.available || info.tag === dismissedTag) return;
     update = info;
     err = "";
-    installed = false;
   }
 
   function showFailed(message: string) {
@@ -30,25 +30,26 @@
     let alive = true;
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
-    listen<UpdateInfo>("kurisu://update-available", (e) => showUpdate(e.payload)).then(
-      (u) => (alive ? (un1 = u) : u())
-    );
-    listen<{ message: string }>("kurisu://update-failed", (e) => showFailed(e.payload.message)).then(
-      (u) => (alive ? (un2 = u) : u())
-    );
-    // Pull stashed results in case startup events fired before the listeners existed.
-    api
-      .takePendingUpdate()
-      .then((info) => {
-        if (alive && info) showUpdate(info);
-      })
-      .catch(() => {});
-    api
-      .takeUpdateFailed()
-      .then((msg) => {
-        if (alive && msg) showFailed(msg);
-      })
-      .catch(() => {});
+    const listeners = [
+      listen<UpdateInfo>("kurisu://update-available", (e) => {
+        if (alive) showUpdate(e.payload);
+      }).then((u) => (alive ? (un1 = u) : u())),
+      listen<{ message: string }>("kurisu://update-failed", (e) => {
+        if (alive) showFailed(e.payload.message);
+      }).then((u) => (alive ? (un2 = u) : u())),
+    ];
+    // Listen before pulling results so a new event cannot fall between them.
+    void Promise.allSettled(listeners).then(async () => {
+      if (!alive) return;
+      await Promise.allSettled([
+        api.takePendingUpdate().then((info) => {
+          if (alive && info) showUpdate(info);
+        }),
+        api.takeUpdateFailed().then((msg) => {
+          if (alive && msg) showFailed(msg);
+        }),
+      ]);
+    });
     return () => {
       alive = false;
       un1?.();
@@ -57,11 +58,19 @@
   });
 
   async function install() {
-    if (!update || installInFlight()) return;
+    if (!update?.can_install || updateNeedsRestart() || installInFlight()) return;
     err = "";
     try {
-      const result = await runInstallUpdate();
-      if (result === "installed") installed = true;
+      await runInstallUpdate();
+    } catch (e) {
+      err = String(e);
+    }
+  }
+
+  async function viewRelease() {
+    if (!update) return;
+    try {
+      await openUrl(update.html_url);
     } catch (e) {
       err = String(e);
     }
@@ -77,9 +86,9 @@
 {#if update}
   <Dialog onclose={later} busy={installInFlight()}>
     <h3 class="font-semibold mb-1">Update available</h3>
-    {#if installed}
+    {#if updateNeedsRestart()}
       <p class="text-sm text-ink-dim mb-3">
-        Kurisu <b class="text-ink">{update.version}</b> is installed — restart Kurisu to finish.
+        An update is installed — restart Kurisu to finish.
       </p>
       <div class="flex justify-end">
         <button
@@ -107,16 +116,26 @@
         >
           Later
         </button>
-        <button
-          onclick={install}
-          disabled={installInFlight()}
-          class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
-        >
-          {installInFlight() ? "Downloading…" : "Download & install"}
-        </button>
+        {#if update.can_install}
+          <button
+            onclick={install}
+            disabled={installInFlight()}
+            class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
+          >
+            {installInFlight() ? "Downloading…" : "Download & install"}
+          </button>
+        {:else}
+          <button onclick={viewRelease} class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm">
+            View release
+          </button>
+        {/if}
       </div>
       <p class="text-xs text-ink-dim mt-3">
-        Downloads the update, then closes Kurisu so it can finish.
+        {#if update.can_install}
+          Downloads the update. On Windows, follow the installer. On Linux, restart Kurisu after installation.
+        {:else}
+          This release has no installer for your platform. Build the new version from source.
+        {/if}
       </p>
     {/if}
   </Dialog>

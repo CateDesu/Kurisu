@@ -24,8 +24,10 @@ static UPDATE_APPLIED: AtomicBool = AtomicBool::new(false);
 
 static UPDATE_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// Retain the startup result for a webview that misses the event.
+/// Retain the latest result for a webview that misses the event.
 static PENDING_UPDATE: Mutex<Option<Value>> = Mutex::new(None);
+
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[cfg(any(windows, target_os = "linux"))]
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -138,12 +140,9 @@ pub fn is_ci_build() -> bool {
     matches!(option_env!("KURISU_BUILD_VERSION"), Some(v) if !v.is_empty())
 }
 
-/// Unstamped Windows builds cannot update their own location through NSIS. Debug builds stay quiet.
+/// Release builds check on every platform. Debug builds stay quiet unless stamped.
 pub fn auto_check_eligible() -> bool {
-    if is_ci_build() {
-        return true;
-    }
-    !cfg!(debug_assertions) && !cfg!(windows)
+    is_ci_build() || !cfg!(debug_assertions)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -153,6 +152,53 @@ pub struct Release {
     pub html_url: String,
     pub body: String,
     pub assets: HashMap<String, String>,
+}
+
+pub fn update_info(rel: &Release) -> Value {
+    serde_json::json!({
+        "available": is_newer(&rel.version, current_version()),
+        "can_install": platform_asset(rel).is_some(),
+        "restart_pending": update_applied(),
+        "version": rel.version,
+        "tag": rel.tag,
+        "html_url": rel.html_url,
+        "body": rel.body,
+        "current": current_version(),
+    })
+}
+
+pub async fn watch_updates(enabled: impl Fn() -> bool, notify: impl FnMut(Value)) {
+    poll_releases(enabled, fetch_latest_release, notify).await;
+}
+
+async fn poll_releases<F, Fut>(enabled: impl Fn() -> bool, fetch: F, mut notify: impl FnMut(Value))
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Release, String>>,
+{
+    let mut interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut notified_tag = String::new();
+    loop {
+        interval.tick().await;
+        if !enabled() || update_applied() {
+            continue;
+        }
+        let rel = match fetch().await {
+            Ok(rel) => rel,
+            Err(error) => {
+                log::debug!("update check failed: {error}");
+                continue;
+            }
+        };
+        if !enabled() || update_applied() || rel.tag == notified_tag {
+            continue;
+        }
+        if is_newer(&rel.version, current_version()) {
+            notified_tag.clone_from(&rel.tag);
+            notify(update_info(&rel));
+        }
+    }
 }
 
 /// Choose by version. Publication order can put an older rolling build after a milestone.
@@ -603,7 +649,117 @@ mod tests {
             assert!(auto_check_eligible());
         } else if cfg!(debug_assertions) {
             assert!(!auto_check_eligible());
+        } else {
+            assert!(auto_check_eligible());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_checks_retry_offline_starts_and_respect_the_setting() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let revision = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(poll_releases(
+            {
+                let enabled = enabled.clone();
+                move || enabled.load(Ordering::SeqCst)
+            },
+            {
+                let attempts = attempts.clone();
+                let revision = revision.clone();
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let version = format!("9999.0.{}", revision.load(Ordering::SeqCst));
+                    async move {
+                        if attempt == 0 {
+                            return Err("offline".into());
+                        }
+                        Ok(Release {
+                            tag: format!("v{version}"),
+                            version,
+                            body: "Release notes".into(),
+                            ..Release::default()
+                        })
+                    }
+                }
+            },
+            move |payload| tx.send(payload).unwrap(),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        let notice = rx.try_recv().expect("retry should announce the release");
+        assert_eq!(notice["version"], "9999.0.0");
+        assert_eq!(notice["body"], "Release notes");
+        assert_eq!(notice["available"], true);
+        assert_eq!(notice["can_install"], false);
+
+        tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(
+            rx.try_recv().is_err(),
+            "do not announce the same release twice"
+        );
+
+        enabled.store(false, Ordering::SeqCst);
+        tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(rx.try_recv().is_err());
+
+        enabled.store(true, Ordering::SeqCst);
+        revision.store(1, Ordering::SeqCst);
+        tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(rx.try_recv().unwrap()["version"], "9999.0.1");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_checks_while_fetching_suppresses_the_notice() {
+        use std::sync::Arc;
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let response = Arc::new(tokio::sync::Notify::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(poll_releases(
+            {
+                let enabled = enabled.clone();
+                move || enabled.load(Ordering::SeqCst)
+            },
+            {
+                let response = response.clone();
+                move || {
+                    let response = response.clone();
+                    async move {
+                        response.notified().await;
+                        Ok(Release {
+                            tag: "v9999.0.0".into(),
+                            version: "9999.0.0".into(),
+                            ..Release::default()
+                        })
+                    }
+                }
+            },
+            move |payload| tx.send(payload).unwrap(),
+        ));
+        tokio::task::yield_now().await;
+        enabled.store(false, Ordering::SeqCst);
+        response.notify_one();
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[test]

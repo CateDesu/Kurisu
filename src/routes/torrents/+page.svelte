@@ -1,6 +1,7 @@
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
-  import { goto } from "$app/navigation";
+  import { afterNavigate, goto } from "$app/navigation";
+  import { onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
@@ -177,19 +178,22 @@
   let addingFeed = $state(false);
   async function addFeed() {
     const url = feedInput.trim();
-    if (!url || addingFeed) return;
+    if (!url || addingFeed || !auth.isLoggedIn) return;
+    const epoch = auth.epoch;
     addingFeed = true;
     feedsLoadId++;
     error = "";
     try {
-      feeds = await api.addRssFeed(url);
+      const saved = await api.addRssFeed(url);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+      feeds = saved;
       feedsLoaded = true;
       feedInput = "";
       await load();
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     } finally {
-      addingFeed = false;
+      if (epoch === auth.epoch) addingFeed = false;
     }
   }
 
@@ -198,19 +202,24 @@
 
   async function removeFeed() {
     const url = removingFeed;
-    if (!url || removing) return;
+    if (!url || removing || !auth.isLoggedIn) return;
+    const epoch = auth.epoch;
     removing = true;
     feedsLoadId++;
     error = "";
     try {
-      feeds = await api.removeRssFeed(url);
+      const saved = await api.removeRssFeed(url);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+      feeds = saved;
       feedsLoaded = true;
       await load();
     } catch (e) {
-      error = String(e);
+      if (epoch === auth.epoch && auth.isLoggedIn) error = String(e);
     } finally {
-      removing = false;
-      removingFeed = null;
+      if (epoch === auth.epoch) {
+        removing = false;
+        removingFeed = null;
+      }
     }
   }
 
@@ -235,9 +244,12 @@
   }
 
   async function openItem(t: TorrentItem, url: string) {
+    const epoch = auth.epoch;
     if (!(await openLink(url))) return;
+    if (epoch !== auth.epoch || !auth.isLoggedIn) return;
     try {
       await api.markTorrentsSeen([t.guid]);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       markLocal(new Set([t.guid]));
     } catch {
     }
@@ -251,9 +263,14 @@
   const filteredResults = $derived(results.filter(matchesFilters));
 
   let searchId = 0;
+  let alive = true;
+  let resumeQuery: string | null = null;
   async function search(query = searchQ.trim()) {
-    if (!query) return;
+    if (!query || !auth.isLoggedIn) return;
     const id = ++searchId;
+    const epoch = auth.epoch;
+    const current = () => alive && id === searchId && epoch === auth.epoch && auth.isLoggedIn;
+    resumeQuery = null;
     submittedQuery = query;
     searching = true;
     searched = false;
@@ -261,13 +278,13 @@
     error = "";
     try {
       const found = await api.searchTorrents(query, categoryFilter, releaseFilter);
-      if (id !== searchId) return;
+      if (!current()) return;
       results = found;
       searched = true;
     } catch (e) {
-      if (id === searchId) error = String(e);
+      if (current()) error = String(e);
     } finally {
-      if (id === searchId) searching = false;
+      if (current()) searching = false;
     }
   }
 
@@ -278,17 +295,30 @@
     searched: boolean;
     categoryFilter: string;
     releaseFilter: string;
+    pendingQuery: string | null;
+    epoch: number;
   }> = {
-    capture: () => ({ searchQ, submittedQuery, results, searched, categoryFilter, releaseFilter }),
+    capture: () => ({ searchQ, submittedQuery, results, searched, categoryFilter, releaseFilter, pendingQuery: searching ? submittedQuery : resumeQuery, epoch: auth.epoch }),
     restore: (v) => {
+      searchId++;
+      searching = false;
       searchQ = v.searchQ;
       submittedQuery = v.submittedQuery;
-      results = v.results;
-      searched = v.searched;
+      resumeQuery = v.epoch === auth.epoch ? v.pendingQuery : (v.submittedQuery || null);
+      results = resumeQuery ? [] : v.results;
+      searched = !resumeQuery && v.searched;
       categoryFilter = v.categoryFilter;
       releaseFilter = v.releaseFilter;
     },
   };
+
+  afterNavigate(() => {
+    queueMicrotask(() => {
+      if (alive && auth.isLoggedIn && resumeQuery) void search(resumeQuery);
+    });
+  });
+
+  onDestroy(() => { alive = false; searchId++; });
 
   interface Group {
     mediaId: number;
@@ -359,6 +389,7 @@
     loadId++;
     feedsLoadId++;
     entriesLoadId++;
+    searchId++;
     items = [];
     entries = [];
     entriesLoaded = false;
@@ -368,6 +399,17 @@
     feedsLoaded = false;
     loaded = false;
     loading = false;
+    results = [];
+    searched = false;
+    searching = false;
+    submittedQuery = "";
+    resumeQuery = null;
+    error = "";
+    feedFailures = [];
+    feedsError = "";
+    removingFeed = null;
+    removing = false;
+    addingFeed = false;
     if (!loggedIn) return;
     let alive = true;
     let unlisten: (() => void) | undefined;
@@ -400,7 +442,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="04" section="Releases" title="Torrents" description="New releases and your saved feeds" />
+    <PageHeading section="Releases" title="Torrents" description="New releases and your saved feeds" />
     <div class="sticky top-0 z-10 mb-4 bg-base pt-4 pb-4 border-b border-edge">
       <div class="flex items-center gap-2 mb-4 flex-wrap">
         {#if newCount > 0}

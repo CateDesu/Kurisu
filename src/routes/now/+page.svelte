@@ -81,15 +81,11 @@
   });
 
   $effect(() => {
-    const epoch = auth.epoch;
+    auth.epoch;
     if (!auth.isLoggedIn) return;
     untrack(() => {
       void loadCurrent();
-      library.loadFolders().then(() => {
-        if (epoch !== auth.epoch || !auth.isLoggedIn) return;
-        if (library.folders.length > 0 && !library.hasScan && !library.scanning)
-          library.scan().catch((e) => console.error("library scan failed", e));
-      });
+      void library.ensureScan().catch((e) => console.error("library scan failed", e));
     });
   });
 
@@ -194,7 +190,7 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading index="02" section="Now playing" title="Currently Watching" description="Playback and your current shows" />
+    <PageHeading section="Now playing" title="Currently Watching" description="Playback and your current shows" />
 
     {#if np && np.active}
       {@const detectedEp = np.episode}

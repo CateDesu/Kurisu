@@ -28,6 +28,12 @@
     return () => window.removeEventListener("online", onOnline);
   });
 
+  $effect(() => {
+    if (!auth.offline) return;
+    const retry = setInterval(() => void auth.refresh(), 30_000);
+    return () => clearInterval(retry);
+  });
+
   let logoutErr = $state("");
   let confirmingLogout = $state(false);
   let loggingOut = $state(false);
@@ -126,11 +132,10 @@
                 <Icon name={item.icon} />
               </span>
               <span class="truncate">{item.label}</span>
-              <span class="nav-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
             </a>
           {/each}
         </nav>
-        <div class="sidebar-drawing" aria-hidden="true"><Gearwork /><span class="eyebrow">Anime / Personal archive</span></div>
+        <div class="sidebar-drawing" aria-hidden="true"><Gearwork /></div>
         {#if auth.user}
           <div class="profile-block px-4 py-4 border-t border-edge flex items-center gap-3">
             {#if auth.user.avatar}
@@ -201,9 +206,9 @@
 <style>
   .sidebar { width: 244px; background: #040303; }
   .brand-block { position: relative; padding: 25px 22px 23px; border-bottom: 1px solid var(--color-edge); }
-  .brand-caption { display: flex; justify-content: space-between; letter-spacing: .14em; font-size: 12px; }
+  .brand-caption { display: flex; justify-content: space-between; letter-spacing: .14em; font-size: 14px; }
   .brand-caption span { color: var(--color-accent); }
-  .wordmark { display: flex; align-items: baseline; margin-top: 15px; font: 48px/.95 var(--font-serif); letter-spacing: -3px; color: var(--color-ink); }
+  .wordmark { display: flex; align-items: baseline; margin-top: 15px; font: 46px/.95 var(--font-serif); letter-spacing: -3px; color: var(--color-ink); }
   .wordmark-k { display: inline-block; padding: 0 4px 4px; margin-right: 1px; background: var(--color-ink); color: var(--color-base); transform: rotate(-3deg); }
   .wordmark-dot { color: var(--color-accent); }
   .back-button { position: absolute; right: 14px; bottom: 15px; }
@@ -214,10 +219,8 @@
   .nav-link.active { color: var(--color-ink); background: #160d08; border-color: #82543d; }
   .nav-link.active::before { content: ''; position: absolute; left: -1px; top: 7px; bottom: 7px; width: 2px; background: var(--color-accent); }
   .nav-link.active :global(svg) { color: var(--color-accent); }
-  .nav-number { margin-left: auto; font: 11px var(--font-mono); opacity: .8; }
   .sidebar-drawing { position: relative; height: 130px; margin: 0 18px 14px; overflow: hidden; flex-shrink: 1; min-height: 0; }
   .sidebar-drawing :global(svg) { width: 210px; position: absolute; top: -8px; left: -5px; opacity: .27; }
-  .sidebar-drawing span { position: absolute; bottom: 0; font-size: 11px; letter-spacing: .06em; }
   @media (max-height: 940px) { .sidebar-drawing { display: none; } }
   @media (max-height: 800px) {
     .nav-heading { padding-top: 9px; padding-bottom: 5px; }
@@ -225,7 +228,7 @@
   }
   @media (max-height: 700px) {
     .brand-block { padding-top: 12px; padding-bottom: 12px; }
-    .wordmark { font-size: 38px; margin-top: 8px; }
+    .wordmark { font-size: 36px; margin-top: 8px; }
     .nav-heading { padding-top: 6px; padding-bottom: 3px; }
     .nav-link { padding-top: 2px; padding-bottom: 2px; }
   }
@@ -233,6 +236,5 @@
     .sidebar { width: 216px; }
     .brand-block { padding-left: 17px; padding-right: 17px; }
     .nav-link { padding-left: 5px; padding-right: 5px; gap: 5px; }
-    .nav-number { display: none; }
   }
 </style>

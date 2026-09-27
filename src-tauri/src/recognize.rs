@@ -29,6 +29,17 @@ static RE_SEASON_BARE: LazyLock<Regex> =
 static RE_SEASON_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bs(\d{1,2})\b").unwrap());
 static RE_REV_TAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+v\d+\s*$").unwrap());
+static RE_SEASON_WORDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:season[\s._-]+\d{1,2}|\d{1,2}(?:st|nd|rd|th)[\s._-]+season)\b").unwrap()
+});
+static RE_EXPLICIT_EP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\bs\d{1,2}\s*e|\bep(?:isode)?[.\s_-]*|\be[.\s_-]*|#)\s*(\d{1,4})(?:v\d+)?(?:$|[^\w])").unwrap()
+});
+static RE_LEADING_EP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^[\s._:·-]*(\d{1,4})(?:v\d+)?(?:$|[\s._-])").unwrap());
+static RE_BRACKET_EP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[\[(【]\s*(?:(?:ep(?:isode)?\.?|e)\s*)?(\d{1,4})(?:v\d+)?\s*[\])】]").unwrap()
+});
 
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
 
@@ -229,7 +240,15 @@ pub(crate) fn match_title<'a>(
     title: &str,
     url: &str,
 ) -> Option<&'a Matcher> {
-    let candidates = [clean_title(title), clean_title(&basename(url))];
+    let base = basename(url);
+    let candidates = [
+        (clean_title(title), None, false),
+        (clean_title(&base), None, false),
+        (norm_title(title), Some(title), true),
+        (norm_title(&base), Some(base.as_str()), true),
+        (clean_title_inner(title, false), None, true),
+        (clean_title_inner(&base, false), None, true),
+    ];
     let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
     let mut best: Option<(TiebreakKey, &Matcher)> = None;
     let season_ord = cand_season
@@ -237,12 +256,30 @@ pub(crate) fn match_title<'a>(
         .or_else(|| parse_season_word(&basename(url)))
         .or_else(|| parse_season_token(title))
         .or_else(|| parse_season_token(&basename(url)));
-    for cand in candidates {
+    for (cand, raw_title, exact_only) in candidates {
         if cand.is_empty() {
             continue;
         }
         let cand_ord = season_ord.or_else(|| norm_season_ordinal(&cand));
         for m in matchers {
+            if exact_only && !m.norms.iter().any(|n| n == &cand) {
+                continue;
+            }
+            if let Some(raw) = raw_title {
+                let text = strip_ext(raw);
+                let marked_episode = RE_EP_TAIL.find(&text).is_some_and(|tail| {
+                    tail.as_str().trim_start().starts_with(['-', '_', '·'])
+                        || RE_EXPLICIT_EP.is_match(tail.as_str())
+                });
+                if marked_episode
+                    && !m
+                        .variants
+                        .iter()
+                        .any(|v| raw.to_lowercase().contains(&v.to_lowercase()))
+                {
+                    continue;
+                }
+            }
             if cand_ord.is_some_and(|n| {
                 !m.norms.iter().any(|x| {
                     let ord = norm_season_ordinal(x);
@@ -254,7 +291,13 @@ pub(crate) fn match_title<'a>(
             if let Some((tier, nlen)) = m
                 .norms
                 .iter()
-                .filter_map(|n| norm_match_tier(n, &cand).map(|t| (t, n.len())))
+                .filter_map(|n| {
+                    if exact_only {
+                        (n == &cand).then_some((4, n.len()))
+                    } else {
+                        norm_match_tier(n, &cand).map(|t| (t, n.len()))
+                    }
+                })
                 .max()
             {
                 let season_match = cand_season
@@ -276,12 +319,22 @@ pub(crate) fn match_title<'a>(
 }
 
 pub(crate) fn clean_title(s: &str) -> String {
+    clean_title_inner(s, true)
+}
+
+fn clean_title_inner(s: &str, strip_channels: bool) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
     // Strip channel layouts before the episode tail so AAC2.0 cannot leave a false episode zero.
-    let s = RE_CHANNEL.replace_all(&s, " ");
+    let s = if strip_channels {
+        RE_CHANNEL.replace_all(&s, " ")
+    } else {
+        s
+    };
     let s = RE_RES.replace_all(&s, " ");
-    let stripped = strip_episode_tail(&s);
+    let release =
+        s.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-' | '·'));
+    let stripped = strip_episode_tail(release);
     // Preserve numeric titles when stripping would leave nothing.
     let normed = normalize(&stripped);
     let out = if normed.is_empty() {
@@ -365,15 +418,15 @@ fn normalize(s: &str) -> String {
 }
 
 /// Strip only known extensions to preserve titles such as No.6 and D.Gray-man.
-const STRIP_EXTS: &[&str] = &[
+pub(crate) const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "webm", "mov", "ts", "ogm", "wmv", "flv", "mpg", "mpeg", "m2ts",
-    "ogv",
+    "vob", "ogv", "3gp", "rmvb", "asf", "divx",
 ];
 
 fn strip_ext(s: &str) -> String {
     if let Some(i) = s.rfind('.') {
         let ext = &s[i + 1..];
-        if STRIP_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+        if VIDEO_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
             return s[..i].to_string();
         }
     }
@@ -381,9 +434,14 @@ fn strip_ext(s: &str) -> String {
 }
 
 pub(crate) fn basename(url: &str) -> String {
-    let seg = url.rsplit(['/', '\\']).next().unwrap_or(url);
-    let seg = strip_ext(seg);
-    percent_decode(&seg)
+    let parsed = reqwest::Url::parse(url).ok();
+    let parsed = parsed
+        .as_ref()
+        .filter(|u| matches!(u.scheme(), "http" | "https" | "file"));
+    let path = parsed.map_or(url, |u| u.path());
+    let seg = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let decoded = parsed.map_or_else(|| seg.to_string(), |_| percent_decode(seg));
+    strip_ext(&decoded)
 }
 
 pub(crate) fn percent_decode(s: &str) -> String {
@@ -421,7 +479,7 @@ pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<
         }
         if lp.contains(&lv) {
             let remainder = lp.replace(&lv, " ");
-            return Some(parse_last_episode_number(&remainder));
+            return Some(parse_episode_number(&remainder, true));
         }
     }
     None
@@ -438,7 +496,19 @@ pub(crate) fn resolve_episode(matched: &Matcher, candidates: &[&str]) -> Option<
         match parse_episode_after(cand, &matched.variants) {
             Some(Some(n)) => return Some(n),
             Some(None) => variant_hit = true,
-            None => {}
+            None => {
+                if matched.norms.contains(&norm_title(cand)) {
+                    if RE_SEASON_EP.is_match(cand) {
+                        if let Some(episode) = parse_episode_guess(cand) {
+                            return Some(episode);
+                        }
+                    }
+                    if let Some(episode) = bracket_episode(cand) {
+                        return Some(episode);
+                    }
+                    variant_hit = true;
+                }
+            }
         }
     }
     if variant_hit {
@@ -453,12 +523,44 @@ fn looks_like_year(n: i64) -> bool {
     (1900..=chrono::Utc::now().year() as i64 + 1).contains(&n)
 }
 
+fn bracket_episode(s: &str) -> Option<i64> {
+    RE_BRACKET_EP
+        .captures_iter(s)
+        .filter_map(|c| c.get(1)?.as_str().parse::<i64>().ok())
+        .find(|n| !NOISE_NUMBERS.contains(n) && !looks_like_year(*n))
+}
+
 fn parse_last_episode_number(s: &str) -> Option<i64> {
-    let s = RE_BRACKETS.replace_all(s, " ");
+    parse_episode_number(s, false)
+}
+
+fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
+    let s = strip_ext(s);
+    let bracketed = bracket_episode(&s);
+    let s = RE_BRACKETS.replace_all(&s, " ");
     let s = RE_CHANNEL.replace_all(&s, " ");
+    if let Some(episode) = RE_EXPLICIT_EP
+        .captures(&s)
+        .and_then(|c| c.get(1)?.as_str().parse::<i64>().ok())
+    {
+        return Some(episode);
+    }
+    let s = RE_SEASON_WORDS.replace_all(&s, " ");
     let s = RE_SEASON_PREFIX.replace_all(&s, "$1");
     let s = RE_SEASON_BARE.replace_all(&s, " ");
     let s = RE_REV_TAIL.replace(&s, " ");
+    if title_removed {
+        if let Some(episode) = RE_LEADING_EP
+            .captures(&s)
+            .and_then(|c| c.get(1)?.as_str().parse::<i64>().ok())
+            .filter(|n| !looks_like_year(*n))
+        {
+            return Some(episode);
+        }
+    }
+    if bracketed.is_some() {
+        return bracketed;
+    }
     // An episode immediately after the title can resemble a resolution, such as One Piece 1080.
     let after_title = RE_EP_NUM.find(&s).and_then(|m| {
         let lone = s[..m.start()]
@@ -1197,5 +1299,134 @@ mod tests {
         let m = match_title(&matchers, release, "").expect("dot scene form must match season 4");
         assert_eq!(m.media_id, 189046);
         assert_eq!(resolve_episode(m, &[release]), Some(5));
+    }
+
+    #[test]
+    fn playback_urls_ignore_query_numbers_and_season_markers() {
+        let matchers = vec![mk(1, "Frieren")];
+        let url = "https://example.org/Frieren%20-%2005.mkv?token=S03E9876#part2";
+        let base = basename(url);
+        assert_eq!(base, "Frieren - 05");
+        let matched = match_title(&matchers, "", url).unwrap();
+        assert_eq!(resolve_episode(matched, &[&base]), Some(5));
+        assert_eq!(
+            basename("file:///anime/Frieren%20-%2005%2Emkv"),
+            "Frieren - 05"
+        );
+        assert_eq!(basename("/anime/100%20Real - 05.mkv"), "100%20Real - 05");
+    }
+
+    #[test]
+    fn video_extension_digits_do_not_override_episodes() {
+        let show = mk(1, "Some Show");
+        for extension in ["m2ts", "3gp", "m4v", "divx"] {
+            let title = format!("Some Show - 05.{extension}");
+            assert_eq!(resolve_episode(&show, &[&title]), Some(5), "{title}");
+            assert_eq!(clean_title(&title), "some show");
+        }
+    }
+
+    #[test]
+    fn season_alias_without_an_episode_does_not_guess_progress() {
+        let show = mk(1, "Some Show 2nd Season");
+        for title in ["Some Show Season 2", "Some.Show.2nd.Season.mkv"] {
+            assert_eq!(resolve_episode(&show, &[title]), None, "{title}");
+        }
+    }
+
+    #[test]
+    fn episode_markers_beat_numbers_in_episode_titles() {
+        let show = mk(1, "Some Show");
+        for title in [
+            "Some Show S01E05 - Part 2",
+            "Some Show Episode 05 - Part 2",
+            "Some Show - 05 - Episode Title 2",
+        ] {
+            assert_eq!(resolve_episode(&show, &[title]), Some(5), "{title}");
+        }
+    }
+
+    #[test]
+    fn exact_titles_keep_their_numbers_and_decimal_versions() {
+        let matchers = vec![
+            mk(1, "Ghost in the Shell"),
+            mk(2, "Ghost in the Shell 2.0"),
+            mk(3, "Evangelion: 1.0 You Are (Not) Alone"),
+            mk(4, "Patlabor"),
+            mk(5, "Patlabor 2"),
+        ];
+        for (title, expected) in [
+            ("Ghost in the Shell 2.0.mkv", 2),
+            ("Evangelion 1.0 You Are (Not) Alone.mkv", 3),
+            ("Patlabor 2.mkv", 5),
+        ] {
+            let matched = match_title(&matchers, title, "").unwrap();
+            assert_eq!(matched.media_id, expected, "{title}");
+        }
+        let matched = match_title(&matchers, "Patlabor 2.mkv", "").unwrap();
+        assert_eq!(resolve_episode(matched, &["Patlabor 2.mkv"]), None);
+        let title = "Ghost in the Shell 2.0 - 01.mkv";
+        let matched = match_title(&matchers, title, "").unwrap();
+        assert_eq!(matched.media_id, 2);
+        assert_eq!(resolve_episode(matched, &[title]), Some(1));
+        let title = "Patlabor.2.mkv";
+        let matched = match_title(&matchers, title, "").unwrap();
+        assert_eq!(matched.media_id, 5);
+        assert_eq!(resolve_episode(matched, &[title]), None);
+    }
+
+    #[test]
+    fn explicit_episode_numbers_do_not_become_numeric_sequels() {
+        let matchers = vec![mk(1, "Some Show"), mk(2, "Some Show 5")];
+        for title in [
+            "Some Show - 5.mkv",
+            "Some Show - 05.mkv",
+            "Some Show E5.mkv",
+        ] {
+            let matched = match_title(&matchers, title, "").unwrap();
+            assert_eq!(matched.media_id, 1, "{title}");
+            assert_eq!(resolve_episode(matched, &[title]), Some(5));
+        }
+    }
+
+    #[test]
+    fn dotted_numeric_titles_keep_episode_suffixes_after_resolution_cleanup() {
+        let matchers = vec![
+            mk(1, "86"),
+            mk(2, "Patlabor 2"),
+            mk(3, "Ghost in the Shell"),
+            mk(4, "Ghost in the Shell 2.0"),
+        ];
+        for (title, id) in [
+            ("86.01.1080p.mkv", 1),
+            ("86.S01E01.1080p.mkv", 1),
+            ("Patlabor.2.01.1080p.mkv", 2),
+            ("Ghost.in.the.Shell.2.0.01.1080p.mkv", 4),
+        ] {
+            let matched = match_title(&matchers, title, "").unwrap();
+            assert_eq!(matched.media_id, id, "{title}");
+            assert_eq!(resolve_episode(matched, &[title]), Some(1), "{title}");
+        }
+    }
+
+    #[test]
+    fn episode_brackets_survive_metadata_cleanup() {
+        let matchers = vec![mk(1, "Some Show")];
+        for title in [
+            "[G] Some Show [05] [1080p].mkv",
+            "[G] Some Show (05v2) [720p].mkv",
+            "[G] Some Show [Episode 05] [AB123456].mkv",
+            "[G] Some.Show.[05].[1080p].mkv",
+        ] {
+            let matched = match_title(&matchers, title, "").unwrap();
+            assert_eq!(resolve_episode(matched, &[title]), Some(5), "{title}");
+        }
+        for title in [
+            "Some Show [1080]",
+            "Some Show [2026]",
+            "Some Show [00000005]",
+        ] {
+            assert_eq!(resolve_episode(&matchers[0], &[title]), None, "{title}");
+        }
     }
 }

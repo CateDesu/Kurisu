@@ -66,7 +66,12 @@ fn client_id() -> String {
 pub fn update(desired: Option<PresenceInfo>) {
     let updates = UPDATES.get_or_init(|| {
         let (tx, rx) = watch::channel(None);
-        tauri::async_runtime::spawn(run_worker(rx, transport::socket_paths(), IPC_DEADLINE));
+        tauri::async_runtime::spawn(run_worker(
+            rx,
+            transport::socket_paths(),
+            IPC_DEADLINE,
+            backoff,
+        ));
         tx
     });
     updates.send_replace(desired);
@@ -76,6 +81,7 @@ async fn run_worker(
     mut updates: watch::Receiver<Option<PresenceInfo>>,
     paths: Vec<PathBuf>,
     deadline: Duration,
+    retry_delay: fn(u32) -> Duration,
 ) {
     let mut presence = Presence::default();
     loop {
@@ -88,20 +94,49 @@ async fn run_worker(
             }
             result = tokio::time::timeout(deadline, presence.apply(desired, &paths)) => {
                 if !matches!(result, Ok(Ok(()))) {
-                    presence.clear();
-                    presence.fail_count = presence.fail_count.saturating_add(1);
-                    presence.retry_at = Some(Instant::now() + backoff(presence.fail_count));
+                    presence.failed(retry_delay);
                     log::debug!("Discord presence failed or timed out");
                 }
             }
         }
-        if updates.changed().await.is_err() {
-            break;
+        loop {
+            tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() { return; }
+                    break;
+                }
+                received = async {
+                    match presence.client.as_mut() {
+                        Some(client) => client.receive().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let result = match received {
+                        Ok(Some(payload)) => {
+                            let client = presence.client.as_mut().unwrap();
+                            tokio::time::timeout(deadline, client.pong(&payload)).await
+                        }
+                        Ok(None) => continue,
+                        Err(error) => Ok(Err(error)),
+                    };
+                    if !matches!(result, Ok(Ok(()))) {
+                        presence.failed(retry_delay);
+                        if updates.changed().await.is_err() { return; }
+                        break;
+                    }
+                }
+            }
         }
     }
 }
 
 impl Presence {
+    fn failed(&mut self, retry_delay: fn(u32) -> Duration) {
+        self.clear();
+        self.fail_count = self.fail_count.saturating_add(1);
+        self.retry_at = Some(Instant::now() + retry_delay(self.fail_count));
+    }
+
     fn clear(&mut self) {
         self.shown = None;
         self.client = None;
@@ -268,6 +303,7 @@ mod tests {
                 rx,
                 vec![path.clone()],
                 Duration::from_millis(100),
+                backoff,
             ));
             tokio::time::timeout(Duration::from_secs(2), async {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -294,7 +330,12 @@ mod tests {
             std::env::temp_dir().join(format!("kurisu-discord-latest-{}", std::process::id()));
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (tx, rx) = watch::channel(Some(playing()));
-        let worker = tokio::spawn(run_worker(rx, vec![path.clone()], Duration::from_secs(1)));
+        let worker = tokio::spawn(run_worker(
+            rx,
+            vec![path.clone()],
+            Duration::from_secs(1),
+            backoff,
+        ));
         tokio::time::timeout(Duration::from_secs(3), async {
             let (mut stale, _) = listener.accept().await.unwrap();
             read_frame(&mut stale).await;
@@ -320,12 +361,152 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn disconnected_presence_reconnects_without_a_title_change() {
+        let path =
+            std::env::temp_dir().join(format!("kurisu-discord-reconnect-{}", std::process::id()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = watch::channel(Some(playing()));
+        let worker = tokio::spawn(run_worker(
+            rx,
+            vec![path.clone()],
+            Duration::from_secs(1),
+            |_| Duration::ZERO,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_frame(&mut socket).await;
+                ready(&mut socket).await;
+                assert_eq!(read_frame(&mut socket).await["cmd"], "SET_ACTIVITY");
+                drop(socket);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                tx.send_replace(Some(playing()));
+            }
+        })
+        .await;
+        drop(tx);
+        worker.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_ok(), "unchanged playback must reconnect");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_connections_and_rejected_activity_back_off() {
+        for reject in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-discord-backoff-{}-{reject}",
+                std::process::id()
+            ));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (tx, rx) = watch::channel(Some(playing()));
+            let worker = tokio::spawn(run_worker(
+                rx,
+                vec![path.clone()],
+                Duration::from_secs(1),
+                |_| Duration::from_secs(30),
+            ));
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_frame(&mut socket).await;
+            ready(&mut socket).await;
+            read_frame(&mut socket).await;
+            if reject {
+                use tokio::io::AsyncWriteExt;
+                let body = br#"{"evt":"ERROR"}"#;
+                socket.write_all(&1u32.to_le_bytes()).await.unwrap();
+                socket
+                    .write_all(&(body.len() as u32).to_le_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(body).await.unwrap();
+            } else {
+                drop(socket);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for _ in 0..3 {
+                tx.send_replace(Some(playing()));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+            drop(tx);
+            worker.await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_frames_survive_updates_and_ping_payloads_are_echoed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path =
+            std::env::temp_dir().join(format!("kurisu-discord-partial-{}", std::process::id()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = watch::channel(Some(playing()));
+        let worker = tokio::spawn(run_worker(
+            rx,
+            vec![path.clone()],
+            Duration::from_secs(1),
+            backoff,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_frame(&mut socket).await;
+            ready(&mut socket).await;
+            read_frame(&mut socket).await;
+            socket.write_all(&1u32.to_le_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send_replace(Some(PresenceInfo {
+                episode: Some(13),
+                ..playing()
+            }));
+            assert_eq!(
+                read_frame(&mut socket).await["args"]["activity"]["state"],
+                "Episode 13/28"
+            );
+            let reply = br#"{"cmd":"SET_ACTIVITY"}"#;
+            socket
+                .write_all(&(reply.len() as u32).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(reply).await.unwrap();
+            let ping = b"keepalive";
+            socket.write_all(&3u32.to_le_bytes()).await.unwrap();
+            socket
+                .write_all(&(ping.len() as u32).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(ping).await.unwrap();
+            let mut header = [0; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()), 4);
+            assert_eq!(
+                u32::from_le_bytes(header[4..].try_into().unwrap()),
+                ping.len() as u32
+            );
+            let mut pong = [0; 9];
+            socket.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong, ping);
+        })
+        .await;
+        drop(tx);
+        worker.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn invalid_handshakes_are_closed_without_waiting_for_the_claimed_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         for (index, opcode, size, body) in [
             (0, 1u32, u32::MAX, &b""[..]),
             (1, 2, 0, &b""[..]),
             (2, 1, 15, &br#"{"evt":"ERROR"}"#[..]),
+            (3, 3, 100, &b""[..]),
+            (4, 4, 100, &b""[..]),
         ] {
             let path = std::env::temp_dir().join(format!(
                 "kurisu-discord-invalid-{}-{index}",
@@ -333,7 +514,12 @@ mod tests {
             ));
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             let (tx, rx) = watch::channel(Some(playing()));
-            let worker = tokio::spawn(run_worker(rx, vec![path.clone()], Duration::from_secs(10)));
+            let worker = tokio::spawn(run_worker(
+                rx,
+                vec![path.clone()],
+                Duration::from_secs(10),
+                backoff,
+            ));
             tokio::time::timeout(Duration::from_secs(2), async {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 read_frame(&mut socket).await;

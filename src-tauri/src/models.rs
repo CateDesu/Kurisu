@@ -64,7 +64,8 @@ pub struct Media {
 
 impl Media {
     pub fn display_title(&self) -> String {
-        self.title_english.clone()
+        self.title_english
+            .clone()
             .or_else(|| self.title_romaji.clone())
             .or_else(|| self.title_native.clone())
             .unwrap_or_else(|| format!("#{}", self.id))
@@ -73,7 +74,7 @@ impl Media {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ListEntry {
-    pub id: Option<i64>,          // AniList list entry ID
+    pub id: Option<i64>, // AniList list entry ID
     pub media_id: i64,
     pub status: String,
     pub progress: i64,
@@ -233,6 +234,8 @@ pub struct User {
     pub name: String,
     pub avatar: Option<String>,
     pub score_format: Option<String>,
+    #[serde(default)]
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -408,13 +411,26 @@ mod tests {
     fn serialized_field_names_exist_in_types_ts() {
         let models: Vec<(&str, serde_json::Value)> = vec![
             ("Media", serde_json::to_value(Media::default()).unwrap()),
-            ("ListEntry", serde_json::to_value(ListEntry::default()).unwrap()),
+            (
+                "ListEntry",
+                serde_json::to_value(ListEntry::default()).unwrap(),
+            ),
             (
                 "MediaRelation",
-                serde_json::to_value(MediaRelation { relation: String::new(), media: Media::default() }).unwrap(),
+                serde_json::to_value(MediaRelation {
+                    relation: String::new(),
+                    media: Media::default(),
+                })
+                .unwrap(),
             ),
-            ("MediaCharacter", serde_json::to_value(MediaCharacter::default()).unwrap()),
-            ("MediaStaff", serde_json::to_value(MediaStaff::default()).unwrap()),
+            (
+                "MediaCharacter",
+                serde_json::to_value(MediaCharacter::default()).unwrap(),
+            ),
+            (
+                "MediaStaff",
+                serde_json::to_value(MediaStaff::default()).unwrap(),
+            ),
             (
                 "MediaDetail",
                 serde_json::to_value(MediaDetail {
@@ -427,18 +443,50 @@ mod tests {
             ),
             (
                 "AiringItem",
-                serde_json::to_value(AiringItem { airing_at: 0, episode: 0, media: Media::default() }).unwrap(),
+                serde_json::to_value(AiringItem {
+                    airing_at: 0,
+                    episode: 0,
+                    media: Media::default(),
+                })
+                .unwrap(),
             ),
-            ("TorrentItem", serde_json::to_value(TorrentItem::default()).unwrap()),
-            ("UserStats", serde_json::to_value(UserStats::default()).unwrap()),
-            ("ScoreBucket", serde_json::to_value(ScoreBucket::default()).unwrap()),
-            ("StatusCount", serde_json::to_value(StatusCount::default()).unwrap()),
-            ("FormatCount", serde_json::to_value(FormatCount::default()).unwrap()),
-            ("GenreStat", serde_json::to_value(GenreStat::default()).unwrap()),
-            ("YearCount", serde_json::to_value(YearCount::default()).unwrap()),
-            ("LibraryFile", serde_json::to_value(LibraryFile::default()).unwrap()),
+            (
+                "TorrentItem",
+                serde_json::to_value(TorrentItem::default()).unwrap(),
+            ),
+            (
+                "UserStats",
+                serde_json::to_value(UserStats::default()).unwrap(),
+            ),
+            (
+                "ScoreBucket",
+                serde_json::to_value(ScoreBucket::default()).unwrap(),
+            ),
+            (
+                "StatusCount",
+                serde_json::to_value(StatusCount::default()).unwrap(),
+            ),
+            (
+                "FormatCount",
+                serde_json::to_value(FormatCount::default()).unwrap(),
+            ),
+            (
+                "GenreStat",
+                serde_json::to_value(GenreStat::default()).unwrap(),
+            ),
+            (
+                "YearCount",
+                serde_json::to_value(YearCount::default()).unwrap(),
+            ),
+            (
+                "LibraryFile",
+                serde_json::to_value(LibraryFile::default()).unwrap(),
+            ),
             ("User", serde_json::to_value(User::default()).unwrap()),
-            ("Notification", serde_json::to_value(Notification::default()).unwrap()),
+            (
+                "Notification",
+                serde_json::to_value(Notification::default()).unwrap(),
+            ),
             (
                 "TrackingConfig",
                 serde_json::to_value(crate::commands::TrackingConfig::default()).unwrap(),
@@ -447,8 +495,14 @@ mod tests {
                 "TorrentFetch",
                 serde_json::to_value(TorrentFetch::default()).unwrap(),
             ),
-            ("FeedFailure", serde_json::to_value(FeedFailure::default()).unwrap()),
-            ("LibraryScan", serde_json::to_value(LibraryScan::default()).unwrap()),
+            (
+                "FeedFailure",
+                serde_json::to_value(FeedFailure::default()).unwrap(),
+            ),
+            (
+                "LibraryScan",
+                serde_json::to_value(LibraryScan::default()).unwrap(),
+            ),
             (
                 "UnreadableFolder",
                 serde_json::to_value(UnreadableFolder::default()).unwrap(),

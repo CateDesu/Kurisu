@@ -120,6 +120,8 @@ pub struct AniList {
     http: reqwest::Client,
     token: Option<String>,
     rate: Arc<Mutex<RateBudget>>,
+    #[cfg(test)]
+    endpoint: Option<String>,
 }
 
 impl AniList {
@@ -133,6 +135,8 @@ impl AniList {
             http,
             token: None,
             rate: Arc::new(Mutex::new(RateBudget::default())),
+            #[cfg(test)]
+            endpoint: None,
         }
     }
     pub fn set_token(&mut self, t: Option<String>) {
@@ -202,7 +206,7 @@ impl AniList {
         let (status, body) = loop {
             let resp = self
                 .http
-                .post(GRAPHQL)
+                .post(self.endpoint())
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
@@ -254,6 +258,14 @@ impl AniList {
         Ok(serde_json::from_value(data)?)
     }
 
+    fn endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.endpoint {
+            return endpoint;
+        }
+        GRAPHQL
+    }
+
     pub async fn viewer(&self) -> Result<User> {
         #[derive(Deserialize)]
         struct R {
@@ -288,6 +300,7 @@ impl AniList {
             name: r.viewer.name,
             avatar: r.viewer.avatar.and_then(|a| a.large),
             score_format: r.viewer.media_list_options.and_then(|o| o.score_format),
+            offline: false,
         })
     }
 
@@ -900,8 +913,18 @@ impl AniList {
                     serde_json::json!({ "userName": user_name, "chunk": chunk }),
                 )
                 .await?;
-            for list in r.collection.lists.unwrap_or_default() {
-                for e in list.entries.unwrap_or_default().into_iter().flatten() {
+            let before = out.len();
+            let lists = r.collection.lists.ok_or_else(|| {
+                anyhow!("AniList returned null lists, refusing to sync a partial list")
+            })?;
+            for list in lists {
+                let entries = list.entries.ok_or_else(|| {
+                    anyhow!("AniList returned null entries, refusing to sync a partial list")
+                })?;
+                for e in entries {
+                    let e = e.ok_or_else(|| {
+                        anyhow!("AniList returned a null entry, refusing to sync a partial list")
+                    })?;
                     // Keep entries with null media so sync does not delete them during an AniList merge.
                     out.push(ListEntry {
                         id: Some(e.id),
@@ -920,6 +943,11 @@ impl AniList {
                     "AniList returned a null hasNextChunk, refusing to sync a partial list"
                 ));
             };
+            if out.len() == before && (chunk > 1 || has_next) {
+                return Err(anyhow!(
+                    "AniList returned an empty chunk while promising more entries, refusing to sync a partial list"
+                ));
+            }
             if !has_next {
                 return Ok(out);
             }
@@ -932,16 +960,23 @@ impl AniList {
     pub async fn entry_by_media_id(&self, media_id: i64) -> Result<Option<SavedEntry>> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(rename = "MediaList")]
+            #[serde(rename = "Media")]
+            media: EntryMedia,
+        }
+        #[derive(Deserialize)]
+        struct EntryMedia {
+            #[serde(rename = "mediaListEntry")]
             entry: Option<SavedEntry>,
         }
         let q = "query ($mediaId: Int!) {
-            MediaList(mediaId: $mediaId) { id status progress score repeat }
+            Media(id: $mediaId, type: ANIME) {
+                mediaListEntry { id status progress score repeat }
+            }
         }";
         let r: R = self
             .gql(q, serde_json::json!({ "mediaId": media_id }))
             .await?;
-        Ok(r.entry)
+        Ok(r.media.entry)
     }
 
     /// Omitted fields stay unchanged on AniList.
@@ -1128,7 +1163,7 @@ impl AniList {
     }
 }
 
-/// Only a JSON 403 from AniList can reject a token. HTML may be a proxy challenge.
+/// Keep transport errors distinct from AniList errors.
 #[derive(Debug)]
 struct ApiError {
     status: reqwest::StatusCode,
@@ -1161,9 +1196,9 @@ pub fn is_auth_rejection(e: &anyhow::Error) -> bool {
     let Some(api) = e.downcast_ref::<ApiError>() else {
         return false;
     };
-    api.status == reqwest::StatusCode::UNAUTHORIZED
-        || (api.status == reqwest::StatusCode::FORBIDDEN && api.from_json)
-        || api.message.eq_ignore_ascii_case("Invalid Token")
+    api.from_json
+        && (api.status == reqwest::StatusCode::UNAUTHORIZED
+            || api.message.eq_ignore_ascii_case("Invalid Token"))
 }
 
 fn random_state() -> Result<String> {
@@ -1190,7 +1225,7 @@ pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String
 }
 
 /// Forward the URL fragment as a query because browsers do not send fragments to servers.
-const SHIM_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>body{font-family:sans-serif;text-align:center;padding:3em;color:#9aa3b2;background:#0f1115;margin:0}h2{color:#3ba55d;font-weight:600}</style></head><body><h2>Connecting to Kurisu…</h2><p>You can close this tab once the app opens.</p><script>(function(){var h=location.hash.charCodeAt(0)===35?location.hash.slice(1):location.hash;if(h.indexOf('access_token=')!==-1){location.replace('/__capture__?'+h);}})();</script></body></html>";
+const SHIM_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>body{font-family:sans-serif;text-align:center;padding:3em;color:#9aa3b2;background:#0f1115;margin:0}h2{color:#3ba55d;font-weight:600}</style></head><body><h2>Connecting to Kurisu…</h2><p>You can close this tab once the app opens.</p><script>(function(){var h=location.hash.charCodeAt(0)===35?location.hash.slice(1):location.hash;if(h.indexOf('access_token=')!==-1||h.indexOf('error=')!==-1){location.replace('/__capture__?'+h);}})();</script></body></html>";
 
 const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#3ba55d'>Connected to Kurisu.</h2><p>You can close this tab and return to the app.</p></body>";
 const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#e74c3c'>Authorization failed.</h2><p>Return to Kurisu for details.</p></body>";
@@ -1231,24 +1266,20 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve only after a valid token and state. Ignore stray probes until canceled or complete.
-pub fn start_callback_server() -> Result<(String, oneshot::Receiver<String>)> {
-    let (state, _port, rx) = start_callback_server_on(OAUTH_PORT)?;
-    Ok((state, rx))
-}
+pub type OAuthReceiver = oneshot::Receiver<Result<String, String>>;
 
 /// Tests use port zero to avoid the live OAuth listener.
-pub fn start_callback_server_on(port: u16) -> Result<(String, u16, oneshot::Receiver<String>)> {
+pub fn start_callback_server_on(port: u16) -> Result<(String, u16, OAuthReceiver)> {
     let state = random_state()?;
     let expected = state.clone();
-    let (tx, rx) = oneshot::channel::<String>();
+    let (tx, rx) = oneshot::channel::<Result<String, String>>();
     let addr = format!("127.0.0.1:{port}");
     let listener = std::net::TcpListener::bind(&addr).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
-            anyhow::anyhow!(
+            anyhow::Error::new(e).context(format!(
                 "a sign-in is already in progress (port {port} is busy) — finish it in your \
                  browser, or wait a moment and try again"
-            )
+            ))
         } else {
             anyhow::anyhow!(e)
         }
@@ -1299,7 +1330,10 @@ pub fn start_callback_server_on(port: u16) -> Result<(String, u16, oneshot::Rece
                         }
                     }
                 };
-                let _ = tokio::time::timeout(Duration::from_secs(10), read_headers).await;
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = tokio::time::timeout(Duration::from_secs(10), read_headers) => {}
+                }
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let path = req
                     .lines()
@@ -1314,18 +1348,20 @@ pub fn start_callback_server_on(port: u16) -> Result<(String, u16, oneshot::Rece
                     })
                 };
 
-                let (token, body): (Option<String>, &str) =
-                    if let Some(err) = param("error") {
+                let (outcome, body) =
+                    if (param("error").is_some() || param("access_token").is_some())
+                        && param("state").as_deref() != Some(expected.as_str())
+                    {
+                        (None, ERR_HTML)
+                    } else if let Some(err) = param("error") {
                         let msg = param("error_description").unwrap_or(err);
                         log::warn!("OAuth callback: AniList denied access: {}", clip_for_log(&msg));
-                        (None, ERR_HTML)
+                        (Some(Err(format!("AniList authorization failed: {}", clip_for_log(&msg)))), ERR_HTML)
                     } else if let Some(token) = param("access_token") {
-                        match param("state") {
-                            Some(s) if s == expected => (Some(token), OK_HTML),
-                            _ => {
-                                log::warn!("OAuth callback: state mismatch — rejected a token not issued for this login");
-                                (None, ERR_HTML)
-                            }
+                        if token.trim().is_empty() {
+                            (Some(Err("AniList returned an empty access token.".into())), ERR_HTML)
+                        } else {
+                            (Some(Ok(token)), OK_HTML)
                         }
                     } else {
                         let resp = format!(
@@ -1344,8 +1380,8 @@ pub fn start_callback_server_on(port: u16) -> Result<(String, u16, oneshot::Rece
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
-                if let Some(token) = token {
-                    let _ = tx.send(token);
+                if let Some(outcome) = outcome {
+                    let _ = tx.send(outcome);
                     break;
                 }
             }
@@ -1456,7 +1492,7 @@ mod tests {
             message: "Forbidden".into(),
         }
         .into();
-        assert!(super::is_auth_rejection(&json_403));
+        assert!(!super::is_auth_rejection(&json_403));
     }
 
     #[test]
@@ -1495,7 +1531,166 @@ mod tests {
                 .await
                 .expect("listener must still be alive after the probes")
                 .unwrap();
-            assert_eq!(token, "good-token");
+            assert_eq!(token.unwrap(), "good-token");
         });
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn mock_api(
+    responses: Vec<(u16, serde_json::Value)>,
+) -> (
+    AniList,
+    tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        for (status, body) in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let body_start;
+            loop {
+                let mut buffer = [0u8; 4096];
+                let size = socket.read(&mut buffer).await.unwrap();
+                if size == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..size]);
+                if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    body_start = index + 4;
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&request[..body_start]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while request.len() < body_start + length {
+                let mut buffer = [0u8; 4096];
+                let size = socket.read(&mut buffer).await.unwrap();
+                if size == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..size]);
+            }
+            let request =
+                serde_json::from_slice(&request[body_start..body_start + length]).unwrap();
+            let _ = requests.send(request);
+            let body = body.to_string();
+            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+    });
+    let mut api = AniList::new();
+    api.http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    api.endpoint = Some(endpoint);
+    api.set_token(Some("test-session".into()));
+    (api, received)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn a_verified_oauth_denial_finishes_the_login_attempt() {
+        let (state, port, receiver) = start_callback_server_on(0).unwrap();
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://127.0.0.1:{port}/__capture__?error=access_denied&state={state}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.unwrap_err().contains("access_denied"));
+    }
+
+    #[tokio::test]
+    async fn entry_lookup_is_scoped_to_the_authenticated_user() {
+        let (api, mut requests) = mock_api(vec![(200, json!({"data": {
+            "Media": {"mediaListEntry": {"id": 22, "status": "CURRENT", "progress": 4, "score": 8.5, "repeat": 2}},
+            "MediaList": {"id": 999, "status": "COMPLETED", "progress": 12, "score": 10.0, "repeat": 0}
+        }}))]).await;
+        let entry = api.entry_by_media_id(1).await.unwrap().unwrap();
+        assert_eq!(entry.id, 22);
+        let request = requests.recv().await.unwrap();
+        let query = request["query"].as_str().unwrap();
+        assert!(query.contains("mediaListEntry"));
+        assert!(!query.contains("MediaList(mediaId:"));
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_anime_is_not_a_missing_anime() {
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data": {"Media": {"mediaListEntry": null}}}),
+        )])
+        .await;
+        assert!(api.entry_by_media_id(1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_list_payloads_are_rejected() {
+        for lists in [
+            json!(null),
+            json!([{"entries": null}]),
+            json!([{"entries": [null]}]),
+        ] {
+            let (api, _) = mock_api(vec![(
+                200,
+                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+            )])
+            .await;
+            assert!(api.user_list("Tester").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_later_chunk_is_not_a_complete_list() {
+        let (api, _) = mock_api(vec![
+            (200, json!({"data": {"MediaListCollection": {"lists": [{"entries": [{"id": 22, "mediaId": 1}]}], "hasNextChunk": true}}})),
+            (200, json!({"data": {"MediaListCollection": {"lists": [], "hasNextChunk": false}}})),
+        ]).await;
+        assert!(api.user_list("Tester").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_lists_allow_empty_arrays_and_null_media() {
+        for (lists, count) in [
+            (json!([]), 0),
+            (json!([{"entries": []}]), 0),
+            (
+                json!([{"entries": [{"id": 22, "mediaId": 1, "media": null}]}]),
+                1,
+            ),
+        ] {
+            let (api, _) = mock_api(vec![(
+                200,
+                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+            )])
+            .await;
+            assert_eq!(api.user_list("Tester").await.unwrap().len(), count);
+        }
     }
 }

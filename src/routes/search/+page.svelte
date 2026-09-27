@@ -7,21 +7,20 @@
   import type { ListEntry, Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import AnimeCard from "$lib/AnimeCard.svelte";
-  import { addToList } from "$lib/list";
+  import { createListActions } from "$lib/list.svelte";
   import type { Snapshot } from "./$types";
 
   let query = $state("");
   let results = $state<Media[]>([]);
   let searching = $state(false);
   let error = $state("");
-  let adding = $state<number | null>(null);
+  const actions = createListActions();
   const loggedIn = $derived(auth.isLoggedIn);
 
   // Reassign the Map so badge lookups react to changes.
   let listByMedia = $state(new Map<number, ListEntry>());
   let listLoadId = 0;
   let searchId = 0;
-  let addId = 0;
   let alive = true;
   let submittedQuery = "";
   let resumeQuery: string | null = null;
@@ -43,10 +42,10 @@
     loggedIn;
     listByMedia = new Map();
     error = "";
-    adding = null;
+    actions.reset();
     searching = false;
     resumeQuery = null;
-    return () => { listLoadId++; searchId++; addId++; };
+    return () => { listLoadId++; searchId++; actions.reset(); };
   });
 
   $effect(() => {
@@ -97,21 +96,11 @@
   });
 
   async function add(m: Media, status: string) {
-    const id = ++addId;
-    const epoch = auth.epoch;
-    const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
-    adding = m.id;
     error = "";
-    try {
-      const entry = await addToList(m, status);
-      if (!current()) return;
-      listByMedia = new Map(listByMedia).set(m.id, entry);
-      void loadList();
-    } catch (err) {
-      if (current() && id === addId) error = String(err);
-    } finally {
-      if (current() && id === addId) adding = null;
-    }
+    const entry = await actions.add(m, status);
+    if (!entry || !alive) return;
+    listByMedia = new Map(listByMedia).set(m.id, entry);
+    void loadList();
   }
 
   onDestroy(() => { alive = false; });
@@ -123,7 +112,7 @@
   </div>
 {:else}
 <div class="page-content">
-  <PageHeading index="07" section="Discover" title="Search" description="Find your next anime">
+  <PageHeading section="Discover" title="Search" description="Find your next show">
     <form onsubmit={run} class="flex w-72 max-w-full gap-2">
       <input
         bind:value={query}
@@ -137,15 +126,15 @@
     </form>
   </PageHeading>
 
-  {#if error}
+  {#if error || actions.error}
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
-      {error}
+      {error || actions.error}
     </div>
   {/if}
 
   <div class="media-grid">
     {#each results as m (m.id)}
-      <AnimeCard media={m} entry={listByMedia.get(m.id)} adding={adding === m.id} onadd={add} showYear showListedActions />
+      <AnimeCard media={m} entry={listByMedia.get(m.id)} adding={actions.pending(m.id)} onadd={add} showYear showListedActions />
     {/each}
   </div>
 </div>

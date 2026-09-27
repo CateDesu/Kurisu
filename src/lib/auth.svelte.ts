@@ -10,6 +10,20 @@ let offline = $state(false);
 let epoch = $state(0);
 
 let refreshId = 0;
+let authIntent = 0;
+
+async function login(request: () => Promise<User>) {
+  const intent = ++authIntent;
+  refreshId++;
+  const nextUser = await request();
+  if (intent !== authIntent) throw new Error("Sign-in was superseded.");
+  user = nextUser;
+  offline = false;
+  epoch++;
+  library.reset();
+  ready = true;
+  return nextUser;
+}
 
 async function refresh() {
   const request = ++refreshId;
@@ -19,7 +33,7 @@ async function refresh() {
     const nextUser = await api.currentUser();
     if (!current()) return;
     user = nextUser;
-    offline = false;
+    offline = nextUser?.offline ?? false;
   } catch {
     let storedToken = false;
     try {
@@ -51,25 +65,19 @@ export const auth = {
     return epoch;
   },
   refresh,
-  async loginOauth() {
-    user = await api.loginOauth();
-    offline = false;
-    epoch++;
-    ready = true;
-    return user;
+  loginOauth() {
+    return login(() => api.loginOauth());
   },
-  async loginWithToken(token: string) {
-    user = await api.loginWithToken(token);
-    offline = false;
-    epoch++;
-    ready = true;
-    return user;
+  loginWithToken(token: string) {
+    return login(() => api.loginWithToken(token));
   },
   async logout() {
+    const intent = ++authIntent;
     refreshId++;
     try {
       await api.logout();
     } catch (e) {
+      if (intent !== authIntent) throw e;
       console.error("logout failed", e);
       user = null;
       offline = false;
@@ -78,6 +86,7 @@ export const auth = {
       library.reset();
       throw e;
     }
+    if (intent !== authIntent) return;
     user = null;
     offline = false;
     epoch++;

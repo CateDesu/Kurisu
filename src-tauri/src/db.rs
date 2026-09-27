@@ -328,6 +328,7 @@ impl Db {
     }
 
     pub fn replace_account(&self, token: &str, user: &crate::models::User) -> Result<bool> {
+        let profile = serde_json::to_string(user)?;
         let mut c = self.0.lock();
         let tx = c.transaction()?;
         let previous: Option<String> = tx
@@ -346,6 +347,7 @@ impl Db {
             ("anilist_token", token),
             ("anilist_username", user.name.as_str()),
             ("anilist_user_id", id.as_str()),
+            ("anilist_profile", profile.as_str()),
         ] {
             tx.execute(
                 "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
@@ -354,6 +356,15 @@ impl Db {
         }
         tx.commit()?;
         Ok(changed)
+    }
+
+    pub fn cached_user(&self) -> Result<Option<crate::models::User>> {
+        let settings = self.get_settings_batch(&["anilist_user_id", "anilist_profile"])?;
+        let user = settings
+            .get("anilist_profile")
+            .and_then(|value| serde_json::from_str::<crate::models::User>(value).ok())
+            .filter(|user| settings.get("anilist_user_id") == Some(&user.id.to_string()));
+        Ok(user)
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -590,6 +601,7 @@ mod tests {
         for trigger in [
             "CREATE TRIGGER fail BEFORE DELETE ON list_entry BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             "CREATE TRIGGER fail BEFORE INSERT ON settings WHEN NEW.key = 'anilist_username' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            "CREATE TRIGGER fail BEFORE INSERT ON settings WHEN NEW.key = 'anilist_profile' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
         ] {
             let db = Db::open(std::path::Path::new(":memory:")).unwrap();
             let a = crate::models::User { id: 1, name: "A".into(), ..Default::default() };
@@ -601,6 +613,7 @@ mod tests {
             assert_eq!(db.get_setting("anilist_token").unwrap().as_deref(), Some("old"));
             assert_eq!(db.get_setting("anilist_username").unwrap().as_deref(), Some("A"));
             assert_eq!(db.get_setting("anilist_user_id").unwrap().as_deref(), Some("1"));
+            assert_eq!(db.cached_user().unwrap().unwrap().id, 1);
             assert_eq!(db.get_entry(1).unwrap().unwrap().progress, 8);
             db.0.lock().execute_batch("DROP TRIGGER fail").unwrap();
             assert!(db.replace_account("new", &b).unwrap());
@@ -637,6 +650,9 @@ mod tests {
         user.id = 2;
         assert!(db.replace_account("third", &user).unwrap());
         assert!(db.get_entry(1).unwrap().is_none());
+        assert_eq!(db.cached_user().unwrap().unwrap().id, 2);
+        db.set_setting("anilist_user_id", "1").unwrap();
+        assert!(db.cached_user().unwrap().is_none());
     }
 
     #[test]

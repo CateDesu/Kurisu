@@ -7,6 +7,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::{self, AppState, TrackingConfig};
 use crate::discord;
+use crate::library;
 use crate::mpvipc;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
 use crate::recognize::basename;
@@ -107,7 +108,7 @@ struct TrackingPrompt {
 }
 
 struct ActiveTrack {
-    key: String,
+    key: TrackKey,
     accumulated: Duration,
     last_tick: Instant,
     was_playing: bool,
@@ -119,7 +120,7 @@ struct ActiveTrack {
 }
 
 impl ActiveTrack {
-    fn new(key: String) -> Self {
+    fn new(key: TrackKey) -> Self {
         Self {
             key,
             accumulated: Duration::ZERO,
@@ -132,6 +133,14 @@ impl ActiveTrack {
             retry_at: None,
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct TrackKey {
+    source: String,
+    media_id: Option<i64>,
+    episode: Option<i64>,
+    session: Option<String>,
 }
 
 const MAX_AUTO_PUSH_FAILURES: u32 = 4;
@@ -230,9 +239,33 @@ struct TickInfo {
     episode: Option<i64>,
 }
 
+impl TickInfo {
+    fn key(&self, session: Option<String>) -> TrackKey {
+        TrackKey {
+            source: if self.trackid.is_empty() {
+                self.title.clone()
+            } else {
+                self.trackid.clone()
+            },
+            media_id: self.media_id,
+            episode: self.episode,
+            session,
+        }
+    }
+}
+
 async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    let expected_token = state.anilist.lock().token();
     let app_for_blocking = app.clone();
     let info = tokio::task::spawn_blocking(move || read_now(&app_for_blocking)).await??;
+    let session_guard = state.entry_lock.lock().await;
+    if state.anilist.lock().token() != expected_token {
+        *active = None;
+        let _ = app.emit("kurisu://now-playing", idle());
+        discord::update(None);
+        return Ok(());
+    }
 
     let Some(info) = info else {
         if active.is_some() {
@@ -257,11 +290,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         },
     );
 
-    let key = if !info.trackid.is_empty() {
-        info.trackid.clone()
-    } else {
-        info.title.clone()
-    };
+    let key = info.key(expected_token.clone());
     if active.as_ref().map(|t| &t.key) != Some(&key) {
         *active = Some(ActiveTrack::new(key));
     }
@@ -379,11 +408,22 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
                 progress,
             };
             if gate.should_push() {
+                drop(session_guard);
                 let st = app.state::<AppState>();
-                match commands::watcher_set_progress(st.inner(), media_id, episode).await {
+                match commands::watcher_set_progress(
+                    st.inner(),
+                    media_id,
+                    episode,
+                    expected_token.as_deref(),
+                )
+                .await
+                {
                     Ok(Some(entry)) => {
                         track.incremented = true;
-                        let _ = app.emit("kurisu://episode-updated", entry);
+                        let _session = st.entry_lock.lock().await;
+                        if st.anilist.lock().token() == expected_token {
+                            let _ = app.emit("kurisu://episode-updated", entry);
+                        }
                     }
                     Ok(None) => track.incremented = true,
                     Err(e) => {
@@ -451,7 +491,7 @@ fn mpv_tick_info(app: &AppHandle, snap: &mpvipc::MpvSnapshot) -> TickInfo {
     let matched = if is_audio_url(&snap.path) || is_audio_url(&snap.filename) {
         None
     } else {
-        match_title(&matchers, &title, &snap.path)
+        match_playing(app, &matchers, &title, &snap.path)
     };
     let base = basename(&snap.path);
     let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
@@ -468,11 +508,22 @@ fn mpv_tick_info(app: &AppHandle, snap: &mpvipc::MpvSnapshot) -> TickInfo {
     }
 }
 
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn match_playing<'a>(
+    app: &AppHandle,
+    matchers: &'a [crate::recognize::Matcher],
+    title: &str,
+    path: &str,
+) -> Option<&'a crate::recognize::Matcher> {
+    let bindings = library::get_bindings(&app.state::<AppState>().db);
+    library::bound_match(matchers, &bindings, path).or_else(|| match_title(matchers, title, path))
+}
+
 #[cfg(target_os = "linux")]
 fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let finder = match PlayerFinder::new() {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(probe_mpv(app)),
     };
     let players: Vec<_> = finder
         .find_all()
@@ -526,7 +577,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
         let matched = if is_audio_url(&url) {
             None
         } else {
-            match_title(&matchers, &title, &url)
+            match_playing(app, &matchers, &title, &url)
         };
         let base = basename(&url);
         let episode = matched.and_then(|m| resolve_episode(m, &[title.as_str(), base.as_str()]));
@@ -574,8 +625,14 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
         GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
     };
 
-    let manager = SessionManager::RequestAsync()?.join()?;
-    let sessions = manager.GetSessions()?;
+    let manager = match SessionManager::RequestAsync().and_then(|request| request.join()) {
+        Ok(manager) => manager,
+        Err(_) => return Ok(probe_mpv(app)),
+    };
+    let sessions = match manager.GetSessions() {
+        Ok(sessions) => sessions,
+        Err(_) => return Ok(probe_mpv(app)),
+    };
 
     let mut paused = None;
     let mut picked = None;
@@ -675,6 +732,29 @@ mod tests {
             episode: 5,
             progress: 4,
         }
+    }
+
+    #[test]
+    fn stream_episodes_and_sessions_reset_tracking_state() {
+        let mut info = TickInfo {
+            playing: true,
+            player: "mpv".into(),
+            trackid: "https://example.org/stream.m3u8".into(),
+            title: "Some Show - 05".into(),
+            length_us: 1_440_000_000,
+            position_us: 0,
+            media_id: Some(1),
+            matched_title: Some("Some Show".into()),
+            episode: Some(5),
+        };
+        let first = info.key(Some("first-session".into()));
+        assert!(first == info.key(Some("first-session".into())));
+        info.episode = Some(6);
+        assert!(first != info.key(Some("first-session".into())));
+        info.episode = Some(5);
+        assert!(first != info.key(Some("second-session".into())));
+        info.media_id = Some(2);
+        assert!(first != info.key(Some("first-session".into())));
     }
 
     #[test]

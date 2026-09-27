@@ -47,9 +47,40 @@
   }
 
   function onkeydown(event: KeyboardEvent) {
-    if (event.key !== "Escape" || event.defaultPrevented || topDialog()?.element !== dialog) return;
-    event.stopImmediatePropagation();
-    dismiss();
+    if (event.defaultPrevented || topDialog()?.element !== dialog) return;
+    if (event.key === "Escape") {
+      event.stopImmediatePropagation();
+      dismiss();
+    } else if (event.key === "Tab") {
+      const candidates = [...dialog.querySelectorAll<HTMLElement>(
+        'a[href], button, input, select, textarea, [tabindex], [contenteditable]'
+      )].filter((element) => {
+        if (element.tabIndex < 0 || element.matches(':disabled, input[type="hidden"]')) return false;
+        for (let parent: HTMLElement | null = element; parent; parent = parent.parentElement) {
+          if (parent.hidden || parent.inert) return false;
+          const style = getComputedStyle(parent);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          if (parent === dialog) break;
+        }
+        return true;
+      });
+      const controls = candidates.filter((element) => {
+        if (!(element instanceof HTMLInputElement) || element.type !== "radio" || !element.name) return true;
+        const group = candidates.filter((other): other is HTMLInputElement =>
+          other instanceof HTMLInputElement && other.type === "radio" &&
+          other.name === element.name && other.form === element.form
+        );
+        return element === (group.find((radio) => radio.checked) ?? group[0]);
+      });
+      const first = controls[0];
+      const last = controls.at(-1);
+      const active = document.activeElement;
+      if (!first || !dialog.contains(active) || active === dialog ||
+          (event.shiftKey ? active === first : active === last)) {
+        event.preventDefault();
+        (event.shiftKey ? last ?? dialog : first ?? dialog).focus();
+      }
+    }
   }
 </script>
 
