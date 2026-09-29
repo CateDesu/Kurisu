@@ -40,6 +40,9 @@ static RE_LEADING_EP: LazyLock<Regex> =
 static RE_BRACKET_EP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[\[(【]\s*(?:(?:ep(?:isode)?\.?|e)\s*)?(\d{1,4})(?:v\d+)?\s*[\])】]").unwrap()
 });
+static RE_EP_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^\w.])(?P<marker>s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<start>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<end>[0-9]{1,4})(?:v[0-9]+)?(?:$|[^\w.])").unwrap()
+});
 
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
 
@@ -234,7 +237,7 @@ type TiebreakKey = (
     std::cmp::Reverse<i64>,
 );
 
-/// Explicit seasons must agree. An unnumbered entry can match season one.
+/// Seasons must agree. Unnumbered releases cannot imply a numbered sequel.
 pub(crate) fn match_title<'a>(
     matchers: &'a [Matcher],
     title: &str,
@@ -280,11 +283,10 @@ pub(crate) fn match_title<'a>(
                     continue;
                 }
             }
-            if cand_ord.is_some_and(|n| {
-                !m.norms.iter().any(|x| {
-                    let ord = norm_season_ordinal(x);
-                    ord == Some(n) || (n == 1 && ord.is_none())
-                })
+            let expected_season = cand_ord.unwrap_or(1);
+            if !m.norms.iter().any(|x| {
+                let ord = norm_season_ordinal(x);
+                ord == Some(expected_season) || (expected_season == 1 && ord.is_none())
             }) {
                 continue;
             }
@@ -536,6 +538,23 @@ fn parse_last_episode_number(s: &str) -> Option<i64> {
 
 fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
     let s = strip_ext(s);
+    let s = RE_SEASON_WORDS.replace_all(&s, " ");
+    let explicit = RE_EXPLICIT_EP.captures(&s);
+    let leading = title_removed.then(|| RE_LEADING_EP.captures(&s)).flatten();
+    // A pack has no single episode to track or offer as the next file.
+    if RE_EP_RANGE.captures_iter(&s).any(|c| {
+        let start = c.name("start").unwrap();
+        let first = start.as_str().parse::<i64>().unwrap();
+        let last = c.name("end").unwrap().as_str().parse::<i64>().unwrap();
+        let episode = explicit.as_ref().or(leading.as_ref()).and_then(|c| c.get(1));
+        episode.is_none_or(|episode| episode.start() == start.start())
+            && (title_removed || c.name("marker").is_some() || start.len() >= 2)
+            && first < last
+            && !looks_like_year(first)
+            && !looks_like_year(last)
+    }) {
+        return None;
+    }
     let bracketed = bracket_episode(&s);
     let s = RE_BRACKETS.replace_all(&s, " ");
     let s = RE_CHANNEL.replace_all(&s, " ");
@@ -545,7 +564,6 @@ fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
     {
         return Some(episode);
     }
-    let s = RE_SEASON_WORDS.replace_all(&s, " ");
     let s = RE_SEASON_PREFIX.replace_all(&s, "$1");
     let s = RE_SEASON_BARE.replace_all(&s, " ");
     let s = RE_REV_TAIL.replace(&s, " ");
@@ -870,6 +888,42 @@ mod tests {
             match_title(&matchers, "Boku no Hero Academia - 05.mkv", "").map(|m| m.media_id),
             Some(1)
         );
+    }
+
+    #[test]
+    fn an_unnumbered_release_does_not_fall_forward_to_a_sequel() {
+        let matchers = vec![mk(2, "Boku no Hero Academia 2nd Season")];
+        assert!(match_title(&matchers, "Boku no Hero Academia - 05.mkv", "").is_none());
+        assert_eq!(
+            match_title(&matchers, "Boku no Hero Academia S02E05.mkv", "")
+                .map(|m| m.media_id),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn batch_ranges_do_not_resolve_to_a_single_episode() {
+        let show = mk(1, "Some Show");
+        for release in [
+            "Some Show - 01-12 [1080p]",
+            "Some Show - 01 ~ 12 [1080p]",
+            "Some Show E01-E12 [1080p]",
+            "Some Show S01E01-E12 [1080p]",
+            "Some Show [01-12] [1080p]",
+            "Some Show - ٠١-١٢",
+        ] {
+            assert_eq!(resolve_episode(&show, &[release]), None, "{release}");
+        }
+        assert_eq!(
+            resolve_episode(&show, &["Some Show E03 - 1-2-3 Go!"]),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_episode(&show, &["Some Show - 03 - 1-2-3 Go!"]),
+            Some(3)
+        );
+        assert_eq!(parse_episode_guess("Show Season 2 - 05"), Some(5));
+        assert_eq!(parse_episode_guess("Show 2 - 05"), Some(5));
     }
 
     #[test]

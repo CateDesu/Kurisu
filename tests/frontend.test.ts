@@ -5,7 +5,7 @@ import { button, deferred, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries([
-    "getEntry", "setProgress", "updateEntry", "getMedia", "getMediaDetail", "getRecommendations",
+    "getEntry", "setProgress", "updateEntry", "deleteEntry", "getMedia", "getMediaDetail", "getRecommendations",
     "localEntries", "getAiringSchedule", "getTrackingConfig", "getAppSetting", "setTrackingConfig",
     "getLibraryBinding", "bindLibraryPath", "getRssFeeds", "fetchTorrents", "searchTorrents", "setAppSetting",
   ].map((name) => [name, vi.fn()])),
@@ -149,6 +149,51 @@ test("Completed immediately fills known episode totals", async () => {
   button("Save").click();
   await settle();
   expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, "COMPLETED", 12, null, null);
+});
+
+test.each(["save", "remove"])("a pending entry %s cannot close through its details link", async (action) => {
+  const saving = deferred<typeof entry>();
+  const onclose = vi.fn();
+  mocks.api.updateEntry.mockReturnValue(saving.promise);
+  mocks.api.deleteEntry.mockReturnValue(saving.promise);
+  await render(EditEntry, { entry, scoreFormat: "POINT_100", onclose });
+  const input = document.querySelector("#ed-progress") as HTMLInputElement;
+  input.value = "3";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  if (action === "save") button("Save").click();
+  else {
+    button("Remove from list").click();
+    await settle();
+    button("Confirm remove").click();
+  }
+  await settle();
+  for (const control of document.querySelectorAll("#ed-status, #ed-progress, #ed-score, #ed-repeat")) {
+    expect(control.matches(":disabled")).toBe(true);
+  }
+  button("Example Show").click();
+  expect(onclose).not.toHaveBeenCalled();
+  saving.resolve({ ...entry, progress: 3 });
+  await settle();
+  expect(onclose).toHaveBeenCalledOnce();
+});
+
+test("a failed entry save keeps edits and allows retry", async () => {
+  mocks.api.updateEntry.mockRejectedValueOnce(new Error("Connection lost"))
+    .mockResolvedValue({ ...entry, progress: 3 });
+  const onclose = vi.fn();
+  await render(EditEntry, { entry, scoreFormat: "POINT_100", onclose });
+  const input = document.querySelector("#ed-progress") as HTMLInputElement;
+  input.value = "3";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  button("Save").click();
+  await settle();
+  expect(document.body.textContent).toContain("Connection lost");
+  expect(input.value).toBe("3");
+  expect(input.matches(":disabled")).toBe(false);
+  expect(onclose).not.toHaveBeenCalled();
+  button("Save").click();
+  await settle();
+  expect(onclose).toHaveBeenCalledOnce();
 });
 
 test("a legacy offline profile cannot edit scores with an unknown scale", async () => {

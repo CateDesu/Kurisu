@@ -174,6 +174,7 @@
     <div class="min-w-0 flex-1">
       <button
         type="button"
+        disabled={saving || removing}
         onclick={() => {
           onclose();
           goto(`/anime/${entry.media_id}`);
@@ -212,82 +213,83 @@
       e.preventDefault();
       save();
     }}
-    class="space-y-3"
   >
-    <div>
-      <label class="block text-sm mb-1" for="ed-status">Status</label>
-      <Select
-        id="ed-status"
-        bind:value={status}
-        options={statusOptions}
-        onchange={(value) => { if (value === "COMPLETED" && total != null) progress = total; }}
-      />
-    </div>
-
-    <div class="flex gap-3">
-      <div class="flex-1">
-        <label class="block text-sm mb-1" for="ed-progress">Progress {#if total}<span class="text-ink-dim">/ {total}</span>{/if}</label>
-        <input
-          id="ed-progress"
-          type="number"
-          min="0"
-          max={total ?? undefined}
-          bind:value={progress}
-          onblur={clampInputs}
-          class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
+    <fieldset disabled={saving || removing} class="space-y-3">
+      <div>
+        <label class="block text-sm mb-1" for="ed-status">Status</label>
+        <Select
+          id="ed-status"
+          bind:value={status}
+          options={statusOptions}
+          onchange={(value) => { if (value === "COMPLETED" && total != null) progress = total; }}
         />
       </div>
-      <div class="flex-1">
-        <label class="block text-sm mb-1" for="ed-score">Score <span class="text-ink-dim">{scoreUnit}</span></label>
-        {#if scoreAvailable}
-          <ScoreInput id="ed-score" bind:value={score} format={scoreFormat} />
-        {:else}
-          <p class="text-xs text-ink-dim">Reconnect to AniList to load your score format.</p>
-        {/if}
-      </div>
-      <div class="w-24 shrink-0">
-        <label class="block text-sm mb-1" for="ed-repeat" title="How many times you've finished this show">Rewatches</label>
-        <input
-          id="ed-repeat"
-          type="number"
-          min="0"
-          bind:value={repeat}
-          onblur={clampInputs}
-          class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
-        />
-      </div>
-    </div>
 
-    <div class="flex items-center justify-between gap-2 pt-1">
-      <button
-        type="button"
-        onclick={remove}
-        disabled={removing || saving}
-        class={confirmingRemove
-          ? "px-3 py-1.5 rounded-md text-sm bg-red-500/20 text-red-300 hover:bg-red-500/30 disabled:opacity-40"
-          : "px-3 py-1.5 rounded-md text-sm text-red-400/80 hover:text-red-400 hover:bg-red-500/10 disabled:opacity-40"}
-        title="Remove this series from your list"
-      >
-        {removing ? "Removing…" : confirmingRemove ? "Confirm remove" : "Remove from list"}
-      </button>
-      <div class="flex gap-2">
+      <div class="flex gap-3">
+        <div class="flex-1">
+          <label class="block text-sm mb-1" for="ed-progress">Progress {#if total}<span class="text-ink-dim">/ {total}</span>{/if}</label>
+          <input
+            id="ed-progress"
+            type="number"
+            min="0"
+            max={total ?? undefined}
+            bind:value={progress}
+            onblur={clampInputs}
+            class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
+          />
+        </div>
+        <div class="flex-1">
+          <label class="block text-sm mb-1" for="ed-score">Score <span class="text-ink-dim">{scoreUnit}</span></label>
+          {#if scoreAvailable}
+            <ScoreInput id="ed-score" bind:value={score} format={scoreFormat} />
+          {:else}
+            <p class="text-xs text-ink-dim">Reconnect to AniList to load your score format.</p>
+          {/if}
+        </div>
+        <div class="w-24 shrink-0">
+          <label class="block text-sm mb-1" for="ed-repeat" title="How many times you've finished this show">Rewatches</label>
+          <input
+            id="ed-repeat"
+            type="number"
+            min="0"
+            bind:value={repeat}
+            onblur={clampInputs}
+            class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
+          />
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between gap-2 pt-1">
         <button
           type="button"
-          onclick={onclose}
-          disabled={saving || removing}
-          class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+          onclick={remove}
+          disabled={removing || saving}
+          class={confirmingRemove
+            ? "px-3 py-1.5 rounded-md text-sm bg-red-500/20 text-red-300 hover:bg-red-500/30 disabled:opacity-40"
+            : "px-3 py-1.5 rounded-md text-sm text-red-400/80 hover:text-red-400 hover:bg-red-500/10 disabled:opacity-40"}
+          title="Remove this series from your list"
         >
-          Cancel
+          {removing ? "Removing…" : confirmingRemove ? "Confirm remove" : "Remove from list"}
         </button>
-        <button
-          type="submit"
-          disabled={saving}
-          class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
-        >
-          {saving ? "Saving…" : "Save"}
-        </button>
+        <div class="flex gap-2">
+          <button
+            type="button"
+            onclick={onclose}
+            disabled={saving || removing}
+            class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={saving}
+            class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm disabled:opacity-50"
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
       </div>
-    </div>
+    </fieldset>
   </form>
 
   {#if recs.length > 0}
