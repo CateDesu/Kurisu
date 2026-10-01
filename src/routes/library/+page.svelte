@@ -327,7 +327,7 @@
           {@const next = nextFile(g)}
           {@const cov = cover(g)}
           {@const isOpen = expanded.has(g.mediaId)}
-          <section class="cv-card bg-panel border border-edge rounded-lg overflow-hidden">
+          <section class="cv-group bg-panel border border-edge rounded-lg overflow-hidden">
             <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
             <div
               class="flex items-center gap-3 p-2.5 border-b border-edge cursor-pointer select-none hover:bg-panel-2/40 transition-colors"

@@ -111,10 +111,13 @@ input, textarea {
   gap: 0.75rem;
 }
 
-/* Remember rendered sizes so skipping offscreen content does not shift the scrollbar. */
-.cv-row {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 90px;
+/* Keep text heights accurate while containing layout and paint work. */
+.cv-row, .cv-card, .cv-group {
+  contain: content;
+}
+
+.program-shell main, .dialog-sheet {
+  scrollbar-gutter: stable;
 }
 
 @media (max-width: 960px) {
@@ -126,8 +129,4 @@ input, textarea {
     animation-duration: .01ms !important;
     transition-duration: .01ms !important;
   }
-}
-.cv-card {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 230px;
 }
