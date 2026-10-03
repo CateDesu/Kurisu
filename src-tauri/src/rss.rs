@@ -8,6 +8,7 @@ use crate::models::FeedFailure;
 const FEEDS_KEY: &str = "rss_feeds";
 const DEFAULT_FEEDS: &[&str] = &["https://nyaa.si/?page=rss&c=1_2&f=0"];
 static FEEDS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static FETCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 #[derive(Debug, Default, Clone)]
 pub struct RawItem {
@@ -101,6 +102,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
         let http = http.clone();
         let feed = feed.clone();
         tasks.push(tokio::spawn(async move {
+            let _slot = FETCH_SLOTS.acquire().await.expect("RSS semaphore is open");
             let fetched: Result<String> = async {
                 let mut resp = http.get(&feed).send().await?;
                 let status = resp.status();
@@ -220,6 +222,28 @@ pub async fn search(query: &str, category: &str, filter: &str) -> Result<Vec<Raw
         return Err(anyhow!("Could not complete the search: {}", failure.error));
     }
     Ok(fetched.items)
+}
+
+pub async fn search_variants(
+    queries: &[String],
+    category: &str,
+    filter: &str,
+) -> Result<FeedFetch> {
+    let urls = queries
+        .iter()
+        .map(|query| {
+            let mut url = reqwest::Url::parse(&search_url(query, category, filter)?)?;
+            url.query_pairs_mut()
+                .append_pair("s", "seeders")
+                .append_pair("o", "desc");
+            Ok(url.into())
+        })
+        .collect::<Result<Vec<String>>>()?;
+    let fetched = fetch_all(&urls).await?;
+    if fetched.items.is_empty() && fetched.failures.len() == urls.len() {
+        return Err(anyhow!("Could not search for this show. Please try again."));
+    }
+    Ok(fetched)
 }
 
 pub(crate) struct ParsedFeed {
@@ -433,26 +457,93 @@ fn finish_item(mut it: RawItem) -> RawItem {
     it
 }
 
+pub fn details_url(item: &RawItem) -> Option<String> {
+    for value in [&item.guid, &item.link] {
+        let value = value.rsplit('\u{1}').next().unwrap_or(value);
+        let Ok(url) = reqwest::Url::parse(value) else {
+            continue;
+        };
+        if url.scheme() == "https"
+            && matches!(url.host_str(), Some("nyaa.si" | "www.nyaa.si"))
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            let path = url.path().trim_end_matches('/');
+            if path
+                .strip_prefix("/view/")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return Some(url.to_string());
+            }
+            if let Some(id) = path
+                .strip_prefix("/download/")
+                .and_then(|p| p.strip_suffix(".torrent"))
+            {
+                if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                    return Some(format!("https://nyaa.si/view/{id}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn valid_info_hash(info_hash: &str) -> Option<&str> {
+    let hash = info_hash.trim();
+    let valid = (hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        || (hash.len() == 32
+            && hash
+                .chars()
+                .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')));
+    valid.then_some(hash)
+}
+
 /// Validate the hash before embedding it so feed text cannot inject magnet parameters.
 pub fn magnet_for(info_hash: &str, title: &str) -> Option<String> {
-    let h = info_hash.trim();
-    let valid = (h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
-        || (h.len() == 32
-            && h.chars()
-                .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')));
-    if valid {
-        Some(format!(
-            "magnet:?xt=urn:btih:{h}&dn={}",
-            crate::anilist::urlencoding::encode(title)
-        ))
-    } else {
-        log::warn!("feed item carried a malformed info hash: {h:?}");
-        None
-    }
+    let Some(hash) = valid_info_hash(info_hash) else {
+        log::warn!("feed item carried a malformed info hash: {info_hash:?}");
+        return None;
+    };
+    Some(format!(
+        "magnet:?xt=urn:btih:{hash}&dn={}",
+        crate::anilist::urlencoding::encode(title)
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn release_pages_are_derived_only_from_valid_nyaa_urls() {
+        for (guid, link, expected) in [
+            (
+                "https://nyaa.si/view/123",
+                "https://nyaa.si/download/123.torrent",
+                Some("https://nyaa.si/view/123"),
+            ),
+            (
+                "feed\u{1}https://nyaa.si/view/42",
+                "",
+                Some("https://nyaa.si/view/42"),
+            ),
+            (
+                "opaque-guid",
+                "https://nyaa.si/download/99.torrent",
+                Some("https://nyaa.si/view/99"),
+            ),
+            ("javascript:alert(1)", "https://evil.example/view/1", None),
+            ("https://nyaa.si@evil.example/view/1", "", None),
+            ("https://evil@nyaa.si/view/1", "", None),
+            ("https://nyaa.si/view/not-a-release", "", None),
+        ] {
+            let item = RawItem {
+                guid: guid.into(),
+                link: link.into(),
+                ..Default::default()
+            };
+            assert_eq!(details_url(&item).as_deref(), expected);
+        }
+    }
     use super::*;
 
     #[test]

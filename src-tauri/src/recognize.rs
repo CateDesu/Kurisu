@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
 
@@ -43,6 +43,9 @@ static RE_BRACKET_EP: LazyLock<Regex> = LazyLock::new(|| {
 static RE_EP_RANGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[^\w.])(?P<marker>s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<start>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<end>[0-9]{1,4})(?:v[0-9]+)?(?:$|[^\w.])").unwrap()
 });
+static RE_HALF_EPISODE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}.])(?:s[0-9]{1,2}\s*e|ep(?:isode)?[.\s_-]*|e[.\s_-]*|#)?[0-9]{1,4}\.5(?:v[0-9]+)?(?:$|[^\p{L}\p{N}.])").unwrap()
+});
 
 const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
 
@@ -52,8 +55,10 @@ pub(crate) struct Matcher {
     pub media_id: i64,
     pub display: String,
     pub variants: Vec<String>,
+    pub episodes: Option<i64>,
     norms: Vec<String>,
     status_rank: u8,
+    title_patterns: OnceLock<Vec<Regex>>,
 }
 
 fn status_rank(status: &str) -> u8 {
@@ -104,8 +109,10 @@ pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
             media_id: m.id,
             display: m.display_title(),
             variants,
+            episodes: m.episodes,
             norms,
             status_rank: status_rank(&e.status),
+            title_patterns: OnceLock::new(),
         });
     }
     out.sort_by_key(|m| (m.status_rank, m.media_id));
@@ -520,6 +527,93 @@ pub(crate) fn resolve_episode(matched: &Matcher, candidates: &[&str]) -> Option<
     }
 }
 
+pub(crate) fn excluded_playback_release(matched: &Matcher, candidate: &str) -> bool {
+    let filename = strip_ext(candidate);
+    let candidate = filename.as_str();
+    static EXTRAS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\b(?:trailer|preview|sample|pv|ova|oad|sp|op|ed|ost|ncop|nced|creditless|extras?|specials?)[0-9]*\b",
+        )
+        .unwrap()
+    });
+    let movie = matched.episodes == Some(1);
+    if !(RE_HALF_EPISODE.is_match(candidate)
+        || RE_EP_RANGE.is_match(candidate)
+        || movie && EXTRAS.is_match(&normalize(candidate)))
+    {
+        return false;
+    }
+    let title_patterns = matched.title_patterns.get_or_init(|| {
+        let mut variants = matched.variants.iter().collect::<Vec<_>>();
+        variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+        variants
+            .into_iter()
+            .filter_map(|variant| {
+                let words = variant
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .map(regex::escape)
+                    .collect::<Vec<_>>();
+                if words.is_empty() {
+                    return None;
+                }
+                Regex::new(&format!(
+                    r"(?i)(?:^|[^\p{{L}}\p{{N}}]){}(?:$|[^\p{{L}}\p{{N}}])",
+                    words.join(r"[^\p{L}\p{N}]+")
+                ))
+                .ok()
+            })
+            .collect()
+    });
+    let remainder = title_patterns
+        .iter()
+        .find(|pattern| pattern.is_match(candidate))
+        .map_or(Cow::Borrowed(candidate), |pattern| {
+            pattern.replace(candidate, " ")
+        });
+    if let Some(fractional) = RE_HALF_EPISODE.find(&remainder) {
+        let episode = RE_EXPLICIT_EP
+            .captures(&remainder)
+            .or_else(|| RE_LEADING_EP.captures(&remainder))
+            .and_then(|captures| captures.get(1));
+        if episode.is_none_or(|episode| episode.start() >= fractional.start()) {
+            return true;
+        }
+    }
+    if movie {
+        return RE_EP_RANGE.is_match(&remainder) || EXTRAS.is_match(&normalize(&remainder));
+    }
+    RE_EP_RANGE.captures_iter(&remainder).any(|range| {
+        let first = range["start"].parse::<i64>().unwrap();
+        let last = range["end"].parse::<i64>().unwrap();
+        first < last && !looks_like_year(first) && !looks_like_year(last)
+    }) && resolve_episode(matched, &[candidate]).is_none()
+}
+
+pub(crate) fn resolve_playback_episode(
+    matched: &Matcher,
+    candidates: &[&str],
+    bound: bool,
+) -> Option<i64> {
+    if candidates
+        .iter()
+        .any(|candidate| excluded_playback_release(matched, candidate))
+    {
+        return None;
+    }
+    if matched.episodes != Some(1) {
+        return resolve_episode(matched, candidates);
+    }
+    if let Some(episode) = resolve_episode(matched, candidates) {
+        return Some(episode);
+    }
+    (bound
+        || candidates
+            .iter()
+            .any(|candidate| matched.norms.contains(&norm_title(candidate))))
+    .then_some(1)
+}
+
 fn looks_like_year(n: i64) -> bool {
     use chrono::Datelike;
     (1900..=chrono::Utc::now().year() as i64 + 1).contains(&n)
@@ -546,7 +640,10 @@ fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
         let start = c.name("start").unwrap();
         let first = start.as_str().parse::<i64>().unwrap();
         let last = c.name("end").unwrap().as_str().parse::<i64>().unwrap();
-        let episode = explicit.as_ref().or(leading.as_ref()).and_then(|c| c.get(1));
+        let episode = explicit
+            .as_ref()
+            .or(leading.as_ref())
+            .and_then(|c| c.get(1));
         episode.is_none_or(|episode| episode.start() == start.start())
             && (title_removed || c.name("marker").is_some() || start.len() >= 2)
             && first < last
@@ -614,6 +711,226 @@ fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adversarial_fractional_movie_releases_are_not_the_main_feature() {
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk(1, "Some Movie")
+        };
+        for filename in ["Some Movie - 12.5.mkv", "Some Movie [12.5].mkv"] {
+            assert_eq!(
+                resolve_playback_episode(&movie, &[filename], true),
+                None,
+                "{filename} was recognized as the movie"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_playback_exclusions_preserve_real_titles_audio_and_episode_names() {
+        for title in [
+            "Some Movie",
+            "12.5",
+            "Evangelion: 1.0 You Are (Not) Alone",
+            "The Special",
+        ] {
+            let movie = Matcher {
+                episodes: Some(1),
+                ..mk(1, title)
+            };
+            let filename = format!("[G] {title} [1080p] [AAC5.1].mkv");
+            assert_eq!(
+                resolve_playback_episode(&movie, &[&filename], false),
+                Some(1),
+                "{filename}"
+            );
+        }
+        let series = Matcher {
+            episodes: Some(12),
+            ..mk(1, "Some Show")
+        };
+        for filename in [
+            "Some Show - 12.5.mkv",
+            "Some Show [12.5].mkv",
+            "Some Show - EP5.5.mkv",
+        ] {
+            assert_eq!(
+                resolve_playback_episode(&series, &[filename], false),
+                None,
+                "{filename}"
+            );
+        }
+        assert_eq!(
+            resolve_playback_episode(&series, &["Some Show E03 - 1-2-3 Go!.mkv"], false),
+            Some(3)
+        );
+        for filename in [
+            "Some Show E03 - 12.5 Seconds.mkv",
+            "Some Show - 03 - 12.5 Seconds.mkv",
+        ] {
+            assert_eq!(
+                resolve_playback_episode(&series, &[filename], false),
+                Some(3),
+                "{filename}"
+            );
+        }
+        assert_eq!(
+            resolve_playback_episode(&series, &["Some Show [12.5_1080p].mkv"], false),
+            None
+        );
+    }
+
+    #[test]
+    fn single_episode_playback_uses_known_total_without_guessing_series_or_previews() {
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk(1, "Some Movie")
+        };
+        assert_eq!(
+            resolve_playback_episode(&movie, &["[G] Some Movie [BD 1080p].mkv"], false),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_playback_episode(&movie, &["feature.mkv"], true),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_playback_episode(&movie, &["Unrelated Movie.mkv"], false),
+            None
+        );
+        for release in [
+            "Some Movie [Trailer].mkv",
+            "Some Movie [01-02].mkv",
+            "Some Movie Preview.mkv",
+            "sample.mkv",
+            "[Trailer] Some Movie - 01.mkv",
+        ] {
+            assert_eq!(
+                resolve_playback_episode(&movie, &[release], true),
+                None,
+                "{release}"
+            );
+        }
+        assert_eq!(
+            resolve_playback_episode(&movie, &["Some Movie - 02.mkv"], false),
+            Some(2)
+        );
+        let series = Matcher {
+            episodes: Some(12),
+            ..mk(1, "Some Movie")
+        };
+        assert_eq!(
+            resolve_playback_episode(&series, &["Some Movie.mkv"], true),
+            None
+        );
+        assert_eq!(resolve_episode(&movie, &["Some Movie.mkv"]), None);
+        for title in [
+            "Evangelion: 1.0 You Are (Not) Alone",
+            "5 Centimeters per Second",
+            "1.0",
+        ] {
+            let movie = Matcher {
+                episodes: Some(1),
+                ..mk(1, title)
+            };
+            let filename = format!("[G] {title} [1080p].mkv");
+            assert_eq!(
+                resolve_playback_episode(&movie, &[&filename], false),
+                Some(1),
+                "{filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_movie_bonus_videos_cannot_complete_the_feature() {
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk(1, "Some Movie")
+        };
+        for release in [
+            "Some Movie [OVA].mkv",
+            "Some Movie_OAD1.mkv",
+            "Some Movie [SP01].mkv",
+            "OP1.mkv",
+            "Some Movie [ED1].mkv",
+            "Some Movie [OST].mkv",
+        ] {
+            for bound in [false, true] {
+                assert_eq!(
+                    resolve_playback_episode(&movie, &[release, "Some Movie"], bound),
+                    None,
+                    "{release}, bound: {bound}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_single_episode_ova_titles_remain_watchable() {
+        for title in ["Some Show OVA", "Some Show OAD", "OP", "ED", "SP"] {
+            let movie = Matcher {
+                episodes: Some(1),
+                ..mk(1, title)
+            };
+            let filename = format!("[G] {title} [BD 1080p].mkv");
+            for bound in [false, true] {
+                assert_eq!(
+                    resolve_playback_episode(&movie, &[&filename], bound),
+                    Some(1),
+                    "{filename}, bound: {bound}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn movie_extras_with_release_separators_are_not_watchable_episodes() {
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk(1, "Some Movie")
+        };
+        for release in [
+            "Some_Movie_Sample.mkv",
+            "Some Movie [PV01].mkv",
+            "Some Movie [NCOP01].mkv",
+            "Some Movie Trailer01.mkv",
+            "sample01.mkv",
+        ] {
+            assert_eq!(
+                resolve_playback_episode(&movie, &[release], true),
+                None,
+                "{release}"
+            );
+        }
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk(1, "The Special")
+        };
+        assert_eq!(
+            resolve_playback_episode(&movie, &["The.Special.mkv"], false),
+            Some(1)
+        );
+        for title in ["X", "1"] {
+            let movie = Matcher {
+                episodes: Some(1),
+                ..mk(1, title)
+            };
+            let extra = format!("[G] {title} Extras01.mkv");
+            assert_eq!(
+                resolve_playback_episode(&movie, &[&extra], true),
+                None,
+                "{extra}"
+            );
+            let range = format!("[G] {title} [11-12].mkv");
+            assert_eq!(
+                resolve_playback_episode(&movie, &[&range], true),
+                None,
+                "{range}"
+            );
+        }
+    }
 
     #[test]
     fn clean_strips_group_resolution_and_episode_tail() {
@@ -795,7 +1112,9 @@ mod tests {
             display: "91 Days".into(),
             variants: vec!["91 Days".into()],
             norms: vec!["91 days".into()],
+            episodes: None,
             status_rank: 0,
+            title_patterns: OnceLock::new(),
         };
         assert_eq!(
             resolve_episode(&days, &["91 Days", "91 Days [BD 1080p]"]),
@@ -810,7 +1129,9 @@ mod tests {
             display: "Re:Zero".into(),
             variants: vec!["Re:Zero kara Hajimeru Isekai Seikatsu".into()],
             norms: vec!["re zero kara hajimeru isekai seikatsu".into()],
+            episodes: None,
             status_rank: 0,
+            title_patterns: OnceLock::new(),
         };
         assert_eq!(
             resolve_episode(&rezero, &["Re Zero - 05", "Re Zero - 05"]),
@@ -825,7 +1146,9 @@ mod tests {
             display: "Frieren".into(),
             variants: vec!["Sousou no Frieren".into()],
             norms: vec!["sousou no frieren".into()],
+            episodes: None,
             status_rank: 0,
+            title_patterns: OnceLock::new(),
         };
         let matchers = vec![m];
         assert!(match_title(&matchers, "Sousou no Frieren - 28", "").is_some());
@@ -856,12 +1179,15 @@ mod tests {
             display: title.into(),
             variants: vec![title.into()],
             norms: vec![norm_title(title)],
+            episodes: None,
             status_rank: 0,
+            title_patterns: OnceLock::new(),
         }
     }
 
     fn mk_status(media_id: i64, title: &str, status: &str) -> Matcher {
         Matcher {
+            episodes: None,
             status_rank: status_rank(status),
             ..mk(media_id, title)
         }
@@ -895,8 +1221,7 @@ mod tests {
         let matchers = vec![mk(2, "Boku no Hero Academia 2nd Season")];
         assert!(match_title(&matchers, "Boku no Hero Academia - 05.mkv", "").is_none());
         assert_eq!(
-            match_title(&matchers, "Boku no Hero Academia S02E05.mkv", "")
-                .map(|m| m.media_id),
+            match_title(&matchers, "Boku no Hero Academia S02E05.mkv", "").map(|m| m.media_id),
             Some(2)
         );
     }
@@ -1221,7 +1546,9 @@ mod tests {
                 display: (*en).into(),
                 variants: vec![(*en).into(), rom_by_id[id].into()],
                 norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                episodes: None,
                 status_rank: status_rank(status),
+                title_patterns: OnceLock::new(),
             })
             .collect();
         for raw in [
@@ -1277,7 +1604,9 @@ mod tests {
                 display: (*en).into(),
                 variants: vec![(*en).into(), rom_by_id[id].into()],
                 norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                episodes: None,
                 status_rank: status_rank(status),
+                title_patterns: OnceLock::new(),
             })
             .collect();
         let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")
@@ -1296,14 +1625,18 @@ mod tests {
                 display: "Mushoku Tensei: Jobless Reincarnation Season 2".into(),
                 variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 2".into()],
                 norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 2")],
+                episodes: None,
                 status_rank: status_rank("CURRENT"),
+                title_patterns: OnceLock::new(),
             },
             Matcher {
                 media_id: 178789,
                 display: "Mushoku Tensei: Jobless Reincarnation Season 3".into(),
                 variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 3".into()],
                 norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 3")],
+                episodes: None,
                 status_rank: status_rank("PAUSED"),
+                title_patterns: OnceLock::new(),
             },
         ];
         let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")

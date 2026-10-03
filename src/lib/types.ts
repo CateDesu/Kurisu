@@ -58,12 +58,46 @@ export interface MediaDetail {
   relations: MediaRelation[];
   characters: MediaCharacter[];
   staff: MediaStaff[];
+  cached_at?: number | null;
+  warning?: string | null;
+  unavailable_sections?: string[];
+}
+
+export interface SearchPage {
+  items: Media[];
+  page: number;
+  has_next_page: boolean;
+}
+
+export interface NotificationPage {
+  items: Notification[];
+  page: number;
+  has_next_page: boolean;
+  unread_count: number | null;
+}
+
+export interface FuzzyDate {
+  year: number | null;
+  month: number | null;
+  day: number | null;
+}
+
+export interface EntryDetails {
+  notes: string;
+  started_at: FuzzyDate | null;
+  completed_at: FuzzyDate | null;
+  custom_lists: string[];
+  available_custom_lists: string[];
+  cached_at?: number | null;
+  warning?: string | null;
 }
 
 export interface TorrentItem {
   title: string;
   link: string;
   guid: string;
+  seen_guid?: string | null;
+  details_url?: string | null;
   magnet?: string | null;
   size?: string | null;
   seeders?: number | null;
@@ -100,7 +134,17 @@ export interface TorrentFetch {
   failures: FeedFailure[];
 }
 
+export interface ShowTorrents {
+  batches: TorrentItem[];
+  episodes: TorrentItem[];
+  other: TorrentItem[];
+  next_episode: number | null;
+  warnings: string[];
+}
+
 export interface UserStats {
+  cached_at?: number | null;
+  warning?: string | null;
   count: number;
   episodes_watched: number;
   minutes_watched: number;
@@ -158,6 +202,7 @@ export interface Notification {
   thread_id?: number | null;
   thread_title?: string | null;
   comment_id?: number | null;
+  comment_url?: string | null;
   reason?: string | null;
   deleted_media_title?: string | null;
   user_name?: string | null;
@@ -211,6 +256,12 @@ export function notificationText(n: Notification): string {
 export function notificationUrl(n: Notification): string {
   if (n.media_id) return `https://anilist.co/anime/${n.media_id}`;
   if (n.activity_id) return `https://anilist.co/activity/${n.activity_id}`;
+  if (n.comment_url) {
+    try {
+      const url = new URL(n.comment_url);
+      if (url.protocol === "https:" && url.hostname === "anilist.co" && !url.username && !url.password) return url.href;
+    } catch {}
+  }
   if (n.thread_id) return `https://anilist.co/forum/thread/${n.thread_id}`;
   if (n.user_name) return `https://anilist.co/user/${encodeURIComponent(n.user_name)}`;
   return "https://anilist.co/notifications";
@@ -394,4 +445,30 @@ export function airingLabel(m: Media | null | undefined): string | null {
   if (days < 7) return `Ep ${ep} airs in ${Math.ceil(days)}d`;
   const d = new Date(m.next_airing_at * 1000);
   return `Ep ${ep} airs ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
+}
+
+export interface LibraryBinding {
+  media_id: number;
+  episode_offset: number;
+}
+
+export interface WatchHistoryItem {
+  id: number;
+  path: string;
+  media_id: number;
+  episode: number;
+  watched_at: number;
+  title: string;
+}
+
+export interface PendingChange {
+  media_id: number;
+  title: string;
+  progress: number | null;
+  status: string | null;
+  score: number | null;
+  repeat: number | null;
+  error: string | null;
+  conflict: boolean;
+  missing_media: boolean;
 }

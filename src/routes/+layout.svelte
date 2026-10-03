@@ -9,12 +9,28 @@
   import { bindNowPlaying } from "$lib/nowplaying.svelte";
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
+  import PendingSync from "$lib/PendingSync.svelte";
   import Updater from "$lib/Updater.svelte";
   import Confirm from "$lib/Confirm.svelte";
   import Icon from "$lib/Icon.svelte";
   import Img from "$lib/Img.svelte";
   import Gearwork from "$lib/Gearwork.svelte";
+  import { rememberScroll, type ScrollPosition } from "$lib/scroll";
+  import { smoothScroll } from "$lib/smooth-scroll";
+  import type { Snapshot } from "./$types";
   let { children } = $props();
+
+  let scroll: ReturnType<typeof rememberScroll> | undefined;
+  function trackScroll(node: HTMLElement) {
+    const memory = rememberScroll(node);
+    scroll = memory;
+    return { destroy() { memory.destroy(); scroll = undefined; } };
+  }
+
+  export const snapshot: Snapshot<ScrollPosition> = {
+    capture: () => scroll?.capture() ?? { left: 0, top: 0 },
+    restore: (position) => scroll?.restore(position),
+  };
 
   $effect(() => runClock());
 
@@ -74,9 +90,10 @@
 
   /// Track program navigation because browser history includes the whole tab session.
   let navDepth = $state(0);
-  afterNavigate(({ type, to, from }) => {
-    if (type === "popstate") navDepth = Math.max(0, navDepth - 1);
+  afterNavigate(({ type, to, from, delta }) => {
+    if (type === "popstate") navDepth = Math.max(0, navDepth + (delta ?? -1));
     else if (type !== "enter" && to?.url.pathname !== from?.url.pathname) navDepth += 1;
+    if (type !== "popstate" && !to?.url.hash) scroll?.reset();
   });
   function back() {
     if (navDepth > 0) history.back();
@@ -100,8 +117,9 @@
     </div>
   {:else}
     <Tracking />
+    <PendingSync />
     <Updater />
-    <div class="flex flex-1 overflow-hidden">
+    <div class="flex flex-1 min-h-0 overflow-hidden">
       <aside class="sidebar shrink-0 border-r border-edge flex flex-col">
         <div class="brand-block">
           <div class="eyebrow brand-caption">アニメの記録 <span>クリス</span></div>
@@ -117,7 +135,7 @@
             <Icon name="back" />
           </button>
         </div>
-        <nav class="sidebar-nav flex-1 overflow-auto" aria-label="Main navigation">
+        <nav use:smoothScroll class="sidebar-nav flex-1 overflow-auto" aria-label="Main navigation">
           {#each nav as item, index}
             {#if index === 0 || index === 4 || index === 8}
               <div class="nav-heading eyebrow">{index === 0 ? 'Your shelf' : index === 4 ? 'Discover' : 'Program'}</div>
@@ -168,7 +186,7 @@
           </div>
         {/if}
       </aside>
-      <main class="flex-1 min-w-0 overflow-auto">
+      <main use:trackScroll use:smoothScroll={$pageStore.url.pathname} class="flex-1 min-w-0 min-h-0 overflow-auto">
         {@render children?.()}
       </main>
       <!-- Keep the resize grip in flow so it cannot cover the scrollbar. -->
@@ -180,7 +198,7 @@
   {#if confirmingLogout}
     <Confirm
       title="Log out?"
-      body="Removes your token and clears the cached list. Everything syncs back on your next login."
+      body="Removes your token and clears the cached list. Pending changes stay saved for this account. Your list syncs back on your next login."
       confirmLabel="Log out"
       busy={loggingOut}
       onconfirm={doLogout}

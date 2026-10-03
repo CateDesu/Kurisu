@@ -38,6 +38,7 @@
   const bindTarget = $derived(scope === "folder" ? dir : path);
 
   let q = $state("");
+  let episodeOffset = $state(0);
   let busy = $state<number | null>(null);
   let err = $state("");
   // Wait for the existing binding before allowing a pick that might replace it.
@@ -113,6 +114,10 @@
 
   async function pick(e: ListEntry) {
     if (!current() || busy !== null || !bindingChecked || e.media_id === currentBinding) return;
+    if (!Number.isInteger(episodeOffset) || Math.abs(episodeOffset) > 9999) {
+      err = "Enter a whole-number episode offset between -9999 and 9999.";
+      return;
+    }
     if (currentBinding !== null && pendingRelink !== e.media_id) {
       pendingRelink = e.media_id;
       return;
@@ -120,7 +125,8 @@
     busy = e.media_id;
     err = "";
     try {
-      await api.bindLibraryPath(bindTarget, e.media_id);
+      if (episodeOffset === 0) await api.bindLibraryPath(bindTarget, e.media_id);
+      else await api.bindLibraryPath(bindTarget, e.media_id, episodeOffset);
       if (!current()) return;
       onlinked();
       onclose();
@@ -196,6 +202,13 @@
     placeholder="Search your list…"
     class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent mb-2"
   />
+
+  <div class="mb-3">
+    <label for="link-episode-offset" class="block text-xs text-ink-dim mb-1">Episode offset</label>
+    <input id="link-episode-offset" type="number" step="1" min="-9999" max="9999" bind:value={episodeOffset}
+      disabled={busy !== null} class="w-28 bg-panel-2 border border-edge rounded px-2 py-1.5 text-sm" />
+    <p class="text-xs text-ink-dim mt-1">Added to file episode numbers. Use -12 to map file 13 to episode 1. Results must fit the show's episode total.</p>
+  </div>
 
   <div class="max-h-72 overflow-y-auto space-y-1 -mx-1 px-1">
     {#if candidates.length === 0}

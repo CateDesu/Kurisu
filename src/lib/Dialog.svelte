@@ -15,6 +15,7 @@
 
 <script lang="ts">
   import { onMount, type Snippet } from "svelte";
+  import { smoothScroll } from "$lib/smooth-scroll";
 
   let { children, onclose, busy = false, size = "sm", layer = 50, closeOnBackdrop = true }: {
     children: Snippet;
@@ -88,7 +89,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
-  class="fixed inset-0 bg-black/70 grid place-items-center"
+  class="dialog-backdrop fixed inset-0 bg-black/70 grid place-items-center"
   style:z-index={layer}
   onclick={() => { if (closeOnBackdrop) dismiss(); }}
   role="presentation"
@@ -96,6 +97,7 @@
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     bind:this={dialog}
+    use:smoothScroll
     class="dialog-sheet bg-panel border border-edge rounded-xl p-6 w-full mx-4 shadow-2xl {size === 'md' ? 'max-w-lg' : 'max-w-md'}"
     onclick={(event) => event.stopPropagation()}
     role="dialog"
@@ -107,5 +109,6 @@
 </div>
 
 <style>
+  .dialog-backdrop { overflow: auto; overscroll-behavior: contain; }
   .dialog-sheet { border-top: 2px solid var(--color-rust); max-height: calc(100vh - 32px); overflow-y: auto; }
 </style>

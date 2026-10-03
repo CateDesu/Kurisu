@@ -7,7 +7,11 @@ mod models;
 mod mpvipc;
 mod playback;
 mod recognize;
+#[cfg(target_os = "linux")]
+mod rendering;
 mod rss;
+mod show_torrents;
+mod sync_queue;
 mod updater;
 
 use commands::AppState;
@@ -128,10 +132,9 @@ pub fn run() {
     )
     .init();
 
-    // Disable DMA-BUF to avoid Mesa crashes on exit. KURISU_DMABUF opts back in.
-    if std::env::var_os("KURISU_DMABUF").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    }
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    rendering::configure(&context.config().identifier);
 
     // One instance prevents duplicate trackers and competing writes to the same database.
     let instance_guard = match std::net::TcpListener::bind(SINGLE_INSTANCE_ADDR) {
@@ -181,6 +184,11 @@ pub fn run() {
             commands::logout,
             commands::current_user,
             commands::search_anime,
+            commands::search_anime_page,
+            commands::get_notifications_page,
+            commands::mark_notifications_read,
+            commands::get_entry_details,
+            commands::update_entry_details,
             commands::get_season,
             commands::get_recommendations,
             commands::get_media,
@@ -203,6 +211,11 @@ pub fn run() {
             commands::scan_library,
             commands::bind_library_path,
             commands::library_binding_for,
+            commands::library_binding_details,
+            commands::get_watch_history,
+            sync_queue::get_pending_changes,
+            sync_queue::sync_pending_changes,
+            sync_queue::resolve_pending_change,
             commands::unbind_library_media,
             commands::get_rss_feeds,
             commands::add_rss_feed,
@@ -210,6 +223,7 @@ pub fn run() {
             commands::fetch_torrents,
             commands::mark_torrents_seen,
             commands::search_torrents,
+            commands::find_show_torrents,
             commands::get_user_stats,
             commands::check_update,
             commands::install_update,
@@ -256,6 +270,7 @@ pub fn run() {
                 auth_intent: tokio::sync::watch::channel(0).0,
                 entry_lock: tokio::sync::Mutex::new(()),
                 matchers: Mutex::new(Arc::new(matchers)),
+                library_cache: Default::default(),
             });
 
             let tray_result: Result<(), String> = (|| {
@@ -334,6 +349,7 @@ pub fn run() {
             }
 
             playback::spawn(app.handle().clone());
+            sync_queue::spawn(app.handle().clone());
 
             {
                 use tauri::Emitter;
@@ -379,7 +395,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running kurisu");
 }
 

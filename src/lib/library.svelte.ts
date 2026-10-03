@@ -2,6 +2,19 @@ import { api } from "./api";
 import type { LibraryFile, UnreadableFolder } from "./types";
 
 let files = $state<LibraryFile[]>([]);
+const filesByEpisode = $derived.by(() => {
+  const byMedia = new Map<number, Map<number, LibraryFile>>();
+  for (const file of files) {
+    if (file.media_id == null || file.episode == null) continue;
+    let episodes = byMedia.get(file.media_id);
+    if (!episodes) {
+      episodes = new Map();
+      byMedia.set(file.media_id, episodes);
+    }
+    if (!episodes.has(file.episode)) episodes.set(file.episode, file);
+  }
+  return byMedia;
+});
 let unreadable = $state<UnreadableFolder[]>([]);
 let folders = $state<string[]>([]);
 let foldersFailed = $state(false);
@@ -13,6 +26,7 @@ let scanGen = 0;
 let folderRequest = 0;
 let folderGeneration = 0;
 let folderQueue = Promise.resolve();
+const SCAN_AGE = 60_000;
 
 async function loadFolders() {
   const request = ++folderRequest;
@@ -48,7 +62,7 @@ async function changeFolders(change: () => Promise<string[]>) {
 async function ensureScan() {
   const gen = scanGen;
   await loadFolders();
-  if (gen === scanGen && folders.length > 0 && lastScanAt === 0) await scan();
+  if (gen === scanGen && folders.length > 0 && (lastScanAt === 0 || Date.now() - lastScanAt >= SCAN_AGE)) await scan();
 }
 
 async function scan() {
@@ -102,7 +116,7 @@ export const library = {
     return lastScanAt > 0;
   },
   fileFor(mediaId: number, episode: number): LibraryFile | undefined {
-    return files.find((f) => f.media_id === mediaId && f.episode === episode);
+    return filesByEpisode.get(mediaId)?.get(episode);
   },
   loadFolders,
   ensureScan,

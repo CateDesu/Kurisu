@@ -5,7 +5,7 @@
 
 <script lang="ts">
   import Dialog from "$lib/Dialog.svelte";
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
@@ -15,7 +15,7 @@
   import ScoreInput from "$lib/ScoreInput.svelte";
   import Icon from "$lib/Icon.svelte";
   import Img from "$lib/Img.svelte";
-  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
+  import { displayTitle, STATUS_LABEL, type EntryDetails, type FuzzyDate, type ListEntry, type Media } from "$lib/types";
 
   let {
     entry,
@@ -31,7 +31,9 @@
     repeat: entry.repeat,
   }));
   const epoch = untrack(() => auth.epoch);
-  const current = () => epoch === auth.epoch && auth.isLoggedIn;
+  let alive = true;
+  const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
+  onDestroy(() => { alive = false; });
   const scoreAvailable = $derived(!auth.offline || Boolean(scoreFormat));
   let status = $state(untrack(() => entry.status));
   let progress = $state(untrack(() => entry.progress));
@@ -47,6 +49,41 @@
   let addingRecs = $state(new Set<number>());
   let addedRecs = $state<number[]>([]);
   let recErr = $state("");
+
+  let detailsOpen = $state(false);
+  let details = $state<EntryDetails | null>(null);
+  let detailsLoading = $state(false);
+  let detailsError = $state("");
+  let notes = $state("");
+  let started = $state<FuzzyDate>({ year: null, month: null, day: null });
+  let completed = $state<FuzzyDate>({ year: null, month: null, day: null });
+  let customLists = $state<string[]>([]);
+  const emptyDate = (): FuzzyDate => ({ year: null, month: null, day: null });
+  const cleanDate = (date: FuzzyDate): FuzzyDate => ({ year: date.year ?? null, month: date.month ?? null, day: date.day ?? null });
+  const sameDate = (left: FuzzyDate, right: FuzzyDate | null) => JSON.stringify(cleanDate(left)) === JSON.stringify(cleanDate(right ?? emptyDate()));
+
+  function applyDetails(found: EntryDetails) {
+    details = found;
+    notes = found.notes;
+    started = cleanDate(found.started_at ?? emptyDate());
+    completed = cleanDate(found.completed_at ?? emptyDate());
+    customLists = [...found.custom_lists];
+  }
+
+  async function loadDetails() {
+    if (detailsLoading || !current()) return;
+    detailsLoading = true;
+    detailsError = "";
+    try {
+      const found = await api.getEntryDetails(entry.media_id);
+      if (!current()) return;
+      applyDetails(found);
+    } catch (e) {
+      if (current()) detailsError = String(e);
+    } finally {
+      if (current()) detailsLoading = false;
+    }
+  }
 
   const statusOptions = Object.entries(STATUS_LABEL).map(([value, label]) => ({
     value: value as ListEntry["status"],
@@ -116,15 +153,22 @@
     const progressTouched = progress !== snap.progress;
     const repeatTouched = repeat !== snap.repeat;
     clampInputs();
-    if (status === snap.status && !progressTouched && score === snap.score && !repeatTouched) {
+    const detailsTouched = details && (notes !== details.notes || !sameDate(started, details.started_at) || !sameDate(completed, details.completed_at) || JSON.stringify([...customLists].sort()) !== JSON.stringify([...details.custom_lists].sort()));
+    const basicTouched = status !== snap.status || progressTouched || score !== snap.score || repeatTouched;
+    if (!basicTouched && !detailsTouched) {
       if (current()) onclose();
       return;
     }
     saving = true;
     err = "";
     try {
+      if (details && detailsTouched) {
+        const saved = await api.updateEntryDetails(entry.media_id, notes !== details.notes ? notes : null, !sameDate(started, details.started_at) ? cleanDate(started) : null, !sameDate(completed, details.completed_at) ? cleanDate(completed) : null, JSON.stringify([...customLists].sort()) !== JSON.stringify([...details.custom_lists].sort()) ? [...customLists] : null);
+        if (!current()) return;
+        applyDetails(saved);
+      }
       // Send only edited fields to preserve newer changes from tracking or other clients.
-      await api.updateEntry(
+      if (basicTouched) await api.updateEntry(
         entry.media_id,
         status !== snap.status ? status : null,
         progressTouched ? (progress ?? snap.progress) : null,
@@ -252,11 +296,49 @@
             id="ed-repeat"
             type="number"
             min="0"
+            max="1000"
             bind:value={repeat}
             onblur={clampInputs}
             class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
           />
         </div>
+      </div>
+
+      <div class="border-t border-edge pt-3">
+        <button type="button" class="text-sm text-accent" aria-expanded={detailsOpen} onclick={() => { detailsOpen = !detailsOpen; if (detailsOpen && !details) void loadDetails(); }}>Notes, viewing dates and custom lists {detailsOpen ? "▴" : "▾"}</button>
+        {#if detailsOpen}
+          {#if detailsLoading}<p class="text-xs text-ink-dim mt-2">Loading entry details…</p>{/if}
+          {#if detailsError}
+            <p class="text-xs text-red-400 mt-2">Entry details are unavailable. {detailsError} <button type="button" onclick={loadDetails} disabled={detailsLoading} class="text-accent">Retry entry details</button></p>
+          {/if}
+          {#if details}
+            {#if details.warning}<p class="text-xs text-ink-dim mt-2">Showing saved entry details. Reconnect before saving changes. {details.warning}</p>{/if}
+            <label for="ed-notes" class="block text-sm mt-3 mb-1">Notes</label>
+            <textarea id="ed-notes" bind:value={notes} maxlength="6000" rows="3" class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm"></textarea>
+            <p class="text-xs text-ink-dim mb-2">Notes follow your AniList list privacy settings.</p>
+            {#each [{ label: "Started", date: started }, { label: "Completed", date: completed }] as item (item.label)}
+              <div class="mt-2">
+                <span class="block text-sm mb-1">{item.label} viewing</span>
+                <div class="flex gap-2">
+                  <input type="number" min="1" max="9999" placeholder="Year" aria-label={`${item.label} year`} bind:value={item.date.year} class="w-1/3 bg-panel-2 border border-edge rounded-md p-2 text-sm" />
+                  <input type="number" min="1" max="12" placeholder="Month" aria-label={`${item.label} month`} bind:value={item.date.month} class="w-1/3 bg-panel-2 border border-edge rounded-md p-2 text-sm" />
+                  <input type="number" min="1" max="31" placeholder="Day" aria-label={`${item.label} day`} bind:value={item.date.day} class="w-1/3 bg-panel-2 border border-edge rounded-md p-2 text-sm" />
+                </div>
+              </div>
+            {/each}
+            <p class="text-xs text-ink-dim mt-1">Leave unknown date parts blank.</p>
+            {#if details.available_custom_lists.length}
+              <div class="text-sm mt-3 mb-1">Custom lists</div>
+              <div class="flex flex-wrap gap-x-4 gap-y-2">
+                {#each details.available_custom_lists as name (name)}
+                  <label class="flex gap-2 items-center text-sm"><input type="checkbox" value={name} bind:group={customLists} />{name}</label>
+                {/each}
+              </div>
+            {:else}
+              <p class="text-xs text-ink-dim mt-3">Create custom list names in your AniList list settings to assign them here.</p>
+            {/if}
+          {/if}
+        {/if}
       </div>
 
       <div class="flex items-center justify-between gap-2 pt-1">

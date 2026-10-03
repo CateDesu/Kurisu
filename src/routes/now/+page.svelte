@@ -21,6 +21,7 @@
 
   let current = $state<ListEntry[]>([]);
   let currentError = $state("");
+  let listeningReady = $state(false);
   const loggedIn = $derived(auth.isLoggedIn);
 
   const np = $derived(nowPlaying());
@@ -75,7 +76,7 @@
   $effect(() => {
     auth.epoch;
     const id = playingId;
-    if (auth.isLoggedIn && id != null) {
+    if (auth.isLoggedIn && listeningReady && id != null) {
       untrack(() => { if (!updating) void loadEntry(id); });
     }
   });
@@ -84,7 +85,6 @@
     auth.epoch;
     if (!auth.isLoggedIn) return;
     untrack(() => {
-      void loadCurrent();
       void library.ensureScan().catch((e) => console.error("library scan failed", e));
     });
   });
@@ -114,20 +114,31 @@
 
   $effect(() => {
     const epoch = auth.epoch;
+    listeningReady = false;
     if (!auth.isLoggedIn) return;
     let alive = true;
-    let un: (() => void) | undefined;
-    listen("kurisu://episode-updated", () => {
+    const stops: (() => void)[] = [];
+    const refresh = () => {
       if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       const id = np?.media_id ?? null;
       if (id != null) {
         void loadEntry(id);
       }
-      loadCurrent();
-    }).then((u) => (alive ? (un = u) : u()));
+      void loadCurrent();
+    };
+    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+      listen(event, refresh).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
+        if (alive && epoch === auth.epoch) currentError = String(e);
+      })
+    );
+    void Promise.all(registrations).then(() => {
+      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      listeningReady = true;
+      void loadCurrent();
+    });
     return () => {
       alive = false;
-      un?.();
+      for (const stop of stops) stop();
     };
   });
 
@@ -144,7 +155,9 @@
     try {
       fresh = await api.getEntry(id);
       if (!active()) return;
+      entryLoadId++;
       if (!fresh) {
+        entry = null;
         error = "This show is no longer on your list.";
         return;
       }
@@ -155,6 +168,7 @@
       entry = { ...fresh, progress: episode };
       const saved = await api.setProgress(id, episode, fresh.progress);
       if (!active()) return;
+      entryLoadId++;
       entry = saved;
       await emit("kurisu://episode-updated", saved);
       if (active()) await loadCurrent();

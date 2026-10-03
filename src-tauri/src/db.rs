@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::{ListEntry, Media};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -110,6 +110,20 @@ impl Db {
             );",
             )?;
         }
+        if version < 5 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_change (
+                    account_id INTEGER NOT NULL, media_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(account_id, media_id)
+                );
+                CREATE TABLE IF NOT EXISTS watch_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL, path TEXT NOT NULL,
+                    media_id INTEGER NOT NULL, episode INTEGER NOT NULL,
+                    watched_at INTEGER NOT NULL
+                );",
+            )?;
+        }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
@@ -195,20 +209,20 @@ impl Db {
 
     pub fn upsert_entry(&self, e: &ListEntry) -> Result<()> {
         let c = self.0.lock();
-        c.execute(
+        c.prepare_cached(
             "INSERT OR REPLACE INTO list_entry
              (media_id,entry_id,status,progress,score,repeat,updated_at)
              VALUES (?,?,?,?,?,?,?)",
-            rusqlite::params![
-                e.media_id,
-                e.id,
-                e.status,
-                e.progress,
-                e.score,
-                e.repeat,
-                e.updated_at
-            ],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            e.media_id,
+            e.id,
+            e.status,
+            e.progress,
+            e.score,
+            e.repeat,
+            e.updated_at
+        ])?;
         Ok(())
     }
 
@@ -229,15 +243,17 @@ impl Db {
     pub fn replace_list_snapshot(&self, entries: &[ListEntry]) -> Result<()> {
         let mut c = self.0.lock();
         let tx = c.transaction()?;
-        for e in entries {
-            if let Some(m) = &e.media {
-                upsert_media_row(&tx, m)?;
-            }
-            tx.execute(
+        {
+            let mut statement = tx.prepare_cached(
                 "INSERT OR REPLACE INTO list_entry
                  (media_id,entry_id,status,progress,score,repeat,updated_at)
                  VALUES (?,?,?,?,?,?,?)",
-                rusqlite::params![
+            )?;
+            for e in entries {
+                if let Some(m) = &e.media {
+                    upsert_media_row(&tx, m)?;
+                }
+                statement.execute(rusqlite::params![
                     e.media_id,
                     e.id,
                     e.status,
@@ -245,8 +261,8 @@ impl Db {
                     e.score,
                     e.repeat,
                     e.updated_at
-                ],
-            )?;
+                ])?;
+            }
         }
         // A JSON array avoids SQLite's bound parameter limit.
         let keep: Vec<i64> = entries.iter().map(|e| e.media_id).collect();
@@ -477,36 +493,19 @@ impl Db {
     pub fn prune_media_cache(&self, days: i64) -> Result<usize> {
         let cutoff = chrono::Utc::now().timestamp() - days * 86_400;
         let n = self.0.lock().execute(
-            "DELETE FROM media WHERE cached_at < ? AND id NOT IN (SELECT media_id FROM list_entry)",
+            "DELETE FROM media WHERE cached_at < ?
+             AND id NOT IN (SELECT media_id FROM list_entry)
+             AND id NOT IN (SELECT media_id FROM pending_change)
+             AND id NOT IN (SELECT media_id FROM watch_history)",
             [cutoff],
         )?;
         Ok(n)
-    }
-
-    #[allow(dead_code)]
-    pub fn mark_watched(&self, path: &str, media_id: i64, episode: i64) -> Result<()> {
-        self.0.lock().execute(
-            "INSERT OR REPLACE INTO watched_file (path,media_id,episode,watched_at)
-             VALUES (?,?,?,?)",
-            rusqlite::params![path, media_id, episode, chrono::Utc::now().timestamp()],
-        )?;
-        Ok(())
-    }
-    #[allow(dead_code)]
-    pub fn is_watched(&self, path: &str) -> Result<bool> {
-        Ok(self
-            .0
-            .lock()
-            .query_row("SELECT 1 FROM watched_file WHERE path = ?", [path], |_| {
-                Ok(())
-            })
-            .is_ok())
     }
 }
 
 /// Preserve cached detail fields that lean queries never fetch.
 fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
-    c.execute(
+    c.prepare_cached(
         "INSERT INTO media
          (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
           episodes,format,status,average_score,season,season_year,description,
@@ -527,35 +526,35 @@ fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
           source=COALESCE(excluded.source, source),
           studios=COALESCE(excluded.studios, studios),
           cached_at=excluded.cached_at",
-        rusqlite::params![
-            m.id,
-            m.id_mal,
-            m.title_romaji,
-            m.title_english,
-            m.title_native,
-            m.cover_medium,
-            m.cover_large,
-            m.episodes,
-            m.format,
-            m.status,
-            m.average_score,
-            m.season,
-            m.season_year,
-            m.description,
-            m.next_airing_episode,
-            m.next_airing_at,
-            m.banner_image,
-            m.genres
-                .as_ref()
-                .and_then(|g| serde_json::to_string(g).ok()),
-            m.duration,
-            m.source,
-            m.studios
-                .as_ref()
-                .and_then(|s| serde_json::to_string(s).ok()),
-            chrono::Utc::now().timestamp(),
-        ],
-    )?;
+    )?
+    .execute(rusqlite::params![
+        m.id,
+        m.id_mal,
+        m.title_romaji,
+        m.title_english,
+        m.title_native,
+        m.cover_medium,
+        m.cover_large,
+        m.episodes,
+        m.format,
+        m.status,
+        m.average_score,
+        m.season,
+        m.season_year,
+        m.description,
+        m.next_airing_episode,
+        m.next_airing_at,
+        m.banner_image,
+        m.genres
+            .as_ref()
+            .and_then(|g| serde_json::to_string(g).ok()),
+        m.duration,
+        m.source,
+        m.studios
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok()),
+        chrono::Utc::now().timestamp(),
+    ])?;
     Ok(())
 }
 
@@ -1003,6 +1002,26 @@ mod tests {
         let seen = db.rss_seen_set().unwrap();
         assert!(!seen.contains("old-gone"));
         assert!(seen.contains("old-carried"));
+    }
+
+    #[test]
+    fn media_cache_prune_preserves_watch_history_titles() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&Media {
+            id: 1,
+            title_english: Some("Remembered show".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.record_watch(7, "/anime/episode.mkv", 1, 1).unwrap();
+        db.0.lock()
+            .execute("UPDATE media SET cached_at = 1", [])
+            .unwrap();
+        db.prune_media_cache(30).unwrap();
+        assert_eq!(
+            db.watch_history(7, 10, None).unwrap()[0].title,
+            "Remembered show"
+        );
     }
 
     #[test]

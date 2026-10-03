@@ -1,3 +1,7 @@
+<script module lang="ts">
+  const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+</script>
+
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
   import { open } from "@tauri-apps/plugin-dialog";
@@ -7,8 +11,9 @@
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
-  import { displayTitle, type LibraryFile, type ListEntry } from "$lib/types";
+  import { displayTitle, type LibraryFile, type ListEntry, type WatchHistoryItem } from "$lib/types";
   import Confirm from "$lib/Confirm.svelte";
+  import Dialog from "$lib/Dialog.svelte";
   import Icon from "$lib/Icon.svelte";
   import LinkAnime from "$lib/LinkAnime.svelte";
   import Login from "$lib/Login.svelte";
@@ -25,6 +30,24 @@
   let removing = $state<Set<string>>(new Set());
   let scannedAt = $state(0);
   let scannedCount = $state(0);
+  let numbering = $state<{ path: string; mediaId: number; title: string } | null>(null);
+  let offsetScope = $state<"file" | "folder">("file");
+  let episodeOffset = $state(0);
+  let offsetLoading = $state(false);
+  let offsetBusy = $state(false);
+  let offsetError = $state("");
+  let offsetConflict = $state(false);
+  let offsetReady = $state(false);
+  let offsetAttempt = $state(0);
+  const offsetFolder = $derived(numbering?.path.replace(/[\\/][^\\/]+$/, "") ?? "");
+  const offsetFolderAllowed = $derived(Boolean(offsetFolder) && !library.folders.some((root) => root.replace(/[\\/]+$/, "") === offsetFolder));
+  const offsetTarget = $derived(numbering ? offsetScope === "folder" && offsetFolderAllowed ? offsetFolder : numbering.path : "");
+  let historyOpen = $state(false);
+  let historyItems = $state<WatchHistoryItem[]>([]);
+  let historyLoading = $state(false);
+  let historyError = $state("");
+  let historyMore = $state(false);
+  let historyRequest = 0;
 
   function toggle(mediaId: number) {
     const next = new Set(expanded);
@@ -41,6 +64,7 @@
   }
 
   const groups = $derived.by(() => {
+    const entriesByMedia = new Map(entries.map((entry) => [entry.media_id, entry]));
     const byMedia = new Map<number, Group>();
     const unmatched: LibraryFile[] = [];
     for (const f of library.files) {
@@ -50,7 +74,7 @@
       }
       let g = byMedia.get(f.media_id);
       if (!g) {
-        const entry = entries.find((e) => e.media_id === f.media_id);
+        const entry = entriesByMedia.get(f.media_id);
         g = { mediaId: f.media_id, title: f.matched ?? `#${f.media_id}`, entry, files: [] };
         byMedia.set(f.media_id, g);
       }
@@ -60,7 +84,7 @@
       g.files.sort((a, b) => (a.episode ?? 9999) - (b.episode ?? 9999));
     }
     const matched = [...byMedia.values()].sort((a, b) =>
-      a.title.localeCompare(b.title, undefined, { sensitivity: "base", numeric: true })
+      COLLATOR.compare(a.title, b.title)
     );
     return { matched, unmatched };
   });
@@ -181,6 +205,80 @@
     return g.files.some((f) => f.bound);
   }
 
+  function editNumbering(g: Group, file: LibraryFile) {
+    offsetScope = "file";
+    numbering = { path: file.path, mediaId: g.mediaId, title: g.entry ? displayTitle(g.entry.media) : g.title };
+  }
+
+  $effect(() => {
+    offsetAttempt;
+    const target = offsetTarget;
+    const selected = numbering;
+    const epoch = auth.epoch;
+    if (!target || !selected) return;
+    let current = true;
+    offsetLoading = true;
+    offsetReady = false;
+    offsetError = "";
+    offsetConflict = false;
+    episodeOffset = 0;
+    api.getLibraryBindingDetails(target).then((binding) => {
+      if (!current || epoch !== auth.epoch) return;
+      episodeOffset = binding?.episode_offset ?? 0;
+      offsetConflict = binding != null && binding.media_id !== selected.mediaId;
+      offsetReady = true;
+    }).catch((e) => {
+      if (current && epoch === auth.epoch) offsetError = String(e);
+    }).finally(() => {
+      if (current && epoch === auth.epoch) offsetLoading = false;
+    });
+    return () => { current = false; };
+  });
+
+  async function saveNumbering() {
+    if (!numbering || offsetBusy || offsetLoading || !offsetReady || offsetConflict) return;
+    offsetError = "";
+    if (!Number.isInteger(episodeOffset) || Math.abs(episodeOffset) > 9999) {
+      offsetError = "Enter a whole-number offset between -9999 and 9999.";
+      return;
+    }
+    const epoch = auth.epoch;
+    offsetBusy = true;
+    try {
+      await api.bindLibraryPath(offsetTarget, numbering.mediaId, episodeOffset);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+      await library.scan();
+      if (epoch === auth.epoch) numbering = null;
+    } catch (e) {
+      if (epoch === auth.epoch) offsetError = String(e);
+    } finally {
+      if (epoch === auth.epoch) offsetBusy = false;
+    }
+  }
+
+  async function loadHistory(more = false) {
+    if ((more && historyLoading) || !auth.isLoggedIn) return;
+    const request = ++historyRequest;
+    const epoch = auth.epoch;
+    historyLoading = true;
+    historyError = "";
+    try {
+      const rows = await api.getWatchHistory(50, more ? historyItems.at(-1)?.id : undefined);
+      if (request !== historyRequest || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      historyItems = more ? [...historyItems, ...rows] : rows;
+      historyMore = rows.length === 50;
+    } catch (e) {
+      if (request === historyRequest && epoch === auth.epoch) historyError = String(e);
+    } finally {
+      if (request === historyRequest && epoch === auth.epoch) historyLoading = false;
+    }
+  }
+
+  function toggleHistory() {
+    historyOpen = !historyOpen;
+    if (historyOpen) void loadHistory();
+  }
+
   async function unlink(g: Group) {
     if (unlinkBusy || !auth.isLoggedIn) return;
     const epoch = auth.epoch;
@@ -207,6 +305,14 @@
     entries = [];
     entriesLoaded = false;
     linking = null;
+    numbering = null;
+    offsetBusy = false;
+    offsetLoading = false;
+    historyRequest++;
+    historyItems = [];
+    historyOpen = false;
+    historyLoading = false;
+    historyError = "";
     unlinking = null;
     removingFolder = null;
     removing = new Set();
@@ -216,28 +322,45 @@
     scannedAt = 0;
     if (!loggedIn) return;
     let alive = true;
-    let unlisten: (() => void) | undefined;
-    listen("kurisu://episode-updated", () => {
+    const stops: (() => void)[] = [];
+    const updateEntries = () => {
       if (!alive || epoch !== auth.epoch) return;
       refreshEntries().catch((e) => {
         if (alive && epoch === auth.epoch) error = String(e);
       });
-    }).then((u) => {
-      if (alive) {
-        unlisten = u;
-        void load();
-      } else u();
-    }).catch((e) => {
-      if (alive) {
-        error = String(e);
-        void load();
-      }
+    };
+    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+      listen(event, updateEntries).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
+        if (alive) error = String(e);
+      })
+    );
+    void Promise.all(registrations).then(() => {
+      if (alive && epoch === auth.epoch) void load();
     });
     return () => {
       alive = false;
       entryLoadId++;
-      unlisten?.();
+      historyRequest++;
+      for (const stop of stops) stop();
     };
+  });
+
+  $effect(() => {
+    const epoch = auth.epoch;
+    if (!auth.isLoggedIn) return;
+    let alive = true;
+    const refresh = () => {
+      if (alive && epoch === auth.epoch && document.visibilityState === "visible" && !library.scanning) {
+        void library.ensureScan().catch((e) => { if (alive && epoch === auth.epoch) error = String(e); });
+      }
+    };
+    const timer = setInterval(refresh, 60_000);
+    window.addEventListener("focus", refresh);
+    let stop: (() => void) | undefined;
+    listen("kurisu://watch-history-updated", () => {
+      if (alive && epoch === auth.epoch && historyOpen) void loadHistory();
+    }).then((unlisten) => alive ? stop = unlisten : unlisten()).catch(console.error);
+    return () => { alive = false; clearInterval(timer); window.removeEventListener("focus", refresh); stop?.(); };
   });
 </script>
 
@@ -406,7 +529,7 @@
                   title={basename(next.path)}
                   class="px-3 py-1.5 rounded-md bg-accent hover:bg-accent-2 text-white text-sm shrink-0 flex items-center gap-1.5"
                 >
-                  <Icon name="play" size={13} /> Play Ep {next.episode}
+                  <Icon name="play" size={13} /> {g.entry?.media?.format === "MOVIE" ? "Play movie" : `Play Ep ${next.episode}`}
                 </button>
               {/if}
             </div>
@@ -439,6 +562,12 @@
                       <span class="text-accent shrink-0 grid place-items-center" title="Watched (per your list progress)"><Icon name="check" size={14} /></span>
                     {/if}
                     <span class="text-ink-dim shrink-0 grid place-items-center" title="Play"><Icon name="play" size={13} /></span>
+                    {#if g.entry}
+                      <button onclick={(ev) => { ev.stopPropagation(); editNumbering(g, f); }}
+                        title="Adjust episode numbering" class="text-ink-dim hover:text-accent px-1 grid place-items-center">
+                        <Icon name="sliders" size={14} />
+                      </button>
+                    {/if}
                     <button
                       onclick={(ev) => {
                         ev.stopPropagation();
@@ -493,7 +622,59 @@
         {/if}
       </div>
     {/if}
+    <section class="mt-6 border-t border-edge pt-4">
+      <div class="flex items-center gap-3">
+        <button type="button" onclick={toggleHistory} aria-expanded={historyOpen} aria-controls="library-watch-history"
+          class="text-sm font-semibold text-ink-dim hover:text-ink">{historyOpen ? "▾" : "▸"} Watch history</button>
+        {#if historyOpen}<button onclick={() => loadHistory()} disabled={historyLoading} class="text-xs text-accent hover:underline disabled:opacity-50">Refresh history</button>{/if}
+      </div>
+      {#if historyOpen}
+        <div id="library-watch-history" class="mt-3">
+          <p class="text-xs text-ink-dim mb-3">Playback recorded on this device.</p>
+          {#if historyError}<p role="alert" class="text-sm text-red-400 mb-2">{historyError}</p>{/if}
+          {#if historyLoading && historyItems.length === 0}
+            <p class="text-sm text-ink-dim">Loading watch history…</p>
+          {:else if historyItems.length === 0 && !historyError}
+            <p class="text-sm text-ink-dim">No watched episodes recorded yet.</p>
+          {/if}
+          <div class="divide-y divide-edge">
+            {#each historyItems as watched (watched.id)}
+              <div class="py-2 flex items-start gap-3 text-sm">
+                <div class="flex-1 min-w-0">
+                  <button onclick={() => goto(`/anime/${watched.media_id}`)} class="text-left hover:text-accent">{watched.title || `Show #${watched.media_id}`} · Episode {watched.episode}</button>
+                  <p class="text-xs text-ink-dim mt-1" title={watched.path}>{basename(watched.path)}</p>
+                </div>
+                <time class="text-xs text-ink-dim shrink-0" datetime={new Date(watched.watched_at * 1000).toISOString()}>{new Date(watched.watched_at * 1000).toLocaleString()}</time>
+              </div>
+            {/each}
+          </div>
+          {#if historyMore}<button onclick={() => loadHistory(true)} disabled={historyLoading} class="text-sm text-accent hover:underline mt-3 disabled:opacity-50">{historyLoading ? "Loading…" : "Load older history"}</button>{/if}
+        </div>
+      {/if}
+    </section>
   </div>
+{/if}
+
+{#if numbering}
+  <Dialog onclose={() => { if (!offsetBusy) numbering = null; }} busy={offsetBusy} size="md">
+    <h3 class="font-semibold">Episode numbering · {numbering.title}</h3>
+    <p class="text-xs text-ink-dim mt-2 mb-3 break-all">{offsetTarget}</p>
+    <div class="flex gap-4 text-sm mb-3">
+      <label><input type="radio" bind:group={offsetScope} value="file" disabled={offsetBusy} /> This file</label>
+      {#if offsetFolderAllowed}<label><input type="radio" bind:group={offsetScope} value="folder" disabled={offsetBusy} /> Whole folder</label>{/if}
+    </div>
+    <label for="library-episode-offset" class="block text-sm mb-1">Episode offset</label>
+    <input id="library-episode-offset" type="number" min="-9999" max="9999" step="1" bind:value={episodeOffset}
+      disabled={offsetLoading || offsetBusy || !offsetReady} class="w-28 bg-panel-2 border border-edge rounded px-2 py-1.5 text-sm" />
+    <p class="text-xs text-ink-dim mt-2">Added to detected file episode numbers. Use -12 to map file 13 to episode 1. Choose Whole folder to adjust the season together. Episodes outside the show's total are left unnumbered.</p>
+    {#if offsetLoading}<p class="text-xs text-ink-dim mt-2">Reading the current link…</p>{/if}
+    {#if offsetConflict}<p role="alert" class="text-sm text-amber-400 mt-2">This location is linked to a different show. Select this file only or relink it first.</p>{/if}
+    {#if offsetError}<p role="alert" class="text-sm text-red-400 mt-2">{offsetError} {#if !offsetReady}<button onclick={() => offsetAttempt++} class="underline">Retry</button>{/if}</p>{/if}
+    <div class="flex justify-end gap-2 mt-4">
+      <button onclick={() => numbering = null} disabled={offsetBusy} class="px-3 py-1.5 text-sm">Cancel</button>
+      <button onclick={saveNumbering} disabled={offsetBusy || offsetLoading || !offsetReady || offsetConflict} class="px-3 py-1.5 text-sm bg-accent text-white rounded disabled:opacity-50">{offsetBusy ? "Saving…" : "Save numbering"}</button>
+    </div>
+  </Dialog>
 {/if}
 
 {#if unlinking}

@@ -7,13 +7,14 @@
   import { api } from "$lib/api";
   import { preferences } from "$lib/preferences";
   import { auth } from "$lib/auth.svelte";
-  import { STATUS_LABEL, type FeedFailure, type ListEntry, type ListStatus, type TorrentItem } from "$lib/types";
+  import { displayTitle, STATUS_LABEL, type FeedFailure, type ListEntry, type ListStatus, type ShowTorrents, type TorrentItem } from "$lib/types";
   import Confirm from "$lib/Confirm.svelte";
   import Icon from "$lib/Icon.svelte";
   import Login from "$lib/Login.svelte";
   import Img from "$lib/Img.svelte";
   import Select from "$lib/Select.svelte";
   import TorrentRow from "$lib/TorrentRow.svelte";
+  import ShowTorrentChoices from "$lib/ShowTorrentChoices.svelte";
   import type { Snapshot } from "./$types";
 
   const NEW_KEY = "kurisu.torrents.new";
@@ -70,14 +71,21 @@
   let feedInput = $state("");
   let showFeeds = $state(false);
   let showSearchTips = $state(false);
-  let q = $state("");
+  let showFilters = $state<Partial<Record<ListStatus, string>>>({});
   let newOnly = $state(preferences.get(NEW_KEY) === "1");
   let expandedStatuses = $state(readStatuses());
-  const watchingOnly = $derived(expandedStatuses.size === 1 && expandedStatuses.has("CURRENT"));
-  const allStatuses = $derived(STATUS_ORDER.every((status) => expandedStatuses.has(status)));
   let expanded = $state<Set<number>>(new Set());
   let loading = $state(false);
   let refreshedAt = $state(0);
+  const showTorrentCache = new Map<string, { savedAt: number; choices: ShowTorrents }>();
+  let openedLinks = $state<Set<string>>(new Set());
+  let openedIdentities = $state<Set<string>>(new Set());
+  const seenLinks = $derived(new Set([...openedLinks, ...items.filter((item) => item.seen).map((item) => item.link)]));
+  const seenIdentities = $derived(new Set([...openedIdentities, ...items.filter((item) => item.seen).flatMap(seenGuids)]));
+
+  function seenGuids(item: TorrentItem): string[] {
+    return item.seen_guid ? [item.guid, item.seen_guid] : [item.guid];
+  }
 
   function toggle(mediaId: number) {
     const next = new Set(expanded);
@@ -98,10 +106,6 @@
     preferences.setJson(STATUSES_KEY, [...statuses]);
   }
 
-  function setWatchingOnly(v: boolean) {
-    setStatuses(new Set(v ? ["CURRENT"] : STATUS_ORDER));
-  }
-
   function toggleStatus(status: ListStatus) {
     const next = new Set(expandedStatuses);
     if (next.has(status)) next.delete(status);
@@ -116,9 +120,7 @@
     const id = ++entriesLoadId;
     const epoch = auth.epoch;
     entriesLoading = true;
-    entriesLoaded = false;
     entriesError = "";
-    entries = [];
     try {
       const fresh = await api.localEntries();
       if (id !== entriesLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
@@ -146,16 +148,22 @@
   }
 
   async function load(flash = false) {
+    showTorrentCache.clear();
     const id = ++loadId;
     const epoch = auth.epoch;
     const configuration = loadFeeds();
+    entriesLoaded = false;
+    entries = [];
     void refreshEntries();
     loading = true;
     error = "";
     try {
       const torrents = await api.fetchTorrents();
       if (id !== loadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
-      items = torrents.items;
+      const opened = torrents.items.filter((item) => openedLinks.has(item.link) || seenGuids(item).some((guid) => openedIdentities.has(guid)));
+      const guids = new Set(opened.flatMap(seenGuids));
+      items = torrents.items.map((item) => guids.has(item.guid) ? { ...item, seen: true, is_new: false } : item);
+      if (guids.size) void api.markTorrentsSeen([...guids]).catch(() => {});
       feedFailures = torrents.failures;
       loaded = true;
       if (flash) flashRefreshed();
@@ -228,6 +236,8 @@
   }
 
   async function openLink(url: string): Promise<boolean> {
+    const epoch = auth.epoch;
+    const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
     // Feed links must not invoke arbitrary OS protocols.
     const scheme = url.split(":")[0]?.toLowerCase().trim();
     if (scheme !== "http" && scheme !== "https" && scheme !== "magnet") {
@@ -236,23 +246,30 @@
     }
     try {
       await openUrl(url);
-      return true;
+      return current();
     } catch (e) {
-      error = `Could not open ${url.startsWith("magnet:") ? "magnet link" : "link"}: ${String(e)}`;
+      if (current()) error = `Could not open ${url.startsWith("magnet:") ? "magnet link" : "link"}: ${String(e)}`;
       return false;
     }
   }
 
-  async function openItem(t: TorrentItem, url: string) {
+  async function openItem(t: TorrentItem, url: string): Promise<boolean> {
     const epoch = auth.epoch;
-    if (!(await openLink(url))) return;
-    if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+    if (!(await openLink(url))) return false;
+    if (epoch !== auth.epoch || !auth.isLoggedIn) return false;
+    if (t.link) openedLinks = new Set([...openedLinks, t.link]);
+    const identities = new Set(seenGuids(t));
+    const guids = new Set([...identities, ...items
+      .filter((item) => (t.link && item.link === t.link) || seenGuids(item).some((guid) => identities.has(guid)))
+      .flatMap(seenGuids)]);
+    openedIdentities = new Set([...openedIdentities, ...guids]);
+    markLocal(guids);
     try {
-      await api.markTorrentsSeen([t.guid]);
-      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
-      markLocal(new Set([t.guid]));
+      await api.markTorrentsSeen([...guids]);
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return false;
     } catch {
     }
+    return epoch === auth.epoch && auth.isLoggedIn;
   }
 
   let searchQ = $state("");
@@ -260,7 +277,8 @@
   let searched = $state(false);
   let results = $state<TorrentItem[]>([]);
   let submittedQuery = $state("");
-  const filteredResults = $derived(results.filter(matchesFilters));
+  const seenResults = $derived(results.map((item) => seenLinks.has(item.link) || seenGuids(item).some((guid) => seenIdentities.has(guid)) ? { ...item, seen: true } : item));
+  const filteredResults = $derived(seenResults.filter(matchesFilters));
 
   let searchId = 0;
   let alive = true;
@@ -297,8 +315,11 @@
     releaseFilter: string;
     pendingQuery: string | null;
     epoch: number;
+    showFilters: Partial<Record<ListStatus, string>>;
+    expanded: number[];
   }> = {
-    capture: () => ({ searchQ, submittedQuery, results, searched, categoryFilter, releaseFilter, pendingQuery: searching ? submittedQuery : resumeQuery, epoch: auth.epoch }),
+    capture: () => ({ searchQ, submittedQuery, results: seenResults, searched, categoryFilter, releaseFilter, pendingQuery: searching ? submittedQuery : resumeQuery, epoch: auth.epoch,
+      showFilters: { ...showFilters }, expanded: [...expanded] }),
     restore: (v) => {
       searchId++;
       searching = false;
@@ -309,6 +330,8 @@
       searched = !resumeQuery && v.searched;
       categoryFilter = v.categoryFilter;
       releaseFilter = v.releaseFilter;
+      showFilters = v.epoch === auth.epoch ? { ...v.showFilters } : {};
+      expanded = new Set(v.epoch === auth.epoch ? v.expanded : []);
     },
   };
 
@@ -321,6 +344,7 @@
   onDestroy(() => { alive = false; searchId++; });
 
   interface Group {
+    entry: ListEntry;
     mediaId: number;
     status: string;
     title: string;
@@ -334,8 +358,25 @@
   const unmatchedCount = $derived(items.filter((t) => t.media_id == null || !entriesByMedia.has(t.media_id)).length);
 
   const groups = $derived.by(() => {
-    const needle = q.trim().toLowerCase();
     const byMedia = new Map<number, Group>();
+    function groupFor(entry: ListEntry): Group {
+      let group = byMedia.get(entry.media_id);
+      if (!group) {
+        group = {
+          entry,
+          mediaId: entry.media_id,
+          status: entry.status,
+          title: displayTitle(entry.media) || `#${entry.media_id}`,
+          cover: entry.media?.cover_medium ?? null,
+          newest: 0,
+          hasNew: false,
+          items: [],
+        };
+        byMedia.set(entry.media_id, group);
+      }
+      return group;
+    }
+    for (const entry of entries) groupFor(entry);
     for (const t of items) {
       if (!matchesFilters(t)) continue;
       if (t.media_id == null) continue;
@@ -345,38 +386,31 @@
       const isNew = !t.seen && t.episode != null && t.episode > entry.progress
         && (total == null || t.episode <= total);
       if (newOnly && !isNew) continue;
-      if (needle && !t.title.toLowerCase().includes(needle) && !t.matched?.toLowerCase().includes(needle)) continue;
-      let g = byMedia.get(t.media_id);
-      if (!g) {
-        g = {
-          mediaId: t.media_id,
-          status: entry.status,
-          title: t.matched ?? `#${t.media_id}`,
-          cover: entry.media?.cover_medium ?? null,
-          newest: 0,
-          hasNew: false,
-          items: [],
-        };
-        byMedia.set(t.media_id, g);
-      }
+      const g = groupFor(entry);
       g.items.push({ ...t, is_new: isNew });
       g.newest = Math.max(g.newest, t.published ?? 0);
       g.hasNew = g.hasNew || isNew;
     }
     return [...byMedia.values()].sort((a, b) => {
       if (a.hasNew !== b.hasNew) return a.hasNew ? -1 : 1;
-      return b.newest - a.newest;
+      return b.newest - a.newest || a.title.localeCompare(b.title);
     });
   });
 
   const categories = $derived(STATUS_ORDER.map((status) => {
-    const shows = groups.filter((g) => g.status === status);
+    const allShows = groups.filter((g) => g.status === status);
+    const needle = (showFilters[status] ?? "").trim().toLowerCase();
+    const shows = allShows.filter((g) => !needle || [
+      g.title, g.entry.media?.title_romaji, g.entry.media?.title_native,
+      ...g.items.map((item) => item.title),
+    ].some((title) => title?.toLowerCase().includes(needle)));
     return {
       status,
       label: STATUS_LABEL[status],
       shows,
-      releases: shows.reduce((total, g) => total + g.items.length, 0),
-      newCount: shows.reduce((total, g) => total + g.items.filter((t) => t.is_new).length, 0),
+      total: allShows.length,
+      releases: allShows.reduce((total, g) => total + g.items.length, 0),
+      newCount: allShows.reduce((total, g) => total + g.items.filter((t) => t.is_new).length, 0),
     };
   }));
   const newCount = $derived(categories.reduce((total, category) =>
@@ -395,6 +429,11 @@
     entriesLoaded = false;
     entriesLoading = false;
     entriesError = "";
+    expanded = new Set();
+    showFilters = {};
+    showTorrentCache.clear();
+    openedLinks = new Set();
+    openedIdentities = new Set();
     feeds = [];
     feedsLoaded = false;
     loaded = false;
@@ -412,23 +451,24 @@
     addingFeed = false;
     if (!loggedIn) return;
     let alive = true;
-    let unlisten: (() => void) | undefined;
-    listen("kurisu://episode-updated", () => {
-      if (alive && epoch === auth.epoch) void refreshEntries();
-    }).then((stop) => {
-      if (alive && epoch === auth.epoch) {
-        unlisten = stop;
-        void load();
-      } else stop();
-    }).catch((e) => {
-      if (alive && epoch === auth.epoch) {
-        void load();
-        error = `Could not listen for list updates: ${String(e)}`;
-      }
+    const stops: (() => void)[] = [];
+    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+      listen(event, () => {
+        if (alive && epoch === auth.epoch) void refreshEntries();
+      }).then((stop) => {
+        if (alive && epoch === auth.epoch) stops.push(stop);
+        else stop();
+      })
+    );
+    void Promise.allSettled(registrations).then((results) => {
+      const failures = results.flatMap((result) => result.status === "rejected" ? [String(result.reason)] : []);
+      if (!alive || epoch !== auth.epoch) return;
+      void load();
+      if (failures.length) error = `Could not listen for list updates: ${failures.join("; ")}`;
     });
     return () => {
       alive = false;
-      unlisten?.();
+      for (const stop of stops) stop();
       loadId++;
       feedsLoadId++;
       entriesLoadId++;
@@ -442,34 +482,13 @@
   </div>
 {:else}
   <div class="page-content">
-    <PageHeading section="Releases" title="Torrents" description="New releases and your saved feeds" />
+    <PageHeading section="Releases" title="Torrents" description="Downloads for your list and new releases" />
     <div class="sticky top-0 z-10 mb-4 bg-base pt-4 pb-4 border-b border-edge">
       <div class="flex items-center gap-2 mb-4 flex-wrap">
         {#if newCount > 0}
           <span class="text-xs px-2 py-0.5 rounded-full bg-accent/15 text-accent">{newCount} new</span>
         {/if}
         <div class="flex-1"></div>
-        <input
-          bind:value={q}
-          placeholder="Filter…"
-          class="w-40 bg-panel border border-edge rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-accent"
-        />
-        <div class="flex rounded-md border border-edge overflow-hidden text-sm">
-          <button
-            onclick={() => setWatchingOnly(true)}
-            aria-pressed={watchingOnly}
-            class="px-3 py-1.5 {watchingOnly ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink'}"
-          >
-            Watching
-          </button>
-          <button
-            onclick={() => setWatchingOnly(false)}
-            aria-pressed={allStatuses}
-            class="px-3 py-1.5 {allStatuses ? 'bg-panel-2 text-ink' : 'text-ink-dim hover:text-ink'}"
-          >
-            All
-          </button>
-        </div>
         <label class="flex items-center gap-1.5 text-sm text-ink-dim">
           <input
             type="checkbox"
@@ -477,7 +496,7 @@
             onchange={(e) => setNewOnly(e.currentTarget.checked)}
             class="accent-accent"
           />
-          New only
+          New feed releases only
         </label>
         <button
           onclick={() => load(true)}
@@ -599,7 +618,8 @@
       </button>
       {#if showSearchTips}
         <div id="torrent-search-tips" class="mt-2 space-y-2 max-w-3xl leading-relaxed">
-          <p>Language and release filters apply to Nyaa searches and your loaded feeds. Changing a filter repeats your last search. Feed filters only narrow the releases in your saved feeds.</p>
+          <p>Open a show to find batches and your next unwatched episode, including shows that have finished airing. Each release lists its group in the title so you can choose your preferred version.</p>
+          <p>Language and release filters apply to show downloads, Nyaa searches and your loaded feeds. Changing a filter repeats open searches. New feed releases only hides seen and watched episodes from the feed results. Your full list and download options stay available.</p>
           <p>Nyaa’s categories describe the release. Check its description for individual subtitle and audio tracks. Feeds without category information show “Category unknown”.</p>
           <p><span class="text-accent">Green / Trusted</span> marks trusted uploaders. <span class="text-red-400">Red / Remake</span> marks re-encodes or altered reuploads.</p>
           <p>In the Nyaa search bar, use <code>"exact phrase"</code> for a phrase, <code>-word</code> to exclude a word, and <code>word|other</code> to match either word.</p>
@@ -643,7 +663,7 @@
         {:else}
           <div class="mt-2 bg-panel border border-edge rounded-lg divide-y divide-edge/60 overflow-hidden">
             {#each filteredResults as t (t.guid)}
-              <TorrentRow torrent={t} onopen={(url) => openLink(url)} />
+              <TorrentRow torrent={t} onopen={(url) => openItem(t, url)} />
             {/each}
           </div>
         {/if}
@@ -654,9 +674,11 @@
       {#if !entriesError}
         <div class="text-ink-dim py-10 text-center">Loading your list…</div>
       {/if}
-    {:else if loading && !loaded}
-      <div class="text-ink-dim py-10 text-center">Checking feeds…</div>
     {:else}
+      {#if loading && !loaded}
+        <p class="text-sm text-ink-dim mb-3">Checking feeds… You can browse downloads for your list below.</p>
+      {/if}
+      <p class="text-xs text-ink-dim mb-3">Open a show for batches and your next unwatched episode from different release groups.</p>
       <div class="space-y-3 mb-6">
         {#each categories as category (category.status)}
           {@const categoryOpen = expandedStatuses.has(category.status)}
@@ -674,8 +696,8 @@
                 </span>
                 <span class="font-semibold flex-1">{category.label}</span>
                 <span class="text-xs text-ink-dim">
-                  {category.shows.length} show{category.shows.length === 1 ? "" : "s"}
-                  · {category.releases} release{category.releases === 1 ? "" : "s"}
+                  {category.total} show{category.total === 1 ? "" : "s"}
+                  · {category.releases} feed release{category.releases === 1 ? "" : "s"}
                 </span>
                 {#if category.newCount > 0}
                   <span class="text-xs px-2 py-0.5 rounded-full bg-accent/15 text-accent">{category.newCount} new</span>
@@ -685,9 +707,21 @@
             <div id={`torrents-${category.status}`} hidden={!categoryOpen}>
               {#if categoryOpen}
                 <div class="space-y-3 p-3 border-t border-edge">
+                  <div class="flex items-center gap-3">
+                    <input
+                      value={showFilters[category.status] ?? ""}
+                      oninput={(event) => { showFilters[category.status] = event.currentTarget.value; }}
+                      aria-label={`Filter ${category.label} shows`}
+                      placeholder="Filter shows…"
+                      class="min-w-0 w-64 bg-panel border border-edge rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-accent"
+                    />
+                    {#if showFilters[category.status]?.trim()}
+                      <span class="text-xs text-ink-dim">{category.shows.length} of {category.total} shows</span>
+                    {/if}
+                  </div>
                   {#if category.shows.length === 0}
                     <p class="text-sm text-ink-dim py-3 text-center">
-                      {q.trim() ? "No releases match your filter." : newOnly ? "No new releases in this category." : "No feed releases in this category."}
+                      {showFilters[category.status]?.trim() ? "No shows or releases match your filter." : "No shows in this category."}
                     </p>
                   {/if}
                   {#each category.shows as g (g.mediaId)}
@@ -741,8 +775,20 @@
                           >
                             {g.title}
                           </button>
-                          <div class="text-xs text-ink-dim flex items-center gap-1.5">
-                            <span>{g.items.length} release{g.items.length === 1 ? "" : "s"}</span>
+                          <div class="text-xs text-ink-dim flex flex-wrap items-center gap-1.5">
+                            {#if g.entry.media?.episodes == null || g.entry.progress < g.entry.media.episodes}
+                              <span>Find batches · Next episode {g.entry.progress + 1}</span>
+                            {:else}
+                              <span>Find batches</span>
+                            {/if}
+                            {#if g.entry.media?.status === "FINISHED"}
+                              <span class="opacity-40">·</span>
+                              <span>Finished airing</span>
+                            {/if}
+                            {#if g.items.length > 0}
+                              <span class="opacity-40">·</span>
+                              <span>{g.items.length} feed release{g.items.length === 1 ? "" : "s"}</span>
+                            {/if}
                             {#if g.hasNew}
                               <span class="opacity-40">·</span>
                               <span class="text-accent">new</span>
@@ -751,11 +797,8 @@
                         </div>
                       </div>
                       {#if isOpen}
-                        <div class="divide-y divide-edge/60">
-                          {#each g.items as t (t.guid)}
-                            <TorrentRow torrent={t} onopen={(url) => openItem(t, url)} />
-                          {/each}
-                        </div>
+                        <ShowTorrentChoices entry={g.entry} category={categoryFilter} filter={releaseFilter}
+                          feedItems={g.items} seenLinks={seenLinks} seenIdentities={seenIdentities} cache={showTorrentCache} onopen={openItem} />
                       {/if}
                     </section>
                   {/each}

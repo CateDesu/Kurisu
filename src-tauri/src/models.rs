@@ -106,7 +106,7 @@ pub struct MediaStaff {
     pub image: Option<String>,
 }
 
-/// Offline results omit uncached relations and credits.
+/// Full detail snapshots retain relations and credits offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaDetail {
     pub media: Media,
@@ -115,6 +115,47 @@ pub struct MediaDetail {
     pub characters: Vec<MediaCharacter>,
     #[serde(default)]
     pub staff: Vec<MediaStaff>,
+    #[serde(default)]
+    pub cached_at: Option<i64>,
+    #[serde(default)]
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub unavailable_sections: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchPage {
+    pub items: Vec<Media>,
+    pub page: i64,
+    pub has_next_page: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationPage {
+    pub items: Vec<Notification>,
+    pub page: i64,
+    pub has_next_page: bool,
+    pub unread_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FuzzyDate {
+    pub year: Option<i64>,
+    pub month: Option<i64>,
+    pub day: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EntryDetails {
+    pub notes: String,
+    pub started_at: Option<FuzzyDate>,
+    pub completed_at: Option<FuzzyDate>,
+    pub custom_lists: Vec<String>,
+    pub available_custom_lists: Vec<String>,
+    #[serde(default)]
+    pub cached_at: Option<i64>,
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +172,8 @@ pub struct TorrentItem {
     pub link: String,
     /// Feed GUID, falling back to the link.
     pub guid: String,
+    pub seen_guid: Option<String>,
+    pub details_url: Option<String>,
     pub magnet: Option<String>,
     pub size: Option<String>,
     pub seeders: Option<i64>,
@@ -155,6 +198,15 @@ pub struct TorrentFetch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ShowTorrents {
+    pub batches: Vec<TorrentItem>,
+    pub episodes: Vec<TorrentItem>,
+    pub other: Vec<TorrentItem>,
+    pub next_episode: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FeedFailure {
     pub url: String,
     pub error: String,
@@ -172,6 +224,10 @@ pub struct UserStats {
     pub formats: Vec<FormatCount>,
     pub genres: Vec<GenreStat>,
     pub release_years: Vec<YearCount>,
+    #[serde(default)]
+    pub cached_at: Option<i64>,
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -252,6 +308,7 @@ pub struct Notification {
     pub thread_id: Option<i64>,
     pub thread_title: Option<String>,
     pub comment_id: Option<i64>,
+    pub comment_url: Option<String>,
     pub reason: Option<String>,
     pub deleted_media_title: Option<String>,
     pub user_name: Option<String>,
@@ -438,6 +495,9 @@ mod tests {
                     relations: vec![],
                     characters: vec![],
                     staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
                 })
                 .unwrap(),
             ),
@@ -494,6 +554,10 @@ mod tests {
             (
                 "TorrentFetch",
                 serde_json::to_value(TorrentFetch::default()).unwrap(),
+            ),
+            (
+                "ShowTorrents",
+                serde_json::to_value(ShowTorrents::default()).unwrap(),
             ),
             (
                 "FeedFailure",

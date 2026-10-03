@@ -1,4 +1,4 @@
-//! MPV IPC fallback when OS media sessions have no active player.
+//! MPV IPC sources alongside OS media sessions.
 
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -41,8 +41,8 @@ pub(crate) struct MpvSnapshot {
     pub position_us: i64,
 }
 
-pub(crate) fn probe(paths: &[String]) -> Option<MpvSnapshot> {
-    let mut paused = None;
+pub(crate) fn probe(paths: &[String]) -> Vec<MpvSnapshot> {
+    let mut snapshots = Vec::new();
     for p in paths {
         #[cfg(unix)]
         if std::fs::metadata(p).is_err() {
@@ -53,15 +53,10 @@ pub(crate) fn probe(paths: &[String]) -> Option<MpvSnapshot> {
             continue;
         }
         if let Some(s) = probe_one(p) {
-            if s.playing {
-                return Some(s);
-            }
-            if paused.is_none() {
-                paused = Some(s);
-            }
+            snapshots.push(s);
         }
     }
-    paused
+    snapshots
 }
 
 #[cfg(unix)]
@@ -196,16 +191,17 @@ fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
         vals[i]
             .as_ref()
             .and_then(|v| v.as_f64())
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
             .map(|s| (s * 1_000_000.0).round() as i64)
-            .unwrap_or(0)
     };
+    let position = secs_to_us(IDX_POSITION);
     Some(MpvSnapshot {
         playing: !paused,
         path: path.to_string(),
         media_title: str_at(IDX_TITLE),
         filename: str_at(IDX_FILENAME),
-        duration_us: secs_to_us(IDX_DURATION),
-        position_us: secs_to_us(IDX_POSITION),
+        duration_us: position.and_then(|_| secs_to_us(IDX_DURATION)).unwrap_or(0),
+        position_us: position.unwrap_or(0),
     })
 }
 
@@ -400,6 +396,32 @@ mod tests {
     }
 
     #[test]
+    fn an_unavailable_position_does_not_look_like_a_usable_timeline() {
+        let lines = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, "\"/anime/episode03.mkv\""),
+            ok(IDX_TITLE, "\"Some Show - 03\""),
+            ok(IDX_FILENAME, "\"episode03.mkv\""),
+            ok(IDX_DURATION, "1200"),
+            "{\"request_id\":6,\"error\":\"property unavailable\"}\n".to_string(),
+        ]
+        .concat();
+        let (snapshot, _) = query_lines(&lines);
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.playing);
+        assert_eq!(snapshot.duration_us, 0);
+        assert_eq!(snapshot.position_us, 0);
+        let at_start = lines.replace(
+            "{\"request_id\":6,\"error\":\"property unavailable\"}\n",
+            &ok(IDX_POSITION, "0"),
+        );
+        let (snapshot, _) = query_lines(&at_start);
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.duration_us, 1_200_000_000);
+        assert_eq!(snapshot.position_us, 0);
+    }
+
+    #[test]
     fn an_idle_mpv_with_no_file_is_not_a_track() {
         let lines = [
             ok(IDX_PAUSE, "false"),
@@ -456,7 +478,73 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_playing_socket_outranks_an_earlier_paused_socket() {
+    fn every_playing_socket_is_available_for_recognition() {
+        use std::os::unix::net::UnixListener;
+        let mut paths = Vec::new();
+        let mut servers = Vec::new();
+        for (index, filename) in ["unrelated.mp3", "Some Show - 03.mkv"].iter().enumerate() {
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-mpv-recognition-{}-{index}",
+                std::process::id()
+            ));
+            let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            paths.push(path.to_str().unwrap().to_string());
+            let filename = filename.to_string();
+            servers.push(std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                for _ in PROPS {
+                    reader.read_line(&mut String::new()).unwrap();
+                }
+                let path = serde_json::to_string(&format!("/anime/{filename}")).unwrap();
+                let filename = serde_json::to_string(&filename).unwrap();
+                let lines = [
+                    ok(IDX_PAUSE, "false"),
+                    ok(IDX_PATH, &path),
+                    ok(IDX_TITLE, &filename),
+                    ok(IDX_FILENAME, &filename),
+                    ok(IDX_DURATION, "1200"),
+                    ok(IDX_POSITION, "1100"),
+                ]
+                .concat();
+                (&stream).write_all(lines.as_bytes()).unwrap();
+            }));
+        }
+        let snapshots = probe(&paths).into_iter().collect::<Vec<_>>();
+        for server in servers {
+            server.join().unwrap();
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.path.ends_with("Some Show - 03.mkv")),
+            "the earlier audio socket hid the anime from playback recognition"
+        );
+        assert_eq!(snapshots.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paused_and_playing_sockets_are_available_for_selection() {
         use std::os::unix::net::UnixListener;
         let mut paths = Vec::new();
         let mut servers = Vec::new();
@@ -483,14 +571,16 @@ mod tests {
                 (&stream).write_all(lines.as_bytes()).unwrap();
             }));
         }
-        let snap = probe(&paths).unwrap();
+        let snapshots = probe(&paths);
         for server in servers {
             server.join().unwrap();
         }
         for path in paths {
             std::fs::remove_file(path).unwrap();
         }
-        assert!(snap.playing);
+        assert_eq!(snapshots.len(), 2);
+        assert!(!snapshots[0].playing);
+        assert!(snapshots[1].playing);
     }
 
     /// Requires MPV. Run with cargo test --lib mpv -- --ignored --nocapture

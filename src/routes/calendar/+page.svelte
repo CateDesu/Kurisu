@@ -13,6 +13,12 @@
   import type { Snapshot } from "./$types";
 
   const MINE_KEY = "kurisu.cal.mine";
+  function startOfToday() {
+    const today = new Date(nowMs());
+    today.setHours(0, 0, 0, 0);
+    return today.getTime();
+  }
+  let anchorDay = $state(startOfToday());
   let weekOffset = $state(0);
   let watchingOnly = $state(preferences.get(MINE_KEY) !== "0");
   let items = $state<AiringItem[]>([]);
@@ -49,8 +55,7 @@
   }
 
   function range(offset: number): { start: Date; end: Date } {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
+    const start = new Date(anchorDay);
     start.setDate(start.getDate() + offset * 7);
     const end = new Date(start);
     end.setDate(end.getDate() + 7);
@@ -96,11 +101,12 @@
   }
 
   // Restore invalidates the mount fetch. Captures during loading must refetch the selected week.
-  export const snapshot: Snapshot<{ weekOffset: number; items: AiringItem[] }> = {
-    capture: () => ({ weekOffset, items: loading ? [] : items }),
+  export const snapshot: Snapshot<{ weekOffset: number; anchorDay: number; items: AiringItem[] }> = {
+    capture: () => ({ weekOffset, anchorDay, items: loading ? [] : items }),
     restore: (v) => {
       weekOffset = v.weekOffset;
-      items = v.items;
+      anchorDay = v.anchorDay ?? startOfToday();
+      items = v.anchorDay == null ? [] : v.items;
       loadId++;
       loadedOnce = true;
       loading = false;
@@ -160,23 +166,20 @@
     error = "";
     if (!loggedIn) return;
     let alive = true;
-    let unlisten: (() => void) | undefined;
-    listen("kurisu://episode-updated", () => {
+    const stops: (() => void)[] = [];
+    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+      listen(event, () => {
+        if (alive && epoch === auth.epoch) void refreshEntries();
+      }).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
+        if (alive && epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`;
+      })
+    );
+    void Promise.all(registrations).then(() => {
       if (alive && epoch === auth.epoch) void refreshEntries();
-    }).then((stop) => {
-      if (alive && epoch === auth.epoch) {
-        unlisten = stop;
-        void refreshEntries();
-      } else stop();
-    }).catch((e) => {
-      if (alive && epoch === auth.epoch) {
-        error = `Could not listen for list updates: ${String(e)}`;
-        void refreshEntries();
-      }
     });
     return () => {
       alive = false;
-      unlisten?.();
+      for (const stop of stops) stop();
       loadId++;
       entriesLoadId++;
     };
@@ -222,12 +225,14 @@
           ←
         </button>
         <button
-          onclick={() => { weekOffset = 0; void load(); void refreshEntries(); }}
-          disabled={loading || weekOffset === 0}
+          onclick={() => { anchorDay = startOfToday(); weekOffset = 0; void load(); void refreshEntries(); }}
+          disabled={loading || range(weekOffset).start.getTime() === startOfToday()}
           class="px-2.5 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
         >
           Today
         </button>
+        <button onclick={() => { void load(); void refreshEntries(); }} disabled={loading}
+          class="px-2.5 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50">Refresh</button>
         <button
           onclick={() => shift(1)}
           disabled={loading}

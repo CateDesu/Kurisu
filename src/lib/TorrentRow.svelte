@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "$lib/Icon.svelte";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { timeAgo, type TorrentItem } from "$lib/types";
 
   let { torrent: t, onopen }: { torrent: TorrentItem; onopen: (url: string) => void } = $props();
@@ -11,6 +12,17 @@
     "1_4": "Raw",
   };
   const category = $derived(categories[t.category_id ?? ""] ?? t.category ?? "Category unknown");
+  let detailsError = $state("");
+  async function openDetails() {
+    detailsError = "";
+    try {
+      const url = new URL(t.details_url ?? "");
+      if (!['https:', 'http:'].includes(url.protocol)) throw new Error("Unsupported release page address");
+      await openUrl(url.href);
+    } catch (e) {
+      detailsError = `Could not open release page: ${String(e)}`;
+    }
+  }
 </script>
 
 <div
@@ -20,6 +32,7 @@
 >
   <div class="flex-1 min-w-0">
     <div class="leading-relaxed whitespace-normal [overflow-wrap:anywhere]" title={t.title}>{t.title}</div>
+    {#if detailsError}<p class="text-xs text-red-400 mt-1" role="alert">{detailsError}</p>{/if}
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5 text-xs text-ink-dim">
       {#if t.is_new}
         <span class="font-semibold uppercase text-accent">New</span>
@@ -52,6 +65,11 @@
     </div>
   </div>
   <div class="flex items-center gap-1 shrink-0">
+    {#if t.details_url}
+      <button onclick={openDetails} title="Open release page" class="text-ink-dim hover:text-accent p-1.5 grid place-items-center">
+        <Icon name="external" size={16} />
+      </button>
+    {/if}
     {#if t.magnet}
       <button
         onclick={() => onopen(t.magnet ?? t.link)}

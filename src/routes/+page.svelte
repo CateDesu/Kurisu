@@ -6,6 +6,8 @@
 
   let autoSynced = false;
   let autoSyncedEpoch = 0;
+  let lastSyncAttemptAt = 0;
+  const SYNC_AGE = 5 * 60_000;
   let pendingSync: { epoch: number; promise: ReturnType<typeof api.syncMyList> } | null = null;
 
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
@@ -13,7 +15,6 @@
 
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
-  import { untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
   import { preferences } from "$lib/preferences";
@@ -196,13 +197,16 @@
       }
       const list = await api.localEntries();
       if (!current()) return;
-      entries = switched ? [] : list;
+      entries = list;
       syncedFor = uid;
       if (auth.epoch !== autoSyncedEpoch) {
         autoSynced = false;
         autoSyncedEpoch = auth.epoch;
+        lastSyncAttemptAt = 0;
       }
-      if ((list.length === 0 && !autoSynced) || switched) {
+      const now = Date.now();
+      const stale = !autoSynced || !syncedAt || now - syncedAt >= SYNC_AGE;
+      if (!auth.offline && (switched || (stale && now - lastSyncAttemptAt >= 60_000))) {
         autoSynced = true;
         await sync();
       }
@@ -219,6 +223,7 @@
     const epoch = auth.epoch;
     const current = () => id === syncId && epoch === auth.epoch && auth.isLoggedIn;
     syncing = true;
+    lastSyncAttemptAt = Date.now();
     error = "";
     const request = pendingSync?.epoch === epoch
       ? pendingSync
@@ -262,29 +267,43 @@
   });
 
   $effect(() => {
-    auth.epoch;
-    if (auth.isLoggedIn) untrack(() => load());
-  });
-
-  $effect(() => {
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
     let alive = true;
-    let un: (() => void) | undefined;
+    let stops: (() => void)[] = [];
     let debounce: ReturnType<typeof setTimeout> | null = null;
-    listen("kurisu://episode-updated", () => {
+    const refresh = () => {
       if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => {
         debounce = null;
         if (alive && epoch === auth.epoch && auth.isLoggedIn) void load();
       }, 300);
-    }).then((u) => (alive ? (un = u) : u()));
+    };
+    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+      listen(event, refresh).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
+        if (alive && epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`;
+      })
+    );
+    void Promise.all(registrations).then(() => {
+      if (alive && epoch === auth.epoch) void load();
+    });
     return () => {
       alive = false;
-      un?.();
+      for (const stop of stops) stop();
       if (debounce) clearTimeout(debounce);
     };
+  });
+
+  $effect(() => {
+    const epoch = auth.epoch;
+    if (!auth.isLoggedIn || auth.offline) return;
+    const refresh = () => {
+      if (epoch === auth.epoch && document.visibilityState === "visible" && !loading && !syncing) void load();
+    };
+    window.addEventListener("focus", refresh);
+    const timer = setInterval(refresh, 60_000);
+    return () => { window.removeEventListener("focus", refresh); clearInterval(timer); };
   });
 </script>
 

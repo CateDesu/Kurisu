@@ -118,6 +118,11 @@ input, textarea {
 
 .program-shell main, .dialog-sheet {
   scrollbar-gutter: stable;
+  overscroll-behavior-y: contain;
+}
+
+.sidebar-nav, [role="listbox"] {
+  overscroll-behavior: contain;
 }
 
 @media (max-width: 960px) {

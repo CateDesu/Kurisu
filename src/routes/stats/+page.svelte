@@ -82,9 +82,19 @@
       </div>
     {/if}
 
+    {#if stats?.warning}
+      <div class="text-sm text-ink-dim bg-panel border border-edge rounded-md p-3 mb-4" role="status">
+        Showing saved statistics{stats.cached_at ? ` from ${new Date(stats.cached_at * 1000).toLocaleString()}` : ""}. {stats.warning}
+      </div>
+    {/if}
     {#if loading && !stats}
       <div class="text-ink-dim py-10 text-center">Loading…</div>
+    {:else if !stats}
+      <div class="text-ink-dim py-10 text-center">Statistics are unavailable. Use Refresh to try again.</div>
     {:else if stats}
+      {#if stats.count === 0}
+        <p class="text-ink-dim mb-4">AniList has no anime statistics for your list yet.</p>
+      {/if}
       <div class="grid grid-cols-2 min-[1080px]:grid-cols-4 gap-3 mb-6">
         <div class="bg-panel border border-edge rounded-lg p-3">
           <div class="text-2xl font-semibold tabular-nums">{stats.count}</div>

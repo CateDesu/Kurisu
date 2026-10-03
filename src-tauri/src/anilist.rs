@@ -5,8 +5,9 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::models::{
-    AiringItem, FormatCount, GenreStat, ListEntry, ListStatus, Media, MediaCharacter,
-    MediaRelation, MediaStaff, Notification, ScoreBucket, StatusCount, User, UserStats, YearCount,
+    AiringItem, EntryDetails, FormatCount, FuzzyDate, GenreStat, ListEntry, ListStatus, Media,
+    MediaCharacter, MediaDetail, MediaRelation, MediaStaff, Notification, NotificationPage,
+    ScoreBucket, SearchPage, StatusCount, User, UserStats, YearCount,
 };
 
 const GRAPHQL: &str = "https://graphql.anilist.co";
@@ -227,9 +228,12 @@ impl AniList {
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                     continue;
                 }
-                return Err(anyhow!(
-                    "AniList is rate-limiting this app (429, retry after {wait}s); wait a minute and try again"
-                ));
+                return Err(ApiError {
+                    status,
+                    from_json: true,
+                    message: format!("rate limit reached; retry after {wait}s"),
+                }
+                .into());
             }
             let body: serde_json::Value = resp.json().await.map_err(|e| ApiError {
                 status,
@@ -239,8 +243,19 @@ impl AniList {
             break (status, body);
         };
         if let Some(errs) = body.get("errors") {
-            let msg = errs
-                .get(0)
+            let error = errs.get(0);
+            let reported_status = error
+                .and_then(|e| e.get("status"))
+                .and_then(|s| s.as_u64())
+                .and_then(|s| u16::try_from(s).ok())
+                .and_then(|s| reqwest::StatusCode::from_u16(s).ok())
+                .filter(|s| s.is_client_error() || s.is_server_error());
+            let status = if status.is_success() {
+                reported_status.unwrap_or(status)
+            } else {
+                status
+            };
+            let msg = error
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown AniList error");
@@ -248,6 +263,19 @@ impl AniList {
                 status,
                 from_json: true,
                 message: msg.to_string(),
+            }
+            .into());
+        }
+        if !status.is_success() {
+            return Err(ApiError {
+                status,
+                from_json: false,
+                message: body
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| status.canonical_reason())
+                    .unwrap_or("request failed")
+                    .to_string(),
             }
             .into());
         }
@@ -305,17 +333,29 @@ impl AniList {
     }
 
     pub async fn search(&self, query: &str, per_page: i64) -> Result<Vec<Media>> {
+        Ok(self.search_page(query, 1, per_page).await?.items)
+    }
+
+    pub async fn search_page(&self, query: &str, page: i64, per_page: i64) -> Result<SearchPage> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Page")]
             page: Page,
         }
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Page {
-            media: Option<Vec<Option<AniMedia>>>,
+            media: Vec<Option<AniMedia>>,
+            page_info: PageInfo,
         }
-        let q = "query ($search: String!, $perPage: Int!) {
-            Page(perPage: $perPage) {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: bool,
+        }
+        let q = "query ($search: String!, $page: Int!, $perPage: Int!) {
+            Page(page: $page, perPage: $perPage) {
+                pageInfo { hasNextPage }
                 media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
                     id idMal title { romaji english native }
                     coverImage { medium large }
@@ -327,16 +367,20 @@ impl AniList {
         let r: R = self
             .gql(
                 q,
-                serde_json::json!({ "search": query, "perPage": per_page }),
+                serde_json::json!({ "search": query, "page": page, "perPage": per_page }),
             )
             .await?;
-        Ok(r.page
-            .media
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .map(Media::from)
-            .collect())
+        Ok(SearchPage {
+            items: r
+                .page
+                .media
+                .into_iter()
+                .flatten()
+                .map(Media::from)
+                .collect(),
+            page,
+            has_next_page: r.page.page_info.has_next_page,
+        })
     }
 
     pub async fn season_all(&self, season: &str, year: i64) -> Result<Vec<Media>> {
@@ -462,15 +506,7 @@ impl AniList {
         Ok(Media::from(r.media))
     }
 
-    pub async fn media_detail(
-        &self,
-        id: i64,
-    ) -> Result<(
-        Media,
-        Vec<MediaRelation>,
-        Vec<MediaCharacter>,
-        Vec<MediaStaff>,
-    )> {
+    pub async fn media_detail(&self, id: i64) -> Result<MediaDetail> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Media")]
@@ -566,6 +602,31 @@ impl AniList {
             }
         }";
         let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
+        let mut unavailable_sections = Vec::new();
+        if r.media
+            .relations
+            .as_ref()
+            .and_then(|v| v.edges.as_ref())
+            .is_none()
+        {
+            unavailable_sections.push("relations".to_string());
+        }
+        if r.media
+            .characters
+            .as_ref()
+            .and_then(|v| v.edges.as_ref())
+            .is_none()
+        {
+            unavailable_sections.push("characters".to_string());
+        }
+        if r.media
+            .staff
+            .as_ref()
+            .and_then(|v| v.edges.as_ref())
+            .is_none()
+        {
+            unavailable_sections.push("staff".to_string());
+        }
         let relations = r
             .media
             .relations
@@ -621,7 +682,15 @@ impl AniList {
                 })
             })
             .collect();
-        Ok((r.media.media.into(), relations, characters, staff))
+        Ok(MediaDetail {
+            media: r.media.media.into(),
+            relations,
+            characters,
+            staff,
+            cached_at: None,
+            warning: None,
+            unavailable_sections,
+        })
     }
 
     pub async fn user_statistics(&self, user_name: &str) -> Result<UserStats> {
@@ -697,7 +766,11 @@ impl AniList {
         let r: R = self
             .gql(q, serde_json::json!({ "name": user_name }))
             .await?;
-        let a = r.user.statistics.and_then(|s| s.anime).unwrap_or_default();
+        let a = r
+            .user
+            .statistics
+            .and_then(|s| s.anime)
+            .ok_or_else(|| anyhow!("AniList statistics are unavailable for this account"))?;
         let mut release_years: Vec<YearCount> = a
             .release_years
             .unwrap_or_default()
@@ -760,6 +833,8 @@ impl AniList {
                 })
                 .collect(),
             release_years,
+            cached_at: None,
+            warning: None,
         })
     }
 
@@ -988,15 +1063,50 @@ impl AniList {
         score: Option<f64>,
         repeat: Option<i64>,
     ) -> Result<SavedEntry> {
+        self.save_entry_target(
+            serde_json::json!({"mediaId": media_id}),
+            status,
+            progress,
+            score,
+            repeat,
+        )
+        .await
+    }
+
+    pub(crate) async fn save_entry_by_id(
+        &self,
+        entry_id: i64,
+        status: Option<ListStatus>,
+        progress: Option<i64>,
+        score: Option<f64>,
+        repeat: Option<i64>,
+    ) -> Result<SavedEntry> {
+        self.save_entry_target(
+            serde_json::json!({"id": entry_id}),
+            status,
+            progress,
+            score,
+            repeat,
+        )
+        .await
+    }
+
+    async fn save_entry_target(
+        &self,
+        mut vars: serde_json::Value,
+        status: Option<ListStatus>,
+        progress: Option<i64>,
+        score: Option<f64>,
+        repeat: Option<i64>,
+    ) -> Result<SavedEntry> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "SaveMediaListEntry")]
             entry: SavedEntry,
         }
-        let q = "mutation ($mediaId: Int!, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int) {
-            SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score repeat }
+        let q = "mutation ($id: Int, $mediaId: Int, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int) {
+            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score repeat }
         }";
-        let mut vars = serde_json::json!({ "mediaId": media_id });
         let obj = vars.as_object_mut().expect("vars object");
         if let Some(st) = status {
             obj.insert("status".into(), st.as_str().into());
@@ -1037,17 +1147,115 @@ impl AniList {
         Ok(true)
     }
 
+    pub async fn entry_details(&self, media_id: i64) -> Result<EntryDetails> {
+        self.entry_details_with_id(media_id)
+            .await
+            .map(|(_, details)| details)
+    }
+
+    pub(crate) async fn entry_details_with_id(&self, media_id: i64) -> Result<(i64, EntryDetails)> {
+        let q = "query ($id: Int!) {
+            Media(id: $id, type: ANIME) { mediaListEntry { id notes startedAt { year month day } completedAt { year month day } customLists } }
+            Viewer { mediaListOptions { animeList { customLists } } }
+        }";
+        let r: serde_json::Value = self.gql(q, serde_json::json!({"id": media_id})).await?;
+        let raw = r
+            .pointer("/Media/mediaListEntry")
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| anyhow!("This show has no saved AniList entry yet"))?;
+        let entry_id = raw
+            .get("id")
+            .and_then(|id| id.as_i64())
+            .filter(|id| *id > 0)
+            .ok_or_else(|| anyhow!("AniList did not return the saved entry ID"))?;
+        let mut details = parse_entry_details(raw)?;
+        details.available_custom_lists = r
+            .pointer("/Viewer/mediaListOptions/animeList/customLists")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for name in &details.custom_lists {
+            if !details.available_custom_lists.contains(name) {
+                details.available_custom_lists.push(name.clone());
+            }
+        }
+        Ok((entry_id, details))
+    }
+
+    pub async fn save_entry_details(
+        &self,
+        entry_id: i64,
+        notes: Option<&str>,
+        started_at: Option<&FuzzyDate>,
+        completed_at: Option<&FuzzyDate>,
+        custom_lists: Option<&[String]>,
+    ) -> Result<EntryDetails> {
+        let q = "mutation ($id: Int!, $notes: String, $started: FuzzyDateInput, $completed: FuzzyDateInput, $lists: [String]) {
+            SaveMediaListEntry(id: $id, notes: $notes, startedAt: $started, completedAt: $completed, customLists: $lists) {
+                notes startedAt { year month day } completedAt { year month day } customLists
+            }
+        }";
+        let mut vars = serde_json::json!({"id": entry_id});
+        if let Some(v) = notes {
+            vars["notes"] = serde_json::json!(v);
+        }
+        if let Some(v) = started_at {
+            vars["started"] = serde_json::to_value(v)?;
+        }
+        if let Some(v) = completed_at {
+            vars["completed"] = serde_json::to_value(v)?;
+        }
+        if let Some(v) = custom_lists {
+            vars["lists"] = serde_json::json!(v);
+        }
+        let r: serde_json::Value = self.gql(q, vars).await?;
+        parse_entry_details(
+            r.get("SaveMediaListEntry")
+                .filter(|v| !v.is_null())
+                .ok_or_else(|| anyhow!("AniList did not return the saved entry"))?,
+        )
+    }
+
     /// Leave AniList's unread count unchanged when opening the inbox.
     pub async fn notifications(&self) -> Result<Vec<Notification>> {
+        Ok(self.notifications_page(1).await?.items)
+    }
+
+    pub async fn mark_notifications_read(&self) -> Result<()> {
+        let _: serde_json::Value = self.gql("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    pub async fn notifications_page(&self, page: i64) -> Result<NotificationPage> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Page")]
             page: Page,
+            #[serde(rename = "Viewer")]
+            viewer: Viewer,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Viewer {
+            unread_notification_count: Option<i64>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Page {
-            notifications: Option<Vec<Raw>>,
+            notifications: Vec<Raw>,
+            page_info: PageInfo,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Comment {
+            site_url: Option<String>,
         }
         #[derive(Deserialize, Default)]
         #[serde(default, rename_all = "camelCase")]
@@ -1064,6 +1272,7 @@ impl AniList {
             activity_id: Option<i64>,
             thread: Option<ThreadRef>,
             comment_id: Option<i64>,
+            comment: Option<Comment>,
             reason: Option<String>,
             deleted_media_title: Option<String>,
             user: Option<UserRef>,
@@ -1100,7 +1309,7 @@ impl AniList {
         struct AvatarRef {
             large: Option<String>,
         }
-        let q = "query { Page(page: 1, perPage: 50) { notifications(resetNotificationCount: false) {
+        let q = "query ($page: Int!) { Viewer { unreadNotificationCount } Page(page: $page, perPage: 50) { pageInfo { hasNextPage } notifications(resetNotificationCount: false) {
             ... on AiringNotification { id type createdAt media { id title { userPreferred } coverImage { medium } } episode contexts }
             ... on FollowingNotification { id type createdAt context user { id name avatar { large } } }
             ... on ActivityLikeNotification { id type createdAt context activityId user { name avatar { large } } }
@@ -1109,20 +1318,20 @@ impl AniList {
             ... on ActivityReplySubscribedNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ActivityReplyLikeNotification { id type createdAt context activityId user { name avatar { large } } }
             ... on ActivityMessageNotification { id type createdAt context activityId user { name avatar { large } } }
-            ... on ThreadCommentMentionNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
-            ... on ThreadCommentReplyNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
-            ... on ThreadCommentSubscribedNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
-            ... on ThreadCommentLikeNotification { id type createdAt context commentId thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentMentionNotification { id type createdAt context commentId comment { siteUrl } thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentReplyNotification { id type createdAt context commentId comment { siteUrl } thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentSubscribedNotification { id type createdAt context commentId comment { siteUrl } thread { id title } user { name avatar { large } } }
+            ... on ThreadCommentLikeNotification { id type createdAt context commentId comment { siteUrl } thread { id title } user { name avatar { large } } }
             ... on ThreadLikeNotification { id type createdAt context thread { id title } user { name avatar { large } } }
             ... on RelatedMediaAdditionNotification { id type createdAt context media { id title { userPreferred } coverImage { medium } } }
             ... on MediaDataChangeNotification { id type createdAt context media { id title { userPreferred } coverImage { medium } } reason }
             ... on MediaMergeNotification { id type createdAt context media { id title { userPreferred } coverImage { medium } } reason }
             ... on MediaDeletionNotification { id type createdAt context deletedMediaTitle reason }
         } } }";
-        let r: R = self.gql(q, serde_json::json!({})).await?;
-        Ok(r.page
+        let r: R = self.gql(q, serde_json::json!({ "page": page })).await?;
+        let items = r
+            .page
             .notifications
-            .unwrap_or_default()
             .into_iter()
             .filter(|n| !n.kind.is_empty())
             .map(|n| Notification {
@@ -1151,6 +1360,7 @@ impl AniList {
                 thread_id: n.thread.as_ref().map(|t| t.id),
                 thread_title: n.thread.as_ref().and_then(|t| t.title.clone()),
                 comment_id: n.comment_id,
+                comment_url: n.comment.and_then(|c| c.site_url),
                 reason: n.reason,
                 deleted_media_title: n.deleted_media_title,
                 user_name: n.user.as_ref().map(|u| u.name.clone()),
@@ -1159,8 +1369,38 @@ impl AniList {
                     .as_ref()
                     .and_then(|u| u.avatar.as_ref().and_then(|a| a.large.clone())),
             })
-            .collect())
+            .collect();
+        Ok(NotificationPage {
+            items,
+            page,
+            has_next_page: r.page.page_info.has_next_page,
+            unread_count: r.viewer.unread_notification_count,
+        })
     }
+}
+
+fn parse_entry_details(raw: &serde_json::Value) -> Result<EntryDetails> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Details {
+        notes: Option<String>,
+        started_at: Option<FuzzyDate>,
+        completed_at: Option<FuzzyDate>,
+        custom_lists: Option<std::collections::BTreeMap<String, bool>>,
+    }
+    let entry: Details = serde_json::from_value(raw.clone())?;
+    Ok(EntryDetails {
+        notes: entry.notes.unwrap_or_default(),
+        started_at: entry.started_at,
+        completed_at: entry.completed_at,
+        custom_lists: entry
+            .custom_lists
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(name, enabled)| enabled.then_some(name))
+            .collect(),
+        ..Default::default()
+    })
 }
 
 /// Keep transport errors distinct from AniList errors.
@@ -1184,7 +1424,27 @@ fn is_not_found(e: &anyhow::Error) -> bool {
     let Some(api) = e.downcast_ref::<ApiError>() else {
         return false;
     };
-    api.status == reqwest::StatusCode::NOT_FOUND || api.message == "Not Found"
+    api.from_json && (api.status == reqwest::StatusCode::NOT_FOUND || api.message == "Not Found")
+}
+
+pub fn is_retryable(error: &anyhow::Error) -> bool {
+    if let Some(api) = error.downcast_ref::<ApiError>() {
+        if api.from_json && (is_not_found(error) || is_auth_rejection(error)) {
+            return false;
+        }
+        return !api.from_json
+            || api.status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || api.status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || (api.status == reqwest::StatusCode::FORBIDDEN
+                && api
+                    .message
+                    .to_ascii_lowercase()
+                    .starts_with("the anilist api has been temporarily disabled"))
+            || api.status.is_server_error();
+    }
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_body() || e.is_request())
 }
 
 pub fn media_not_found(e: &anyhow::Error) -> bool {
@@ -1692,5 +1952,156 @@ mod regression_tests {
             .await;
             assert_eq!(api.user_list("Tester").await.unwrap().len(), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn graphql_error_status_controls_retries_without_broadening_permanent_failures() {
+        for (transport, reported, message, retry, auth, missing) in [
+            (200, json!(429), "Too Many Requests.", true, false, false),
+            (200, json!(503), "Service unavailable", true, false, false),
+            (200, json!(400), "validation", false, false, false),
+            (200, json!(401), "Unauthenticated", false, true, false),
+            (200, json!(404), "Anime unavailable", false, false, true),
+            (200, json!(403), "Access denied", false, false, false),
+            (
+                403,
+                json!(403),
+                "This IP address has been blocked",
+                false,
+                false,
+                false,
+            ),
+            (200, json!(999), "Invalid status", false, false, false),
+            (
+                200,
+                json!("429"),
+                "Invalid status type",
+                false,
+                false,
+                false,
+            ),
+            (503, json!(400), "Request failed", true, false, false),
+        ] {
+            let (api, _) = mock_api(vec![(
+                transport,
+                json!({"errors":[{"status":reported,"message":message}],"data":null}),
+            )])
+            .await;
+            let error = api.entry_by_media_id(1).await.err().unwrap();
+            assert_eq!(is_retryable(&error), retry, "{transport}: {message}");
+            assert_eq!(is_auth_rejection(&error), auth, "{transport}: {message}");
+            assert_eq!(media_not_found(&error), missing, "{transport}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn json_gateway_errors_preserve_status_without_invalidating_account_or_media() {
+        for status in [401, 404, 502, 503] {
+            let (api, _) =
+                mock_api(vec![(status, json!({"message": "Gateway unavailable"}))]).await;
+            let error = api.entry_by_media_id(1).await.err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<ApiError>().unwrap().status.as_u16(),
+                status
+            );
+            assert!(is_retryable(&error), "{status}");
+            assert!(!is_auth_rejection(&error), "{status}");
+            assert!(!media_not_found(&error), "{status}");
+        }
+    }
+
+    #[test]
+    fn retry_classification_keeps_permanent_failures_out_of_the_queue() {
+        for (status, from_json, message, expected) in [
+            (429, true, "slow down", true),
+            (408, true, "timeout", true),
+            (503, true, "unavailable", true),
+            (404, false, "edge page", true),
+            (400, true, "validation failed", false),
+            (401, true, "Invalid Token", false),
+            (200, true, "Not Found", false),
+            (200, true, "Invalid Token", false),
+        ] {
+            let error: anyhow::Error = ApiError {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                from_json,
+                message: message.into(),
+            }
+            .into();
+            assert_eq!(is_retryable(&error), expected, "{status}: {message}");
+            if !from_json {
+                assert!(!media_not_found(&error));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_returns_page_boundaries_from_anilist() {
+        let (api, mut requests) = mock_api(vec![(
+            200,
+            json!({"data":{"Page":{"pageInfo":{"hasNextPage":true},"media":[{"id":26}]}}}),
+        )])
+        .await;
+        let page = api.search_page("Show", 2, 25).await.unwrap();
+        assert_eq!(page.page, 2);
+        assert!(page.has_next_page);
+        assert_eq!(page.items[0].id, 26);
+        assert_eq!(requests.recv().await.unwrap()["variables"]["page"], 2);
+    }
+
+    #[tokio::test]
+    async fn notifications_keep_the_unread_count_and_comment_permalink() {
+        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"Viewer":{"unreadNotificationCount":4},"Page":{"pageInfo":{"hasNextPage":true},"notifications":[{"id":8,"type":"THREAD_COMMENT_REPLY","commentId":22,"comment":{"siteUrl":"https://anilist.co/forum/thread/1/comment/22"}}]}}}))]).await;
+        let page = api.notifications_page(2).await.unwrap();
+        assert_eq!(page.unread_count, Some(4));
+        assert!(page.has_next_page);
+        assert_eq!(
+            page.items[0].comment_url.as_deref(),
+            Some("https://anilist.co/forum/thread/1/comment/22")
+        );
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["variables"]["page"], 2);
+        assert!(request["query"]
+            .as_str()
+            .unwrap()
+            .contains("resetNotificationCount: false"));
+    }
+
+    #[tokio::test]
+    async fn statistics_null_is_unavailable_instead_of_an_empty_account() {
+        let (api, _) = mock_api(vec![(200, json!({"data":{"User":{"statistics":null}}}))]).await;
+        assert!(api
+            .user_statistics("Tester")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn details_distinguish_missing_sections_from_empty_sections() {
+        let (api, _) = mock_api(vec![(200, json!({"data":{"Media":{"id":1,"relations":null,"characters":{"edges":[]},"staff":null}}}))]).await;
+        let details = api.media_detail(1).await.unwrap();
+        assert_eq!(details.unavailable_sections, vec!["relations", "staff"]);
+    }
+
+    #[tokio::test]
+    async fn notes_mutation_omits_untouched_dates_lists_and_progress() {
+        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":{"year":2024,"month":null,"day":null},"customLists":{"Favorites":true,"Other":false}}}}))]).await;
+        let result = api
+            .save_entry_details(1, Some("New note"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.custom_lists, vec!["Favorites"]);
+        assert_eq!(result.started_at.unwrap().year, Some(2024));
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["variables"], json!({"id":1,"notes":"New note"}));
+        assert!(!request["query"].as_str().unwrap().contains("progress:"));
     }
 }

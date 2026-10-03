@@ -1,6 +1,5 @@
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
-  import { untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
@@ -39,6 +38,11 @@
   let editing = $state(false);
   let adding = $state<string | null>(null);
   let expanded = $state(false);
+  let entryError = $state("");
+  let entryAvailable = $state(false);
+  let recsError = $state("");
+  let recsLoading = $state(false);
+  let recsLoadId = 0;
 
   const status_options = [
     { v: "CURRENT", label: "Watching" },
@@ -56,22 +60,36 @@
     const current = () => reqId === loadId && epoch === auth.epoch && auth.isLoggedIn && mediaId === id;
     loading = true;
     error = "";
-    try {
-      const [d, e] = await Promise.all([api.getMediaDetail(mediaId), api.getEntry(mediaId)]);
-      if (!current()) return;
-      detail = d;
-      if (entryReq === entryLoadId) entry = e ? { ...e, media: e.media ?? d.media } : null;
-    } catch (err) {
-      if (current()) error = String(err);
-    } finally {
-      if (current()) loading = false;
-    }
+    entryError = "";
+    entryAvailable = false;
+    const [d, e] = await Promise.allSettled([api.getMediaDetail(mediaId), api.getEntry(mediaId)]);
     if (!current()) return;
+    if (d.status === "fulfilled") detail = d.value;
+    else error = String(d.reason);
+    if (entryReq === entryLoadId) {
+      if (e.status === "fulfilled") {
+        entry = e.value ? { ...e.value, media: e.value.media ?? detail?.media ?? null } : null;
+        entryAvailable = true;
+      } else entryError = String(e.reason);
+    }
+    loading = false;
+    if (detail) void loadRecommendations();
+  }
+
+  async function loadRecommendations() {
+    const req = ++recsLoadId;
+    const epoch = auth.epoch;
+    const mediaId = id;
+    const current = () => req === recsLoadId && epoch === auth.epoch && auth.isLoggedIn && mediaId === id;
+    recsLoading = true;
+    recsError = "";
     try {
-      const r = await api.getRecommendations(mediaId);
-      if (current()) recs = r;
-    } catch {
-      if (current()) recs = [];
+      const found = await api.getRecommendations(mediaId);
+      if (current()) recs = found;
+    } catch (e) {
+      if (current()) recsError = String(e);
+    } finally {
+      if (current()) recsLoading = false;
     }
   }
 
@@ -84,12 +102,15 @@
       const e = await api.getEntry(mediaId);
       if (reqId !== entryLoadId || epoch !== auth.epoch || !auth.isLoggedIn || mediaId !== id) return;
       entry = e ? { ...e, media: e.media ?? detail?.media ?? null } : null;
-    } catch {
+      entryAvailable = true;
+      entryError = "";
+    } catch (e) {
+      if (reqId === entryLoadId && epoch === auth.epoch && mediaId === id) entryError = String(e);
     }
   }
 
   async function add(status: string) {
-    if (!auth.isLoggedIn || adding || !detail) return;
+    if (!auth.isLoggedIn || adding || !detail || !entryAvailable) return;
     const reqId = ++addId;
     const epoch = auth.epoch;
     const mediaId = id;
@@ -113,9 +134,13 @@
     if (e.media_id !== id) return;
     entryLoadId++;
     entry = { ...e, media: e.media ?? detail?.media ?? null };
+    entryAvailable = true;
+    entryError = "";
   }
 
   const media = $derived(detail?.media ?? null);
+  const entryMedia = $derived(detail?.warning ? entry?.media ?? media : media ?? entry?.media);
+  const editorEntry = $derived(entry ? { ...entry, media: entryMedia } : null);
   const desc = $derived(plainDescription(media?.description));
   const air = $derived(airingLabel(media));
   const nextFile = $derived(entry ? library.fileFor(id, entry.progress + 1) : undefined);
@@ -148,35 +173,36 @@
     adding = null;
     expanded = false;
     recs = [];
+    recsError = "";
+    recsLoading = false;
+    entryError = "";
+    entryAvailable = false;
     loading = false;
     error = "";
-    return () => { loadId++; entryLoadId++; addId++; };
-  });
-
-  $effect(() => {
-    auth.epoch;
-    const mediaId = id;
-    if (!auth.isLoggedIn) return;
-    if (!Number.isFinite(mediaId)) {
-      detail = null;
-      entry = null;
-      loading = false;
-      error = "Invalid anime id.";
-      return;
-    }
-    untrack(() => load(mediaId));
+    return () => { loadId++; entryLoadId++; addId++; recsLoadId++; };
   });
 
   $effect(() => {
     const epoch = auth.epoch;
     const mediaId = id;
     if (!auth.isLoggedIn) return;
+    if (!Number.isFinite(mediaId)) {
+      loading = false;
+      error = "Invalid anime id.";
+      return;
+    }
+    loading = true;
     let alive = true;
-    let stop: (() => void) | undefined;
-    listen("kurisu://episode-updated", () => {
-      if (alive && epoch === auth.epoch && mediaId === id) void reloadEntry();
-    }).then((unlisten) => alive ? (stop = unlisten) : unlisten()).catch(console.error);
-    return () => { alive = false; stop?.(); };
+    const stops: (() => void)[] = [];
+    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+      listen(event, () => {
+        if (alive && epoch === auth.epoch && mediaId === id) void reloadEntry();
+      }).then((stop) => alive ? stops.push(stop) : stop()).catch(console.error)
+    );
+    void Promise.all(registrations).then(() => {
+      if (alive && epoch === auth.epoch && mediaId === id) void load(mediaId);
+    });
+    return () => { alive = false; for (const stop of stops) stop(); };
   });
 
   $effect(() => {
@@ -200,6 +226,7 @@
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-3 mt-6">
       {error || "This anime could not be loaded."}
     </div>
+    <button onclick={() => load(id)} class="mt-3 px-3 py-2 bg-panel-2 rounded-md">Retry details</button>
   </div>
 {:else}
   {#if media.banner_image}
@@ -248,6 +275,23 @@
       </div>
     {/if}
 
+    {#if detail?.warning || detail?.unavailable_sections?.length}
+      <div role="status" class="text-sm text-ink-dim bg-panel border border-edge rounded-md p-3 mb-4">
+        {#if detail.warning}
+          Showing saved details{detail.cached_at ? ` from ${new Date(detail.cached_at * 1000).toLocaleString()}` : ""}. {detail.warning}
+        {/if}
+        {#if detail.unavailable_sections?.length}
+          Current {detail.unavailable_sections.join(", ")} data is unavailable. Previously saved information is shown where available.
+        {/if}
+        <button onclick={() => load(id)} disabled={loading} class="text-accent ml-2 disabled:opacity-50">{loading ? "Loading…" : "Retry details"}</button>
+      </div>
+    {/if}
+    {#if entryError}
+      <div role="status" class="text-sm text-red-400 mb-4">Your list entry is unavailable. {entryError}
+        <button onclick={reloadEntry} class="text-accent ml-2">Retry list entry</button>
+      </div>
+    {/if}
+
     {#if media.genres?.length}
       <div class="flex flex-wrap gap-1.5 mb-4">
         {#each media.genres as g (g)}
@@ -266,7 +310,7 @@
         <EpisodeStepper
           mediaId={id}
           progress={entry.progress}
-          total={media.episodes ?? null}
+          total={entryMedia?.episodes ?? null}
           onchange={applyEntry}
         />
         {#if scoreLabel(entry.score, auth.user?.score_format)}
@@ -288,6 +332,8 @@
         >
           <Icon name="edit" size={13} /> Edit
         </button>
+      {:else if !entryAvailable}
+        <span class="text-sm text-ink-dim">Your list status is unavailable.</span>
       {:else}
         <span class="text-sm text-ink-dim shrink-0">Add to list:</span>
         {#each status_options as o (o.v)}
@@ -388,6 +434,15 @@
       </div>
     {/if}
 
+    {#if recsError}
+      <div class="text-sm text-ink-dim mb-4">Recommendations are unavailable. {recsError}
+        <button onclick={loadRecommendations} disabled={recsLoading} class="text-accent ml-2">Retry recommendations</button>
+      </div>
+    {:else if recsLoading}
+      <p class="text-sm text-ink-dim mb-4">Loading recommendations…</p>
+    {:else if recs.length === 0}
+      <p class="text-sm text-ink-dim mb-4">No recommendations yet.</p>
+    {/if}
     {#if recs.length > 0}
       <div class="mb-2">
         <h2 class="text-xs font-semibold uppercase tracking-wide text-ink-dim mb-2">
@@ -416,9 +471,9 @@
   </div>
 {/if}
 
-{#if auth.isLoggedIn && editing && entry}
+{#if auth.isLoggedIn && editing && editorEntry}
   <EditEntry
-    entry={entry}
+    entry={editorEntry}
     scoreFormat={auth.user?.score_format ?? null}
     onclose={() => {
       editing = false;

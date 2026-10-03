@@ -111,3 +111,21 @@ test("removing an unscanned folder still scans the remaining roots", async () =>
   expect(api.scanLibrary).toHaveBeenCalledOnce();
   expect(library.files[0]?.path).toBe("/anime/remaining/episode.mkv");
 });
+
+test("removing a scanned folder clears episode lookups before the next scan finishes", async () => {
+  const next = deferred<{ files: unknown[]; unreadable: unknown[] }>();
+  api.scanLibrary.mockResolvedValueOnce({ files: [
+    { path: "/anime/old/episode.mkv", media_id: 1, episode: 1 },
+  ], unreadable: [] }).mockReturnValueOnce(next.promise);
+  api.removeLibraryFolder.mockResolvedValue([]);
+  const { library } = await import("$lib/library.svelte");
+  await library.scan();
+  expect(library.fileFor(1, 1)).toBeDefined();
+
+  const removing = library.removeFolder("/anime/old");
+  await settle();
+  expect(library.fileFor(1, 1)).toBeUndefined();
+  next.resolve({ files: [], unreadable: [] });
+  await removing;
+  expect(library.fileFor(1, 1)).toBeUndefined();
+});

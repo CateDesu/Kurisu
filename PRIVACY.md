@@ -11,4 +11,4 @@ The program connects to:
 
 These services apply their own privacy policies.
 
-Your token, list cache, and settings are stored locally in `kurisu.db`. The token is plaintext. Data leaves the machine only through the connections above. Delete the program's data directory to remove its local database and settings.
+Your token, cached list and anime details, entry notes and dates, statistics, settings, pending list changes, and local watch history are stored in `kurisu.db`. Watch history includes the local file path, show, episode, and time. Pending changes and watch history are kept separately for each AniList account and remain on this device after signing out. The token is plaintext. Data leaves the machine only through the connections above. Delete the program's data directory to remove its local database and settings.
