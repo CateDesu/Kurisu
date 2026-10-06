@@ -8,7 +8,6 @@ import type {
   ListEntry,
   Media,
   MediaDetail,
-  Notification,
   TorrentItem,
   TorrentFetch,
   ShowTorrents,
@@ -52,7 +51,6 @@ export const api = {
   loginOauth: () => invoke<User>("login_oauth"),
   logout: () => invoke<void>("logout"),
 
-  searchAnime: (query: string) => invoke<Media[]>("search_anime", { query }),
   searchAnimePage: (query: string, page = 1) => invoke<SearchPage>("search_anime_page", { query, page }),
   getSeason: (season: string, year: number) =>
     invoke<Media[]>("get_season", { season, year }),
@@ -84,7 +82,6 @@ export const api = {
   deleteEntry: (mediaId: number) =>
     invoke<void>("delete_entry_cmd", { mediaId }),
 
-  getNotifications: () => invoke<Notification[]>("get_notifications"),
   getNotificationsPage: (page = 1) => invoke<NotificationPage>("get_notifications_page", { page }),
   markNotificationsRead: () => invoke<void>("mark_notifications_read"),
 

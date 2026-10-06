@@ -2,7 +2,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use discord_rich_presence::activity::Activity;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -134,7 +133,7 @@ impl Client {
         self.send_bytes(4, body).await
     }
 
-    pub(super) async fn set_activity(&mut self, activity: Activity<'_>) -> io::Result<()> {
+    pub(super) async fn set_activity(&mut self, activity: Value) -> io::Result<()> {
         self.send(1, &json!({
             "cmd": "SET_ACTIVITY",
             "args": {"pid": std::process::id(), "activity": activity},

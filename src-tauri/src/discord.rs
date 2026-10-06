@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use discord_rich_presence::activity::{Activity, Assets, Timestamps};
+use serde_json::{json, Value};
 use tokio::sync::watch;
 
 #[path = "discord_transport.rs"]
@@ -232,21 +232,20 @@ fn state_line(episode: Option<i64>, total: Option<i64>, playing: bool) -> String
     }
 }
 
-fn build_activity(d: &PresenceInfo, end_ms: i64) -> Activity<'static> {
+fn build_activity(d: &PresenceInfo, end_ms: i64) -> Value {
     // Discord limits title fields to 128 characters.
     let title: String = d.title.chars().take(128).collect();
-    let mut activity = Activity::new().details(title.clone()).state(state_line(
-        d.episode,
-        d.total_episodes,
-        d.playing,
-    ));
+    let mut activity = json!({
+        "details": title,
+        "state": state_line(d.episode, d.total_episodes, d.playing),
+    });
     // Discord fetches cover URLs through its image proxy.
     if let Some(url) = &d.cover_url {
         let url: String = url.chars().take(256).collect();
-        activity = activity.assets(Assets::new().large_image(url).large_text(title));
+        activity["assets"] = json!({"large_image": url, "large_text": title});
     }
     if end_ms > 0 {
-        activity = activity.timestamps(Timestamps::new().end(end_ms));
+        activity["timestamps"] = json!({"end": end_ms});
     }
     activity
 }
@@ -265,6 +264,45 @@ mod tests {
             cover_url: Some("https://s4.anilist.co/cover.jpg".into()),
             total_episodes: Some(28),
         }
+    }
+
+    #[test]
+    fn activity_payload_preserves_optional_fields_and_string_limits() {
+        assert_eq!(
+            build_activity(&playing(), 123_456),
+            serde_json::json!({
+                "details": "Frieren",
+                "state": "Episode 12/28",
+                "assets": {
+                    "large_image": "https://s4.anilist.co/cover.jpg",
+                    "large_text": "Frieren"
+                },
+                "timestamps": {"end": 123_456}
+            })
+        );
+        let bare = PresenceInfo {
+            playing: false,
+            episode: None,
+            cover_url: None,
+            ..playing()
+        };
+        assert_eq!(
+            build_activity(&bare, 0),
+            serde_json::json!({"details": "Frieren", "state": "Paused"})
+        );
+        let long = PresenceInfo {
+            title: "あ".repeat(129),
+            cover_url: Some(format!("https://example.com/{}", "a".repeat(300))),
+            ..playing()
+        };
+        let payload = build_activity(&long, 0);
+        assert_eq!(payload["details"], "あ".repeat(128));
+        assert_eq!(payload["assets"]["large_text"], payload["details"]);
+        assert_eq!(payload["assets"]["large_image"].as_str().unwrap().len(), 256);
+        assert!(payload.get("timestamps").is_none());
+        let payload = build_activity(&bare, 123_456);
+        assert!(payload.get("assets").is_none());
+        assert_eq!(payload["timestamps"]["end"], 123_456);
     }
 
     #[cfg(unix)]

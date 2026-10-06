@@ -11,6 +11,7 @@ mod recognize;
 mod rendering;
 mod rss;
 mod show_torrents;
+mod shutdown;
 mod sync_queue;
 mod updater;
 
@@ -173,17 +174,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(shutdown::Shutdown::default())
         .invoke_handler(tauri::generate_handler![
-            commands::get_client_id,
-            commands::set_client_id,
-            commands::get_redirect_uri,
-            commands::set_redirect_uri,
+            shutdown::shutdown_ready,
+            shutdown::finish_shutdown,
             commands::is_logged_in,
             commands::login_with_token,
             commands::login_oauth,
             commands::logout,
             commands::current_user,
-            commands::search_anime,
             commands::search_anime_page,
             commands::get_notifications_page,
             commands::mark_notifications_read,
@@ -200,7 +199,6 @@ pub fn run() {
             commands::update_entry,
             commands::set_progress,
             commands::delete_entry_cmd,
-            commands::get_notifications,
             commands::get_tracking_config,
             commands::set_tracking_config,
             commands::get_app_setting,
@@ -269,6 +267,7 @@ pub fn run() {
                 user: Mutex::new(None),
                 auth_intent: tokio::sync::watch::channel(0).0,
                 entry_lock: tokio::sync::Mutex::new(()),
+                remote_lock: tokio::sync::Mutex::new(()),
                 matchers: Mutex::new(Arc::new(matchers)),
                 library_cache: Default::default(),
             });
@@ -341,7 +340,9 @@ pub fn run() {
                             .flatten()
                             .map(|v| v == "1")
                             .unwrap_or(false);
-                        if tray_available && close_to_tray && w.hide().is_ok() {
+                        if (tray_available && close_to_tray && w.hide().is_ok())
+                            || shutdown::request(w.app_handle(), 0)
+                        {
                             api.prevent_close();
                         }
                     }
@@ -395,8 +396,15 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(context)
-        .expect("error while running kurisu");
+        .build(context)
+        .expect("error while building kurisu")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if shutdown::request(app, code.unwrap_or(0)) {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 #[cfg(test)]

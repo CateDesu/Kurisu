@@ -27,14 +27,12 @@ pub struct RawItem {
 }
 
 /// Use defaults only when unset. An explicitly empty list stays empty.
-pub fn get_feeds(db: &Db) -> Vec<String> {
-    match db.get_setting(FEEDS_KEY).ok().flatten() {
-        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("corrupt rss_feeds setting, starting from empty: {e}");
-            Vec::new()
-        }),
-        None => DEFAULT_FEEDS.iter().map(|s| s.to_string()).collect(),
-    }
+pub fn get_feeds(db: &Db) -> Result<Vec<String>> {
+    Ok(db
+        .get_setting(FEEDS_KEY)?
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_else(|| DEFAULT_FEEDS.iter().map(|s| s.to_string()).collect()))
 }
 
 fn save_feeds(db: &Db, feeds: &[String]) -> Result<()> {
@@ -67,7 +65,7 @@ pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
     }
     let url = parsed.as_str();
     let _guard = FEEDS_LOCK.lock();
-    let mut feeds = get_feeds(db);
+    let mut feeds = get_feeds(db)?;
     if !feeds.iter().any(|f| f == url) {
         feeds.push(url.to_string());
         save_feeds(db, &feeds)?;
@@ -77,7 +75,7 @@ pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
 
 pub fn remove_feed(db: &Db, url: &str) -> Result<Vec<String>> {
     let _guard = FEEDS_LOCK.lock();
-    let mut feeds = get_feeds(db);
+    let mut feeds = get_feeds(db)?;
     feeds.retain(|f| f != url);
     save_feeds(db, &feeds)?;
     Ok(feeds)
@@ -169,7 +167,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 }
                 ok += 1;
                 for mut item in items {
-                    // Scope GUIDs by feed so deduplication and seen state cannot cross feeds.
+                    // Keep entries distinct when different feeds reuse a raw GUID.
                     item.guid = format!("{feed}\u{1}{}", item.guid);
                     if seen_guids.insert(item.guid.clone()) {
                         out.push(item);
@@ -512,6 +510,55 @@ pub fn magnet_for(info_hash: &str, title: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn feed_edits_preserve_unreadable_saved_settings() {
+        for saved in [
+            rusqlite::types::Value::Text("[invalid".into()),
+            rusqlite::types::Value::Blob(b"unreadable".to_vec()),
+        ] {
+            for add in [true, false] {
+                let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+                db.0.lock()
+                    .execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?)",
+                        rusqlite::params![super::FEEDS_KEY, saved],
+                    )
+                    .unwrap();
+                assert!(super::get_feeds(&db).is_err());
+                let result = if add {
+                    super::add_feed(&db, "https://example.com/rss")
+                } else {
+                    super::remove_feed(&db, "https://example.com/rss")
+                };
+                let retained: rusqlite::types::Value =
+                    db.0.lock()
+                        .query_row(
+                            "SELECT value FROM settings WHERE key = ?",
+                            [super::FEEDS_KEY],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                assert_eq!(retained, saved);
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn only_unset_feeds_use_defaults() {
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+        assert_eq!(super::get_feeds(&db).unwrap(), super::DEFAULT_FEEDS);
+        assert!(super::remove_feed(&db, super::DEFAULT_FEEDS[0])
+            .unwrap()
+            .is_empty());
+        assert!(super::get_feeds(&db).unwrap().is_empty());
+        super::add_feed(&db, "https://example.com/rss").unwrap();
+        assert_eq!(
+            super::get_feeds(&db).unwrap(),
+            vec!["https://example.com/rss"]
+        );
+    }
 
     #[test]
     fn release_pages_are_derived_only_from_valid_nyaa_urls() {

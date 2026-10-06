@@ -2,14 +2,13 @@
   import PageHeading from "$lib/PageHeading.svelte";
   import { onDestroy, untrack } from "svelte";
   import { afterNavigate } from "$app/navigation";
-  import { listen } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import AnimeCard from "$lib/AnimeCard.svelte";
   import Select from "$lib/Select.svelte";
-  import { createListActions } from "$lib/list.svelte";
+  import { createListActions, listenForListUpdates } from "$lib/list.svelte";
   import type { Snapshot } from "./$types";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;
@@ -192,19 +191,10 @@
   $effect(() => {
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
-    let active = true;
-    const stops: (() => void)[] = [];
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, () => {
-        if (active && epoch === auth.epoch) void refreshEntries();
-      }).then((stop) => active ? stops.push(stop) : stop()).catch((e) => {
-        if (active && epoch === auth.epoch) entriesError = String(e);
-      })
+    return listenForListUpdates(
+      () => { if (epoch === auth.epoch) void refreshEntries(); },
+      (e) => { if (epoch === auth.epoch) entriesError = String(e); },
     );
-    void Promise.all(registrations).then(() => {
-      if (active && epoch === auth.epoch) void refreshEntries();
-    });
-    return () => { active = false; for (const stop of stops) stop(); };
   });
 
   onDestroy(() => { alive = false; actions.reset(); });
@@ -242,8 +232,8 @@
     </form>
     <div class="flex items-center gap-3 flex-wrap mb-4">
       <input aria-label="Filter season titles" bind:value={titleFilter} placeholder="Filter titles…" class="min-w-0 flex-1 bg-panel-2 border border-edge rounded px-3 py-2 text-sm" />
-      <Select id="season-format" bind:value={formatFilter} options={formatOptions} class="w-40" />
-      <Select id="season-list-status" bind:value={listFilter} options={listOptions} class="w-44" />
+      <Select id="season-format" label="Filter by format" bind:value={formatFilter} options={formatOptions} class="w-40" />
+      <Select id="season-list-status" label="Filter by list status" bind:value={listFilter} options={listOptions} class="w-44" />
       <span class="text-xs text-ink-dim">{visible.length} of {media.length} shows</span>
     </div>
 

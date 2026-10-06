@@ -11,6 +11,7 @@
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
+  import { listenForListUpdates } from "$lib/list.svelte";
   import { displayTitle, type LibraryFile, type ListEntry, type WatchHistoryItem } from "$lib/types";
   import Confirm from "$lib/Confirm.svelte";
   import Dialog from "$lib/Dialog.svelte";
@@ -322,26 +323,22 @@
     scannedAt = 0;
     if (!loggedIn) return;
     let alive = true;
-    const stops: (() => void)[] = [];
     const updateEntries = () => {
       if (!alive || epoch !== auth.epoch) return;
       refreshEntries().catch((e) => {
         if (alive && epoch === auth.epoch) error = String(e);
       });
     };
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, updateEntries).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
-        if (alive) error = String(e);
-      })
+    const stop = listenForListUpdates(
+      updateEntries,
+      (e) => { if (epoch === auth.epoch) error = String(e); },
+      () => { if (epoch === auth.epoch) void load(); },
     );
-    void Promise.all(registrations).then(() => {
-      if (alive && epoch === auth.epoch) void load();
-    });
     return () => {
       alive = false;
       entryLoadId++;
       historyRequest++;
-      for (const stop of stops) stop();
+      stop();
     };
   });
 
@@ -393,12 +390,9 @@
 
     {#if library.unreadable.length > 0}
       <div class="text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md p-2 mb-4">
-        {library.unreadable.length === 1
-          ? "1 folder could not be read"
-          : `${library.unreadable.length} folders could not be read`} — files under
-        {library.unreadable.length === 1 ? "it are" : "them are"} missing from this scan.
+        Some paths could not be read. Files may be missing from this scan.
         <ul class="mt-1 space-y-0.5">
-          {#each library.unreadable as u (u.path)}
+          {#each library.unreadable as u}
             <li class="text-xs" title={u.error}>{u.path}: {u.error}</li>
           {/each}
         </ul>

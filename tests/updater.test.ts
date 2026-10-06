@@ -128,3 +128,31 @@ test("periodic checks respect dismissal and show a later release", async () => {
   expect(document.body.textContent).toContain("2.0.1");
   expect(button("Download & install").disabled).toBe(false);
 });
+
+test("install waits for pending progress before starting the installer", async () => {
+  const { registerPendingEdit } = await import("$lib/pendingEdits");
+  const { runInstallUpdate } = await import("$lib/update.svelte");
+  const saving = deferred<void>();
+  const unregister = registerPendingEdit(async () => {
+    await saving.promise;
+    unregister();
+  });
+  const install = runInstallUpdate();
+  await Promise.resolve();
+  expect(mocks.api.installUpdate).not.toHaveBeenCalled();
+  saving.resolve();
+  await install;
+  expect(mocks.api.installUpdate).toHaveBeenCalledOnce();
+});
+
+test("a pending progress failure prevents the installer from starting", async () => {
+  const { registerPendingEdit } = await import("$lib/pendingEdits");
+  const { runInstallUpdate } = await import("$lib/update.svelte");
+  const unregister = registerPendingEdit(async () => { throw new Error("Disk is full"); });
+  try {
+    await expect(runInstallUpdate()).rejects.toThrow("Disk is full");
+    expect(mocks.api.installUpdate).not.toHaveBeenCalled();
+  } finally {
+    unregister();
+  }
+});

@@ -1,6 +1,6 @@
 <script lang="ts">
   import Dialog from "$lib/Dialog.svelte";
-  import { listen, emit } from "@tauri-apps/api/event";
+  import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
@@ -9,7 +9,6 @@
   import type { TrackingPrompt } from "$lib/types";
 
   let prompt = $state<TrackingPrompt | null>(null);
-  // Queue prompts while the window is hidden or another prompt is open.
   let queued = $state<TrackingPrompt[]>([]);
   let busy = $state(false);
   let err = $state("");
@@ -83,9 +82,8 @@
         return;
       }
       // Pass the fresh baseline so a concurrent edit cannot be overwritten.
-      const entry = await api.setProgress(p.media_id, p.episode, fresh.progress);
+      await api.setProgress(p.media_id, p.episode, fresh.progress);
       if (!current()) return;
-      await emit("kurisu://episode-updated", entry);
       if (prompt === p) dismiss();
     } catch (e) {
       if (current()) err = String(e);

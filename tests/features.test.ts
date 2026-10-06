@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { emit } from "@tauri-apps/api/event";
 import { auth } from "./session.svelte";
-import { button, deferred, settle } from "./helpers";
+import { button, deferred, selectOption, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries(["localEntries", "searchAnimePage", "getNotificationsPage", "markNotificationsRead", "getMediaDetail", "getEntry", "getRecommendations", "getUserStats", "getEntryDetails", "updateEntryDetails", "updateEntry", "setProgress"].map((name) => [name, vi.fn()])),
@@ -118,9 +119,7 @@ test.each([null, 10])("detail completion uses its current total instead of cache
   await render(Detail);
   button("Edit").click();
   await settle();
-  (document.querySelector("#ed-status") as HTMLButtonElement).click();
-  await settle();
-  button("Completed").click();
+  selectOption("#ed-status", "COMPLETED");
   await settle();
   expect((document.querySelector("#ed-progress") as HTMLInputElement).value).toBe("12");
   expect((document.querySelector("#ed-progress") as HTMLInputElement).max).toBe("12");
@@ -133,9 +132,7 @@ test("saved detail metadata cannot cap a newer list entry total", async () => {
   expect((document.querySelector('[aria-label="One more episode"]') as HTMLButtonElement).disabled).toBe(false);
   button("Edit").click();
   await settle();
-  (document.querySelector("#ed-status") as HTMLButtonElement).click();
-  await settle();
-  button("Completed").click();
+  selectOption("#ed-status", "COMPLETED");
   await settle();
   expect((document.querySelector("#ed-progress") as HTMLInputElement).value).toBe("12");
 });
@@ -289,6 +286,17 @@ test("a queue refresh cannot overwrite newly saved currently watching progress",
   for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback();
   await settle();
   expect(document.body.textContent).toContain("Ep 5/12 on your list");
+});
+
+test("currently watching retains accepted progress when frontend event delivery fails", async () => {
+  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  vi.mocked(emit).mockRejectedValue(new Error("event bridge unavailable"));
+  mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 4 });
+  await render(Now);
+  button("Update to Ep 4").click();
+  await settle();
+  expect(document.body.textContent).toContain("Ep 4/12 on your list");
+  expect(document.body.textContent).not.toContain("event bridge unavailable");
 });
 
 test("currently watching reloads authoritative progress after a failed write", async () => {

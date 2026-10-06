@@ -97,19 +97,23 @@ impl Db {
     }
 
     pub(crate) fn put_pending(&self, account: i64, pending: &Pending) -> Result<()> {
-        self.0.lock().execute(
+        self.durable_write(|conn| {
+            conn.execute(
             "INSERT OR REPLACE INTO pending_change (account_id,media_id,payload) VALUES (?,?,?)",
             rusqlite::params![account, pending.media_id, serde_json::to_string(pending)?],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub(crate) fn remove_pending(&self, account: i64, media_id: i64) -> Result<()> {
-        self.0.lock().execute(
-            "DELETE FROM pending_change WHERE account_id = ? AND media_id = ?",
-            [account, media_id],
-        )?;
-        Ok(())
+        self.durable_write(|conn| {
+            conn.execute(
+                "DELETE FROM pending_change WHERE account_id = ? AND media_id = ?",
+                [account, media_id],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn record_watch(
@@ -119,27 +123,28 @@ impl Db {
         media_id: i64,
         episode: i64,
     ) -> Result<()> {
-        let conn = self.0.lock();
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO watch_history (account_id,path,media_id,episode,watched_at)
+        self.durable_write(|conn| {
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO watch_history (account_id,path,media_id,episode,watched_at)
              SELECT ?,?,?,?,? WHERE NOT EXISTS (
                  SELECT 1 FROM watch_history WHERE account_id = ? AND path = ? AND media_id = ?
                  AND episode = ? AND watched_at > ?)",
-            rusqlite::params![
-                account_id,
-                path,
-                media_id,
-                episode,
-                now,
-                account_id,
-                path,
-                media_id,
-                episode,
-                now - 300
-            ],
-        )?;
-        Ok(())
+                rusqlite::params![
+                    account_id,
+                    path,
+                    media_id,
+                    episode,
+                    now,
+                    account_id,
+                    path,
+                    media_id,
+                    episode,
+                    now - 300
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn watch_history(
@@ -271,21 +276,21 @@ fn remote_entry(media_id: i64, remote: anilist::SavedEntry) -> ListEntry {
     ListEntry {
         id: Some(remote.id),
         media_id,
-        status: remote.status.unwrap_or_else(|| "CURRENT".into()),
-        progress: remote.progress.unwrap_or(0),
+        status: remote.status,
+        progress: remote.progress,
         score: remote.score,
-        repeat: remote.repeat.unwrap_or(0),
+        repeat: remote.repeat,
         ..Default::default()
     }
 }
 
-fn changed() {
+pub(crate) fn changed() {
     if let Some(handle) = APP.get() {
         let _ = handle.emit("kurisu://pending-changed", ());
     }
 }
 
-fn publish(entry: &ListEntry) {
+pub(crate) fn publish(entry: &ListEntry) {
     if let Some(handle) = APP.get() {
         let _ = handle.emit("kurisu://episode-updated", entry);
     }
@@ -329,7 +334,9 @@ fn already_applied(pending: &Pending, remote: &ListEntry) -> bool {
         && p.repeat.is_none_or(|v| remote.repeat == v)
 }
 
+/// Caller holds remote_lock so queued writes and account replacement remain ordered.
 pub(crate) async fn flush_unlocked(state: &AppState) -> Result<(), String> {
+    let _guard = state.entry_lock.lock().await;
     let Some(account) = account_id(&state.db) else {
         return Ok(());
     };
@@ -337,15 +344,19 @@ pub(crate) async fn flush_unlocked(state: &AppState) -> Result<(), String> {
     if !al.has_token() {
         return Ok(());
     }
-    for mut pending in state
+    let pending = state
         .db
         .pending(account)
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|p| !p.conflict)
         .take(10)
-    {
-        let remote = match al.entry_by_media_id(pending.media_id).await {
+        .collect::<Vec<_>>();
+    drop(_guard);
+    for mut pending in pending {
+        let result = al.entry_by_media_id(pending.media_id).await;
+        let _guard = state.entry_lock.lock().await;
+        let remote = match result {
             Ok(remote) => remote.map(|e| remote_entry(pending.media_id, e)),
             Err(e) => {
                 pending.error = Some(e.to_string());
@@ -392,6 +403,7 @@ pub(crate) async fn flush_unlocked(state: &AppState) -> Result<(), String> {
             changed();
             continue;
         }
+        drop(_guard);
         send_pending(state, account, pending, remote.and_then(|entry| entry.id)).await?;
     }
     Ok(())
@@ -423,6 +435,7 @@ async fn send_pending(
                 .await
         }
     };
+    let _guard = state.entry_lock.lock().await;
     match saved {
         Ok(saved) => {
             let mut entry = remote_entry(pending.media_id, saved);
@@ -503,7 +516,7 @@ pub async fn sync_pending_changes(
     state: State<'_, AppState>,
 ) -> Result<Vec<PendingChange>, String> {
     let token = state.anilist.lock().token();
-    let _guard = state.entry_lock.lock().await;
+    let _remote = state.remote_lock.lock().await;
     if state.anilist.lock().token() != token {
         return Err("Account changed".into());
     }
@@ -526,10 +539,11 @@ async fn resolve_pending_inner(
     state: &AppState,
 ) -> Result<(), String> {
     let token = state.anilist.lock().token();
-    let _guard = state.entry_lock.lock().await;
+    let _remote = state.remote_lock.lock().await;
     if token.is_none() || state.anilist.lock().token() != token {
         return Err("Account changed".into());
     }
+    let _guard = state.entry_lock.lock().await;
     let account = account_id(&state.db).ok_or("Not signed in")?;
     let Some(pending) = state
         .db
@@ -547,7 +561,10 @@ async fn resolve_pending_inner(
             );
         }
         let al = state.anilist.lock().clone();
-        let remote = match al.entry_by_media_id(media_id).await {
+        drop(_guard);
+        let result = al.entry_by_media_id(media_id).await;
+        let _guard = state.entry_lock.lock().await;
+        let remote = match result {
             Ok(remote) => remote,
             Err(e) => {
                 if anilist::media_not_found(&e) {
@@ -556,6 +573,7 @@ async fn resolve_pending_inner(
                 return Err(crate::commands::write_err(state, &e));
             }
         };
+        drop(_guard);
         return send_pending(state, account, pending, remote.map(|entry| entry.id)).await;
     }
     if pending.missing_media {
@@ -569,7 +587,10 @@ async fn resolve_pending_inner(
         return Ok(());
     }
     let al = state.anilist.lock().clone();
-    let remote = match al.entry_by_media_id(media_id).await {
+    drop(_guard);
+    let result = al.entry_by_media_id(media_id).await;
+    let _guard = state.entry_lock.lock().await;
+    let remote = match result {
         Ok(remote) => remote,
         Err(e) if anilist::media_not_found(&e) => None,
         Err(e) => return Err(crate::commands::write_err(state, &e)),
@@ -603,7 +624,7 @@ pub fn spawn(app: tauri::AppHandle) {
         loop {
             interval.tick().await;
             let state = app.state::<AppState>();
-            let _guard = state.entry_lock.lock().await;
+            let _guard = state.remote_lock.lock().await;
             if let Err(e) = flush_unlocked(&state).await {
                 log::debug!("pending sync: {e}");
             }
@@ -626,6 +647,7 @@ mod tests {
             user: Mutex::new(None),
             auth_intent: tokio::sync::watch::channel(0).0,
             entry_lock: tokio::sync::Mutex::new(()),
+            remote_lock: tokio::sync::Mutex::new(()),
             matchers: Mutex::new(Arc::new(vec![])),
             library_cache: Default::default(),
         }

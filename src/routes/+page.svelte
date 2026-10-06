@@ -15,7 +15,7 @@
 
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listenForListUpdates } from "$lib/list.svelte";
   import { goto } from "$app/navigation";
   import { preferences } from "$lib/preferences";
   import { auth } from "$lib/auth.svelte";
@@ -270,7 +270,6 @@
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
     let alive = true;
-    let stops: (() => void)[] = [];
     let debounce: ReturnType<typeof setTimeout> | null = null;
     const refresh = () => {
       if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
@@ -280,17 +279,14 @@
         if (alive && epoch === auth.epoch && auth.isLoggedIn) void load();
       }, 300);
     };
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, refresh).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
-        if (alive && epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`;
-      })
+    const stop = listenForListUpdates(
+      refresh,
+      (e) => { if (epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`; },
+      () => { if (epoch === auth.epoch) void load(); },
     );
-    void Promise.all(registrations).then(() => {
-      if (alive && epoch === auth.epoch) void load();
-    });
     return () => {
       alive = false;
-      for (const stop of stops) stop();
+      stop();
       if (debounce) clearTimeout(debounce);
     };
   });
@@ -325,7 +321,7 @@
       />
       </label>
       <span class="eyebrow sort-label">Sort by</span>
-      <Select bind:value={sortKey} options={SORT_OPTIONS} class="w-36" onchange={pickSort} />
+      <Select label="Sort list" bind:value={sortKey} options={SORT_OPTIONS} class="w-36" onchange={pickSort} />
       <button
         onclick={flipDir}
         title={sortDesc ? "Descending — click for ascending" : "Ascending — click for descending"}

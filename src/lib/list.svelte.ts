@@ -1,6 +1,26 @@
+import { listen } from "@tauri-apps/api/event";
 import { api } from "$lib/api";
 import { auth } from "$lib/auth.svelte";
 import type { Media } from "$lib/types";
+
+export function listenForListUpdates(
+  refresh: () => void,
+  onError: (error: unknown) => void,
+  ready = refresh,
+) {
+  let alive = true;
+  const stops: (() => void)[] = [];
+  const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
+    listen(event, () => { if (alive) refresh(); })
+      .then((stop) => alive ? stops.push(stop) : stop())
+      .catch((error) => { if (alive) onError(error); })
+  );
+  void Promise.all(registrations).then(() => { if (alive) ready(); });
+  return () => {
+    alive = false;
+    for (const stop of stops) stop();
+  };
+}
 
 export async function addToList(media: Media, status: string) {
   const epoch = auth.epoch;

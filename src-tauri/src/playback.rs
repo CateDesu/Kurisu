@@ -118,6 +118,7 @@ struct ActiveTrack {
     fail_count: u32,
     retry_at: Option<Instant>,
     history_recorded: bool,
+    push: Option<tokio::task::JoinHandle<Result<bool, String>>>,
 }
 
 impl ActiveTrack {
@@ -133,6 +134,7 @@ impl ActiveTrack {
             fail_count: 0,
             retry_at: None,
             history_recorded: false,
+            push: None,
         }
     }
 }
@@ -233,6 +235,7 @@ pub fn spawn(app: AppHandle) {
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[derive(Clone)]
 struct TickInfo {
     playing: bool,
     player: String,
@@ -267,7 +270,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     let expected_token = state.anilist.lock().token();
     let app_for_blocking = app.clone();
     let info = tokio::task::spawn_blocking(move || read_now(&app_for_blocking)).await??;
-    let session_guard = state.entry_lock.lock().await;
+    let _session_guard = state.entry_lock.lock().await;
     if state.anilist.lock().token() != expected_token {
         *active = None;
         let _ = app.emit("kurisu://now-playing", idle());
@@ -308,7 +311,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     // Credit only intervals playing at both ends. Pauses between samples are invisible.
     let was_playing_before = track.was_playing;
     if info.playing && track.was_playing {
-        track.accumulated += track.last_tick.elapsed();
+        track.accumulated += track.last_tick.elapsed().min(TICK * 2);
     }
     track.was_playing = info.playing;
     track.last_tick = Instant::now();
@@ -383,6 +386,45 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
         );
     }
 
+    if track.push.as_ref().is_some_and(|push| push.is_finished()) {
+        let result = track
+            .push
+            .take()
+            .unwrap()
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+        match result {
+            Ok(history_recorded) => {
+                track.incremented = true;
+                track.history_recorded |= history_recorded;
+                if state
+                    .db
+                    .get_entry(media_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| entry.progress >= episode)
+                {
+                    record_history(app, state.inner(), track, &info, expected_token.as_deref());
+                }
+            }
+            Err(e) => {
+                track.fail_count += 1;
+                track.retry_at = Some(Instant::now() + auto_push_backoff(track.fail_count));
+                if track.fail_count >= MAX_AUTO_PUSH_FAILURES {
+                    log::warn!(
+                        "auto progress-update of {media_id} failed {} times, giving up on this track: {e}",
+                        track.fail_count
+                    );
+                } else {
+                    log::warn!(
+                        "auto progress-update of {media_id} failed (attempt {}), retrying later: {e}",
+                        track.fail_count
+                    );
+                }
+            }
+        }
+    }
+
     let gate = AutoGate {
         incremented: track.incremented,
         was_playing_before,
@@ -417,55 +459,41 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
                 );
             }
         }
-        "auto" if info.playing && gate.should_push() => {
-            drop(session_guard);
-            let st = app.state::<AppState>();
-            match commands::watcher_set_progress(
-                st.inner(),
-                media_id,
-                episode,
-                expected_token.as_deref(),
-            )
-            .await
-            {
-                Ok(Some(entry)) => {
-                    track.incremented = true;
-                    let _session = st.entry_lock.lock().await;
-                    let same_account = st.anilist.lock().token() == expected_token;
-                    if same_account {
-                        record_history(app, st.inner(), track, &info, expected_token.as_deref());
-                        let _ = app.emit("kurisu://episode-updated", entry);
-                    }
+        "auto" if info.playing && gate.should_push() && track.push.is_none() => {
+            let handle = app.clone();
+            let watched = info.clone();
+            let history_recorded = track.history_recorded;
+            track.push = Some(tokio::spawn(async move {
+                let state = handle.state::<AppState>();
+                let result = commands::watcher_set_progress(
+                    state.inner(),
+                    media_id,
+                    episode,
+                    expected_token.as_deref(),
+                )
+                .await?;
+                let _guard = state.entry_lock.lock().await;
+                if state.anilist.lock().token() != expected_token {
+                    return Ok(false);
                 }
-                Ok(None) => {
-                    track.incremented = true;
-                    let _session = st.entry_lock.lock().await;
-                    if st
-                        .db
-                        .get_entry(media_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|entry| entry.progress >= episode)
-                    {
-                        record_history(app, st.inner(), track, &info, expected_token.as_deref());
-                    }
+                if let Some(entry) = result {
+                    let _ = handle.emit("kurisu://episode-updated", entry);
                 }
-                Err(e) => {
-                    track.fail_count += 1;
-                    track.retry_at = Some(Instant::now() + auto_push_backoff(track.fail_count));
-                    if track.fail_count >= MAX_AUTO_PUSH_FAILURES {
-                        log::warn!(
-                            "auto progress-update of {media_id} failed {} times, giving up on this track: {e}",
-                            track.fail_count
-                        );
-                    } else {
-                        log::warn!(
-                            "auto progress-update of {media_id} failed (attempt {}), retrying later: {e}",
-                            track.fail_count
-                        );
-                    }
-                }
-            }
+                let accepted = state
+                    .db
+                    .get_entry(media_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| entry.progress >= episode);
+                Ok(history_recorded
+                    || (accepted
+                        && save_history(
+                            &handle,
+                            state.inner(),
+                            &watched,
+                            expected_token.as_deref(),
+                        )))
+            }));
         }
         _ => {}
     }
@@ -512,16 +540,24 @@ fn record_history(
     info: &TickInfo,
     expected_token: Option<&str>,
 ) {
-    if track.history_recorded
-        || expected_token.is_none()
-        || state.anilist.lock().token().as_deref() != expected_token
-    {
-        return;
+    if !track.history_recorded {
+        track.history_recorded = save_history(app, state, info, expected_token);
+    }
+}
+
+fn save_history(
+    app: &AppHandle,
+    state: &AppState,
+    info: &TickInfo,
+    expected_token: Option<&str>,
+) -> bool {
+    if expected_token.is_none() || state.anilist.lock().token().as_deref() != expected_token {
+        return false;
     }
     let (Some(media_id), Some(episode), Some(path)) =
         (info.media_id, info.episode, local_video_path(&info.trackid))
     else {
-        return;
+        return false;
     };
     let Some(account_id) = state
         .db
@@ -531,14 +567,17 @@ fn record_history(
         .and_then(|id| id.parse::<i64>().ok())
         .filter(|id| *id > 0)
     else {
-        return;
+        return false;
     };
     match state.db.record_watch(account_id, &path, media_id, episode) {
         Ok(()) => {
-            track.history_recorded = true;
             let _ = app.emit("kurisu://watch-history-updated", media_id);
+            true
         }
-        Err(error) => log::warn!("could not save local watch history: {error}"),
+        Err(error) => {
+            log::warn!("could not save local watch history: {error}");
+            false
+        }
     }
 }
 
@@ -610,7 +649,13 @@ fn match_playing<'a>(
     &'a crate::recognize::Matcher,
     Option<library::LibraryBinding>,
 )> {
-    let bindings = library::get_bindings(&app.state::<AppState>().db);
+    let bindings = match library::get_bindings(&app.state::<AppState>().db) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            log::warn!("cannot read library bindings, skipping playback match: {error}");
+            return None;
+        }
+    };
     library::bound_match(matchers, &bindings, path)
         .map(|(m, binding)| (m, Some(binding)))
         .or_else(|| match_title(matchers, title, path).map(|m| (m, None)))

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { emit } from "@tauri-apps/api/event";
 import { auth } from "./session.svelte";
-import { button, deferred, settle } from "./helpers";
+import { button, deferred, selectOption, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries([
@@ -13,7 +14,7 @@ const mocks = vi.hoisted(() => ({
   listeners: new Map<string, Set<(event: { payload: unknown }) => void>>(),
   navigation: [] as (() => void)[],
   library: {
-    files: [] as unknown[], folders: [] as string[], unreadable: [], scanning: false, hasScan: false,
+    files: [] as unknown[], folders: [] as string[], unreadable: [] as { path: string; error: string }[], scanning: false, hasScan: false,
     foldersFailed: false, fileFor: vi.fn(), loadFolders: vi.fn(), scan: vi.fn(), ensureScan: vi.fn(),
   },
 }));
@@ -48,6 +49,7 @@ import Library from "../src/routes/library/+page.svelte";
 import Torrents from "../src/routes/torrents/+page.svelte";
 import Search from "../src/routes/search/+page.svelte";
 import ShowTorrentChoices from "$lib/ShowTorrentChoices.svelte";
+import EpisodeStepper from "$lib/EpisodeStepper.svelte";
 import type { ShowTorrents } from "$lib/types";
 
 const media = { id: 1, title_english: "Example Show", episodes: 12 };
@@ -85,6 +87,7 @@ beforeEach(() => {
   auth.user = { id: 1, name: "Example", score_format: "POINT_100" };
   mocks.library.files = [];
   mocks.library.folders = [];
+  mocks.library.unreadable = [];
   mocks.library.hasScan = false;
   mocks.library.loadFolders.mockResolvedValue(undefined);
   mocks.library.ensureScan.mockResolvedValue(undefined);
@@ -147,12 +150,51 @@ test("tracking confirms against the latest progress baseline", async () => {
   expect(document.querySelector('[role="dialog"]')).toBeNull();
 });
 
+test("tracking closes an accepted progress prompt when frontend event delivery fails", async () => {
+  vi.mocked(emit).mockRejectedValue(new Error("event bridge unavailable"));
+  mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 8 });
+  await render(Tracking);
+  event("kurisu://tracking-prompt", { media_id: 1, episode: 8, progress: 0, title: "Example Show" });
+  await settle();
+  button("Set progress to Ep 8").click();
+  await settle();
+  expect(mocks.api.setProgress).toHaveBeenCalledOnce();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+});
+
+test("an accepted stepper write is not labeled unsaved when frontend event delivery fails", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.mocked(emit).mockRejectedValue(new Error("event bridge unavailable"));
+    mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 1 });
+    const onerror = vi.fn();
+    await render(EpisodeStepper, { mediaId: 1, progress: 0, total: 12, onerror });
+    (document.querySelector('[aria-label="One more episode"]') as HTMLButtonElement).click();
+    await vi.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(mocks.api.setProgress).toHaveBeenCalledWith(1, 1, 0);
+    expect(document.body.textContent?.replace(/\s/g, "")).toContain("1/12");
+    expect(document.querySelector('[title^="Not saved"]')).toBeNull();
+    expect(onerror).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("library renders different scan errors for the same path", async () => {
+  mocks.library.unreadable = [
+    { path: "/anime/unavailable", error: "first read failed" },
+    { path: "/anime/unavailable", error: "second read failed" },
+  ];
+  await render(Library);
+  expect(document.body.textContent).toContain("first read failed");
+  expect(document.body.textContent).toContain("second read failed");
+});
+
 test("Completed immediately fills known episode totals", async () => {
   mocks.api.updateEntry.mockResolvedValue({ ...entry, status: "COMPLETED", progress: 12 });
   await render(EditEntry, { entry, scoreFormat: "POINT_100", onclose: vi.fn() });
-  button("Watching ▾").click();
-  await settle();
-  button("Completed").click();
+  selectOption("#ed-status", "COMPLETED");
   await settle();
   expect((document.querySelector("#ed-progress") as HTMLInputElement).value).toBe("12");
   button("Save").click();
@@ -750,15 +792,11 @@ test("show download filters reload choices and discard older filter results", as
   (button("Example Show").closest('[role="button"]') as HTMLElement).click();
   await settle();
   expect(document.body.textContent).toContain("Original choices");
-  (document.querySelector("#torrent-category") as HTMLButtonElement).click();
-  await settle();
-  button("English-translated").click();
+  selectOption("#torrent-category", "1_2");
   await settle();
   expect(mocks.api.findShowTorrents).toHaveBeenLastCalledWith(1, "1_2", "0");
   expect(document.body.textContent).not.toContain("Original choices");
-  (document.querySelector("#torrent-release") as HTMLButtonElement).click();
-  await settle();
-  button("Trusted only").click();
+  selectOption("#torrent-release", "2");
   await settle();
   expect(mocks.api.findShowTorrents).toHaveBeenLastCalledWith(1, "1_2", "2");
   expect(document.body.textContent).toContain("Trusted choices");
@@ -1042,6 +1080,33 @@ test("torrent startup still reads the list when event registration fails", async
   expect(mocks.api.localEntries).toHaveBeenCalledTimes(1);
   expect(document.querySelector('[aria-controls="torrents-CURRENT"]')!.textContent).toContain("1 show");
   expect(document.body.textContent).toContain("Could not listen for list updates");
+});
+
+test.each(["kurisu://episode-updated", "kurisu://pending-changed"])("torrent list keeps refreshing and cleans up when %s registration fails", async (failedEvent) => {
+  const { listen } = await import("@tauri-apps/api/event");
+  const register = vi.mocked(listen).getMockImplementation()!;
+  vi.mocked(listen).mockImplementation(async (name, handler, options) => {
+    if (name === failedEvent) throw new Error("event bridge unavailable");
+    return register(name, handler, options);
+  });
+  const activeEvent = failedEvent === "kurisu://episode-updated" ? "kurisu://pending-changed" : "kurisu://episode-updated";
+  const instance = await render(Torrents);
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(1);
+  expect(document.querySelector('[aria-controls="torrents-CURRENT"]')!.textContent).toContain("1 show");
+  expect(document.body.textContent).toContain("Could not listen for list updates");
+
+  mocks.api.localEntries.mockResolvedValue([]);
+  event(activeEvent, undefined);
+  await settle();
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
+  expect(document.querySelector('[aria-controls="torrents-CURRENT"]')!.textContent).toContain("0 shows");
+
+  await unmount(instance);
+  mounted = mounted.filter((item) => item !== instance);
+  expect(mocks.listeners.get(activeEvent)?.size).toBe(0);
+  event(activeEvent, undefined);
+  await settle();
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
 });
 
 test("late torrent listener registrations clean up without reading after teardown", async () => {

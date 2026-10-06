@@ -7,6 +7,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { runClock } from "$lib/now.svelte";
   import { bindNowPlaying } from "$lib/nowplaying.svelte";
+  import Shutdown from "$lib/Shutdown.svelte";
   import TitleBar from "$lib/TitleBar.svelte";
   import Tracking from "$lib/Tracking.svelte";
   import PendingSync from "$lib/PendingSync.svelte";
@@ -110,6 +111,7 @@
 
 <div class="program-shell relative flex flex-col h-screen border border-edge">
   <TitleBar />
+  <Shutdown />
 
   {#if !auth.ready}
     <div class="grid place-items-center flex-1 text-ink-dim">

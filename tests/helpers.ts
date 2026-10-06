@@ -18,3 +18,10 @@ export function button(text: string, scope: ParentNode = document): HTMLButtonEl
   if (!result) throw new Error(`Missing button: ${text}`);
   return result;
 }
+
+export function selectOption(selector: string, value: string) {
+  const element = document.querySelector<HTMLSelectElement>(selector);
+  if (!element) throw new Error(`Missing select: ${selector}`);
+  element.value = value;
+  element.dispatchEvent(new Event("change", { bubbles: true }));
+}

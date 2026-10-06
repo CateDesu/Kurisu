@@ -1,13 +1,12 @@
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
-  import { listen } from "@tauri-apps/api/event";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { openPath, openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
-  import { addToList } from "$lib/list.svelte";
+  import { addToList, listenForListUpdates } from "$lib/list.svelte";
   import {
     airingLabel,
     displayTitle,
@@ -192,17 +191,11 @@
       return;
     }
     loading = true;
-    let alive = true;
-    const stops: (() => void)[] = [];
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, () => {
-        if (alive && epoch === auth.epoch && mediaId === id) void reloadEntry();
-      }).then((stop) => alive ? stops.push(stop) : stop()).catch(console.error)
+    return listenForListUpdates(
+      () => { if (epoch === auth.epoch && mediaId === id) void reloadEntry(); },
+      console.error,
+      () => { if (epoch === auth.epoch && mediaId === id) void load(mediaId); },
     );
-    void Promise.all(registrations).then(() => {
-      if (alive && epoch === auth.epoch && mediaId === id) void load(mediaId);
-    });
-    return () => { alive = false; for (const stop of stops) stop(); };
   });
 
   $effect(() => {

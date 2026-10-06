@@ -1,7 +1,7 @@
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
-  import { listen, emit } from "@tauri-apps/api/event";
+  import { listenForListUpdates } from "$lib/list.svelte";
   import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
@@ -116,30 +116,23 @@
     const epoch = auth.epoch;
     listeningReady = false;
     if (!auth.isLoggedIn) return;
-    let alive = true;
-    const stops: (() => void)[] = [];
     const refresh = () => {
-      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       const id = np?.media_id ?? null;
       if (id != null) {
         void loadEntry(id);
       }
       void loadCurrent();
     };
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, refresh).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
-        if (alive && epoch === auth.epoch) currentError = String(e);
-      })
+    return listenForListUpdates(
+      refresh,
+      (e) => { if (epoch === auth.epoch) currentError = String(e); },
+      () => {
+        if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+        listeningReady = true;
+        void loadCurrent();
+      },
     );
-    void Promise.all(registrations).then(() => {
-      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
-      listeningReady = true;
-      void loadCurrent();
-    });
-    return () => {
-      alive = false;
-      for (const stop of stops) stop();
-    };
   });
 
   async function updateTo(episode: number) {
@@ -170,7 +163,6 @@
       if (!active()) return;
       entryLoadId++;
       entry = saved;
-      await emit("kurisu://episode-updated", saved);
       if (active()) await loadCurrent();
     } catch (e) {
       if (!active()) return;

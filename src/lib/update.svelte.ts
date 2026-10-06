@@ -1,3 +1,4 @@
+import { flushPendingEdits } from "$lib/pendingEdits";
 import { api } from "$lib/api";
 
 let installing = $state(false);
@@ -19,11 +20,14 @@ export async function runInstallUpdate(): Promise<string> {
   if (installing) throw new Error("an update is already being installed");
   if (restartPending) throw new Error("restart Kurisu to finish the installed update");
   installing = true;
+  let restarting = false;
   try {
+    await flushPendingEdits();
     const result = await api.installUpdate();
+    restarting = result === "restarting";
     if (result === "installed" || result === "restarting") restartPending = true;
     return result;
   } finally {
-    installing = false;
+    installing = restarting;
   }
 }

@@ -2,7 +2,7 @@
   import PageHeading from "$lib/PageHeading.svelte";
   import { afterNavigate, goto } from "$app/navigation";
   import { onDestroy } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listenForListUpdates } from "$lib/list.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "$lib/api";
   import { preferences } from "$lib/preferences";
@@ -450,25 +450,18 @@
     removing = false;
     addingFeed = false;
     if (!loggedIn) return;
-    let alive = true;
-    const stops: (() => void)[] = [];
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, () => {
-        if (alive && epoch === auth.epoch) void refreshEntries();
-      }).then((stop) => {
-        if (alive && epoch === auth.epoch) stops.push(stop);
-        else stop();
-      })
+    const failures: string[] = [];
+    const stop = listenForListUpdates(
+      () => { if (epoch === auth.epoch) void refreshEntries(); },
+      (e) => { failures.push(String(e)); },
+      () => {
+        if (epoch !== auth.epoch) return;
+        void load();
+        if (failures.length) error = `Could not listen for list updates: ${failures.join("; ")}`;
+      },
     );
-    void Promise.allSettled(registrations).then((results) => {
-      const failures = results.flatMap((result) => result.status === "rejected" ? [String(result.reason)] : []);
-      if (!alive || epoch !== auth.epoch) return;
-      void load();
-      if (failures.length) error = `Could not listen for list updates: ${failures.join("; ")}`;
-    });
     return () => {
-      alive = false;
-      for (const stop of stops) stop();
+      stop();
       loadId++;
       feedsLoadId++;
       entriesLoadId++;

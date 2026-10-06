@@ -14,7 +14,7 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        // NORMAL avoids a sync on every commit. A power loss may discard recent cache writes.
+        // Rebuildable cache writes use NORMAL. Local intent uses durable_write.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )?;
@@ -32,6 +32,22 @@ impl Db {
             }
         }
         Ok(Db(Mutex::new(conn)))
+    }
+
+    pub(crate) fn durable_write(
+        &self,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut conn = self.0.lock();
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result: Result<()> = (|| {
+            let tx = conn.transaction()?;
+            write(&tx)?;
+            Ok(tx.commit()?)
+        })();
+        let reset = conn.pragma_update(None, "synchronous", "NORMAL");
+        result?;
+        Ok(reset?)
     }
 
     /// BEGIN IMMEDIATE prevents concurrent migrations.
@@ -1062,5 +1078,43 @@ mod tests {
         for f in &files {
             let _ = std::fs::remove_file(f);
         }
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn failed_durable_transactions_roll_back_and_restore_the_cache_policy() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let result = db.durable_write(|tx| {
+            let mode: i64 = tx.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+            assert_eq!(mode, 2);
+            tx.execute(
+                "INSERT INTO settings VALUES ('durability-test', 'pending')",
+                [],
+            )?;
+            anyhow::bail!("simulated write failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(db.get_setting("durability-test").unwrap(), None);
+        let mode: i64 =
+            db.0.lock()
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(mode, 1);
+        db.durable_write(|tx| {
+            tx.execute(
+                "INSERT INTO settings VALUES ('durability-test', 'saved')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_setting("durability-test").unwrap().as_deref(),
+            Some("saved")
+        );
     }
 }

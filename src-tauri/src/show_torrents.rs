@@ -480,29 +480,35 @@ fn item_key(item: &RawItem) -> String {
         })
 }
 
+pub fn torrent_item(raw: RawItem) -> TorrentItem {
+    TorrentItem {
+        seen_guid: Some(stable_guid(&raw)),
+        details_url: rss::details_url(&raw),
+        magnet: raw
+            .info_hash
+            .as_deref()
+            .and_then(|hash| rss::magnet_for(hash, &raw.title)),
+        title: raw.title,
+        link: raw.link,
+        guid: raw.guid,
+        size: raw.size,
+        seeders: raw.seeders,
+        leechers: raw.leechers,
+        category_id: raw.category_id,
+        category: raw.category,
+        trusted: raw.trusted,
+        remake: raw.remake,
+        published: raw.published,
+        ..Default::default()
+    }
+}
+
 pub fn search_results(items: Vec<RawItem>, seen: &HashSet<String>) -> Vec<TorrentItem> {
     items
         .into_iter()
         .map(|raw| TorrentItem {
             seen: was_seen(&raw, seen),
-            seen_guid: Some(stable_guid(&raw)),
-            details_url: rss::details_url(&raw),
-            magnet: raw
-                .info_hash
-                .as_deref()
-                .and_then(|hash| rss::magnet_for(hash, &raw.title)),
-            title: raw.title,
-            link: raw.link,
-            guid: raw.guid,
-            size: raw.size,
-            seeders: raw.seeders,
-            leechers: raw.leechers,
-            category_id: raw.category_id,
-            category: raw.category,
-            trusted: raw.trusted,
-            remake: raw.remake,
-            published: raw.published,
-            ..Default::default()
+            ..torrent_item(raw)
         })
         .collect()
 }
@@ -609,28 +615,13 @@ fn classify(entry: &ListEntry, matchers: &[Matcher], items: Vec<RawItem>) -> Sho
                 })
             };
         let item = TorrentItem {
-            seen_guid: Some(stable_guid(&raw)),
-            details_url: rss::details_url(&raw),
-            magnet: raw
-                .info_hash
-                .as_deref()
-                .and_then(|hash| rss::magnet_for(hash, &raw.title)),
             guid: stable_guid(&raw),
-            title: raw.title,
-            link: raw.link,
-            size: raw.size,
-            seeders: raw.seeders,
-            leechers: raw.leechers,
-            category_id: raw.category_id,
-            category: raw.category,
-            trusted: raw.trusted,
-            remake: raw.remake,
-            published: raw.published,
             media_id: Some(matched.media_id),
             matched: Some(matched.display.clone()),
             episode,
             is_new: false,
             seen: false,
+            ..torrent_item(raw)
         };
         if batch {
             result.batches.push(item);
@@ -994,7 +985,7 @@ mod tests {
         let guid = initial.episodes[0].guid.clone();
         release.guid = "second-search\u{1}item".into();
         let mut refreshed = classify(&e, &matchers, vec![release.clone()]);
-        db.mark_rss_seen(&[guid.clone()]).unwrap();
+        db.mark_rss_seen(std::slice::from_ref(&guid)).unwrap();
         restore_seen(&mut refreshed, &db.rss_seen_set().unwrap());
         assert_eq!(refreshed.episodes[0].guid, guid);
         assert!(refreshed.episodes[0].seen);

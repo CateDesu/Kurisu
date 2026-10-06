@@ -583,10 +583,22 @@ mod tests {
         assert!(snapshots[1].playing);
     }
 
-    /// Requires MPV. Run with cargo test --lib mpv -- --ignored --nocapture
+    #[cfg(unix)]
     #[test]
-    #[ignore]
     fn probes_a_live_mpv() {
+        struct Player {
+            child: std::process::Child,
+            dir: std::path::PathBuf,
+        }
+
+        impl Drop for Player {
+            fn drop(&mut self) {
+                self.child.kill().ok();
+                self.child.wait().ok();
+                std::fs::remove_dir_all(&self.dir).ok();
+            }
+        }
+
         let dir = std::env::temp_dir().join(format!("kurisu-mpv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("t.wav");
@@ -605,7 +617,7 @@ mod tests {
         wav_bytes.extend_from_slice(&8_u16.to_le_bytes()); // bits
         wav_bytes.extend_from_slice(b"data");
         wav_bytes.extend_from_slice(&data_len.to_le_bytes());
-        wav_bytes.extend(std::iter::repeat_n(0_u8, data_len as usize));
+        wav_bytes.extend(std::iter::repeat_n(128_u8, data_len as usize));
         std::fs::write(&wav, wav_bytes).unwrap();
 
         let sock = dir.join("sock");
@@ -613,34 +625,43 @@ mod tests {
         // MPV requires the socket argument in the =value form.
         let mut ipc_arg = std::ffi::OsString::from("--input-ipc-server=");
         ipc_arg.push(&sock);
-        cmd.arg("--vo=null")
+        cmd.arg("--no-config")
+            .arg("--load-scripts=no")
+            .arg("--vo=null")
             .arg("--ao=null")
             .arg("--loop-file=inf")
             .arg(&ipc_arg)
             .arg(&wav);
         // Do not let Cargo's library path override MPV's system libraries.
         cmd.env_remove("LD_LIBRARY_PATH");
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let mut child = cmd.spawn().expect("mpv is installed");
-        let mut appeared = false;
-        for _ in 0..30 {
-            if sock.exists() {
-                appeared = true;
-                break;
+        let mut player = Player {
+            child: cmd
+                .spawn()
+                .expect("install MPV to run the IPC integration test"),
+            dir,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            assert!(
+                player.child.try_wait().unwrap().is_none(),
+                "MPV exited before playback started"
+            );
+            if let Some(snap) = probe_one(sock.to_str().unwrap()) {
+                if snap.position_us > 0 {
+                    break snap;
+                }
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(appeared, "mpv never opened the IPC socket");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MPV did not start playback"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
 
-        let snap = probe_one(sock.to_str().unwrap()).expect("mpv answers with a loaded file");
         assert!(snap.playing);
         assert!(snap.path.ends_with("t.wav"));
         assert_eq!(snap.duration_us, 5_000_000);
-        assert!(snap.position_us > 0);
-
-        child.kill().ok();
-        child.wait().ok();
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

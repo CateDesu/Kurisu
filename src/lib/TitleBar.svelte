@@ -1,6 +1,24 @@
 <script lang="ts">
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
+  import { flushPendingEdits } from "$lib/pendingEdits";
+
+  let closeError = $state("");
+  let closing = $state(false);
+  async function close() {
+    if (closing) return;
+    closing = true;
+    closeError = "";
+    try {
+      await flushPendingEdits();
+      await appWindow.close();
+    } catch (error) {
+      closeError = `Could not save progress: ${String(error)}`;
+    } finally {
+      closing = false;
+    }
+  }
+
   const appWindow = getCurrentWindow();
   let maximized = $state(false);
 
@@ -53,13 +71,17 @@
         </svg>
       {/if}
     </button>
-    <button class="tb-btn tb-close" title="Close" onclick={() => appWindow.close()}>
+    <button class="tb-btn tb-close" title="Close" disabled={closing} onclick={close}>
       <svg viewBox="0 0 10 10" width="10" height="10" stroke="currentColor" stroke-width="1.2">
         <path d="M1 1 L9 9 M9 1 L1 9" />
       </svg>
     </button>
   </div>
 </div>
+
+{#if closeError}
+  <div role="alert" class="px-4 py-2 text-red-400">{closeError}</div>
+{/if}
 
 <style>
   .titlebar { background: #020202; }

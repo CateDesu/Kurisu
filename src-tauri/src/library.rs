@@ -15,14 +15,12 @@ const MAX_DEPTH: usize = 8;
 static FOLDERS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 static BINDINGS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-pub fn get_folders(db: &Db) -> Vec<String> {
-    match db.get_setting(FOLDERS_KEY).ok().flatten() {
-        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("corrupt library_folders setting, starting from empty: {e}");
-            Vec::new()
-        }),
-        None => Vec::new(),
-    }
+pub fn get_folders(db: &Db) -> Result<Vec<String>> {
+    Ok(db
+        .get_setting(FOLDERS_KEY)?
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 fn save_folders(db: &Db, folders: &[String]) -> Result<()> {
@@ -31,7 +29,7 @@ fn save_folders(db: &Db, folders: &[String]) -> Result<()> {
 
 pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     let _guard = FOLDERS_LOCK.lock();
-    let mut folders = get_folders(db);
+    let mut folders = get_folders(db)?;
     if folders.iter().any(|f| f == path) {
         return Ok(folders);
     }
@@ -54,7 +52,7 @@ fn folders_overlap(a: &str, b: &str) -> bool {
 
 pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     let _guard = FOLDERS_LOCK.lock();
-    let mut folders = get_folders(db);
+    let mut folders = get_folders(db)?;
     folders.retain(|f| f != path);
     save_folders(db, &folders)?;
     Ok(folders)
@@ -105,14 +103,12 @@ impl From<i64> for LibraryBinding {
     }
 }
 
-pub fn get_bindings(db: &Db) -> std::collections::HashMap<String, LibraryBinding> {
-    match db.get_setting(BINDINGS_KEY).ok().flatten() {
-        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("corrupt library_bindings setting, starting from empty: {e}");
-            std::collections::HashMap::new()
-        }),
-        None => std::collections::HashMap::new(),
-    }
+pub fn get_bindings(db: &Db) -> Result<HashMap<String, LibraryBinding>> {
+    Ok(db
+        .get_setting(BINDINGS_KEY)?
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 pub fn bind_path(db: &Db, path: &str, media_id: i64, episode_offset: i64) -> Result<()> {
@@ -120,7 +116,7 @@ pub fn bind_path(db: &Db, path: &str, media_id: i64, episode_offset: i64) -> Res
         return Err(anyhow!("episode offset must be between -9999 and 9999"));
     }
     let _guard = BINDINGS_LOCK.lock();
-    let mut bindings = get_bindings(db);
+    let mut bindings = get_bindings(db)?;
     let resolved = resolved_path(path);
     bindings.retain(|saved, _| resolved_path(saved) != resolved);
     bindings.insert(
@@ -135,25 +131,27 @@ pub fn bind_path(db: &Db, path: &str, media_id: i64, episode_offset: i64) -> Res
 
 pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
     let _guard = BINDINGS_LOCK.lock();
-    let mut bindings = get_bindings(db);
+    let mut bindings = get_bindings(db)?;
     bindings.retain(|_, binding| binding.media_id != media_id);
     db.set_setting(BINDINGS_KEY, &serde_json::to_string(&bindings)?)
 }
 
-pub fn binding_for_exact(db: &Db, path: &str) -> Option<LibraryBinding> {
+pub fn binding_for_exact(db: &Db, path: &str) -> Result<Option<LibraryBinding>> {
     let resolved = resolved_path(path);
     let local = local_path(path);
-    binding_paths(&get_bindings(db))
+    Ok(binding_paths(&get_bindings(db)?)
         .into_iter()
         .filter(|(_, saved, _)| *saved == resolved)
         .max_by_key(|(saved, _, _)| (local_path(saved) == local, std::cmp::Reverse(saved.clone())))
-        .map(|(_, _, id)| id)
+        .map(|(_, _, id)| id))
 }
 
-pub fn effective_binding(db: &Db, path: &str) -> Option<LibraryBinding> {
-    bound_path_id(&binding_paths(&get_bindings(db)), path, |id| {
-        db.get_entry(id).ok().flatten().is_some()
-    })
+pub fn effective_binding(db: &Db, path: &str) -> Result<Option<LibraryBinding>> {
+    Ok(bound_path_id(
+        &binding_paths(&get_bindings(db)?),
+        path,
+        |id| db.get_entry(id).ok().flatten().is_some(),
+    ))
 }
 
 type BindingPath = (String, std::path::PathBuf, LibraryBinding);
@@ -665,6 +663,54 @@ mod tests {
     }
 
     #[test]
+    fn television_bonus_clips_stay_unnumbered_in_bound_and_unbound_scans() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&crate::models::Media {
+            id: 1,
+            title_english: Some("Some Show".into()),
+            episodes: Some(12),
+            format: Some("TV".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&crate::models::ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let dir = cache_folder("television-bonus");
+        for filename in [
+            "Some Show NCOP01.mkv",
+            "Some Show Trailer01.mkv",
+            "Some Show - 01.mkv",
+        ] {
+            std::fs::write(dir.join(filename), []).unwrap();
+        }
+        let matchers = crate::recognize::build_matchers(&db);
+        let folders = [dir.to_str().unwrap().into()];
+        let bindings = HashMap::from([(dir.to_str().unwrap().into(), 1.into())]);
+        for bindings in [&HashMap::new(), &bindings] {
+            let scan = scan_paths(&folders, &matchers, bindings);
+            assert!(scan.unreadable.is_empty());
+            assert_eq!(scan.files.len(), 3);
+            println!(
+                "television bonus scan: {}",
+                serde_json::to_string(&scan).unwrap()
+            );
+            for file in &scan.files {
+                assert_eq!(
+                    file.episode,
+                    file.path.ends_with("Some Show - 01.mkv").then_some(1),
+                    "{}",
+                    file.path
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn adversarial_movie_bonus_scan_preserves_the_feature_and_real_ova() {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
         for (id, title) in [(1, "Some Movie"), (2, "Some Show OVA")] {
@@ -831,12 +877,14 @@ mod tests {
         assert_eq!(
             super::effective_binding(&db, file.to_str().unwrap())
                 .unwrap()
+                .unwrap()
                 .episode_offset,
             -12
         );
         super::bind_path(&db, folder.to_str().unwrap(), 1, -24).unwrap();
         assert_eq!(
             super::effective_binding(&db, file.to_str().unwrap())
+                .unwrap()
                 .unwrap()
                 .episode_offset,
             -24
@@ -846,11 +894,15 @@ mod tests {
         assert_eq!(
             super::effective_binding(&db, url.as_str())
                 .unwrap()
+                .unwrap()
                 .episode_offset,
             -36
         );
         db.delete_entry(1).unwrap();
-        assert_eq!(super::effective_binding(&db, file.to_str().unwrap()), None);
+        assert_eq!(
+            super::effective_binding(&db, file.to_str().unwrap()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -861,23 +913,24 @@ mod tests {
             r#"{"/anime/first":1,"/anime/second":{"media_id":2,"episode_offset":-12}}"#,
         )
         .unwrap();
-        let bindings = super::get_bindings(&db);
+        let bindings = super::get_bindings(&db).unwrap();
         assert_eq!(bindings["/anime/first"], 1.into());
         assert_eq!(bindings["/anime/second"].episode_offset, -12);
         super::bind_path(&db, "/anime/first", 1, 3).unwrap();
         assert_eq!(
             super::binding_for_exact(&db, "/anime/first")
                 .unwrap()
+                .unwrap()
                 .episode_offset,
             3
         );
         assert_eq!(
-            super::get_bindings(&db)["/anime/second"].episode_offset,
+            super::get_bindings(&db).unwrap()["/anime/second"].episode_offset,
             -12
         );
         assert!(super::bind_path(&db, "/anime/first", 1, i64::MAX).is_err());
         super::unbind_media(&db, 1).unwrap();
-        assert_eq!(super::get_bindings(&db).len(), 1);
+        assert_eq!(super::get_bindings(&db).unwrap().len(), 1);
     }
 
     #[test]
@@ -903,7 +956,7 @@ mod tests {
             std::fs::write(dir.join(format!("Some Show - {episode}.mkv")), []).unwrap();
         }
         super::bind_path(&db, dir.to_str().unwrap(), 2, -12).unwrap();
-        let bindings = super::get_bindings(&db);
+        let bindings = super::get_bindings(&db).unwrap();
         let scan = scan_paths(&[dir.to_str().unwrap().into()], &matchers, &bindings);
         assert_eq!(
             scan.files.iter().map(|f| f.episode).collect::<Vec<_>>(),
@@ -921,7 +974,7 @@ mod tests {
             None
         );
         super::bind_path(&db, file.to_str().unwrap(), 2, -1).unwrap();
-        let bindings = super::get_bindings(&db);
+        let bindings = super::get_bindings(&db).unwrap();
         let (matched, binding) = super::bound_match(&matchers, &bindings, &url).unwrap();
         assert_eq!(
             super::resolve_bound_episode(matched, &["Some Show - 13.mkv"], Some(binding)),
@@ -1104,7 +1157,77 @@ mod tests {
         assert!(add_folder(&db, "/anime/").is_err());
         assert!(add_folder(&db, "/").is_err());
         add_folder(&db, "/anime2").unwrap();
-        assert_eq!(get_folders(&db), vec!["/anime", "/anime2"]);
+        assert_eq!(get_folders(&db).unwrap(), vec!["/anime", "/anime2"]);
+    }
+
+    #[test]
+    fn folder_edits_preserve_unreadable_saved_settings() {
+        for saved in [
+            rusqlite::types::Value::Text("[invalid".into()),
+            rusqlite::types::Value::Blob(b"unreadable".to_vec()),
+        ] {
+            for add in [true, false] {
+                let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+                db.0.lock()
+                    .execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?)",
+                        rusqlite::params![super::FOLDERS_KEY, saved],
+                    )
+                    .unwrap();
+                assert!(get_folders(&db).is_err());
+                let result = if add {
+                    add_folder(&db, "/anime")
+                } else {
+                    super::remove_folder(&db, "/anime")
+                };
+                let retained: rusqlite::types::Value =
+                    db.0.lock()
+                        .query_row(
+                            "SELECT value FROM settings WHERE key = ?",
+                            [super::FOLDERS_KEY],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                assert_eq!(retained, saved);
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn binding_edits_preserve_unreadable_saved_settings() {
+        for saved in [
+            rusqlite::types::Value::Text("{invalid".into()),
+            rusqlite::types::Value::Blob(b"unreadable".to_vec()),
+        ] {
+            for bind in [true, false] {
+                let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+                db.0.lock()
+                    .execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?)",
+                        rusqlite::params![super::BINDINGS_KEY, saved],
+                    )
+                    .unwrap();
+                assert!(super::get_bindings(&db).is_err());
+                assert!(super::binding_for_exact(&db, "/anime").is_err());
+                assert!(super::effective_binding(&db, "/anime").is_err());
+                let result = if bind {
+                    super::bind_path(&db, "/anime", 1, 0)
+                } else {
+                    super::unbind_media(&db, 1)
+                };
+                let retained: rusqlite::types::Value =
+                    db.0.lock()
+                        .query_row(
+                            "SELECT value FROM settings WHERE key = ?",
+                            [super::BINDINGS_KEY],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                assert_eq!(retained, saved);
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]
@@ -1205,18 +1328,25 @@ mod tests {
         super::bind_path(&db, &text(&real), 1, 0).unwrap();
         super::bind_path(&db, &text(&file), 2, 0).unwrap();
         assert_eq!(
-            super::binding_for_exact(&db, &text(&alias_file)),
+            super::binding_for_exact(&db, &text(&alias_file)).unwrap(),
             Some(2.into())
         );
         super::bind_path(&db, &text(&alias_file), 3, 0).unwrap();
-        assert_eq!(super::binding_for_exact(&db, &text(&file)), Some(3.into()));
-        assert_eq!(super::get_bindings(&db).len(), 2);
+        assert_eq!(
+            super::binding_for_exact(&db, &text(&file)).unwrap(),
+            Some(3.into())
+        );
+        assert_eq!(super::get_bindings(&db).unwrap().len(), 2);
         super::bind_path(&db, &text(&alias), 4, 0).unwrap();
-        assert_eq!(super::binding_for_exact(&db, &text(&real)), Some(4.into()));
-        assert_eq!(super::get_bindings(&db).len(), 2);
+        assert_eq!(
+            super::binding_for_exact(&db, &text(&real)).unwrap(),
+            Some(4.into())
+        );
+        assert_eq!(super::get_bindings(&db).unwrap().len(), 2);
         assert_eq!(
             bound_live(
                 &super::get_bindings(&db)
+                    .unwrap()
                     .into_iter()
                     .map(|(path, b)| (path, b.media_id))
                     .collect(),

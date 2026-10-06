@@ -22,17 +22,6 @@ impl ListStatus {
             ListStatus::Repeating => "REPEATING",
         }
     }
-    #[allow(dead_code)]
-    pub fn label(self) -> &'static str {
-        match self {
-            ListStatus::Current => "Watching",
-            ListStatus::Planning => "Plan to Watch",
-            ListStatus::Completed => "Completed",
-            ListStatus::Paused => "Paused",
-            ListStatus::Dropped => "Dropped",
-            ListStatus::Repeating => "Rewatching",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -170,8 +159,9 @@ pub struct AiringItem {
 pub struct TorrentItem {
     pub title: String,
     pub link: String,
-    /// Feed GUID, falling back to the link.
+    /// Feed scoped GUID or stable search identity.
     pub guid: String,
+    /// Shared identity for seen state across feeds and searches.
     pub seen_guid: Option<String>,
     pub details_url: Option<String>,
     pub magnet: Option<String>,

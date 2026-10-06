@@ -91,11 +91,6 @@ pub fn take_pending_update() -> Option<Value> {
     PENDING_UPDATE.lock().take()
 }
 
-#[allow(dead_code)]
-pub fn parse_version(s: &str) -> Vec<u64> {
-    version_key(s).0
-}
-
 fn version_key(s: &str) -> (Vec<u64>, u8, u64) {
     let trimmed = s.trim().trim_start_matches(['v', 'V']);
     let (core, pre) = match trimmed.split_once('-') {
@@ -628,10 +623,10 @@ mod tests {
 
     #[test]
     fn version_parse_and_compare() {
-        assert_eq!(parse_version("v0.3.1"), vec![0, 3, 1]);
-        assert_eq!(parse_version("1.0.0.8"), vec![1, 0, 0, 8]);
-        assert_eq!(parse_version("0.4-rc1"), vec![0, 4]);
-        assert_eq!(parse_version(""), vec![0]);
+        assert_eq!(version_key("v0.3.1").0, vec![0, 3, 1]);
+        assert_eq!(version_key("1.0.0.8").0, vec![1, 0, 0, 8]);
+        assert_eq!(version_key("0.4-rc1").0, vec![0, 4]);
+        assert_eq!(version_key("").0, vec![0]);
         assert!(is_newer("1.0.0.8", "1.0.0"));
         assert!(is_newer("1.0.0.8", "1.0.0.7"));
         assert!(is_newer("1.1.0", "1.0.0.99"));

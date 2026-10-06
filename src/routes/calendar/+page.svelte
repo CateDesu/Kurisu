@@ -1,7 +1,7 @@
 <script lang="ts">
   import PageHeading from "$lib/PageHeading.svelte";
   import { untrack } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listenForListUpdates } from "$lib/list.svelte";
   import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { preferences } from "$lib/preferences";
@@ -165,21 +165,12 @@
     entriesError = "";
     error = "";
     if (!loggedIn) return;
-    let alive = true;
-    const stops: (() => void)[] = [];
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, () => {
-        if (alive && epoch === auth.epoch) void refreshEntries();
-      }).then((stop) => alive ? stops.push(stop) : stop()).catch((e) => {
-        if (alive && epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`;
-      })
+    const stop = listenForListUpdates(
+      () => { if (epoch === auth.epoch) void refreshEntries(); },
+      (e) => { if (epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`; },
     );
-    void Promise.all(registrations).then(() => {
-      if (alive && epoch === auth.epoch) void refreshEntries();
-    });
     return () => {
-      alive = false;
-      for (const stop of stops) stop();
+      stop();
       loadId++;
       entriesLoadId++;
     };

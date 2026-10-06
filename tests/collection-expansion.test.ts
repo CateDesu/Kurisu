@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { auth } from "./session.svelte";
-import { button, deferred, settle } from "./helpers";
+import { button, deferred, selectOption, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries(["localEntries", "syncMyList", "getSeason", "getAiringSchedule", "getLibraryBindingDetails", "bindLibraryPath", "getWatchHistory"].map((name) => [name, vi.fn()])),
@@ -143,12 +143,8 @@ test("seasons can jump directly to a year and combine title, format and list fil
   const filter = document.querySelector('[aria-label="Filter season titles"]') as HTMLInputElement;
   filter.value = "example";
   filter.dispatchEvent(new Event("input", { bubbles: true }));
-  (document.querySelector("#season-format") as HTMLButtonElement).click();
-  await settle();
-  button("MOVIE").click();
-  (document.querySelector("#season-list-status") as HTMLButtonElement).click();
-  await settle();
-  button("Not on my list").click();
+  selectOption("#season-format", "MOVIE");
+  selectOption("#season-list-status", "UNLISTED");
   await settle();
   expect(document.body.textContent).toContain("Example Movie");
   expect(document.body.textContent).not.toContain("Example Show");
@@ -156,7 +152,7 @@ test("seasons can jump directly to a year and combine title, format and list fil
   mocks.api.getSeason.mockResolvedValue([media]);
   button("Next →").click();
   await settle();
-  expect(document.querySelector("#season-format")?.textContent).toContain("MOVIE");
+  expect((document.querySelector("#season-format") as HTMLSelectElement).value).toBe("MOVIE");
   expect(document.body.textContent).toContain("No shows match these filters.");
 });
 
@@ -288,8 +284,8 @@ test("torrent release page action rejects non-web addresses", async () => {
 
 test("seasons re-evaluates its list filter when a queued entry is discarded", async () => {
   await render(Seasons);
-  (document.querySelector("#season-list-status") as HTMLButtonElement).click();
-  await settle(); button("Watching").click(); await settle();
+  selectOption("#season-list-status", "CURRENT");
+  await settle();
   expect(document.body.textContent).toContain("Example Show");
   mocks.api.localEntries.mockResolvedValue([]);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
@@ -315,8 +311,8 @@ test.each([["seasons", Seasons], ["calendar", Calendar], ["library", Library]] a
   mocks.library.files = [{ path: "/anime/show/1.mkv", media_id: 1, matched: "Example Show", episode: 1 }];
   await render(component);
   if (name === "seasons") {
-    (document.querySelector("#season-list-status") as HTMLButtonElement).click();
-    await settle(); button("Watching").click(); await settle();
+    selectOption("#season-list-status", "CURRENT");
+    await settle();
   }
   mocks.api.localEntries.mockResolvedValue([]);
   registration.resolve();

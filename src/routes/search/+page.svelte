@@ -2,13 +2,12 @@
   import PageHeading from "$lib/PageHeading.svelte";
   import { onDestroy } from "svelte";
   import { afterNavigate } from "$app/navigation";
-  import { listen } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import type { ListEntry, Media } from "$lib/types";
   import Login from "$lib/Login.svelte";
   import AnimeCard from "$lib/AnimeCard.svelte";
-  import { createListActions } from "$lib/list.svelte";
+  import { createListActions, listenForListUpdates } from "$lib/list.svelte";
   import type { Snapshot } from "./$types";
 
   let query = $state("");
@@ -55,19 +54,10 @@
   $effect(() => {
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
-    let active = true;
-    const stops: (() => void)[] = [];
-    const registrations = ["kurisu://episode-updated", "kurisu://pending-changed"].map((event) =>
-      listen(event, () => {
-        if (active && epoch === auth.epoch) void loadList();
-      }).then((stop) => active ? stops.push(stop) : stop()).catch((e) => {
-        if (active && epoch === auth.epoch) error = String(e);
-      })
+    return listenForListUpdates(
+      () => { if (epoch === auth.epoch) void loadList(); },
+      (e) => { if (epoch === auth.epoch) error = String(e); },
     );
-    void Promise.all(registrations).then(() => {
-      if (active && epoch === auth.epoch) void loadList();
-    });
-    return () => { active = false; for (const stop of stops) stop(); };
   });
 
   export const snapshot: Snapshot<{ query: string; results: Media[]; submittedQuery: string; resultPage: number; hasMore: boolean; searched: boolean; pending: { term: string; more: boolean } | null }> = {

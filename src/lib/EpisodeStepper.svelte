@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { installInFlight } from "$lib/update.svelte";
+  import { isPendingEdit, registerPendingEdit, trackPendingSave } from "$lib/pendingEdits";
   import { untrack } from "svelte";
-  import { emit } from "@tauri-apps/api/event";
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import type { ListEntry } from "$lib/types";
@@ -23,9 +24,12 @@
   let saved = $state(untrack(() => progress));
   let saving = $state(false);
   let failed = $state("");
+  let inFlight: Promise<void> | null = null;
+  let unregister: (() => void) | undefined;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const targetId = untrack(() => mediaId);
   const epoch = untrack(() => auth.epoch);
+  const editKey = `${epoch}:${targetId}`;
   const current = () => epoch === auth.epoch && auth.isLoggedIn;
 
   const dirty = $derived(pending !== saved);
@@ -33,14 +37,16 @@
   const atMax = $derived(pending >= (total ?? 9999));
 
   function step(delta: number) {
+    if (installInFlight()) return;
     let next = pending + delta;
     if (next < 0) next = 0;
     const max = total ?? 9999;
     if (next > max) next = max;
     if (next === pending) return;
     pending = next;
+    unregister = registerPendingEdit(flush, editKey);
     if (timer) clearTimeout(timer);
-    timer = setTimeout(commit, 3000);
+    timer = setTimeout(() => { void commit().catch(() => {}); }, 3000);
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -54,7 +60,26 @@
     step(delta);
   }
 
-  async function commit() {
+  function commit(): Promise<void> {
+    if (inFlight) return inFlight;
+    if (!isPendingEdit(editKey, flush)) return Promise.resolve();
+    inFlight = trackPendingSave(save().finally(() => {
+      inFlight = null;
+      if (!current() || pending === saved) {
+        unregister?.();
+        unregister = undefined;
+      }
+    }));
+    return inFlight;
+  }
+
+  async function flush() {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    await commit();
+  }
+
+  async function save() {
     timer = null;
     if (pending === saved || saving || !current()) return;
     saving = true;
@@ -63,21 +88,15 @@
     try {
       const entry = await api.setProgress(targetId, v, saved);
       if (!current()) return;
-      if (entry.progress === v) {
-        saved = v;
-        onchange?.(entry);
-        await emit("kurisu://episode-updated", entry);
-      } else {
-        pending = entry.progress;
-        saved = entry.progress;
-        onchange?.(entry);
-      }
+      if (entry.progress !== v) pending = entry.progress;
+      saved = entry.progress;
+      onchange?.(entry);
     } catch (e) {
       if (!current()) return;
-      pending = saved;
       failed = String(e);
       console.error("set progress failed", e);
       onerror?.(failed);
+      throw e;
     } finally {
       saving = false;
     }
@@ -88,7 +107,7 @@
       if (timer) {
         clearTimeout(timer);
         timer = null;
-        queueMicrotask(() => { void commit(); });
+        queueMicrotask(() => { void commit().catch(() => {}); });
       }
     };
   });
@@ -132,7 +151,7 @@
     type="button"
     onclick={(e) => { e.stopPropagation(); step(-1); }}
     onkeydown={onKeydown}
-    disabled={atMin || saving}
+    disabled={atMin || saving || installInFlight()}
     aria-label="One less episode"
     class={btnCls}>−</button
   >
@@ -147,7 +166,7 @@
     type="button"
     onclick={(e) => { e.stopPropagation(); step(1); }}
     onkeydown={onKeydown}
-    disabled={atMax || saving}
+    disabled={atMax || saving || installInFlight()}
     aria-label="One more episode"
     class={btnCls}>+</button
   >

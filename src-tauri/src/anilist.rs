@@ -102,10 +102,12 @@ impl From<AniMedia> for Media {
 #[derive(Deserialize)]
 pub struct SavedEntry {
     pub id: i64,
-    pub status: Option<String>,
-    pub progress: Option<i64>,
+    pub status: String,
+    pub progress: i64,
+    // Null is valid, but an omitted score makes the reply incomplete.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub score: Option<f64>,
-    pub repeat: Option<i64>,
+    pub repeat: i64,
 }
 
 /// Clones share the rate budget, including limits reported by failed requests.
@@ -281,9 +283,20 @@ impl AniList {
         }
         let data = body
             .get("data")
-            .ok_or_else(|| anyhow!("AniList: no data field"))?
+            .ok_or_else(|| ApiError {
+                status,
+                from_json: false,
+                message: "AniList: no data field".into(),
+            })?
             .clone();
-        Ok(serde_json::from_value(data)?)
+        serde_json::from_value(data).map_err(|error| {
+            ApiError {
+                status,
+                from_json: false,
+                message: format!("AniList returned unusable data: {error}"),
+            }
+            .into()
+        })
     }
 
     fn endpoint(&self) -> &str {
@@ -330,10 +343,6 @@ impl AniList {
             score_format: r.viewer.media_list_options.and_then(|o| o.score_format),
             offline: false,
         })
-    }
-
-    pub async fn search(&self, query: &str, per_page: i64) -> Result<Vec<Media>> {
-        Ok(self.search_page(query, 1, per_page).await?.items)
     }
 
     pub async fn search_page(&self, query: &str, page: i64, per_page: i64) -> Result<SearchPage> {
@@ -945,20 +954,18 @@ impl AniList {
             has_next_chunk: Option<bool>,
         }
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct AniList {
-            #[allow(dead_code)]
-            status: Option<String>,
             entries: Option<Vec<Option<Entry>>>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Entry {
             id: i64,
-            status: Option<String>,
-            progress: Option<i64>,
+            status: String,
+            progress: i64,
+            #[serde(deserialize_with = "Option::deserialize")]
             score: Option<f64>,
-            repeat: Option<i64>,
+            repeat: i64,
             updated_at: Option<i64>,
             media_id: i64,
             media: Option<AniMedia>,
@@ -967,7 +974,6 @@ impl AniList {
             MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk, perChunk: 500) {
                 hasNextChunk
                 lists {
-                    status
                     entries {
                         id status progress score repeat updatedAt mediaId
                         media {
@@ -1004,10 +1010,10 @@ impl AniList {
                     out.push(ListEntry {
                         id: Some(e.id),
                         media_id: e.media_id,
-                        status: e.status.unwrap_or_else(|| "CURRENT".into()),
-                        progress: e.progress.unwrap_or(0),
+                        status: e.status,
+                        progress: e.progress,
                         score: e.score,
-                        repeat: e.repeat.unwrap_or(0),
+                        repeat: e.repeat,
                         updated_at: e.updated_at,
                         media: e.media.map(Media::from),
                     });
@@ -1218,16 +1224,12 @@ impl AniList {
         )
     }
 
-    /// Leave AniList's unread count unchanged when opening the inbox.
-    pub async fn notifications(&self) -> Result<Vec<Notification>> {
-        Ok(self.notifications_page(1).await?.items)
-    }
-
     pub async fn mark_notifications_read(&self) -> Result<()> {
         let _: serde_json::Value = self.gql("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
         Ok(())
     }
 
+    /// Leave AniList's unread count unchanged when opening the inbox.
     pub async fn notifications_page(&self, page: i64) -> Result<NotificationPage> {
         #[derive(Deserialize)]
         struct R {
@@ -1495,35 +1497,7 @@ fn clip_for_log(s: &str) -> String {
 }
 
 fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < b.len() => {
-                let hex = |c: u8| (c as char).to_digit(16);
-                match (hex(b[i + 1]), hex(b[i + 2])) {
-                    (Some(hi), Some(lo)) => {
-                        out.push((hi * 16 + lo) as u8);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(b'%');
-                        i += 1;
-                    }
-                }
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::recognize::percent_decode(&s.replace('+', " "))
 }
 
 pub type OAuthReceiver = oneshot::Receiver<Result<String, String>>;
@@ -1671,6 +1645,8 @@ mod tests {
     fn percent_decode_handles_escapes_plus_and_junk() {
         assert_eq!(super::percent_decode("abc-123_x.y~z"), "abc-123_x.y~z");
         assert_eq!(super::percent_decode("a%20b+c"), "a b c");
+        assert_eq!(super::percent_decode("%2B+%252B"), "+ %2B");
+        assert_eq!(super::percent_decode("%E3%81%82%FF"), "あ�");
         assert_eq!(super::percent_decode("%41%6eiList"), "AniList");
         assert_eq!(super::percent_decode("100%"), "100%");
         assert_eq!(super::percent_decode("%zz%4"), "%zz%4");
@@ -1929,7 +1905,7 @@ mod regression_tests {
     #[tokio::test]
     async fn a_missing_later_chunk_is_not_a_complete_list() {
         let (api, _) = mock_api(vec![
-            (200, json!({"data": {"MediaListCollection": {"lists": [{"entries": [{"id": 22, "mediaId": 1}]}], "hasNextChunk": true}}})),
+            (200, json!({"data": {"MediaListCollection": {"lists": [{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "score": 0}]}], "hasNextChunk": true}}})),
             (200, json!({"data": {"MediaListCollection": {"lists": [], "hasNextChunk": false}}})),
         ]).await;
         assert!(api.user_list("Tester").await.is_err());
@@ -1941,7 +1917,7 @@ mod regression_tests {
             (json!([]), 0),
             (json!([{"entries": []}]), 0),
             (
-                json!([{"entries": [{"id": 22, "mediaId": 1, "media": null}]}]),
+                json!([{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "media": null, "score": null}]}]),
                 1,
             ),
         ] {
