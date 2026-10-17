@@ -42,6 +42,18 @@ fn save_feeds(db: &Db, feeds: &[String]) -> Result<()> {
 pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| anyhow!("feed URL must be a valid http:// or https:// URL"))?;
+    validate_feed_url(&parsed)?;
+    let url = parsed.as_str();
+    let _guard = FEEDS_LOCK.lock();
+    let mut feeds = get_feeds(db)?;
+    if !feeds.iter().any(|f| f == url) {
+        feeds.push(url.to_string());
+        save_feeds(db, &feeds)?;
+    }
+    Ok(feeds)
+}
+
+fn validate_feed_url(parsed: &reqwest::Url) -> Result<()> {
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(anyhow!("feed URL must start with http:// or https://"));
     }
@@ -63,14 +75,7 @@ pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
             ));
         }
     }
-    let url = parsed.as_str();
-    let _guard = FEEDS_LOCK.lock();
-    let mut feeds = get_feeds(db)?;
-    if !feeds.iter().any(|f| f == url) {
-        feeds.push(url.to_string());
-        save_feeds(db, &feeds)?;
-    }
-    Ok(feeds)
+    Ok(())
 }
 
 pub fn remove_feed(db: &Db, url: &str) -> Result<Vec<String>> {
@@ -92,7 +97,13 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let http = reqwest::Client::builder()
         .user_agent("Kurisu")
         .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if let Err(error) = validate_feed_url(attempt.url()) {
+                attempt.error(error.to_string())
+            } else {
+                reqwest::redirect::Policy::limited(3).redirect(attempt)
+            }
+        }))
         .build()?;
 
     let mut tasks = Vec::with_capacity(feeds.len());
@@ -102,6 +113,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
         tasks.push(tokio::spawn(async move {
             let _slot = FETCH_SLOTS.acquire().await.expect("RSS semaphore is open");
             let fetched: Result<String> = async {
+                validate_feed_url(&reqwest::Url::parse(&feed)?)?;
                 let mut resp = http.get(&feed).send().await?;
                 let status = resp.status();
                 if !status.is_success() {
@@ -909,6 +921,53 @@ mod tests {
                 body
             )
             .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_urls_and_redirects_keep_the_feed_transport_rules_and_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (host, direct, endless, expected_requests) in [
+            ("0.0.0.0", false, false, 1),
+            ("0.0.0.0", true, false, 0),
+            ("localhost", false, false, 2),
+            ("127.0.0.1", false, true, 4),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let received = requests.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                    }
+                    let index = received.fetch_add(1, Ordering::SeqCst);
+                    let response = if index == 0 || endless {
+                        format!("HTTP/1.1 302 Found\r\nLocation: http://{host}:{port}/rss\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SAMPLE}", SAMPLE.len())
+                    };
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let initial_host = if direct { host } else { "127.0.0.1" };
+            let result = fetch_all(&[format!("http://{initial_host}:{port}/start")]).await;
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            assert_eq!(requests.load(Ordering::SeqCst), expected_requests, "{host}");
+            if host == "localhost" {
+                let fetched = result.unwrap();
+                assert!(fetched.failures.is_empty());
+                assert_eq!(fetched.items.len(), 3);
+            } else {
+                assert!(result.is_err(), "{host}");
+            }
         }
     }
 

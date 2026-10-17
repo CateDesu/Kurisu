@@ -1,5 +1,3 @@
-//! MPV IPC sources alongside OS media sessions.
-
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::time::Duration;
@@ -7,11 +5,6 @@ use std::time::Duration;
 /// Bound the whole exchange, including peers that trickle incomplete replies.
 const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 const MAX_REPLY_BYTES: usize = 1024 * 1024;
-
-/// Skip timed out pipes for the session. Retrying would leak another blocked thread each tick.
-#[cfg(windows)]
-static POISONED_PIPES: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
@@ -48,10 +41,6 @@ pub(crate) fn probe(paths: &[String]) -> Vec<MpvSnapshot> {
         if std::fs::metadata(p).is_err() {
             continue;
         }
-        #[cfg(windows)]
-        if POISONED_PIPES.lock().contains(p) {
-            continue;
-        }
         if let Some(s) = probe_one(p) {
             snapshots.push(s);
         }
@@ -80,31 +69,70 @@ fn probe_one(path: &str) -> Option<MpvSnapshot> {
 
 #[cfg(windows)]
 fn probe_one(path: &str) -> Option<MpvSnapshot> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let p = path.to_string();
-    std::thread::spawn(move || {
-        let snap = (|| {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&p)
-                .ok()?;
-            let writer = file.try_clone().ok()?;
-            query(
-                BufReader::new(file),
-                writer,
-                std::time::Instant::now() + QUERY_DEADLINE,
-            )
-        })();
-        let _ = tx.send(snap);
-    });
-    match rx.recv_timeout(QUERY_DEADLINE + std::time::Duration::from_secs(1)) {
-        Ok(snap) => snap,
-        Err(_) => {
-            POISONED_PIPES.lock().insert(path.to_string());
-            None
+    use std::io;
+    use tokio::io::Interest;
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+
+    struct Pipe<'a> {
+        socket: NamedPipeClient,
+        runtime: &'a tokio::runtime::Runtime,
+        deadline: tokio::time::Instant,
+    }
+
+    impl Pipe<'_> {
+        fn io(
+            &self,
+            interest: Interest,
+            mut operation: impl FnMut() -> io::Result<usize>,
+        ) -> io::Result<usize> {
+            self.runtime.block_on(async {
+                tokio::time::timeout_at(self.deadline, async {
+                    loop {
+                        self.socket.ready(interest).await?;
+                        match operation() {
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                            result => return result,
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+            })
         }
     }
+
+    impl io::Read for &Pipe<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.io(Interest::READABLE, || self.socket.try_read(buf))
+        }
+    }
+
+    impl Write for &Pipe<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.io(Interest::WRITABLE, || self.socket.try_write(buf))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let deadline = std::time::Instant::now() + QUERY_DEADLINE;
+    let socket = {
+        let _guard = runtime.enter();
+        ClientOptions::new().open(path).ok()?
+    };
+    // Dropping overlapped I/O closes a stalled pipe so the next probe can retry.
+    let pipe = Pipe {
+        socket,
+        runtime: &runtime,
+        deadline: deadline.into(),
+    };
+    query(BufReader::new(&pipe), &pipe, deadline)
 }
 
 fn query<R: BufRead, W: Write>(
@@ -232,6 +260,100 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stalled_windows_pipe_closes_and_recovers_without_restarting() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let path = format!(r"\\.\pipe\kurisu-mpv-recovery-{}", std::process::id());
+        let server_path = path.clone();
+        let (ready, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let pipe = ServerOptions::new().create(&server_path).unwrap();
+                    ready.send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), pipe.connect())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut reader = tokio::io::BufReader::new(pipe);
+                    for (property, id) in PROPS {
+                        let mut line = String::new();
+                        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(
+                            request["command"],
+                            serde_json::json!(["get_property", property])
+                        );
+                        assert_eq!(request["request_id"], id);
+                    }
+                    let closed = matches!(
+                        tokio::time::timeout(
+                            QUERY_DEADLINE + Duration::from_secs(2),
+                            reader.read_u8()
+                        )
+                        .await,
+                        Ok(Err(_))
+                    );
+                    let mut pipe = reader.into_inner();
+                    pipe.disconnect().unwrap();
+                    ready.send(()).unwrap();
+                    if matches!(
+                        tokio::time::timeout(Duration::from_secs(2), pipe.connect()).await,
+                        Ok(Ok(()))
+                    ) {
+                        let mut reader = tokio::io::BufReader::new(&mut pipe);
+                        for _ in PROPS {
+                            tokio::time::timeout(
+                                Duration::from_secs(2),
+                                reader.read_line(&mut String::new()),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        }
+                        let reply = [
+                            ok(IDX_PAUSE, "false"),
+                            ok(IDX_PATH, r#""C:\\Anime\\Some Show - 03.mkv""#),
+                            ok(IDX_TITLE, r#""Some Show - 03""#),
+                            ok(IDX_FILENAME, r#""Some Show - 03.mkv""#),
+                            ok(IDX_DURATION, "1200"),
+                            ok(IDX_POSITION, "1100"),
+                        ]
+                        .concat();
+                        for fragment in reply.as_bytes().chunks(17) {
+                            pipe.write_all(fragment).await.unwrap();
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(2), pipe.read_u8()).await;
+                    }
+                    closed
+                })
+        });
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(probe(std::slice::from_ref(&path)).is_empty());
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        let recovered = probe(&[format!("{path}-missing"), path]);
+        let closed = server.join().unwrap();
+        assert!(closed, "the timed out probe left its pipe open");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a recovered MPV must be detected on the next tick"
+        );
+        assert_eq!(recovered[0].position_us, 1_100_000_000);
+        assert_eq!(recovered[0].duration_us, 1_200_000_000);
+        assert!(recovered[0].playing);
+    }
 
     fn query_lines(lines: &str) -> (Option<MpvSnapshot>, String) {
         let mut sink = Vec::new();

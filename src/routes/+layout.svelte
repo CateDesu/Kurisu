@@ -182,10 +182,10 @@
         {:else}
           <div class="px-4 py-5 border-t border-edge text-sm text-ink-dim">
             Not signed in
-            {#if logoutErr}
-              <p class="text-red-400 mt-1">Log out failed: {logoutErr}</p>
-            {/if}
           </div>
+        {/if}
+        {#if logoutErr}
+          <p class="px-4 py-2 text-sm text-red-400" role="alert">Log out failed: {logoutErr}</p>
         {/if}
       </aside>
       <main use:trackScroll use:smoothScroll={$pageStore.url.pathname} class="flex-1 min-w-0 min-h-0 overflow-auto">

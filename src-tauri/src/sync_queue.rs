@@ -280,6 +280,7 @@ fn remote_entry(media_id: i64, remote: anilist::SavedEntry) -> ListEntry {
         progress: remote.progress,
         score: remote.score,
         repeat: remote.repeat,
+        updated_at: remote.updated_at,
         ..Default::default()
     }
 }
@@ -688,6 +689,167 @@ mod tests {
 
     fn remote(progress: i64) -> serde_json::Value {
         json!({"id":22,"status":"CURRENT","progress":progress,"score":0,"repeat":0})
+    }
+
+    #[tokio::test]
+    async fn incomplete_remote_lookup_cannot_discard_saved_progress() {
+        for reply in [
+            json!({"data":{"Media":{}}}),
+            json!({"data":{"Media":null}}),
+            json!({"data":{}}),
+        ] {
+            let (api, mut requests) = anilist::mock_api(vec![
+                (200, reply),
+                (200, json!({"data":{"Media":{"mediaListEntry":null}}})),
+            ])
+            .await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            let (_, mut pending, _) = stage(
+                &state,
+                1,
+                Patch {
+                    progress: Some(4),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            pending.conflict = true;
+            state.db.put_pending(7, &pending).unwrap();
+            local_entry(&state, &pending).unwrap();
+
+            assert!(resolve_pending_inner(1, false, &state).await.is_err());
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
+            assert_eq!(state.db.pending(7).unwrap()[0].patch.progress, Some(4));
+            assert!(state.anilist.lock().has_token());
+
+            resolve_pending_inner(1, false, &state).await.unwrap();
+            assert!(state.db.get_entry(1).unwrap().is_none());
+            assert!(state.db.pending(7).unwrap().is_empty());
+            requests.recv().await.unwrap();
+            requests.recv().await.unwrap();
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_remote_lookup_keeps_existing_changes_retryable() {
+        let (api, mut requests) =
+            anilist::mock_api(vec![(200, json!({"data":{"Media":{}}}))]).await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        let (_, pending, _) = stage(
+            &state,
+            1,
+            Patch {
+                progress: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        local_entry(&state, &pending).unwrap();
+
+        assert!(flush_unlocked(&state).await.is_err());
+        let pending = state.db.pending(7).unwrap();
+        assert_eq!(pending[0].patch.progress, Some(4));
+        assert!(!pending[0].conflict);
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_remote_lookup_cannot_turn_a_queued_add_into_a_blind_write() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":{}}})),
+            (200, json!({"data":{"SaveMediaListEntry":remote(4)}})),
+        ])
+        .await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        state.db.delete_entry(1).unwrap();
+        let (_, pending, _) = stage(
+            &state,
+            1,
+            Patch {
+                status: Some("CURRENT".into()),
+                progress: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        local_entry(&state, &pending).unwrap();
+
+        assert!(flush_unlocked(&state).await.is_err());
+        let pending = state.db.pending(7).unwrap();
+        assert_eq!(pending[0].patch.progress, Some(4));
+        assert!(!pending[0].conflict);
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_entry_timestamps_survive_every_sync_outcome() {
+        for action in ["retry", "acknowledge", "keep_remote", "keep_local", "save"] {
+            let mut before = remote(if action == "acknowledge" { 4 } else { 3 });
+            before["updatedAt"] = json!(1_700_000_000);
+            let mut after = remote(4);
+            after["updatedAt"] = json!(1_700_000_500);
+            let writes = matches!(action, "retry" | "keep_local" | "save");
+            let mut replies = vec![];
+            if action != "save" {
+                replies.push((200, json!({"data":{"Media":{"mediaListEntry":before}}})));
+            }
+            if writes {
+                replies.push((200, json!({"data":{"SaveMediaListEntry":after}})));
+            }
+            let (api, mut requests) = anilist::mock_api(replies).await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            if action == "save" {
+                crate::commands::save_entry_inner(&state, 1, None, Some(4), None, None)
+                    .await
+                    .unwrap();
+            } else {
+                let (_, pending, _) = stage(
+                    &state,
+                    1,
+                    Patch {
+                        progress: Some(4),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                local_entry(&state, &pending).unwrap();
+                if matches!(action, "keep_remote" | "keep_local") {
+                    resolve_pending_inner(1, action == "keep_local", &state)
+                        .await
+                        .unwrap();
+                } else {
+                    flush_unlocked(&state).await.unwrap();
+                }
+            }
+
+            let entry = state.db.get_entry(1).unwrap().unwrap();
+            assert_eq!(
+                entry.updated_at,
+                Some(if writes { 1_700_000_500 } else { 1_700_000_000 }),
+                "{action} must preserve the remote update time used by Updated sorting"
+            );
+            assert_eq!(entry.progress, if action == "keep_remote" { 3 } else { 4 });
+            assert!(state.db.pending(7).unwrap().is_empty());
+            let count = if writes && action != "save" { 2 } else { 1 };
+            for _ in 0..count {
+                let request = requests.recv().await.unwrap();
+                assert!(request["query"].as_str().unwrap().contains("updatedAt"));
+            }
+            assert!(requests.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

@@ -3,13 +3,13 @@ import { mount, unmount } from "svelte";
 import { deferred, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
-  setProgress: vi.fn(), installUpdate: vi.fn(), close: vi.fn(), invoke: vi.fn(),
+  setProgress: vi.fn(), close: vi.fn(), invoke: vi.fn(),
   onResized: vi.fn().mockResolvedValue(() => {}),
   isMaximized: vi.fn().mockResolvedValue(false),
   auth: { epoch: 0, isLoggedIn: true },
   listeners: new Map<string, () => Promise<void>>(),
 }));
-vi.mock("$lib/api", () => ({ api: { setProgress: mocks.setProgress, installUpdate: mocks.installUpdate } }));
+vi.mock("$lib/api", () => ({ api: { setProgress: mocks.setProgress } }));
 vi.mock("$lib/auth.svelte", () => ({ auth: mocks.auth }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => mocks }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
@@ -200,21 +200,21 @@ test("native Quit stays open after a failed save", async () => {
   expect(mocks.invoke).toHaveBeenLastCalledWith("finish_shutdown", { success: true });
 });
 
-test("installing flushes progress and prevents new buffered clicks", async () => {
-  const { runInstallUpdate } = await import("$lib/update.svelte");
-  const installer = deferred<string>();
-  mocks.installUpdate.mockReturnValue(installer.promise);
+test("a failed immediate final episode save stays pending and can complete on retry", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  await unmount(components.pop()!);
+  const onchange = vi.fn();
+  const completed = { media_id: 1, progress: 12, status: "COMPLETED" };
+  mocks.setProgress.mockRejectedValueOnce(new Error("Disk is full")).mockResolvedValue(completed);
+  components.push(mount(Stepper, { target, props: { mediaId: 1, progress: 11, total: 12, onchange } }));
+  await settle();
   await increment();
-  const installing = runInstallUpdate();
-  await settle();
-  expect(mocks.setProgress).toHaveBeenCalledWith(1, 4, 3);
-  const plus = target.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!;
-  expect(plus.disabled).toBe(true);
-  plus.click();
+  expect(mocks.setProgress).toHaveBeenCalledExactlyOnceWith(1, 12, 11);
+  expect(onchange).not.toHaveBeenCalled();
+  expect(target.querySelector('[title="Not saved: Error: Disk is full"]')).not.toBeNull();
+  await flushPendingEdits();
+  expect(mocks.setProgress).toHaveBeenNthCalledWith(2, 1, 12, 11);
+  expect(onchange).toHaveBeenCalledExactlyOnceWith(completed);
   await vi.advanceTimersByTimeAsync(3000);
-  expect(mocks.setProgress).toHaveBeenCalledOnce();
-  installer.resolve("restarting");
-  await installing;
-  await settle();
-  expect(plus.disabled).toBe(true);
+  expect(mocks.setProgress).toHaveBeenCalledTimes(2);
 });

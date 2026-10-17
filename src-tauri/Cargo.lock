@@ -2149,6 +2149,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dbus",
  "directories",
  "env_logger",
  "log",

@@ -10,7 +10,7 @@ static RE_BRACKETS: LazyLock<Regex> =
 static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b\d{3,4}p\d{2,3}\b|\b[48]k\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[456]|avc|av1|vp9|vp0|vvc|xvid|divx|mpeg-?2|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
 });
-// Require a separator before E05 to preserve Steins;Gate. Keep episode zero for specials.
+// Require a separator before E05 to preserve Steins;Gate.
 static RE_EP_TAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\s*[-_·]?\s*(?:[sS]\d{1,2}[eE]|ep(?:isode)?\.?|[-_·\s][eE]|#)?\s*0*[1-9]\d{0,3}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
 });

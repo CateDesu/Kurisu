@@ -4,11 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 const mocks = vi.hoisted(() => ({
-  api: Object.fromEntries(["takePendingUpdate", "takeUpdateFailed", "checkUpdate", "installUpdate", "getTrackingConfig", "getAppSetting"].map((name) => [name, vi.fn()])),
+  api: Object.fromEntries(["takePendingUpdate", "takeUpdateFailed", "checkUpdate", "installUpdate", "getTrackingConfig", "getAppSetting", "setProgress"].map((name) => [name, vi.fn()])),
   listener: null as ((event: { payload: unknown }) => void) | null,
 }));
 vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/auth.svelte", () => ({ auth: { user: { id: 1, name: "Example" }, isLoggedIn: true } }));
+vi.mock("$lib/auth.svelte", () => ({ auth: { user: { id: 1, name: "Example" }, isLoggedIn: true, epoch: 0 } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, callback: typeof mocks.listener) => {
   if (name === "kurisu://update-available") mocks.listener = callback;
   return () => {};
@@ -36,6 +36,7 @@ afterEach(async () => {
   for (const instance of instances) await runtime.unmount(instance);
   instances = [];
   document.body.replaceChildren();
+  vi.useRealTimers();
 });
 
 async function settle() {
@@ -155,4 +156,34 @@ test("a pending progress failure prevents the installer from starting", async ()
   } finally {
     unregister();
   }
+});
+
+test("installing flushes progress and prevents new buffered clicks", async () => {
+  vi.useFakeTimers();
+  const { default: Stepper } = await import("$lib/EpisodeStepper.svelte");
+  const { runInstallUpdate } = await import("$lib/update.svelte");
+  const progress = deferred<{ media_id: number; progress: number }>();
+  const installer = deferred<string>();
+  mocks.api.setProgress.mockReturnValue(progress.promise);
+  mocks.api.installUpdate.mockReturnValue(installer.promise);
+  instances.push(runtime.mount(Stepper, { target: document.body, props: { mediaId: 1, progress: 3, total: 12 } }));
+  await settle();
+  const plus = document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!;
+  plus.click();
+  await settle();
+  const installing = runInstallUpdate();
+  await settle();
+  expect(mocks.api.setProgress).toHaveBeenCalledExactlyOnceWith(1, 4, 3);
+  expect(mocks.api.installUpdate).not.toHaveBeenCalled();
+  expect(plus.disabled).toBe(true);
+  plus.click();
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(mocks.api.setProgress).toHaveBeenCalledOnce();
+  progress.resolve({ media_id: 1, progress: 4 });
+  await settle();
+  expect(mocks.api.installUpdate).toHaveBeenCalledOnce();
+  installer.resolve("restarting");
+  await installing;
+  await settle();
+  expect(plus.disabled).toBe(true);
 });

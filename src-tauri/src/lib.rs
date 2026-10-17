@@ -28,7 +28,7 @@ fn open_database(app: &tauri::App) -> Result<db::Db, String> {
         .map_err(|e| format!("no app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
-    // Protect the whole directory because SQLite creates token-bearing sidecars lazily.
+    // SQLite creates token sidecars lazily. Protect the whole directory.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -76,7 +76,7 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) -> std
                 staged.push((tmp_side, dst_side));
             }
         }
-        // Remove foreign sidecars before SQLite can replay them over the migrated database.
+        // Remove foreign sidecars before SQLite can replay them.
         for suffix in ["-wal", "-shm"] {
             let mut dst_side = db_path.as_os_str().to_os_string();
             dst_side.push(suffix);
@@ -86,10 +86,11 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) -> std
                 Err(e) => return Err(e),
             }
         }
-        std::fs::rename(&tmp, db_path)?;
         for (from, to) in &staged {
             std::fs::rename(from, to)?;
         }
+        // A nonempty main file prevents retries on the next launch.
+        std::fs::rename(&tmp, db_path)?;
         Ok(())
     })();
     if let Err(e) = &result {
@@ -137,7 +138,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     rendering::configure(&context.config().identifier);
 
-    // One instance prevents duplicate trackers and competing writes to the same database.
+    // One instance prevents duplicate trackers and competing database writes.
     let instance_guard = match std::net::TcpListener::bind(SINGLE_INSTANCE_ADDR) {
         Ok(l) => Some(l),
         Err(_) => {
@@ -152,7 +153,7 @@ pub fn run() {
         }
     };
 
-    // Answer before database setup so another launch cannot mistake slow startup for a dead listener.
+    // Answer before database setup so slow startup still looks alive.
     if let Some(guard) = instance_guard {
         std::thread::spawn(move || {
             use std::io::Write;
@@ -289,7 +290,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
-                                // Restore before focusing. A minimized window ignores focus requests.
+                                // Minimized windows ignore focus requests.
                                 let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
@@ -463,6 +464,45 @@ mod tests {
         assert!(!dest_dir.join("kurisu.db-wal").exists());
         assert!(!dest_dir.join("kurisu.db-shm").exists());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn migration_preserves_uncheckpointed_writes() {
+        let (base, legacy_dir, dest_dir) = test_dirs("wal");
+        let legacy = legacy_dir.join("kurisu.db");
+        let source = rusqlite::Connection::open(&legacy).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE saved_progress (episode INTEGER NOT NULL);
+             INSERT INTO saved_progress VALUES (7);",
+            )
+            .unwrap();
+        assert!(
+            std::fs::metadata(legacy_dir.join("kurisu.db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        let destination = dest_dir.join("kurisu.db");
+
+        migrate_legacy_db(&legacy, &destination).unwrap();
+
+        let migrated = rusqlite::Connection::open(&destination).unwrap();
+        let episode: i64 = migrated
+            .query_row("SELECT episode FROM saved_progress", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(episode, 7);
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(migrated);
+        drop(source);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

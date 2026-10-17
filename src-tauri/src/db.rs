@@ -292,7 +292,7 @@ impl Db {
     pub fn entries_with_media(&self) -> Result<Vec<ListEntry>> {
         let c = self.0.lock();
         let mut stmt = c.prepare(
-            // Omit large detail fields while preserving the column layout used by row_to_media_offset.
+            // Keep the row_to_media_offset column layout without loading large details.
             "SELECT e.media_id,e.entry_id,e.status,e.progress,e.score,e.repeat,e.updated_at,
                     m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
                     m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,
@@ -418,7 +418,7 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
-    /// Remove the value from freed database pages and the WAL as well as the live table.
+    /// Scrub freed pages and the WAL as well as the live table.
     pub fn scrub_setting(&self, key: &str) -> Result<()> {
         let c = self.0.lock();
         c.execute("DELETE FROM settings WHERE key = ?", [key])?;
@@ -832,6 +832,35 @@ mod tests {
             assert_eq!(e.id, Some(77));
             assert_eq!(e.updated_at, Some(111));
             db.rss_seen_set().unwrap();
+            db.put_pending(
+                7,
+                &crate::sync_queue::Pending {
+                    media_id: 7,
+                    base: Some(e),
+                    patch: crate::sync_queue::Patch {
+                        progress: Some(4),
+                        ..Default::default()
+                    },
+                    error: None,
+                    conflict: false,
+                    missing_media: false,
+                },
+            )
+            .unwrap();
+            db.record_watch(7, "Old Show - 04.mkv", 7, 4).unwrap();
+            drop(db);
+            let db = Db::open(&path).unwrap();
+            let pending = db.pending(7).unwrap();
+            assert_eq!(pending.len(), 1, "upgrade from v{from} lost pending changes");
+            assert_eq!(pending[0].media_id, 7);
+            assert_eq!(pending[0].patch.progress, Some(4));
+            assert_eq!(pending[0].base.as_ref().unwrap().progress, 3);
+            let history = db.watch_history(7, 50, None).unwrap();
+            assert_eq!(history.len(), 1, "upgrade from v{from} lost watch history");
+            assert_eq!(history[0].path, "Old Show - 04.mkv");
+            assert_eq!(history[0].media_id, 7);
+            assert_eq!(history[0].episode, 4);
+            assert_eq!(history[0].title, "Old Show");
             drop(db);
             let _ = std::fs::remove_file(&path);
         }

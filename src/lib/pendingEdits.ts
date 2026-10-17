@@ -1,6 +1,6 @@
 const edits = new Map<unknown, () => Promise<void>>();
 // Replacing a buffered edit must not stop shutdown from waiting for its active save.
-const saves = new Set<Promise<void>>();
+const saves = new Set<Promise<unknown>>();
 
 export function registerPendingEdit(flush: () => Promise<void>, key: unknown = flush) {
   edits.set(key, flush);
@@ -11,7 +11,7 @@ export function isPendingEdit(key: unknown, flush: () => Promise<void>) {
   return edits.get(key) === flush;
 }
 
-export function trackPendingSave(save: Promise<void>) {
+export function trackPendingSave<T>(save: Promise<T>): Promise<T> {
   saves.add(save);
   void save.then(() => saves.delete(save), () => saves.delete(save));
   return save;

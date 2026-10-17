@@ -34,7 +34,6 @@ struct Shown {
     total_episodes: Option<i64>,
 }
 
-/// Ignore small seeks and timing jitter.
 const SEEK_DRIFT_MS: i64 = 30_000;
 
 #[derive(Default)]
@@ -298,7 +297,10 @@ mod tests {
         let payload = build_activity(&long, 0);
         assert_eq!(payload["details"], "あ".repeat(128));
         assert_eq!(payload["assets"]["large_text"], payload["details"]);
-        assert_eq!(payload["assets"]["large_image"].as_str().unwrap().len(), 256);
+        assert_eq!(
+            payload["assets"]["large_image"].as_str().unwrap().len(),
+            256
+        );
         assert!(payload.get("timestamps").is_none());
         let payload = build_activity(&bare, 123_456);
         assert!(payload.get("assets").is_none());

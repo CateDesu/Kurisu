@@ -18,45 +18,58 @@ pub const OAUTH_PORT: u16 = 39417;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NextAiring {
+    #[serde(deserialize_with = "Option::deserialize")]
     episode: Option<i64>,
+    #[serde(deserialize_with = "Option::deserialize")]
     airing_at: Option<i64>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AniMedia {
     id: i64,
+    #[serde(deserialize_with = "Option::deserialize")]
     id_mal: Option<i64>,
     title: AniTitle,
-    // AniList can return explicit nulls even for merged or stub entries.
+    // Selected fields may be null for stubs, but omitted fields are incomplete.
+    #[serde(deserialize_with = "Option::deserialize")]
     cover_image: Option<AniCover>,
+    #[serde(deserialize_with = "Option::deserialize")]
     episodes: Option<i64>,
+    #[serde(deserialize_with = "Option::deserialize")]
     format: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     status: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     average_score: Option<i64>,
+    #[serde(deserialize_with = "Option::deserialize")]
     season: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     season_year: Option<i64>,
+    #[serde(deserialize_with = "Option::deserialize")]
     description: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     next_airing_episode: Option<NextAiring>,
-    banner_image: Option<String>,
-    genres: Option<Vec<Option<String>>>,
-    duration: Option<i64>,
-    source: Option<String>,
-    studios: Option<AniStudios>,
 }
 #[derive(Deserialize, Default)]
 struct AniTitle {
+    #[serde(deserialize_with = "Option::deserialize")]
     romaji: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     english: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     native: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct AniCover {
+    #[serde(deserialize_with = "Option::deserialize")]
     medium: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     large: Option<String>,
 }
 #[derive(Deserialize)]
 struct AniStudios {
+    #[serde(deserialize_with = "Option::deserialize")]
     nodes: Option<Vec<AniStudioNode>>,
 }
 #[derive(Deserialize)]
@@ -83,18 +96,7 @@ impl From<AniMedia> for Media {
             description: m.description,
             next_airing_episode: m.next_airing_episode.as_ref().and_then(|n| n.episode),
             next_airing_at: m.next_airing_episode.as_ref().and_then(|n| n.airing_at),
-            banner_image: m.banner_image,
-            genres: m
-                .genres
-                .map(|g| g.into_iter().flatten().collect::<Vec<_>>())
-                .filter(|g: &Vec<String>| !g.is_empty()),
-            duration: m.duration,
-            source: m.source,
-            studios: m
-                .studios
-                .and_then(|s| s.nodes)
-                .map(|n| n.into_iter().map(|s| s.name).collect::<Vec<_>>())
-                .filter(|s: &Vec<String>| !s.is_empty()),
+            ..Default::default()
         }
     }
 }
@@ -108,6 +110,8 @@ pub struct SavedEntry {
     #[serde(deserialize_with = "Option::deserialize")]
     pub score: Option<f64>,
     pub repeat: i64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: Option<i64>,
 }
 
 /// Clones share the rate budget, including limits reported by failed requests.
@@ -512,6 +516,7 @@ impl AniList {
             }
         }";
         let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
+        require_media_id(id, r.media.id)?;
         Ok(Media::from(r.media))
     }
 
@@ -522,7 +527,18 @@ impl AniList {
             media: DetailMedia,
         }
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct DetailMedia {
+            #[serde(deserialize_with = "Option::deserialize")]
+            banner_image: Option<String>,
+            #[serde(deserialize_with = "Option::deserialize")]
+            genres: Option<Vec<Option<String>>>,
+            #[serde(deserialize_with = "Option::deserialize")]
+            duration: Option<i64>,
+            #[serde(deserialize_with = "Option::deserialize")]
+            source: Option<String>,
+            #[serde(deserialize_with = "Option::deserialize")]
+            studios: Option<AniStudios>,
             relations: Option<Relations>,
             characters: Option<CharConn>,
             staff: Option<StaffConn>,
@@ -611,6 +627,7 @@ impl AniList {
             }
         }";
         let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
+        require_media_id(id, r.media.media.id)?;
         let mut unavailable_sections = Vec::new();
         if r.media
             .relations
@@ -691,8 +708,25 @@ impl AniList {
                 })
             })
             .collect();
+        let media = Media {
+            banner_image: r.media.banner_image,
+            genres: r
+                .media
+                .genres
+                .map(|g| g.into_iter().flatten().collect::<Vec<_>>())
+                .filter(|g: &Vec<String>| !g.is_empty()),
+            duration: r.media.duration,
+            source: r.media.source,
+            studios: r
+                .media
+                .studios
+                .and_then(|s| s.nodes)
+                .map(|n| n.into_iter().map(|s| s.name).collect::<Vec<_>>())
+                .filter(|s: &Vec<String>| !s.is_empty()),
+            ..r.media.media.into()
+        };
         Ok(MediaDetail {
-            media: r.media.media.into(),
+            media,
             relations,
             characters,
             staff,
@@ -716,18 +750,23 @@ impl AniList {
         struct Statistics {
             anime: Option<Anime>,
         }
-        #[derive(Deserialize, Default)]
-        #[serde(default, rename_all = "camelCase")]
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Anime {
             count: i64,
             episodes_watched: i64,
             minutes_watched: i64,
             mean_score: f64,
             standard_deviation: f64,
+            #[serde(deserialize_with = "Option::deserialize")]
             scores: Option<Vec<Score>>,
+            #[serde(deserialize_with = "Option::deserialize")]
             statuses: Option<Vec<Status>>,
+            #[serde(deserialize_with = "Option::deserialize")]
             formats: Option<Vec<Format>>,
+            #[serde(deserialize_with = "Option::deserialize")]
             genres: Option<Vec<Genre>>,
+            #[serde(deserialize_with = "Option::deserialize")]
             release_years: Option<Vec<Year>>,
         }
         #[derive(Deserialize)]
@@ -737,24 +776,29 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct Status {
+            #[serde(deserialize_with = "Option::deserialize")]
             status: Option<String>,
             count: i64,
         }
         #[derive(Deserialize)]
         struct Format {
+            #[serde(deserialize_with = "Option::deserialize")]
             format: Option<String>,
             count: i64,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Genre {
+            #[serde(deserialize_with = "Option::deserialize")]
             genre: Option<String>,
             count: i64,
+            #[serde(deserialize_with = "Option::deserialize")]
             minutes_watched: Option<i64>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Year {
+            #[serde(deserialize_with = "Option::deserialize")]
             release_year: Option<i64>,
             count: i64,
         }
@@ -1006,7 +1050,7 @@ impl AniList {
                     let e = e.ok_or_else(|| {
                         anyhow!("AniList returned a null entry, refusing to sync a partial list")
                     })?;
-                    // Keep entries with null media so sync does not delete them during an AniList merge.
+                    // Keep null media entries so AniList merges cannot trigger local deletion.
                     out.push(ListEntry {
                         id: Some(e.id),
                         media_id: e.media_id,
@@ -1046,12 +1090,12 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct EntryMedia {
-            #[serde(rename = "mediaListEntry")]
+            #[serde(rename = "mediaListEntry", deserialize_with = "Option::deserialize")]
             entry: Option<SavedEntry>,
         }
         let q = "query ($mediaId: Int!) {
             Media(id: $mediaId, type: ANIME) {
-                mediaListEntry { id status progress score repeat }
+                mediaListEntry { id status progress score repeat updatedAt }
             }
         }";
         let r: R = self
@@ -1111,7 +1155,7 @@ impl AniList {
             entry: SavedEntry,
         }
         let q = "mutation ($id: Int, $mediaId: Int, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int) {
-            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score repeat }
+            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score repeat updatedAt }
         }";
         let obj = vars.as_object_mut().expect("vars object");
         if let Some(st) = status {
@@ -1225,7 +1269,17 @@ impl AniList {
     }
 
     pub async fn mark_notifications_read(&self) -> Result<()> {
-        let _: serde_json::Value = self.gql("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "Page")]
+            _page: ReadPage,
+        }
+        #[derive(Deserialize)]
+        struct ReadPage {
+            #[serde(rename = "notifications")]
+            _notifications: Vec<serde_json::Value>,
+        }
+        let _: Response = self.gql("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
         Ok(())
     }
 
@@ -1381,20 +1435,55 @@ impl AniList {
     }
 }
 
+fn require_media_id(expected: i64, actual: i64) -> Result<()> {
+    if actual != expected {
+        return Err(ApiError {
+            status: reqwest::StatusCode::OK,
+            from_json: false,
+            message: format!("AniList returned anime {actual} instead of {expected}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn parse_entry_details(raw: &serde_json::Value) -> Result<EntryDetails> {
+    #[derive(Deserialize)]
+    struct Date {
+        #[serde(deserialize_with = "Option::deserialize")]
+        year: Option<i64>,
+        #[serde(deserialize_with = "Option::deserialize")]
+        month: Option<i64>,
+        #[serde(deserialize_with = "Option::deserialize")]
+        day: Option<i64>,
+    }
+    impl From<Date> for FuzzyDate {
+        fn from(date: Date) -> Self {
+            Self {
+                year: date.year,
+                month: date.month,
+                day: date.day,
+            }
+        }
+    }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Details {
+        // Selected fields may be null, but missing fields are an incomplete response.
+        #[serde(deserialize_with = "Option::deserialize")]
         notes: Option<String>,
-        started_at: Option<FuzzyDate>,
-        completed_at: Option<FuzzyDate>,
+        #[serde(deserialize_with = "Option::deserialize")]
+        started_at: Option<Date>,
+        #[serde(deserialize_with = "Option::deserialize")]
+        completed_at: Option<Date>,
+        #[serde(deserialize_with = "Option::deserialize")]
         custom_lists: Option<std::collections::BTreeMap<String, bool>>,
     }
     let entry: Details = serde_json::from_value(raw.clone())?;
     Ok(EntryDetails {
         notes: entry.notes.unwrap_or_default(),
-        started_at: entry.started_at,
-        completed_at: entry.completed_at,
+        started_at: entry.started_at.map(FuzzyDate::from),
+        completed_at: entry.completed_at.map(FuzzyDate::from),
         custom_lists: entry
             .custom_lists
             .unwrap_or_default()
@@ -1773,6 +1862,20 @@ mod tests {
 }
 
 #[cfg(test)]
+pub(crate) fn mock_media(id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "idMal": null,
+        "title": {"romaji": null, "english": null, "native": null},
+        "coverImage": null, "episodes": null, "format": null, "status": null,
+        "averageScore": null, "season": null, "seasonYear": null,
+        "description": null, "nextAiringEpisode": null,
+        "bannerImage": null, "genres": null, "duration": null, "source": null,
+        "studios": null, "relations": {"edges": []},
+        "characters": {"edges": []}, "staff": {"edges": []}
+    })
+}
+
+#[cfg(test)]
 pub(crate) async fn mock_api(
     responses: Vec<(u16, serde_json::Value)>,
 ) -> (
@@ -2021,7 +2124,7 @@ mod feature_tests {
     async fn search_returns_page_boundaries_from_anilist() {
         let (api, mut requests) = mock_api(vec![(
             200,
-            json!({"data":{"Page":{"pageInfo":{"hasNextPage":true},"media":[{"id":26}]}}}),
+            json!({"data":{"Page":{"pageInfo":{"hasNextPage":true},"media":[mock_media(26)]}}}),
         )])
         .await;
         let page = api.search_page("Show", 2, 25).await.unwrap();
@@ -2061,15 +2164,238 @@ mod feature_tests {
     }
 
     #[tokio::test]
+    async fn incomplete_mark_read_replies_do_not_report_success() {
+        for reply in [
+            json!({"data":null}),
+            json!({"data":{}}),
+            json!({"data":{"Page":null}}),
+            json!({"data":{"Page":{}}}),
+            json!({"data":{"Page":{"notifications":null}}}),
+        ] {
+            let (api, _) = mock_api(vec![(200, reply)]).await;
+            let error = api
+                .mark_notifications_read()
+                .await
+                .expect_err("missing acknowledgement");
+            assert!(is_retryable(&error));
+            assert!(!is_auth_rejection(&error));
+        }
+        for notifications in [json!([]), json!([{}]), json!([{"id":8}])] {
+            let (api, mut requests) = mock_api(vec![(
+                200,
+                json!({"data":{"Page":{"notifications":notifications}}}),
+            )])
+            .await;
+            api.mark_notifications_read().await.unwrap();
+            assert!(requests.recv().await.unwrap()["query"]
+                .as_str()
+                .unwrap()
+                .contains("resetNotificationCount: true"));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_statistics_still_allow_zero_counts_and_null_buckets() {
+        for null_members in [false, true] {
+            let mut anime = json!({
+                "count":0,"episodesWatched":0,"minutesWatched":0,
+                "meanScore":0.0,"standardDeviation":0.0,
+                "scores":null,"statuses":null,"formats":null,"genres":null,"releaseYears":null
+            });
+            if null_members {
+                anime["statuses"] = json!([{"status":null,"count":0}]);
+                anime["formats"] = json!([{"format":null,"count":0}]);
+                anime["genres"] = json!([{"genre":null,"count":0,"minutesWatched":null}]);
+                anime["releaseYears"] = json!([{"releaseYear":null,"count":0}]);
+            }
+            let (api, _) = mock_api(vec![(
+                200,
+                json!({"data":{"User":{"statistics":{"anime":anime}}}}),
+            )])
+            .await;
+            let found = api.user_statistics("Tester").await.unwrap();
+            assert_eq!(found.count, 0);
+            assert_eq!(found.episodes_watched, 0);
+            assert!(found.scores.is_empty());
+            assert!(found.statuses.is_empty());
+            assert!(found.formats.is_empty());
+            assert!(found.genres.is_empty());
+            assert!(found.release_years.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_media_cannot_pass_through_other_query_paths() {
+        let mut media = mock_media(1);
+        media.as_object_mut().unwrap().remove("episodes");
+        for path in [
+            "search",
+            "season",
+            "recommendations",
+            "calendar",
+            "list",
+            "relations",
+        ] {
+            let data = match path {
+                "search" | "season" => json!({"Page":{
+                    "pageInfo":{"hasNextPage":false},"media":[media]
+                }}),
+                "recommendations" => {
+                    json!({"Page":{"recommendations":[{"mediaRecommendation":media}]}})
+                }
+                "calendar" => {
+                    let mut airing = media.clone();
+                    airing["isAdult"] = json!(false);
+                    json!({"Page":{"pageInfo":{"hasNextPage":false},"airingSchedules":[{
+                        "airingAt":1000,"episode":1,"media":airing
+                    }]}})
+                }
+                "list" => json!({"MediaListCollection":{"hasNextChunk":false,"lists":[{"entries":[{
+                    "id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,
+                    "repeat":0,"updatedAt":null,"media":media
+                }]}]}}),
+                "relations" => {
+                    let mut parent = mock_media(2);
+                    let mut relation = media.clone();
+                    relation["type"] = json!("ANIME");
+                    parent["relations"] =
+                        json!({"edges":[{"relationType":"SEQUEL","node":relation}]});
+                    json!({"Media":parent})
+                }
+                _ => unreachable!(),
+            };
+            let (api, _) = mock_api(vec![(200, json!({"data":data}))]).await;
+            let result = match path {
+                "search" => api.search_page("Show", 1, 25).await.map(|_| ()),
+                "season" => api.season_all("WINTER", 2026).await.map(|_| ()),
+                "recommendations" => api.recommendations(1).await.map(|_| ()),
+                "calendar" => api.airing_schedule(1, 2000).await.map(|_| ()),
+                "list" => api.user_list("Tester").await.map(|_| ()),
+                "relations" => api.media_detail(2).await.map(|_| ()),
+                _ => unreachable!(),
+            };
+            let error = result.expect_err(path);
+            assert!(is_retryable(&error), "{path}");
+            assert!(!is_auth_rejection(&error), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_nested_media_fields_do_not_become_explicit_nulls() {
+        for (parent, field) in [
+            ("title", "romaji"),
+            ("title", "english"),
+            ("title", "native"),
+            ("coverImage", "medium"),
+            ("coverImage", "large"),
+            ("nextAiringEpisode", "episode"),
+            ("nextAiringEpisode", "airingAt"),
+            ("studios", "nodes"),
+        ] {
+            let mut media = mock_media(1);
+            media["coverImage"] = json!({"medium":null,"large":null});
+            media["nextAiringEpisode"] = json!({"episode":1,"airingAt":1000});
+            media["studios"] = json!({"nodes":[]});
+            media[parent].as_object_mut().unwrap().remove(field);
+            let (api, _) = mock_api(vec![(200, json!({"data":{"Media":media}}))]).await;
+            let error = api.media_detail(1).await.expect_err(field);
+            assert!(is_retryable(&error), "missing {parent}.{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queried_media_must_match_the_requested_identity() {
+        for details in [false, true] {
+            let (api, _) = mock_api(vec![(200, json!({"data":{"Media":mock_media(2)}}))]).await;
+            let result = if details {
+                api.media_detail(1).await.map(|detail| detail.media)
+            } else {
+                api.media_by_id(1).await
+            };
+            let error = result.expect_err("a different anime must not satisfy this request");
+            assert!(is_retryable(&error));
+            assert!(!media_not_found(&error));
+            assert!(!is_auth_rejection(&error));
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_queries_require_selected_fields_but_allow_explicit_nulls() {
+        for field in [
+            "id",
+            "idMal",
+            "title",
+            "coverImage",
+            "episodes",
+            "format",
+            "status",
+            "averageScore",
+            "season",
+            "seasonYear",
+            "description",
+            "nextAiringEpisode",
+        ] {
+            let mut media = mock_media(1);
+            media.as_object_mut().unwrap().remove(field);
+            let (api, _) = mock_api(vec![(200, json!({"data":{"Media":media}}))]).await;
+            let error = api.media_by_id(1).await.expect_err(field);
+            assert!(is_retryable(&error), "missing {field}");
+        }
+        let mut summary = mock_media(1);
+        for field in [
+            "bannerImage",
+            "genres",
+            "duration",
+            "source",
+            "studios",
+            "relations",
+            "characters",
+            "staff",
+        ] {
+            summary.as_object_mut().unwrap().remove(field);
+        }
+        let (api, _) = mock_api(vec![(200, json!({"data":{"Media":summary}}))]).await;
+        let media = api.media_by_id(1).await.unwrap();
+        assert_eq!(media.id, 1);
+        assert_eq!(media.episodes, None);
+        assert_eq!(media.cover_medium, None);
+    }
+
+    #[tokio::test]
     async fn details_distinguish_missing_sections_from_empty_sections() {
-        let (api, _) = mock_api(vec![(200, json!({"data":{"Media":{"id":1,"relations":null,"characters":{"edges":[]},"staff":null}}}))]).await;
+        let mut media = mock_media(1);
+        media["relations"] = json!(null);
+        media["staff"] = json!(null);
+        let (api, _) = mock_api(vec![(200, json!({"data":{"Media":media}}))]).await;
         let details = api.media_detail(1).await.unwrap();
         assert_eq!(details.unavailable_sections, vec!["relations", "staff"]);
     }
 
     #[tokio::test]
+    async fn explicit_null_metadata_is_a_valid_empty_entry() {
+        let empty =
+            json!({"id":22,"notes":null,"startedAt":null,"completedAt":null,"customLists":null});
+        let (api, _) = mock_api(vec![
+            (200, json!({"data":{"Media":{"mediaListEntry":empty}}})),
+            (200, json!({"data":{"SaveMediaListEntry":empty}})),
+        ])
+        .await;
+        for details in [
+            api.entry_details(1).await.unwrap(),
+            api.save_entry_details(22, Some(""), None, None, None)
+                .await
+                .unwrap(),
+        ] {
+            assert!(details.notes.is_empty());
+            assert!(details.started_at.is_none());
+            assert!(details.completed_at.is_none());
+            assert!(details.custom_lists.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn notes_mutation_omits_untouched_dates_lists_and_progress() {
-        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":{"year":2024,"month":null,"day":null},"customLists":{"Favorites":true,"Other":false}}}}))]).await;
+        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":{"year":2024,"month":null,"day":null},"completedAt":null,"customLists":{"Favorites":true,"Other":false}}}}))]).await;
         let result = api
             .save_entry_details(1, Some("New note"), None, None, None)
             .await

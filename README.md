@@ -50,7 +50,7 @@ Output: `src-tauri/target/release/`. Use `npm run tauri dev` for development.
 
 Set `KURISU_BUILD_VERSION` to the newest published version for local release builds to avoid repeat update prompts. Disable automatic checks to keep a custom build.
 
-Run the CI checks from the program root. Rust tests on Unix require MPV on `PATH` for the live IPC test.
+Run the CI checks from the program root. Rust tests on Unix require MPV on `PATH` for the live IPC test. Linux tests also require `dbus-daemon` for the isolated MPRIS test.
 
 ```sh
 npm run check

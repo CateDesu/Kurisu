@@ -37,7 +37,7 @@
   const atMax = $derived(pending >= (total ?? 9999));
 
   function step(delta: number) {
-    if (installInFlight()) return;
+    if (saving || installInFlight() || auth.changingSession) return;
     let next = pending + delta;
     if (next < 0) next = 0;
     const max = total ?? 9999;
@@ -46,7 +46,12 @@
     pending = next;
     unregister = registerPendingEdit(flush, editKey);
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => { void commit().catch(() => {}); }, 3000);
+    timer = null;
+    if (total != null && total > 0 && next === total) {
+      void commit().catch(() => {});
+    } else {
+      timer = setTimeout(() => { void commit().catch(() => {}); }, 3000);
+    }
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -151,7 +156,7 @@
     type="button"
     onclick={(e) => { e.stopPropagation(); step(-1); }}
     onkeydown={onKeydown}
-    disabled={atMin || saving || installInFlight()}
+    disabled={atMin || saving || installInFlight() || auth.changingSession}
     aria-label="One less episode"
     class={btnCls}>−</button
   >
@@ -166,7 +171,7 @@
     type="button"
     onclick={(e) => { e.stopPropagation(); step(1); }}
     onkeydown={onKeydown}
-    disabled={atMax || saving || installInFlight()}
+    disabled={atMax || saving || installInFlight() || auth.changingSession}
     aria-label="One more episode"
     class={btnCls}>+</button
   >

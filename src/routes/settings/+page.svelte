@@ -15,6 +15,8 @@
 
   let closeToTray = $state(false);
   const isLinux = typeof navigator !== "undefined" && navigator.userAgent.includes("Linux");
+  const isWindows = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+  const defaultMpvSocket = isWindows ? String.raw`\\.\pipe\mpvsocket` : "/tmp/mpvsocket";
   let hardwareAcceleration = $state(false);
   let renderingSaved = $state(false);
 
@@ -100,7 +102,7 @@
     if (!trackingLoaded || trackingSaving) return;
     trackingSaving = true;
     trackingError = "";
-    // Normalize empty and fractional inputs before sending Rust integer parameters.
+    // Rust integer parameters need whole numbers.
     const int = (v: unknown, fallback: number, lo: number, hi: number) => {
       if (v == null || v === "") return fallback;
       const n = Math.round(Number(v));
@@ -207,11 +209,6 @@
       </button>
     {:else}
       <p class="text-sm text-ink-dim mb-3">Not signed in.</p>
-      {#if signInErr}
-        <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-3">
-          {signInErr}
-        </div>
-      {/if}
       <button
         onclick={signIn}
         disabled={signingIn}
@@ -220,12 +217,17 @@
         {signingIn ? "Connecting…" : "Sign in with AniList"}
       </button>
     {/if}
+    {#if signInErr}
+      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-3" role="alert">
+        {signInErr}
+      </div>
+    {/if}
   </section>
 
   <section class="pt-4 border-t border-edge">
     <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Playback tracking</h2>
     <p class="text-sm text-ink-dim mb-3">
-      Detect playback in MPV/VLC/Celluloid (any MPRIS2 player) and update your list.
+      Detect playback through {isWindows ? "Windows media sessions" : "MPRIS2 players such as VLC and Celluloid"} and update your list.
       Bare MPV is detected through its IPC socket.
     </p>
     <fieldset disabled={!trackingLoaded} class="min-w-0">
@@ -302,14 +304,14 @@
       <input
         id="mpv-sock"
         type="text"
-        placeholder="/tmp/mpvsocket"
+        placeholder={defaultMpvSocket}
         bind:value={cfg.mpv_ipc_socket}
         oninput={() => (trackingSavedAt = 0)}
         class="w-full bg-panel border border-edge rounded-md px-2 py-1 text-sm font-mono focus:outline-none focus:border-accent"
       />
       <p class="text-xs text-ink-dim mt-1">
         Bare MPV doesn't report playback to the OS, so Kurisu reads mpv's IPC socket
-        directly. Turn it on with <code>input-ipc-server=/tmp/mpvsocket</code> in your
+        directly. Turn it on with <code>input-ipc-server={defaultMpvSocket}</code> in your
         mpv.conf. Leave this blank to try the common default paths.
       </p>
     </div>

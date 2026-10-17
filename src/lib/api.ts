@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { trackPendingSave } from "./pendingEdits";
 import type {
   EntryDetails,
   FuzzyDate,
@@ -65,7 +66,7 @@ export const api = {
 
   getEntryDetails: (mediaId: number) => invoke<EntryDetails>("get_entry_details", { mediaId }),
   updateEntryDetails: (mediaId: number, notes: string | null, startedAt: FuzzyDate | null, completedAt: FuzzyDate | null, customLists: string[] | null) =>
-    invoke<EntryDetails>("update_entry_details", { mediaId, notes, startedAt, completedAt, customLists }),
+    trackPendingSave(invoke<EntryDetails>("update_entry_details", { mediaId, notes, startedAt, completedAt, customLists })),
 
   syncMyList: () => invoke<ListEntry[]>("sync_my_list"),
   localEntries: () => invoke<ListEntry[]>("local_entries"),
@@ -76,11 +77,11 @@ export const api = {
     score: number | null,
     repeat: number | null
   ) =>
-    invoke<ListEntry>("update_entry", { mediaId, status, progress, score, repeat }),
+    trackPendingSave(invoke<ListEntry>("update_entry", { mediaId, status, progress, score, repeat })),
   setProgress: (mediaId: number, progress: number, expected?: number) =>
-    invoke<ListEntry>("set_progress", { mediaId, progress, expected }),
+    trackPendingSave(invoke<ListEntry>("set_progress", { mediaId, progress, expected })),
   deleteEntry: (mediaId: number) =>
-    invoke<void>("delete_entry_cmd", { mediaId }),
+    trackPendingSave(invoke<void>("delete_entry_cmd", { mediaId })),
 
   getNotificationsPage: (page = 1) => invoke<NotificationPage>("get_notifications_page", { page }),
   markNotificationsRead: () => invoke<void>("mark_notifications_read"),

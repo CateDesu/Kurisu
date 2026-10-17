@@ -757,7 +757,8 @@ pub fn get_entry(media_id: i64, state: State<'_, AppState>) -> Result<Option<Lis
 const MEDIA_GONE: &str =
     "AniList no longer has this anime. It was likely merged into another entry. Search for it to re-add the correct one.";
 
-/// Null fields stay unchanged on AniList. Completing fills progress when the total is known.
+/// Reaching the total completes unless another status is chosen.
+/// Completed fills progress to the known total.
 #[tauri::command]
 pub async fn update_entry(
     media_id: i64,
@@ -783,6 +784,7 @@ pub async fn save_entry_inner(
     let _write = state.entry_lock.lock().await;
     check_write_session(state, &expected_token)?;
     let st = status.as_deref().map(parse_status).transpose()?;
+    let status = st.map(|status| status.as_str().to_string());
     if status.is_none() && progress.is_none() && score.is_none() && repeat.is_none() {
         return Err("nothing to update".to_string());
     }
@@ -795,6 +797,8 @@ pub async fn save_entry_inner(
     };
     let media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
     let total = media.as_ref().and_then(|m| m.episodes);
+    let requested_progress = progress;
+    let (status, repeat) = complete_progress_edit(status, progress, repeat, total, before.as_ref());
     let mut progress = progress.map(|p| p.max(0));
     if let (Some(t), Some(p)) = (total, progress.as_mut()) {
         *p = (*p).min(t);
@@ -814,18 +818,19 @@ pub async fn save_entry_inner(
         match result {
             Ok(Some(remote)) => {
                 let remote_rewatch = start_rewatch && remote.status == "COMPLETED";
-                state
-                    .db
-                    .upsert_entry(&ListEntry {
-                        id: Some(remote.id),
-                        media_id,
-                        status: remote.status,
-                        progress: remote.progress,
-                        score: remote.score,
-                        repeat: remote.repeat,
-                        ..Default::default()
-                    })
-                    .map_err(|e| e.to_string())?;
+                let entry = ListEntry {
+                    id: Some(remote.id),
+                    media_id,
+                    status: remote.status,
+                    progress: remote.progress,
+                    score: remote.score,
+                    repeat: remote.repeat,
+                    updated_at: remote.updated_at,
+                    ..Default::default()
+                };
+                state.db.upsert_entry(&entry).map_err(|e| e.to_string())?;
+                let (status, repeat) =
+                    complete_progress_edit(status, requested_progress, repeat, total, Some(&entry));
                 state.refresh_matchers();
                 drop(_write);
                 return save_entry_unlocked(
@@ -873,6 +878,35 @@ pub async fn save_entry_inner(
         drop(_write);
     }
     save_entry_unlocked(state, media_id, status, progress, score, repeat).await
+}
+
+fn complete_progress_edit(
+    status: Option<String>,
+    progress: Option<i64>,
+    repeat: Option<i64>,
+    total: Option<i64>,
+    before: Option<&ListEntry>,
+) -> (Option<String>, Option<i64>) {
+    if !progress.is_some_and(|p| at_last_episode(total, p))
+        || status
+            .as_deref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case("COMPLETED"))
+    {
+        return (status, repeat);
+    }
+    let repeat = repeat.or_else(|| {
+        before
+            .filter(|entry| {
+                entry.status == "REPEATING" && progress.is_some_and(|p| entry.progress < p)
+            })
+            .map(|entry| entry.repeat + 1)
+    });
+    let status = if before.is_none_or(|entry| entry.status != "COMPLETED") {
+        Some("COMPLETED".into())
+    } else {
+        status
+    };
+    (status, repeat)
 }
 
 /// Caller holds remote_lock and sends only changed fields.
@@ -971,7 +1005,11 @@ async fn save_entry_unlocked(
         progress: saved.progress,
         score: saved.score,
         repeat: saved.repeat,
-        updated_at: Some(chrono::Utc::now().timestamp()),
+        updated_at: Some(
+            saved
+                .updated_at
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        ),
         media: state.db.get_media(media_id).map_err(|e| e.to_string())?,
     };
     state.db.upsert_entry(&entry).map_err(|e| e.to_string())?;
@@ -1373,7 +1411,7 @@ pub async fn fetch_torrents(state: State<'_, AppState>) -> Result<TorrentFetch, 
                 None => (None, None),
             };
             let was_seen = crate::show_torrents::was_seen(&r, &seen);
-            // Episodes beyond the known total may belong to another season. Never flag them as new.
+            // Episodes beyond the total may belong to another season, so hide new flags.
             let within_total = match (episode, total) {
                 (Some(ep), Some(t)) => ep <= t,
                 _ => true,
@@ -1392,7 +1430,7 @@ pub async fn fetch_torrents(state: State<'_, AppState>) -> Result<TorrentFetch, 
         })
         .collect();
     items.sort_by_key(|i| std::cmp::Reverse(i.published.unwrap_or(0)));
-    // Keep seen marks for items still in the feed so old releases do not become new again.
+    // Retain seen marks for current feed items to avoid flagging old releases.
     carried.extend(items.iter().map(|i| i.guid.clone()));
     let _ = state.db.prune_rss_seen_keeping(60, &carried);
     Ok(TorrentFetch { items, failures })
@@ -1723,7 +1761,7 @@ pub async fn check_update() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
-    // Concurrent installs would share and truncate the same scratch files.
+    // Serialize installs to prevent scratch file collisions.
     let _install = INSTALL_LOCK
         .try_lock()
         .map_err(|_| "an update is already in progress".to_string())?;
@@ -1763,7 +1801,7 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
             })?;
         crate::updater::download(&url, &tmp).await?;
 
-        // Verify and install from the same open handle so the file cannot be swapped between them.
+        // Install through the verified handle to prevent replacement races.
         let verify = async {
             let tmp2 = tmp.clone();
             match tokio::task::spawn_blocking(move || {
@@ -1788,7 +1826,7 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
 
         #[cfg(windows)]
         let outcome = (|| {
-            // Keep the verified handle open through spawn to prevent installer replacement.
+            // Hold the verified handle through spawn to prevent replacement.
             if let Err(e) = std::process::Command::new(&tmp).spawn() {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!("could not launch the installer: {e}"));
@@ -2770,6 +2808,196 @@ mod feature_cache_tests {
     }
 
     #[tokio::test]
+    async fn incomplete_detail_replies_preserve_the_complete_cached_snapshot() {
+        let complete = json!({
+            "id": 1, "idMal": null,
+            "title": {"romaji": null, "english": "Saved show", "native": null},
+            "coverImage": {"medium": null, "large": null},
+            "episodes": 12, "format": "TV", "status": "FINISHED",
+            "averageScore": null, "season": null, "seasonYear": null,
+            "description": "Saved description", "nextAiringEpisode": null,
+            "bannerImage": "saved.jpg", "genres": ["Action"], "duration": 24,
+            "source": "MANGA", "studios": {"nodes": [{"name": "Saved studio"}]},
+            "relations": {"edges": []}, "characters": {"edges": []}, "staff": {"edges": []}
+        });
+        for field in [
+            "id",
+            "idMal",
+            "title",
+            "coverImage",
+            "episodes",
+            "format",
+            "status",
+            "averageScore",
+            "season",
+            "seasonYear",
+            "description",
+            "nextAiringEpisode",
+            "bannerImage",
+            "genres",
+            "duration",
+            "source",
+            "studios",
+        ] {
+            let mut incomplete = complete.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            let (api, _) = anilist::mock_api(vec![
+                (200, json!({"data": {"Media": complete}})),
+                (200, json!({"data": {"Media": incomplete}})),
+            ])
+            .await;
+            let state = state(api);
+            get_media_detail_inner(1, &state).await.unwrap();
+
+            let found = get_media_detail_inner(1, &state).await.unwrap();
+            assert!(
+                found.warning.is_some(),
+                "missing {field} was accepted as fresh metadata"
+            );
+            assert_eq!(found.media.id, 1, "missing {field}");
+            assert_eq!(found.media.episodes, Some(12), "missing {field}");
+            assert_eq!(
+                found.media.banner_image.as_deref(),
+                Some("saved.jpg"),
+                "missing {field}"
+            );
+            let stored = state.db.get_media(1).unwrap().unwrap();
+            assert_eq!(stored.episodes, Some(12), "missing {field}");
+            assert_eq!(
+                stored.description.as_deref(),
+                Some("Saved description"),
+                "missing {field}"
+            );
+            assert_eq!(
+                stored.genres,
+                Some(vec!["Action".into()]),
+                "missing {field}"
+            );
+            assert!(state.db.get_media(0).unwrap().is_none(), "missing {field}");
+            assert!(state.anilist.lock().has_token(), "missing {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_detail_identity_preserves_the_requested_cached_show() {
+        let mut saved = anilist::mock_media(1);
+        saved["title"]["english"] = json!("Saved show");
+        saved["episodes"] = json!(12);
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":saved}})),
+            (200, json!({"data":{"Media":anilist::mock_media(2)}})),
+        ])
+        .await;
+        let state = state(api);
+        get_media_detail_inner(1, &state).await.unwrap();
+
+        let found = get_media_detail_inner(1, &state).await.unwrap();
+        assert!(found.warning.is_some());
+        assert_eq!(found.media.id, 1);
+        assert_eq!(found.media.episodes, Some(12));
+        assert!(state.db.get_media(2).unwrap().is_none());
+        let stored: MediaDetail =
+            serde_json::from_str(&state.db.get_setting("media_detail:1").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(stored.media.id, 1);
+        assert!(state.anilist.lock().has_token());
+    }
+
+    #[tokio::test]
+    async fn explicit_null_detail_fields_still_clear_cached_values() {
+        let mut saved = anilist::mock_media(1);
+        saved["episodes"] = json!(12);
+        saved["bannerImage"] = json!("saved.jpg");
+        saved["genres"] = json!(["Action"]);
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":saved}})),
+            (200, json!({"data":{"Media":anilist::mock_media(1)}})),
+        ])
+        .await;
+        let state = state(api);
+        get_media_detail_inner(1, &state).await.unwrap();
+
+        let found = get_media_detail_inner(1, &state).await.unwrap();
+        assert!(found.warning.is_none());
+        assert_eq!(found.media.id, 1);
+        assert_eq!(found.media.episodes, None);
+        assert_eq!(found.media.banner_image, None);
+        assert_eq!(found.media.genres, None);
+        let stored = state.db.get_media(1).unwrap().unwrap();
+        assert_eq!(stored.episodes, None);
+        assert_eq!(stored.banner_image, None);
+        assert_eq!(stored.genres, None);
+    }
+
+    #[tokio::test]
+    async fn incomplete_statistics_replies_preserve_cached_statistics() {
+        let complete = json!({
+            "count": 3, "episodesWatched": 36, "minutesWatched": 864,
+            "meanScore": 80.0, "standardDeviation": 4.0,
+            "scores": [{"score": 80, "count": 3}],
+            "statuses": [{"status": "COMPLETED", "count": 3}],
+            "formats": [{"format": "TV", "count": 3}],
+            "genres": [{"genre": "Action", "count": 3, "minutesWatched": 864}],
+            "releaseYears": [{"releaseYear": 2024, "count": 3}]
+        });
+        for field in [
+            "count",
+            "episodesWatched",
+            "minutesWatched",
+            "meanScore",
+            "standardDeviation",
+            "scores",
+            "statuses",
+            "formats",
+            "genres",
+            "releaseYears",
+            "statuses.status",
+            "formats.format",
+            "genres.genre",
+            "genres.minutesWatched",
+            "releaseYears.releaseYear",
+        ] {
+            let mut incomplete = complete.clone();
+            if let Some((bucket, nested)) = field.split_once('.') {
+                incomplete[bucket][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(nested);
+            } else {
+                incomplete.as_object_mut().unwrap().remove(field);
+            }
+            let (api, _) = anilist::mock_api(vec![
+                (
+                    200,
+                    json!({"data":{"User":{"statistics":{"anime":complete}}}}),
+                ),
+                (
+                    200,
+                    json!({"data":{"User":{"statistics":{"anime":incomplete}}}}),
+                ),
+            ])
+            .await;
+            let state = state(api);
+            get_user_stats_inner(&state).await.unwrap();
+
+            let found = get_user_stats_inner(&state).await.unwrap();
+            assert!(
+                found.warning.is_some(),
+                "missing {field} was accepted as fresh statistics"
+            );
+            assert_eq!(found.count, 3, "missing {field}");
+            assert_eq!(found.episodes_watched, 36, "missing {field}");
+            assert_eq!(found.scores[0].score, 80, "missing {field}");
+            let stored: UserStats =
+                serde_json::from_str(&state.db.get_setting("user_stats:7").unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(stored.count, 3, "missing {field}");
+            assert_eq!(stored.episodes_watched, 36, "missing {field}");
+            assert!(state.anilist.lock().has_token(), "missing {field}");
+        }
+    }
+
+    #[tokio::test]
     async fn adversarial_detail_rejections_expire_sessions_instead_of_returning_cached_success() {
         for status in [200, 401] {
             for cache in ["details", "media", "none"] {
@@ -2935,12 +3163,10 @@ mod feature_cache_tests {
 
     #[tokio::test]
     async fn adversarial_fresh_details_update_playback_episode_recognition() {
-        let (api, _) = anilist::mock_api(vec![(
-            200,
-            json!({"data":{"Media":{"id":1,"title":{"english":"Some Movie"},"episodes":1,
-                "relations":{"edges":[]},"characters":{"edges":[]},"staff":{"edges":[]}}}}),
-        )])
-        .await;
+        let mut media = anilist::mock_media(1);
+        media["title"]["english"] = json!("Some Movie");
+        media["episodes"] = json!(1);
+        let (api, _) = anilist::mock_api(vec![(200, json!({"data":{"Media":media}}))]).await;
         let state = state(api);
         state
             .db
@@ -2982,6 +3208,108 @@ mod feature_cache_tests {
     }
 
     #[tokio::test]
+    async fn incomplete_metadata_preserves_cached_fields_and_does_not_report_saved() {
+        let complete = json!({"id":22,"notes":"Remote note",
+            "startedAt":{"year":2024,"month":1,"day":2},
+            "completedAt":{"year":2024,"month":2,"day":3},"customLists":{}});
+        for missing in [
+            "notes",
+            "startedAt",
+            "completedAt",
+            "customLists",
+            "startedAt.year",
+            "startedAt.month",
+            "startedAt.day",
+            "completedAt.year",
+            "completedAt.month",
+            "completedAt.day",
+        ] {
+            for operation in ["read", "preflight", "save"] {
+                let mut incomplete = complete.clone();
+                if let Some((parent, field)) = missing.split_once('.') {
+                    incomplete[parent].as_object_mut().unwrap().remove(field);
+                } else {
+                    incomplete.as_object_mut().unwrap().remove(missing);
+                }
+                let lookup = if operation == "save" {
+                    complete.clone()
+                } else {
+                    incomplete.clone()
+                };
+                let (api, mut requests) = anilist::mock_api(vec![
+                    (200, json!({"data":{"Media":{"mediaListEntry":lookup}}})),
+                    (200, json!({"data":{"SaveMediaListEntry":incomplete}})),
+                ])
+                .await;
+                let state = state(api);
+                pending_progress(&state);
+                let cached = EntryDetails {
+                    notes: "Saved note".into(),
+                    started_at: Some(FuzzyDate {
+                        year: Some(2024),
+                        month: Some(1),
+                        day: Some(2),
+                    }),
+                    completed_at: Some(FuzzyDate {
+                        year: Some(2024),
+                        month: Some(2),
+                        day: Some(3),
+                    }),
+                    custom_lists: vec!["Favorites".into()],
+                    cached_at: Some(100),
+                    ..Default::default()
+                };
+                let saved = serde_json::to_string(&cached).unwrap();
+                state.db.set_setting("entry_details:7:1", &saved).unwrap();
+                if operation == "read" {
+                    let recovered = get_entry_details_inner(1, &state).await.unwrap();
+                    assert!(
+                        recovered.warning.is_some(),
+                        "missing {missing} was accepted as fresh metadata"
+                    );
+                    assert_eq!(recovered.notes, cached.notes);
+                    assert_eq!(recovered.started_at, cached.started_at);
+                    assert_eq!(recovered.completed_at, cached.completed_at);
+                    assert_eq!(recovered.custom_lists, cached.custom_lists);
+                    assert_eq!(recovered.cached_at, Some(100));
+                } else {
+                    assert!(
+                        update_entry_details_inner(
+                            1,
+                            Some("New note".into()),
+                            None,
+                            None,
+                            None,
+                            &state
+                        )
+                        .await
+                        .is_err(),
+                        "incomplete {operation} with missing {missing} reported success"
+                    );
+                }
+                requests.recv().await.unwrap();
+                if operation == "save" {
+                    assert_eq!(
+                        requests.recv().await.unwrap()["variables"]["notes"],
+                        "New note"
+                    );
+                } else {
+                    assert!(
+                        requests.try_recv().is_err(),
+                        "incomplete preflight must not send a mutation"
+                    );
+                }
+                assert_eq!(
+                    state.db.get_setting("entry_details:7:1").unwrap(),
+                    Some(saved)
+                );
+                assert!(state.anilist.lock().has_token());
+                assert_eq!(state.db.pending(7).unwrap()[0].patch.progress, Some(4));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn metadata_updates_target_the_preflight_entry_identity() {
         for removed in [false, true] {
             let response = if removed {
@@ -2992,11 +3320,11 @@ mod feature_cache_tests {
             } else {
                 (
                     200,
-                    json!({"data":{"SaveMediaListEntry":{"notes":"New note","customLists":{}}}}),
+                    json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":null,"completedAt":null,"customLists":{}}}}),
                 )
             };
             let (api, mut requests) = anilist::mock_api(vec![
-                (200, json!({"data":{"Media":{"mediaListEntry":{"id":22,"notes":"Old note","customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})),
+                (200, json!({"data":{"Media":{"mediaListEntry":{"id":22,"notes":"Old note","startedAt":null,"completedAt":null,"customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})),
                 response,
             ]).await;
             let state = state(api);
@@ -3040,8 +3368,8 @@ mod feature_cache_tests {
     #[tokio::test]
     async fn metadata_without_entry_identity_does_not_send_a_write() {
         let (api, mut requests) = anilist::mock_api(vec![
-            (200, json!({"data":{"Media":{"mediaListEntry":{"notes":"Old note","customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})),
-            (200, json!({"data":{"SaveMediaListEntry":{"notes":"New note","customLists":{}}}})),
+            (200, json!({"data":{"Media":{"mediaListEntry":{"notes":"Old note","startedAt":null,"completedAt":null,"customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})),
+            (200, json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":null,"completedAt":null,"customLists":{}}}})),
         ]).await;
         let state = state(api);
         let result =
@@ -3096,7 +3424,7 @@ mod feature_cache_tests {
         for reject_lookup in [true, false] {
             let mut responses = vec![];
             if !reject_lookup {
-                responses.push((200, json!({"data":{"Media":{"mediaListEntry":{"id":22,"notes":"Old note","customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})));
+                responses.push((200, json!({"data":{"Media":{"mediaListEntry":{"id":22,"notes":"Old note","startedAt":null,"completedAt":null,"customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})));
             }
             responses.push((401, rejected.clone()));
             let (api, _) = anilist::mock_api(responses).await;
@@ -3132,7 +3460,7 @@ mod feature_cache_tests {
             let error = json!({"errors":[{"status":status,"message":"Feature temporarily unavailable"}],"data":null});
             let (api, _) = anilist::mock_api(vec![
                 (status, error.clone()),
-                (200, json!({"data":{"Media":{"mediaListEntry":{"id":22,"notes":"Old note","customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})),
+                (200, json!({"data":{"Media":{"mediaListEntry":{"id":22,"notes":"Old note","startedAt":null,"completedAt":null,"customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}}})),
                 (status, error.clone()),
                 (status, error.clone()),
                 (status, error),
@@ -3331,6 +3659,397 @@ mod persistence_tests {
 
     fn remote() -> serde_json::Value {
         json!({"id":22,"mediaId":1,"status":"COMPLETED","progress":12,"repeat":2,"score":70})
+    }
+
+    #[tokio::test]
+    async fn accepted_status_spellings_match_online_and_offline() {
+        for (requested, canonical) in [
+            ("watching", "CURRENT"),
+            ("plan_to_watch", "PLANNING"),
+            ("completed", "COMPLETED"),
+            ("repeating", "REPEATING"),
+        ] {
+            for offline in [false, true] {
+                let progress = if canonical == "COMPLETED" { 12 } else { 3 };
+                let mut before = remote();
+                before["status"] = json!("PAUSED");
+                before["progress"] = json!(3);
+                let mut after = before.clone();
+                after["status"] = json!(canonical);
+                after["progress"] = json!(progress);
+                let responses = if offline {
+                    vec![
+                        (503, json!({"errors":[{"message":"Unavailable"}]})),
+                        (200, json!({"data":{"Media":{"mediaListEntry":before}}})),
+                        (200, json!({"data":{"SaveMediaListEntry":after}})),
+                    ]
+                } else {
+                    vec![(200, json!({"data":{"SaveMediaListEntry":after}}))]
+                };
+                let (api, mut requests) = anilist::mock_api(responses).await;
+                let state = state(api);
+                let mut entry = state.db.get_entry(1).unwrap().unwrap();
+                entry.status = "PAUSED".into();
+                entry.progress = 3;
+                state.db.upsert_entry(&entry).unwrap();
+
+                let saved = save_entry_inner(&state, 1, Some(requested.into()), None, None, None)
+                    .await
+                    .unwrap();
+
+                assert_eq!(saved.status, canonical, "{requested}, offline={offline}");
+                assert_eq!(saved.progress, progress);
+                let sent = requests.recv().await.unwrap();
+                assert_eq!(sent["variables"]["status"], canonical);
+                if offline {
+                    assert_eq!(
+                        state.db.pending(7).unwrap()[0].patch.status.as_deref(),
+                        Some(canonical)
+                    );
+                    assert_eq!(
+                        local_entries_inner(&state).await.unwrap()[0].status,
+                        canonical
+                    );
+                    crate::sync_queue::flush_unlocked(&state).await.unwrap();
+                    requests.recv().await.unwrap();
+                    assert_eq!(
+                        requests.recv().await.unwrap()["variables"],
+                        sent["variables"]
+                    );
+                }
+                assert_eq!(state.db.get_entry(1).unwrap().unwrap().status, canonical);
+                assert!(state.db.pending(7).unwrap().is_empty());
+                assert!(requests.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_episode_edits_complete_online_and_after_offline_retry() {
+        for offline in [false, true] {
+            for stepper in [false, true] {
+                for previous_status in ["CURRENT", "REPEATING"] {
+                    let mut before = remote();
+                    before["status"] = json!(previous_status);
+                    before["progress"] = json!(11);
+                    let mut after = remote();
+                    let finishing_rewatch = previous_status == "REPEATING";
+                    after["repeat"] = json!(if finishing_rewatch { 3 } else { 2 });
+                    let responses = if offline {
+                        vec![
+                            (503, json!({"errors":[{"message":"Unavailable"}]})),
+                            (200, json!({"data":{"Media":{"mediaListEntry":before}}})),
+                            (200, json!({"data":{"SaveMediaListEntry":after}})),
+                        ]
+                    } else {
+                        vec![(200, json!({"data":{"SaveMediaListEntry":after}}))]
+                    };
+                    let (api, mut requests) = anilist::mock_api(responses).await;
+                    let state = state(api);
+                    let mut entry = state.db.get_entry(1).unwrap().unwrap();
+                    entry.status = previous_status.into();
+                    entry.progress = 11;
+                    state.db.upsert_entry(&entry).unwrap();
+
+                    let saved = if stepper {
+                        set_progress_inner(&state, 1, 12, Some(11)).await
+                    } else {
+                        save_entry_inner(&state, 1, None, Some(12), None, None).await
+                    }
+                    .unwrap();
+                    assert_eq!((saved.status.as_str(), saved.progress), ("COMPLETED", 12));
+                    assert_eq!(saved.repeat, if finishing_rewatch { 3 } else { 2 });
+                    let mut expected = json!({"id":22,"status":"COMPLETED","progress":12});
+                    if finishing_rewatch {
+                        expected["repeat"] = json!(3);
+                    }
+                    assert_eq!(requests.recv().await.unwrap()["variables"], expected);
+                    if offline {
+                        let pending = state.db.pending(7).unwrap();
+                        assert_eq!(pending[0].patch.status.as_deref(), Some("COMPLETED"));
+                        assert_eq!(pending[0].patch.progress, Some(12));
+                        assert_eq!(pending[0].patch.repeat, finishing_rewatch.then_some(3));
+                        crate::sync_queue::flush_unlocked(&state).await.unwrap();
+                        requests.recv().await.unwrap();
+                        assert_eq!(requests.recv().await.unwrap()["variables"], expected);
+                    }
+                    let cached = state.db.get_entry(1).unwrap().unwrap();
+                    assert_eq!((cached.status.as_str(), cached.progress), ("COMPLETED", 12));
+                    assert_eq!(cached.repeat, saved.repeat);
+                    assert_eq!(cached.score, Some(70.0));
+                    assert!(state.db.pending(7).unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_episode_edits_preserve_explicit_status_and_repeat_choices() {
+        for (total, progress, status, repeat, previous_progress, expected) in [
+            (
+                Some(12),
+                Some(11),
+                None,
+                None,
+                10,
+                json!({"id":22,"progress":11}),
+            ),
+            (
+                Some(12),
+                Some(13),
+                None,
+                None,
+                11,
+                json!({"id":22,"progress":12}),
+            ),
+            (
+                None,
+                Some(12),
+                None,
+                None,
+                11,
+                json!({"id":22,"progress":12}),
+            ),
+            (
+                Some(0),
+                Some(0),
+                None,
+                None,
+                0,
+                json!({"id":22,"progress":0}),
+            ),
+            (
+                Some(12),
+                Some(12),
+                Some("PAUSED"),
+                None,
+                11,
+                json!({"id":22,"status":"PAUSED","progress":12}),
+            ),
+            (
+                Some(12),
+                Some(12),
+                Some("CURRENT"),
+                None,
+                11,
+                json!({"id":22,"status":"CURRENT","progress":12}),
+            ),
+            (
+                Some(12),
+                Some(12),
+                Some("REPEATING"),
+                None,
+                11,
+                json!({"id":22,"status":"REPEATING","progress":12}),
+            ),
+            (
+                Some(12),
+                Some(12),
+                Some("completed"),
+                None,
+                11,
+                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":3}),
+            ),
+            (
+                Some(12),
+                Some(12),
+                Some("COMPLETED"),
+                Some(9),
+                11,
+                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":9}),
+            ),
+            (
+                Some(12),
+                None,
+                Some("COMPLETED"),
+                None,
+                11,
+                json!({"id":22,"status":"COMPLETED","progress":12}),
+            ),
+            (
+                Some(12),
+                Some(12),
+                None,
+                None,
+                12,
+                json!({"id":22,"status":"COMPLETED","progress":12}),
+            ),
+        ] {
+            let mut reply = remote();
+            reply["status"] = expected
+                .get("status")
+                .cloned()
+                .unwrap_or(json!("REPEATING"));
+            reply["progress"] = expected["progress"].clone();
+            reply["repeat"] = expected.get("repeat").cloned().unwrap_or(json!(2));
+            let (api, mut requests) =
+                anilist::mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":reply}}))]).await;
+            let state = state(api);
+            let mut entry = state.db.get_entry(1).unwrap().unwrap();
+            entry.status = "REPEATING".into();
+            entry.progress = previous_progress;
+            state.db.upsert_entry(&entry).unwrap();
+            let mut media = state.db.get_media(1).unwrap().unwrap();
+            media.episodes = total;
+            state.db.upsert_media(&media).unwrap();
+
+            save_entry_inner(&state, 1, status.map(String::from), progress, None, repeat)
+                .await
+                .unwrap();
+
+            assert_eq!(requests.recv().await.unwrap()["variables"], expected);
+            let cached = state.db.get_entry(1).unwrap().unwrap();
+            assert_eq!(cached.status, reply["status"]);
+            assert_eq!(cached.progress, reply["progress"]);
+            assert_eq!(cached.repeat, reply["repeat"]);
+            assert!(state.db.pending(7).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_final_episode_cache_miss_uses_the_remote_rewatch_count_once() {
+        for explicit_completion in [false, true] {
+            let mut before = remote();
+            before["status"] = json!("REPEATING");
+            before["progress"] = json!(11);
+            before["repeat"] = json!(5);
+            let mut after = remote();
+            after["repeat"] = json!(6);
+            let (api, mut requests) = anilist::mock_api(vec![
+                (200, json!({"data":{"Media":{"mediaListEntry":before}}})),
+                (200, json!({"data":{"SaveMediaListEntry":after}})),
+                (200, json!({"data":{"SaveMediaListEntry":after}})),
+            ])
+            .await;
+            let state = state(api);
+            state.db.delete_entry(1).unwrap();
+
+            let saved = save_entry_inner(
+                &state,
+                1,
+                explicit_completion.then(|| "COMPLETED".into()),
+                Some(12),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (saved.status.as_str(), saved.progress, saved.repeat),
+                ("COMPLETED", 12, 6)
+            );
+            requests.recv().await.unwrap();
+            assert_eq!(
+                requests.recv().await.unwrap()["variables"],
+                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":6})
+            );
+
+            save_entry_inner(&state, 1, None, Some(12), None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                requests.recv().await.unwrap()["variables"],
+                json!({"id":22,"progress":12})
+            );
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().repeat, 6);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_final_episode_edit_can_create_a_completed_entry() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":{"mediaListEntry":null}}})),
+            (200, json!({"data":{"SaveMediaListEntry":remote()}})),
+        ])
+        .await;
+        let state = state(api);
+        state.db.delete_entry(1).unwrap();
+
+        let saved = save_entry_inner(&state, 1, None, Some(12), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!((saved.status.as_str(), saved.progress), ("COMPLETED", 12));
+        requests.recv().await.unwrap();
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"],
+            json!({"mediaId":1,"status":"COMPLETED","progress":12})
+        );
+        assert!(state.db.pending(7).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn progress_below_the_latest_total_does_not_complete() {
+        let mut reply = remote();
+        reply["status"] = json!("CURRENT");
+        let (api, mut requests) =
+            anilist::mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":reply}}))]).await;
+        let state = state(api);
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.status = "CURRENT".into();
+        entry.progress = 11;
+        state.db.upsert_entry(&entry).unwrap();
+        let mut media = state.db.get_media(1).unwrap().unwrap();
+        media.episodes = Some(13);
+        state.db.upsert_media(&media).unwrap();
+
+        let saved = save_entry_inner(&state, 1, None, Some(12), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"],
+            json!({"id":22,"progress":12})
+        );
+        assert_eq!((saved.status.as_str(), saved.progress), ("CURRENT", 12));
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().status, "CURRENT");
+    }
+
+    #[tokio::test]
+    async fn final_episode_edits_coalesce_without_counting_a_rewatch_twice() {
+        let mut before = remote();
+        before["status"] = json!("REPEATING");
+        before["progress"] = json!(10);
+        let mut after = remote();
+        after["repeat"] = json!(3);
+        let (api, mut requests) = anilist::mock_api(vec![
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+            (200, json!({"data":{"Media":{"mediaListEntry":before}}})),
+            (200, json!({"data":{"SaveMediaListEntry":after}})),
+        ])
+        .await;
+        let state = state(api);
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.status = "REPEATING".into();
+        entry.progress = 10;
+        state.db.upsert_entry(&entry).unwrap();
+
+        save_entry_inner(&state, 1, None, Some(11), None, None)
+            .await
+            .unwrap();
+        save_entry_inner(&state, 1, None, Some(12), None, None)
+            .await
+            .unwrap();
+        save_entry_inner(&state, 1, None, Some(12), None, None)
+            .await
+            .unwrap();
+        let pending = state.db.pending(7).unwrap();
+        assert_eq!(pending[0].patch.status.as_deref(), Some("COMPLETED"));
+        assert_eq!(pending[0].patch.progress, Some(12));
+        assert_eq!(pending[0].patch.repeat, Some(3));
+        assert_eq!(pending[0].base.as_ref().unwrap().progress, 10);
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+
+        crate::sync_queue::flush_unlocked(&state).await.unwrap();
+
+        requests.recv().await.unwrap();
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"],
+            json!({"id":22,"status":"COMPLETED","progress":12,"repeat":3})
+        );
+        assert!(state.db.pending(7).unwrap().is_empty());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().repeat, 3);
     }
 
     fn assert_progress_preserved(state: &AppState) {
@@ -3553,7 +4272,7 @@ mod persistence_tests {
     #[tokio::test]
     async fn a_slow_metadata_read_cannot_replace_a_newer_save() {
         let old = json!({"data":{
-            "Media":{"mediaListEntry":{"id":22,"notes":"Old note","customLists":{}}},
+            "Media":{"mediaListEntry":{"id":22,"notes":"Old note","startedAt":null,"completedAt":null,"customLists":{}}},
             "Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}
         }});
         let (api, mut reads) = anilist::mock_api(vec![(429, json!({})), (200, old.clone())]).await;
@@ -3566,7 +4285,7 @@ mod persistence_tests {
             (200, old),
             (
                 200,
-                json!({"data":{"SaveMediaListEntry":{"notes":"New note","customLists":{}}}}),
+                json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":null,"completedAt":null,"customLists":{}}}}),
             ),
         ])
         .await;

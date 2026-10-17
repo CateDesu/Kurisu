@@ -17,7 +17,7 @@
   const actions = createListActions();
   const loggedIn = $derived(auth.isLoggedIn);
 
-  // Reassign the Map so badge lookups react to changes.
+  // Reassign for reactive badge lookups.
   let listByMedia = $state(new Map<number, ListEntry>());
   let listLoadId = 0;
   let searchId = 0;

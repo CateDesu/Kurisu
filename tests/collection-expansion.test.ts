@@ -4,7 +4,7 @@ import { auth } from "./session.svelte";
 import { button, deferred, selectOption, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
-  api: Object.fromEntries(["localEntries", "syncMyList", "getSeason", "getAiringSchedule", "getLibraryBindingDetails", "bindLibraryPath", "getWatchHistory"].map((name) => [name, vi.fn()])),
+  api: Object.fromEntries(["localEntries", "syncMyList", "setProgress", "getSeason", "getAiringSchedule", "getLibraryBindingDetails", "bindLibraryPath", "getWatchHistory"].map((name) => [name, vi.fn()])),
   library: { files: [] as unknown[], folders: [] as string[], unreadable: [], foldersFailed: false, scanning: false, hasScan: true, ensureScan: vi.fn(), scan: vi.fn(), fileFor: vi.fn() },
   listeners: new Map<string, Set<() => void>>(),
   navigation: [] as (() => void)[],
@@ -93,6 +93,28 @@ test("an offline cached list does not attempt an automatic network sync", async 
   await render(Collection);
   expect(document.body.textContent).toContain("Example Show");
   expect(mocks.api.syncMyList).not.toHaveBeenCalled();
+});
+
+test.each(["click", "keyboard"])("finishing with %s moves a show straight into Completed", async (control) => {
+  vi.useFakeTimers();
+  const watching = { ...entry, progress: 11 };
+  const completed = { ...watching, progress: 12, status: "COMPLETED" };
+  mocks.api.localEntries.mockResolvedValue([watching]);
+  mocks.api.syncMyList.mockResolvedValue([watching]);
+  mocks.api.setProgress.mockResolvedValue(completed);
+  await render(Collection);
+
+  const plus = document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!;
+  if (control === "click") plus.click();
+  else plus.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+  await settle();
+
+  expect(mocks.api.setProgress).toHaveBeenCalledExactlyOnceWith(1, 12, 11);
+  expect(document.querySelector(".collection-row")).toBeNull();
+  button("Completed 1").click();
+  await settle();
+  expect(document.querySelector(".collection-row")!.textContent).toContain("Example Show");
+  expect(document.querySelector(".row-progress")!.textContent).toContain("12/12");
 });
 
 test("switching accounts retains that account's saved entries when network sync fails", async () => {

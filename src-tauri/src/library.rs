@@ -322,7 +322,7 @@ impl ScanCache {
         for folder in folders {
             collect_videos(Path::new(folder), 0, &mut paths, &mut unreadable);
         }
-        // Canonical paths deduplicate aliases and roots saved before overlap checks existed.
+        // Canonical paths deduplicate aliases and overlapping saved roots.
         let mut seen = std::collections::HashSet::new();
         let mut paths: Vec<_> = paths
             .into_iter()

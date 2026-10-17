@@ -11,7 +11,7 @@ use serde_json::Value;
 const REPO: &str = "CateDesu/Kurisu";
 const USER_AGENT: &str = "Kurisu";
 
-/// Legacy failure marker. Keep until acknowledged.
+/// Keep the failure marker until acknowledged.
 pub const FAILED_MARKER: &str = ".kurisu-update-failed";
 
 pub const FAILED_MESSAGE: &str = "The last update failed to install cleanly, so the previous version was kept. Nothing was lost — you can retry the update from Settings.";
@@ -19,7 +19,7 @@ pub const FAILED_MESSAGE: &str = "The last update failed to install cleanly, so 
 /// Keep the original launch path after Linux replaces the running inode.
 static EXE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// After a swap, require restart before offering another install.
+/// Swaps require restart before another install.
 static UPDATE_APPLIED: AtomicBool = AtomicBool::new(false);
 
 static UPDATE_FAILED: AtomicBool = AtomicBool::new(false);
@@ -123,7 +123,7 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
     version_key(remote) > version_key(current)
 }
 
-/// Stamp the full rolling version to avoid offering the installed release again.
+/// Stamp the full rolling version to prevent repeat update offers.
 pub fn current_version() -> &'static str {
     match option_env!("KURISU_BUILD_VERSION") {
         Some(v) if !v.is_empty() => v,
@@ -135,7 +135,7 @@ pub fn is_ci_build() -> bool {
     matches!(option_env!("KURISU_BUILD_VERSION"), Some(v) if !v.is_empty())
 }
 
-/// Release builds check on every platform. Debug builds stay quiet unless stamped.
+/// Unstamped debug builds skip automatic checks.
 pub fn auto_check_eligible() -> bool {
     is_ci_build() || !cfg!(debug_assertions)
 }
@@ -196,7 +196,7 @@ where
     }
 }
 
-/// Choose by version. Publication order can put an older rolling build after a milestone.
+/// Compare versions because publication order can put older builds last.
 pub async fn fetch_latest_release() -> Result<Release, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -365,10 +365,10 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
+    let mut created = false;
     let res: Result<(), String> = async {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            // Allow slow links enough time to download the Windows installer.
             .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|e| e.to_string())?;
@@ -385,9 +385,13 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
                 "update download is implausibly large ({total} bytes)"
             ));
         }
-        let mut file = tokio::fs::File::create(&part)
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
             .await
             .map_err(|e| e.to_string())?;
+        created = true;
         let mut got: u64 = 0;
         while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
@@ -415,14 +419,14 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
         Ok(())
     }
     .await;
-    if res.is_err() {
+    if res.is_err() && created {
         let _ = tokio::fs::remove_file(&part).await;
     }
     res
 }
 
-/// Return the verified handle, rewound. None is a mismatch and errors also refuse installation.
-/// Linux copies from this handle. Windows must keep it open through installer launch.
+/// Return a rewound verified handle, or None on mismatch.
+/// Linux copies from it. Windows holds it through installer launch.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std::fs::File>> {
     use sha2::{Digest, Sha256};
@@ -482,10 +486,12 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
         scratch_suffix()
     ));
     let backup = dir.join(format!("{name}.kurisu-old"));
+    let mut created = false;
     let result = (|| -> io::Result<()> {
-        let mut staged = std::fs::File::create(&staging)?;
+        let mut staged = std::fs::File::create_new(&staging)?;
+        created = true;
         io::copy(new_bin, &mut staged)?;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+        staged.set_permissions(std::fs::Permissions::from_mode(0o755))?;
         // Flush before publishing so a crash cannot leave an empty executable.
         staged.sync_all()?;
         drop(staged);
@@ -494,7 +500,9 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
         sync_dir(dir);
         Ok(())
     })();
-    let _ = std::fs::remove_file(&staging);
+    if created {
+        let _ = std::fs::remove_file(&staging);
+    }
     if result.is_ok() {
         UPDATE_APPLIED.store(true, Ordering::SeqCst);
     }
@@ -511,6 +519,7 @@ fn preserve_executable(exe: &Path, backup: &Path) -> io::Result<()> {
         std::process::id(),
         scratch_suffix()
     ));
+    let mut created = false;
     let result = (|| {
         if std::fs::hard_link(exe, &temporary).is_err() {
             let mut old = std::fs::File::open(exe)?;
@@ -518,15 +527,20 @@ fn preserve_executable(exe: &Path, backup: &Path) -> io::Result<()> {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
+            created = true;
             io::copy(&mut old, &mut copy)?;
             copy.set_permissions(old.metadata()?.permissions())?;
             copy.sync_all()?;
+        } else {
+            created = true;
         }
         std::fs::rename(&temporary, backup)?;
         sync_dir(dir);
         Ok(())
     })();
-    let _ = std::fs::remove_file(&temporary);
+    if created {
+        let _ = std::fs::remove_file(&temporary);
+    }
     result
 }
 
@@ -572,7 +586,7 @@ fn elf_file_matches_arch(file: &mut std::fs::File) -> io::Result<bool> {
     Ok(elf_header_matches_arch(&ident))
 }
 
-/// Leave files younger than an hour in case another process is still downloading or verifying.
+/// Keep recent files that another process may still be downloading or verifying.
 pub fn sweep_update_leftovers(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -620,6 +634,323 @@ pub fn sweep_install_leftovers(exe_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_update_staging_collisions_preserve_existing_paths() {
+        use std::io::Read;
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let exe = std::env::current_exe().unwrap();
+        let child_name = "kurisu-update-staging-test";
+        if exe.file_name().unwrap() != child_name {
+            let dir = std::env::temp_dir().join(format!(
+                "kurisu-update-staging-{}-{}",
+                std::process::id(),
+                scratch_suffix()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let child = dir.join(child_name);
+            std::fs::copy(&exe, &child).unwrap();
+            // Never replace Cargo's test executable or share updater globals.
+            let result = std::process::Command::new(&child)
+                .args([
+                    "--exact",
+                    "updater::tests::linux_update_staging_collisions_preserve_existing_paths",
+                    "--nocapture",
+                ])
+                .output();
+            std::fs::remove_dir_all(&dir).unwrap();
+            let result = result.unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        init_install_path().unwrap();
+        let dir = exe.parent().unwrap();
+        let original = std::fs::metadata(&exe).unwrap();
+        let digest_file = |path: &Path| {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            io::copy(&mut std::fs::File::open(path).unwrap(), &mut digest).unwrap();
+            digest.finalize()
+        };
+        let original_digest = digest_file(&exe);
+        let payload = dir.join("payload");
+        // Reuse the running ELF header for a small publication fixture.
+        let mut header = [0; 20];
+        std::fs::File::open(&exe)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        let mut replacement = header.to_vec();
+        replacement.extend_from_slice(b"kurisu update payload");
+        std::fs::write(&payload, &replacement).unwrap();
+        let sentinel = dir.join("unrelated-data");
+        std::fs::write(&sentinel, b"saved user data").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let absent = dir.join("absent-target");
+        let backup = dir.join(format!("{child_name}.kurisu-old"));
+
+        for backup_collision in [false, true] {
+            for kind in ["symlink", "hardlink", "file", "dangling", "directory"] {
+                let staging = dir.join(format!(
+                    ".kurisu-new-{}-{}",
+                    std::process::id(),
+                    SCRATCH_SEQ.load(Ordering::Relaxed) + u64::from(backup_collision)
+                ));
+                match kind {
+                    "symlink" => symlink(&sentinel, &staging).unwrap(),
+                    "hardlink" => std::fs::hard_link(&sentinel, &staging).unwrap(),
+                    "file" => std::fs::write(&staging, b"existing staging data").unwrap(),
+                    "dangling" => symlink(&absent, &staging).unwrap(),
+                    "directory" => std::fs::create_dir(&staging).unwrap(),
+                    _ => unreachable!(),
+                }
+                let result = apply_linux_update(&mut std::fs::File::open(&payload).unwrap());
+                assert!(
+                    std::fs::read(&sentinel).unwrap() == b"saved user data",
+                    "{kind}: unrelated data changed"
+                );
+                assert_eq!(
+                    std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{kind}"
+                );
+                assert!(result.is_err(), "{kind}: {result:?}");
+                let installed = std::fs::metadata(&exe).unwrap();
+                assert_eq!(installed.ino(), original.ino(), "{kind}");
+                assert_eq!(installed.len(), original.len(), "{kind}");
+                assert!(!update_applied());
+                assert!(!backup.exists());
+                assert!(!absent.exists());
+                assert!(
+                    std::fs::symlink_metadata(&staging).is_ok(),
+                    "{kind}: pre-existing staging path was removed, backup: {backup_collision}"
+                );
+                match kind {
+                    "symlink" => assert_eq!(std::fs::read_link(&staging).unwrap(), sentinel),
+                    "hardlink" => assert_eq!(std::fs::read(&staging).unwrap(), b"saved user data"),
+                    "file" => {
+                        assert_eq!(std::fs::read(&staging).unwrap(), b"existing staging data")
+                    }
+                    "dangling" => assert_eq!(std::fs::read_link(&staging).unwrap(), absent),
+                    "directory" => assert!(staging.is_dir()),
+                    _ => unreachable!(),
+                }
+                if kind == "directory" {
+                    std::fs::remove_dir(&staging).unwrap();
+                } else {
+                    std::fs::remove_file(&staging).unwrap();
+                }
+            }
+        }
+
+        std::fs::create_dir(&backup).unwrap();
+        assert!(apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).is_err());
+        assert_eq!(std::fs::metadata(&exe).unwrap().ino(), original.ino());
+        assert!(!update_applied());
+        assert!(std::fs::read_dir(dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kurisu-new-")));
+        std::fs::remove_dir(&backup).unwrap();
+
+        apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), replacement);
+        assert_eq!(digest_file(&backup), original_digest);
+        assert!(update_applied());
+        assert!(apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).is_err());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    async fn serve_download(response: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(&response).await.unwrap();
+        });
+        (format!("http://{address}/update"), server)
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn download_staging_collisions_preserve_existing_paths() {
+        const CHILD_DIR: &str = "KURISU_TEST_DOWNLOAD_COLLISIONS";
+        let dir = match std::env::var_os(CHILD_DIR) {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let dir = std::env::temp_dir().join(format!(
+                    "kurisu-download-collisions-{}-{}",
+                    std::process::id(),
+                    scratch_suffix()
+                ));
+                std::fs::create_dir(&dir).unwrap();
+                // Isolate the scratch sequence from concurrently running tests.
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "updater::tests::download_staging_collisions_preserve_existing_paths",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_DIR, &dir)
+                    .output();
+                std::fs::remove_dir_all(&dir).unwrap();
+                let output = output.unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+        };
+        let target = dir.join("payload.bin");
+        let sentinel = dir.join("unrelated-data");
+        let absent = dir.join("absent-target");
+        std::fs::write(&target, b"previous download").unwrap();
+        std::fs::write(&sentinel, b"saved user data").unwrap();
+        #[cfg(unix)]
+        let kinds = ["file", "directory", "symlink", "hardlink", "dangling"];
+        #[cfg(windows)]
+        let kinds = ["file", "directory"];
+        for status in ["200 OK", "503 Unavailable"] {
+            for kind in kinds {
+                let part = target.with_file_name(format!(
+                    "payload.bin.part-{}",
+                    SCRATCH_SEQ.load(Ordering::Relaxed)
+                ));
+                match kind {
+                    "file" => std::fs::write(&part, b"existing staging data").unwrap(),
+                    "directory" => std::fs::create_dir(&part).unwrap(),
+                    #[cfg(unix)]
+                    "symlink" => std::os::unix::fs::symlink(&sentinel, &part).unwrap(),
+                    #[cfg(unix)]
+                    "dangling" => std::os::unix::fs::symlink(&absent, &part).unwrap(),
+                    #[cfg(unix)]
+                    "hardlink" => std::fs::hard_link(&sentinel, &part).unwrap(),
+                    _ => unreachable!(),
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload"
+                );
+                let (url, server) = serve_download(response.into_bytes()).await;
+                let result = tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+                    .await
+                    .unwrap();
+                server.await.unwrap();
+                assert!(result.is_err(), "{kind}, {status}: {result:?}");
+                assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+                assert_eq!(std::fs::read(&sentinel).unwrap(), b"saved user data");
+                assert!(!absent.exists());
+                assert!(
+                    std::fs::symlink_metadata(&part).is_ok(),
+                    "{kind}, {status}: pre-existing staging path was removed"
+                );
+                match kind {
+                    "file" => assert_eq!(std::fs::read(&part).unwrap(), b"existing staging data"),
+                    "directory" => assert!(part.is_dir()),
+                    #[cfg(unix)]
+                    "symlink" => assert_eq!(std::fs::read_link(&part).unwrap(), sentinel),
+                    #[cfg(unix)]
+                    "dangling" => assert_eq!(std::fs::read_link(&part).unwrap(), absent),
+                    #[cfg(unix)]
+                    "hardlink" => assert_eq!(std::fs::read(&part).unwrap(), b"saved user data"),
+                    _ => unreachable!(),
+                }
+                if kind == "directory" {
+                    std::fs::remove_dir(&part).unwrap();
+                } else {
+                    std::fs::remove_file(&part).unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn downloaded_payloads_are_published_complete_and_verify_from_disk() {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let payload = b"kurisu update payload";
+        let digest = format!("{:x}", Sha256::digest(payload));
+        for chunked in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "kurisu-download-{}-{}",
+                std::process::id(),
+                scratch_suffix()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("payload.bin");
+            std::fs::write(&target, b"previous download").unwrap();
+            let mut response = if chunked {
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", payload.len())
+            } else {
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len())
+            }
+            .into_bytes();
+            response.extend_from_slice(payload);
+            if chunked {
+                response.extend_from_slice(b"\r\n0\r\n\r\n");
+            }
+            let (url, server) = serve_download(response).await;
+            tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+            let mut verified = verify_and_open(&target, &digest).unwrap().unwrap();
+            let mut received = Vec::new();
+            verified.read_to_end(&mut received).unwrap();
+            assert_eq!(received, payload);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            drop(verified);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn failed_downloads_keep_the_previous_payload_and_remove_partial_files() {
+        for response in [
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort body".into(),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\nshort body".into(),
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", MAX_DOWNLOAD_BYTES + 1),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "kurisu-download-failed-{}-{}",
+                std::process::id(),
+                scratch_suffix()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("payload.bin");
+            std::fs::write(&target, b"previous download").unwrap();
+            let (url, server) = serve_download(response.into_bytes()).await;
+            assert!(tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+                .await
+                .unwrap()
+                .is_err());
+            server.await.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn version_parse_and_compare() {

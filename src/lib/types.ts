@@ -1,4 +1,4 @@
-// Mirror the Rust payloads. Backend tests check field names for drift.
+// Mirror the Rust payloads.
 
 import { nowMs } from "./now.svelte";
 

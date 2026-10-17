@@ -204,7 +204,7 @@ fn min_watch_time(length_us: i64) -> Duration {
     quarter.min(Duration::from_secs(60))
 }
 
-/// Isolate each tick so a panic cannot stop tracking. Setup requires the Tauri runtime.
+/// Isolate tick panics. Requires the Tauri runtime.
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut active: Option<ActiveTrack> = None;
@@ -695,14 +695,33 @@ fn preferred_source(sources: impl IntoIterator<Item = TickInfo>) -> Option<TickI
 }
 
 #[cfg(target_os = "linux")]
+fn mpris_players(finder: &PlayerFinder) -> Vec<mpris::Player> {
+    finder
+        .iter_players()
+        .map(|players| players.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn mpris_timeline(player: &mpris::Player, metadata: &mpris::Metadata) -> (i64, i64) {
+    let microseconds = |duration: Duration| i64::try_from(duration.as_micros()).ok();
+    let position = player.get_position().ok().and_then(microseconds);
+    (
+        position
+            .and(metadata.length())
+            .and_then(microseconds)
+            .unwrap_or(0),
+        position.unwrap_or(0),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
     let mut sources = Vec::new();
     if let Ok(finder) = PlayerFinder::new() {
         let state = app.state::<AppState>();
         let matchers = state.matchers.lock().clone();
-        for player in finder
-            .find_all()
-            .unwrap_or_default()
+        for player in mpris_players(&finder)
             .into_iter()
             .filter(|p| !is_browser(p))
         {
@@ -722,17 +741,14 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
             let base = basename(&url);
             let episode =
                 matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
-            let position = player.get_position().ok();
+            let (length_us, position_us) = mpris_timeline(&player, &md);
             sources.push(TickInfo {
                 playing,
                 player: player.identity().to_string(),
                 trackid: if url.is_empty() { title.clone() } else { url },
                 title,
-                length_us: position
-                    .and(md.length())
-                    .unwrap_or(Duration::ZERO)
-                    .as_micros() as i64,
-                position_us: position.unwrap_or(Duration::ZERO).as_micros() as i64,
+                length_us,
+                position_us,
                 media_id: matched.map(|(m, _)| m.media_id),
                 matched_title: matched.map(|(m, _)| m.display.clone()),
                 episode,
@@ -759,6 +775,24 @@ fn is_browser_str(id: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn is_browser(player: &mpris::Player) -> bool {
     is_browser_str(&format!("{} {}", player.bus_name(), player.identity()))
+}
+
+#[cfg(any(windows, test))]
+fn windows_timeline(start: Option<i64>, end: Option<i64>, position: Option<i64>) -> (i64, i64) {
+    let Some(start) = start else {
+        return (0, 0);
+    };
+    let relative = |timestamp: i64| {
+        timestamp
+            .checked_sub(start)
+            .filter(|value| *value >= 0)
+            .map(|value| value / 10)
+    };
+    let position = position.and_then(relative);
+    (
+        position.and(end).and_then(relative).unwrap_or(0),
+        position.unwrap_or(0),
+    )
 }
 
 #[cfg(windows)]
@@ -794,11 +828,20 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
                 .map(|h| h.to_string_lossy())
                 .unwrap_or_default();
             let timeline = session.GetTimelineProperties().ok();
-            let position = timeline
-                .as_ref()
-                .and_then(|t| t.Position().ok())
-                .map(|t| t.Duration / 10)
-                .filter(|position| *position >= 0);
+            let (length_us, position_us) = windows_timeline(
+                timeline
+                    .as_ref()
+                    .and_then(|t| t.StartTime().ok())
+                    .map(|t| t.Duration),
+                timeline
+                    .as_ref()
+                    .and_then(|t| t.EndTime().ok())
+                    .map(|t| t.Duration),
+                timeline
+                    .as_ref()
+                    .and_then(|t| t.Position().ok())
+                    .map(|t| t.Duration),
+            );
             let matched = match_title(&matchers, &title, "");
             let episode =
                 matched.and_then(|m| library::resolve_bound_episode(m, &[title.as_str()], None));
@@ -807,13 +850,8 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
                 player,
                 trackid: String::new(),
                 title,
-                length_us: timeline
-                    .as_ref()
-                    .filter(|_| position.is_some())
-                    .and_then(|t| t.EndTime().ok())
-                    .map(|t| t.Duration / 10)
-                    .unwrap_or(0),
-                position_us: position.unwrap_or(0),
+                length_us,
+                position_us,
                 media_id: matched.map(|m| m.media_id),
                 matched_title: matched.map(|m| m.display.clone()),
                 episode,
@@ -832,6 +870,203 @@ fn read_now(_app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_media_timestamps_are_relative_to_the_start_of_the_item() {
+        let timeline = |start_seconds: i64, end_seconds: i64, position_seconds: i64| {
+            windows_timeline(
+                Some(start_seconds * 10_000_000),
+                Some(end_seconds * 10_000_000),
+                Some(position_seconds * 10_000_000),
+            )
+        };
+        assert_eq!(timeline(0, 100, 75), (100_000_000, 75_000_000));
+        for start in [100, -100] {
+            let (length_us, position_us) = timeline(start, start + 100, start + 75);
+            assert_eq!((length_us, position_us), (100_000_000, 75_000_000));
+            assert!(!AutoGate {
+                length_us,
+                position_us,
+                ..watched()
+            }
+            .should_push());
+        }
+    }
+
+    #[test]
+    fn unavailable_or_invalid_windows_timestamps_do_not_trigger_auto_tracking() {
+        for (start, end, position, expected) in [
+            (Some(0), Some(100), None, (0, 0)),
+            (None, Some(100), Some(75), (0, 0)),
+            (Some(50), Some(100), Some(49), (0, 0)),
+            (Some(50), None, Some(75), (0, 2)),
+            (Some(50), Some(49), Some(75), (0, 2)),
+            (Some(i64::MIN), Some(i64::MAX), Some(0), (0, 0)),
+        ] {
+            let (length_us, position_us) = windows_timeline(start, end, position);
+            assert_eq!((length_us, position_us), expected);
+            assert!(!AutoGate {
+                length_us,
+                position_us,
+                ..watched()
+            }
+            .should_push());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broken_mpris_sessions_and_invalid_timelines_do_not_poison_tracking() {
+        use dbus::arg::Variant;
+        use dbus::channel::{MatchingReceiver, Sender};
+        use std::io::BufRead;
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        use std::sync::Arc;
+
+        struct Bus(std::process::Child);
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                self.0.kill().ok();
+                self.0.wait().ok();
+            }
+        }
+        let mut bus = Bus(std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("install dbus-daemon to run the MPRIS integration test"));
+        let mut address = String::new();
+        std::io::BufReader::new(bus.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim().to_string();
+        let broken = Arc::new(AtomicBool::new(true));
+        let service_broken = broken.clone();
+        let position = Arc::new(AtomicI64::new(42_000_000));
+        let service_position = position.clone();
+        let length = Arc::new(AtomicI64::new(1_200_000_000));
+        let service_length = length.clone();
+        let service_address = address.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let service = std::thread::spawn(move || {
+            let connection = dbus::blocking::Connection::new_address(&service_address).unwrap();
+            for name in ["aaa_healthy", "bbb_broken", "ccc_healthy"] {
+                connection
+                    .request_name(format!("org.mpris.MediaPlayer2.{name}"), false, false, true)
+                    .unwrap();
+            }
+            connection.start_receive(
+                dbus::message::MatchRule::new_method_call(),
+                Box::new(move |message, connection| {
+                    if message
+                        .member()
+                        .is_some_and(|member| member == "Introspect")
+                    {
+                        connection
+                            .send(message.method_return().append1("<node/>"))
+                            .unwrap();
+                        return true;
+                    }
+                    let (_, property) = message.read2::<String, String>().unwrap();
+                    let failed = message
+                        .destination()
+                        .is_some_and(|name| name.ends_with("bbb_broken"))
+                        && service_broken.load(Ordering::SeqCst);
+                    let response = match property.as_str() {
+                        "Identity" if !failed => message.method_return().append1(Variant("VLC")),
+                        "HasTrackList" => message.method_return().append1(Variant(false)),
+                        "PlaybackStatus" => message.method_return().append1(Variant("Playing")),
+                        "Position" => message
+                            .method_return()
+                            .append1(Variant(service_position.load(Ordering::SeqCst))),
+                        "Metadata" => {
+                            let metadata: dbus::arg::PropMap = std::collections::HashMap::from([
+                                (
+                                    "mpris:length".into(),
+                                    Variant(Box::new(service_length.load(Ordering::SeqCst))
+                                        as Box<dyn dbus::arg::RefArg>),
+                                ),
+                                (
+                                    "xesam:title".into(),
+                                    Variant(Box::new("Some Show - 03".to_string())
+                                        as Box<dyn dbus::arg::RefArg>),
+                                ),
+                                (
+                                    "xesam:url".into(),
+                                    Variant(Box::new(
+                                        "file:///anime/Some%20Show%20-%2003.mkv".to_string(),
+                                    )
+                                        as Box<dyn dbus::arg::RefArg>),
+                                ),
+                            ]);
+                            message.method_return().append1(Variant(metadata))
+                        }
+                        _ => message.error(
+                            &"org.freedesktop.DBus.Error.UnknownProperty".into(),
+                            c"session is unavailable",
+                        ),
+                    };
+                    connection.send(response).unwrap();
+                    true
+                }),
+            );
+            ready_tx.send(()).unwrap();
+            while matches!(
+                stop_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
+                connection.process(Duration::from_millis(20)).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let connection = dbus::ffidisp::Connection::open_private(&address).unwrap();
+        connection.register().unwrap();
+        let finder = PlayerFinder::for_connection(connection);
+        let players = mpris_players(&finder);
+        let healthy = players
+            .iter()
+            .map(|player| {
+                (
+                    player.bus_name().to_string(),
+                    player.get_playback_status().unwrap(),
+                    player.get_metadata().unwrap().title().unwrap().to_string(),
+                    player.get_position().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        broken.store(false, Ordering::SeqCst);
+        let recovered = mpris_players(&finder).len();
+        let timeline = || {
+            let metadata = players[0].get_metadata().unwrap();
+            mpris_timeline(&players[0], &metadata)
+        };
+        let valid_timeline = timeline();
+        let invalid_positions = [-1, i64::MIN].map(|invalid| {
+            position.store(invalid, Ordering::SeqCst);
+            timeline()
+        });
+        position.store(42_000_000, Ordering::SeqCst);
+        let invalid_lengths = [-1, i64::MIN].map(|invalid| {
+            length.store(invalid, Ordering::SeqCst);
+            timeline()
+        });
+        stop_tx.send(()).unwrap();
+        service.join().unwrap();
+
+        assert_eq!(healthy.len(), 2);
+        assert!(healthy[0].0.ends_with("aaa_healthy"));
+        assert!(healthy[1].0.ends_with("ccc_healthy"));
+        for (_, status, title, position) in healthy {
+            assert_eq!(status, PlaybackStatus::Playing);
+            assert_eq!(title, "Some Show - 03");
+            assert_eq!(position, Duration::from_secs(42));
+        }
+        assert_eq!(recovered, 3);
+        assert_eq!(valid_timeline, (1_200_000_000, 42_000_000));
+        assert_eq!(invalid_positions, [(0, 0); 2]);
+        assert_eq!(invalid_lengths, [(0, 42_000_000); 2]);
+    }
 
     #[test]
     fn bound_playback_uses_library_numbering_despite_embedded_titles() {

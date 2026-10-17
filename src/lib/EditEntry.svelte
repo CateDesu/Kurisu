@@ -11,6 +11,7 @@
   import { api } from "$lib/api";
   import { auth } from "$lib/auth.svelte";
   import { library } from "$lib/library.svelte";
+  import { trackPendingSave } from "$lib/pendingEdits";
   import Select from "$lib/Select.svelte";
   import ScoreInput from "$lib/ScoreInput.svelte";
   import Icon from "$lib/Icon.svelte";
@@ -32,10 +33,13 @@
   }));
   const epoch = untrack(() => auth.epoch);
   let alive = true;
-  const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
+  const sameSession = () => epoch === auth.epoch && auth.isLoggedIn;
+  const current = () => alive && sameSession();
   onDestroy(() => { alive = false; });
   const scoreAvailable = $derived(!auth.offline || Boolean(scoreFormat));
   let status = $state(untrack(() => entry.status));
+  let statusBeforeCompletion: string | null = null;
+  let statusChosen = false;
   let progress = $state(untrack(() => entry.progress));
   let score = $state<number | null>(untrack(() => entry.score ?? null));
   let repeat = $state(untrack(() => entry.repeat));
@@ -147,10 +151,24 @@
     if (repeat != null) repeat = Math.max(0, repeat);
   }
 
+  function progressChanged(event: Event) {
+    if (statusChosen) return;
+    const value = (event.currentTarget as HTMLInputElement).valueAsNumber;
+    if (total != null && total > 0 && value === total) {
+      if (status !== "COMPLETED") {
+        statusBeforeCompletion = status;
+        status = "COMPLETED";
+      }
+    } else if (statusBeforeCompletion !== null) {
+      status = statusBeforeCompletion;
+      statusBeforeCompletion = null;
+    }
+  }
+
   async function save() {
     if (saving || removing || !current()) return;
     // Detect edits before clamping so untouched fields stay untouched.
-    const progressTouched = progress !== snap.progress;
+    const progressTouched = progress !== snap.progress || statusBeforeCompletion !== null;
     const repeatTouched = repeat !== snap.repeat;
     clampInputs();
     const detailsTouched = details && (notes !== details.notes || !sameDate(started, details.started_at) || !sameDate(completed, details.completed_at) || JSON.stringify([...customLists].sort()) !== JSON.stringify([...details.custom_lists].sort()));
@@ -161,21 +179,24 @@
     }
     saving = true;
     err = "";
-    try {
+    const write = async () => {
       if (details && detailsTouched) {
         const saved = await api.updateEntryDetails(entry.media_id, notes !== details.notes ? notes : null, !sameDate(started, details.started_at) ? cleanDate(started) : null, !sameDate(completed, details.completed_at) ? cleanDate(completed) : null, JSON.stringify([...customLists].sort()) !== JSON.stringify([...details.custom_lists].sort()) ? [...customLists] : null);
-        if (!current()) return;
-        applyDetails(saved);
+        if (!sameSession()) return;
+        if (alive) applyDetails(saved);
       }
       // Send only edited fields to preserve newer changes from tracking or other clients.
       if (basicTouched) await api.updateEntry(
         entry.media_id,
-        status !== snap.status ? status : null,
+        statusBeforeCompletion === null && (status !== snap.status || (statusChosen && progressTouched)) ? status : null,
         progressTouched ? (progress ?? snap.progress) : null,
         // Zero clears a score. Null leaves the remote score unchanged.
         scoreAvailable && score !== snap.score ? (score ?? 0) : null,
         repeatTouched ? (repeat ?? snap.repeat) : null
       );
+    };
+    try {
+      await trackPendingSave(write());
       if (current()) onclose();
     } catch (e) {
       if (current()) err = String(e);
@@ -196,7 +217,7 @@
     removing = true;
     err = "";
     try {
-      await api.deleteEntry(entry.media_id);
+      await trackPendingSave(api.deleteEntry(entry.media_id));
       if (current()) onclose();
     } catch (e) {
       if (current()) err = String(e);
@@ -265,7 +286,11 @@
           id="ed-status"
           bind:value={status}
           options={statusOptions}
-          onchange={(value) => { if (value === "COMPLETED" && total != null) progress = total; }}
+          onchange={(value) => {
+            statusChosen = true;
+            statusBeforeCompletion = null;
+            if (value === "COMPLETED" && total != null) progress = total;
+          }}
         />
       </div>
 
@@ -278,6 +303,7 @@
             min="0"
             max={total ?? undefined}
             bind:value={progress}
+            oninput={progressChanged}
             onblur={clampInputs}
             class="w-full bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
           />

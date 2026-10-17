@@ -202,6 +202,102 @@ test("Completed immediately fills known episode totals", async () => {
   expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, "COMPLETED", 12, null, null);
 });
 
+test("entering the final episode selects Completed and preserves it through a save retry", async () => {
+  const onclose = vi.fn();
+  mocks.api.updateEntry.mockRejectedValueOnce(new Error("Temporary failure"))
+    .mockResolvedValue({ ...entry, status: "COMPLETED", progress: 12 });
+  await render(EditEntry, { entry: { ...entry, progress: 11 }, scoreFormat: "POINT_100", onclose });
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  progress.value = "12";
+  progress.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(document.querySelector<HTMLSelectElement>("#ed-status")!.value).toBe("COMPLETED");
+  button("Save").click();
+  await settle();
+  expect(onclose).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain("Temporary failure");
+  button("Save").click();
+  await settle();
+  expect(mocks.api.updateEntry).toHaveBeenNthCalledWith(2, 1, null, 12, null, null);
+  expect(onclose).toHaveBeenCalledOnce();
+});
+
+test("undoing an unsaved final episode restores the previous status", async () => {
+  await render(EditEntry, { entry: { ...entry, progress: 10, status: "REPEATING", repeat: 2 }, scoreFormat: "POINT_100", onclose: vi.fn() });
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  for (const value of ["12", "11"]) {
+    progress.value = value;
+    progress.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    expect(document.querySelector<HTMLSelectElement>("#ed-status")!.value).toBe(value === "12" ? "COMPLETED" : "REPEATING");
+  }
+  button("Save").click();
+  await settle();
+  expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, null, 11, null, null);
+});
+
+test("an unknown episode total cannot automatically complete an editor entry", async () => {
+  await render(EditEntry, { entry: { ...entry, progress: 11, media: { ...media, episodes: null } }, scoreFormat: "POINT_100", onclose: vi.fn() });
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  progress.value = "12";
+  progress.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(document.querySelector<HTMLSelectElement>("#ed-status")!.value).toBe("CURRENT");
+});
+
+test("an explicit status choice after reaching the total remains authoritative", async () => {
+  await render(EditEntry, { entry: { ...entry, progress: 11 }, scoreFormat: "POINT_100", onclose: vi.fn() });
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  progress.value = "12";
+  progress.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  selectOption("#ed-status", "CURRENT");
+  button("Save").click();
+  await settle();
+  expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, "CURRENT", 12, null, null);
+});
+
+test.each(["PAUSED", "CURRENT"])("choosing %s before entering the final episode remains authoritative", async (status) => {
+  await render(EditEntry, { entry: { ...entry, progress: 11 }, scoreFormat: "POINT_100", onclose: vi.fn() });
+  selectOption("#ed-status", "PAUSED");
+  if (status === "CURRENT") selectOption("#ed-status", "CURRENT");
+  await settle();
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  progress.value = "12";
+  progress.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(document.querySelector<HTMLSelectElement>("#ed-status")!.value).toBe(status);
+  button("Save").click();
+  await settle();
+  expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, status, 12, null, null);
+});
+
+test("automatic completion lets the backend use a newly discovered episode total", async () => {
+  mocks.api.updateEntry.mockResolvedValue({ ...entry, progress: 12, media: { ...media, episodes: 13 } });
+  const onclose = vi.fn();
+  await render(EditEntry, { entry: { ...entry, progress: 11 }, scoreFormat: "POINT_100", onclose });
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  progress.value = "12";
+  progress.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(document.querySelector<HTMLSelectElement>("#ed-status")!.value).toBe("COMPLETED");
+  button("Save").click();
+  await settle();
+  expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, null, 12, null, null);
+  expect(onclose).toHaveBeenCalledOnce();
+});
+
+test("reentering the final count still requests completion when progress is unchanged", async () => {
+  await render(EditEntry, { entry: { ...entry, progress: 12 }, scoreFormat: "POINT_100", onclose: vi.fn() });
+  const progress = document.querySelector<HTMLInputElement>("#ed-progress")!;
+  progress.value = "12";
+  progress.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  button("Save").click();
+  await settle();
+  expect(mocks.api.updateEntry).toHaveBeenCalledWith(1, null, 12, null, null);
+});
+
 test.each(["save", "remove"])("a pending entry %s cannot close through its details link", async (action) => {
   const saving = deferred<typeof entry>();
   const onclose = vi.fn();
@@ -866,6 +962,21 @@ test("settings controls wait for their saved values before accepting edits", asy
   windowSetting.resolve("0");
   await settle();
   expect(document.querySelector('input[value="auto"]')!.matches(":disabled")).toBe(false);
+});
+
+test.each([
+  ["Windows NT 10.0", String.raw`\\.\pipe\mpvsocket`, "Windows media sessions"],
+  ["Linux", "/tmp/mpvsocket", "MPRIS2"],
+])("settings shows usable MPV setup on %s", async (platform, socket, detection) => {
+  const userAgent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(platform);
+  try {
+    await render(Settings);
+    expect(document.querySelector<HTMLInputElement>("#mpv-sock")!.placeholder).toBe(socket);
+    expect(document.querySelector("code")!.textContent).toBe(`input-ipc-server=${socket}`);
+    expect(document.body.textContent).toContain(detection);
+  } finally {
+    userAgent.mockRestore();
+  }
 });
 
 test("an unrelated window preference failure does not prevent saving loaded tracking settings", async () => {
