@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { emit } from "@tauri-apps/api/event";
 import { auth } from "./session.svelte";
 import { button, deferred, selectOption, settle } from "./helpers";
 
@@ -150,8 +149,7 @@ test("tracking confirms against the latest progress baseline", async () => {
   expect(document.querySelector('[role="dialog"]')).toBeNull();
 });
 
-test("tracking closes an accepted progress prompt when frontend event delivery fails", async () => {
-  vi.mocked(emit).mockRejectedValue(new Error("event bridge unavailable"));
+test("tracking closes an accepted progress prompt without receiving a list-update event", async () => {
   mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 8 });
   await render(Tracking);
   event("kurisu://tracking-prompt", { media_id: 1, episode: 8, progress: 0, title: "Example Show" });
@@ -162,10 +160,9 @@ test("tracking closes an accepted progress prompt when frontend event delivery f
   expect(document.querySelector('[role="dialog"]')).toBeNull();
 });
 
-test("an accepted stepper write is not labeled unsaved when frontend event delivery fails", async () => {
+test("an accepted stepper write is saved without receiving a list-update event", async () => {
   vi.useFakeTimers();
   try {
-    vi.mocked(emit).mockRejectedValue(new Error("event bridge unavailable"));
     mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 1 });
     const onerror = vi.fn();
     await render(EpisodeStepper, { mediaId: 1, progress: 0, total: 12, onerror });

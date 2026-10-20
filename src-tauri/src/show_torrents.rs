@@ -465,8 +465,8 @@ fn strict_match<'a>(
 fn item_key(item: &RawItem) -> String {
     item.info_hash
         .as_deref()
-        .and_then(rss::valid_info_hash)
-        .map(|hash| hash.to_ascii_lowercase())
+        .and_then(rss::info_hash_aliases)
+        .map(|[hex, _]| hex)
         .unwrap_or_else(|| {
             if !item.link.is_empty() {
                 item.link.clone()
@@ -517,8 +517,31 @@ pub fn stable_guid(item: &RawItem) -> String {
     format!("nyaa-show\u{1}{}", item_key(item))
 }
 
+pub(crate) fn seen_guid_aliases(guid: &str) -> Vec<String> {
+    match guid
+        .strip_prefix("nyaa-show\u{1}")
+        .and_then(rss::info_hash_aliases)
+    {
+        Some(hashes) => {
+            let mut aliases: Vec<_> = hashes.map(|hash| format!("nyaa-show\u{1}{hash}")).into();
+            if !aliases.iter().any(|alias| alias == guid) {
+                aliases.push(guid.to_string());
+            }
+            aliases
+        }
+        None => vec![guid.to_string()],
+    }
+}
+
+fn guid_was_seen(guid: &str, seen: &HashSet<String>) -> bool {
+    seen.contains(guid)
+        || seen_guid_aliases(guid)
+            .iter()
+            .any(|alias| seen.contains(alias))
+}
+
 pub fn was_seen(item: &RawItem, seen: &HashSet<String>) -> bool {
-    seen.contains(&item.guid) || seen.contains(&stable_guid(item))
+    seen.contains(&item.guid) || guid_was_seen(&stable_guid(item), seen)
 }
 
 pub fn restore_seen(result: &mut ShowTorrents, seen: &HashSet<String>) {
@@ -528,7 +551,7 @@ pub fn restore_seen(result: &mut ShowTorrents, seen: &HashSet<String>) {
         .chain(result.episodes.iter_mut())
         .chain(result.other.iter_mut())
     {
-        item.seen = seen.contains(&item.guid);
+        item.seen = guid_was_seen(&item.guid, seen);
     }
 }
 
@@ -1145,6 +1168,43 @@ mod tests {
         let mut second = first.clone();
         second.info_hash = Some(" abcdef0123456789abcdef0123456789abcdef01 ".into());
         assert_eq!(stable_guid(&first), stable_guid(&second));
+    }
+
+    #[test]
+    fn equivalent_hex_and_base32_hashes_share_releases_and_seen_marks() {
+        let entry = entry();
+        let first = RawItem {
+            info_hash: Some("abcdef0123456789abcdef0123456789abcdef01".into()),
+            ..raw("[Group] Some Show - 05 [1080p]", 10)
+        };
+        let second = RawItem {
+            info_hash: Some("VPG66AJDIVTYTK6N54ASGRLHRGV433YB".into()),
+            link: "https://another.example/release".into(),
+            guid: "another-feed\u{1}release".into(),
+            ..first.clone()
+        };
+        assert_eq!(stable_guid(&first), stable_guid(&second));
+        let result = classify(
+            &entry,
+            &matchers(&entry),
+            vec![first.clone(), second.clone()],
+        );
+        assert_eq!(result.episodes.len(), 1);
+        for item in [&first, &second] {
+            for old_key in [
+                "nyaa-show\u{1}abcdef0123456789abcdef0123456789abcdef01",
+                "nyaa-show\u{1}vpg66ajdivtytk6n54asgrlhrgv433yb",
+            ] {
+                let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+                db.mark_rss_seen(&[old_key.into()]).unwrap();
+                let seen = db.rss_seen_set().unwrap();
+                assert!(was_seen(item, &seen));
+                assert!(search_results(vec![item.clone()], &seen)[0].seen);
+                let mut discovery = classify(&entry, &matchers(&entry), vec![item.clone()]);
+                restore_seen(&mut discovery, &seen);
+                assert!(discovery.episodes[0].seen);
+            }
+        }
     }
     #[test]
     fn bilingual_release_titles_keep_known_aliases_and_reject_unknown_sequels() {

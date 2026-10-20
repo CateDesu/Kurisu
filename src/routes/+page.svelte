@@ -8,12 +8,14 @@
   let autoSyncedEpoch = 0;
   let lastSyncAttemptAt = 0;
   const SYNC_AGE = 5 * 60_000;
-  let pendingSync: { epoch: number; promise: ReturnType<typeof api.syncMyList> } | null = null;
+  let listRevision = 0;
+  let pendingSync: { epoch: number; revision: number; promise: ReturnType<typeof api.syncMyList> } | null = null;
 
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 </script>
 
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import PageHeading from "$lib/PageHeading.svelte";
   import { listenForListUpdates } from "$lib/list.svelte";
   import { goto } from "$app/navigation";
@@ -172,6 +174,8 @@
 
   let loadId = 0;
   let syncId = 0;
+  let alive = true;
+  onDestroy(() => { alive = false; });
   async function load() {
     if (!auth.isLoggedIn) return;
     const id = ++loadId;
@@ -195,8 +199,13 @@
         await sync();
         return;
       }
+      const revision = listRevision;
       const list = await api.localEntries();
       if (!current()) return;
+      if (revision !== listRevision) {
+        await load();
+        return;
+      }
       entries = list;
       syncedFor = uid;
       if (auth.epoch !== autoSyncedEpoch) {
@@ -227,10 +236,16 @@
     error = "";
     const request = pendingSync?.epoch === epoch
       ? pendingSync
-      : { epoch, promise: api.syncMyList() };
+      : { epoch, revision: listRevision, promise: api.syncMyList() };
     pendingSync = request;
     try {
-      const list = await request.promise;
+      let list = await request.promise;
+      let revision = request.revision;
+      // Tracking and departed steppers can update an already read sync snapshot.
+      while (current() && revision !== listRevision) {
+        revision = listRevision;
+        list = await api.localEntries();
+      }
       if (current()) {
         loadId++;
         loading = false;
@@ -247,6 +262,13 @@
   }
 
   function applyEntry(entry: ListEntry) {
+    listRevision++;
+    if (!alive) return;
+    loadId++;
+    syncId++;
+    pendingSync = null;
+    loading = false;
+    syncing = false;
     entries = entries.map((x) =>
       x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x
     );
@@ -273,6 +295,7 @@
     let debounce: ReturnType<typeof setTimeout> | null = null;
     const refresh = () => {
       if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      listRevision++;
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => {
         debounce = null;

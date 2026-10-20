@@ -8,11 +8,11 @@ const mocks = vi.hoisted(() => ({
     loginWithToken: vi.fn(), loginOauth: vi.fn(), getTrackingConfig: vi.fn(), getAppSetting: vi.fn(),
   },
   reset: vi.fn(),
-  listeners: new Map<string, () => void>(),
+  listeners: new Map<string, () => void | Promise<void>>(),
 }));
 vi.mock("$lib/api", () => ({ api: mocks.api }));
 vi.mock("$lib/library.svelte", () => ({ library: { reset: mocks.reset } }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (event: string, callback: () => void) => {
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (event: string, callback: () => void | Promise<void>) => {
   mocks.listeners.set(event, callback);
   return () => mocks.listeners.delete(event);
 }) }));
@@ -27,6 +27,7 @@ beforeEach(async () => {
   vi.resetAllMocks();
   vi.useFakeTimers();
   mocks.api.currentUser.mockResolvedValue({ id: 1, name: "Example" });
+  mocks.api.isLoggedIn.mockResolvedValue(true);
   mocks.api.logout.mockResolvedValue(undefined);
   mocks.api.setProgress.mockResolvedValue({ media_id: 1, progress: 4 });
   mocks.api.loginWithToken.mockResolvedValue({ id: 2, name: "Other" });
@@ -158,7 +159,9 @@ test("session expiry during the save barrier does not restore the expired accoun
   mocks.api.setProgress.mockReturnValue(saving.promise);
   const loggingOut = auth.logout();
   await settle();
-  mocks.listeners.get("kurisu://auth-expired")!();
+  mocks.api.isLoggedIn.mockResolvedValue(false);
+  await mocks.listeners.get("kurisu://auth-expired")!();
+  expect(auth.isLoggedIn).toBe(false);
   saving.reject(new Error("Session expired"));
   await loggingOut;
   expect(auth.isLoggedIn).toBe(false);

@@ -117,6 +117,111 @@ test.each(["click", "keyboard"])("finishing with %s moves a show straight into C
   expect(document.querySelector(".row-progress")!.textContent).toContain("12/12");
 });
 
+test.each(["cached list", "sync"])("an older %s response cannot undo accepted episode completion", async (source) => {
+  vi.useFakeTimers();
+  const watching = { ...entry, progress: 11 };
+  const completed = { ...watching, progress: 12, status: "COMPLETED" };
+  mocks.api.localEntries.mockResolvedValue([watching]);
+  mocks.api.syncMyList.mockResolvedValue([watching]);
+  mocks.api.setProgress.mockResolvedValue(completed);
+  auth.offline = source === "cached list";
+  const old = deferred<typeof entry[]>();
+  if (source === "sync") mocks.api.syncMyList.mockReturnValueOnce(old.promise);
+  await render(Collection);
+  if (source === "cached list") {
+    mocks.api.localEntries.mockReturnValueOnce(old.promise);
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+    await vi.advanceTimersByTimeAsync(300);
+    await settle();
+    expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
+  }
+
+  document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!.click();
+  await settle();
+  expect(document.querySelector(".collection-row")).toBeNull();
+  if (source === "sync") {
+    mocks.api.localEntries.mockResolvedValue([completed]);
+    for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback();
+    await vi.advanceTimersByTimeAsync(300);
+    await settle();
+    expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
+  }
+  old.resolve([watching]);
+  await settle();
+  expect(document.querySelector(".collection-row")).toBeNull();
+  expect(document.body.textContent).toContain("12 Episodes Tracked");
+  expect(button("Sync").disabled).toBe(false);
+  button("Completed 1").click();
+  await settle();
+  expect(document.querySelector(".row-progress")!.textContent).toContain("12/12");
+  expect(mocks.api.syncMyList).toHaveBeenCalledTimes(source === "sync" ? 1 : 0);
+});
+
+test.each(["cached list", "sync"])("returning to My List cannot reuse a %s snapshot older than a departed stepper save", async (source) => {
+  vi.useFakeTimers();
+  const watching = { ...entry, progress: 11 };
+  const completed = { ...watching, progress: 12, status: "COMPLETED" };
+  const old = deferred<typeof entry[]>();
+  const write = deferred<typeof entry>();
+  mocks.api.localEntries.mockResolvedValue([watching]);
+  mocks.api.syncMyList.mockReturnValue(old.promise);
+  mocks.api.setProgress.mockReturnValue(write.promise);
+  auth.offline = source === "cached list";
+  await render(Collection);
+  document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!.click();
+  await settle();
+  expect(mocks.api.setProgress).toHaveBeenCalledExactlyOnceWith(1, 12, 11);
+  await unmount(mounted.pop()!);
+  document.body.replaceChildren();
+  if (source === "cached list") mocks.api.localEntries.mockReturnValueOnce(old.promise);
+  await render(Collection);
+  mocks.api.localEntries.mockResolvedValue([completed]);
+  write.resolve(completed);
+  await settle();
+  old.resolve([watching]);
+  await settle();
+  expect(document.body.textContent).toContain("12 Episodes Tracked");
+  expect(document.querySelector(".collection-row")).toBeNull();
+  expect(button("Sync").disabled).toBe(false);
+  mocks.api.syncMyList.mockResolvedValue([{ ...watching, progress: 4 }]);
+  button("Sync").click();
+  await settle();
+  expect(document.body.textContent).toContain("4 Episodes Tracked");
+  expect(document.querySelector(".row-progress")!.textContent).toContain("4/12");
+});
+
+test.each(["cached list", "sync"])("an accepted tracking event supersedes an older %s response before its debounce", async (source) => {
+  vi.useFakeTimers();
+  const watching = { ...entry, progress: 11 };
+  const completed = { ...watching, progress: 12, status: "COMPLETED" };
+  const old = deferred<typeof entry[]>();
+  auth.offline = source === "cached list";
+  mocks.api.localEntries.mockResolvedValue([watching]);
+  mocks.api.syncMyList.mockReturnValueOnce(old.promise);
+  await render(Collection);
+  if (source === "cached list") {
+    mocks.api.localEntries.mockReturnValueOnce(old.promise);
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+    await vi.advanceTimersByTimeAsync(300);
+    await settle();
+  } else {
+    await unmount(mounted.pop()!);
+    document.body.replaceChildren();
+    await render(Collection);
+  }
+
+  mocks.api.localEntries.mockResolvedValue([completed]);
+  for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback();
+  old.resolve([watching]);
+  await settle();
+  expect(document.body.textContent).toContain("12 Episodes Tracked");
+  expect(document.querySelector(".collection-row")).toBeNull();
+  if (source === "sync") expect(document.body.textContent).toContain("Synced ✓");
+  await vi.advanceTimersByTimeAsync(300);
+  await settle();
+  expect(document.body.textContent).toContain("12 Episodes Tracked");
+});
+
 test("switching accounts retains that account's saved entries when network sync fails", async () => {
   await render(Collection);
   const saved = { ...entry, media_id: 2, progress: 4, media: { ...media, id: 2, title_english: "Saved second account show" } };

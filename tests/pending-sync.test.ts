@@ -113,8 +113,10 @@ test("pending status catches queue changes during initial listener registration"
   mocks.registration = registration.promise;
   component = mount(PendingSync, {target:document.body});
   await settle();
+  expect(mocks.api.getPendingChanges).not.toHaveBeenCalled();
   mocks.api.getPendingChanges.mockResolvedValue([]);
   registration.resolve();
   await settle();
+  expect(mocks.api.getPendingChanges).toHaveBeenCalledOnce();
   expect(document.body.textContent).not.toContain("waiting to sync");
 });

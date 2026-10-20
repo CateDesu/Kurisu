@@ -3,32 +3,30 @@
   import Gearwork from "$lib/Gearwork.svelte";
 
   let token = $state("");
-  let busy = $state(false);
+  let busy = $state<"oauth" | "token" | null>(null);
   let error = $state("");
+  let attempt = 0;
 
-  async function oauth() {
-    busy = true;
+  async function signIn(method: "oauth" | "token", request: () => Promise<unknown>) {
+    const current = ++attempt;
+    busy = method;
     error = "";
     try {
-      await auth.loginOauth();
+      await request();
     } catch (e) {
-      error = String(e);
+      if (current === attempt) error = String(e);
     } finally {
-      busy = false;
+      if (current === attempt) busy = null;
     }
+  }
+  async function oauth() {
+    if (busy) return;
+    await signIn("oauth", () => auth.loginOauth());
   }
   async function pasteToken(e: Event) {
     e.preventDefault();
-    if (!token.trim()) return;
-    busy = true;
-    error = "";
-    try {
-      await auth.loginWithToken(token.trim());
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = false;
-    }
+    if (busy === "token" || !token.trim()) return;
+    await signIn("token", () => auth.loginWithToken(token.trim()));
   }
 </script>
 
@@ -48,7 +46,7 @@
 
   <button
     onclick={oauth}
-    disabled={busy}
+    disabled={busy !== null}
     class="w-full py-2.5 rounded-md bg-accent hover:bg-accent-2 disabled:opacity-50 text-white font-medium transition-colors"
   >
     {#if busy}Connecting…{:else}Connect via AniList{/if}
@@ -63,13 +61,13 @@
         placeholder="AniList access token"
         class="flex-1 bg-panel-2 border border-edge rounded-md px-3 py-2 text-sm focus:outline-none focus:border-accent"
       />
-      <button disabled={busy} class="px-3 py-2 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50">
+      <button disabled={busy === "token"} class="px-3 py-2 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50">
         Use
       </button>
     </form>
     <p class="text-xs text-ink-dim mt-2">
-      An AniList access token — only needed if the browser sign-in above doesn't
-      open for you.
+      If browser sign-in fails, paste an AniList access token here. This replaces
+      the pending browser sign-in. Use the token itself, not a client ID or secret.
     </p>
   </details>
 </div>

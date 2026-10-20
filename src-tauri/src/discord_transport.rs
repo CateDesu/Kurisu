@@ -212,8 +212,44 @@ mod tests {
     async fn handshake(socket: &mut tokio::net::UnixStream) {
         let mut header = [0; 8];
         socket.read_exact(&mut header).await.unwrap();
-        let mut body = vec![0; u32::from_le_bytes(header[4..].try_into().unwrap()) as usize];
+        assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()), 0);
+        let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        assert!(size <= MAX_FRAME_BYTES);
+        let mut body = vec![0; size];
         socket.read_exact(&mut body).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"v": 1, "client_id": "test-client"})
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_handshake_frames_are_rejected_before_the_connection_timeout() {
+        for (index, opcode, size) in [(0, 1u32, u32::MAX), (1, 2, 0), (2, 3, 100), (3, 4, 100)] {
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-discord-frame-{}-{index}",
+                std::process::id()
+            ));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let connection = tokio::spawn({
+                let path = path.clone();
+                async move { Client::connect(&[path], "test-client").await }
+            });
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                handshake(&mut socket).await;
+                socket.write_all(&opcode.to_le_bytes()).await.unwrap();
+                socket.write_all(&size.to_le_bytes()).await.unwrap();
+                match connection.await.unwrap() {
+                    Ok(_) => panic!("malformed handshake was accepted"),
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+                }
+                assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+            })
+            .await;
+            std::fs::remove_file(path).unwrap();
+            result.unwrap();
+        }
     }
 
     async fn reply(socket: &mut tokio::net::UnixStream, event: &str) {

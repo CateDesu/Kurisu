@@ -69,7 +69,8 @@ const KNOWN_VIDEO_PLAYERS: &[&str] = &[
 ];
 
 const AUDIO_EXTS: &[&str] = &[
-    "mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "aiff",
+    "mp3", "flac", "m4a", "m4b", "mka", "aac", "ogg", "oga", "opus", "wav", "wma", "aif", "aiff",
+    "aifc", "ape", "wv", "wvp", "tta",
 ];
 
 fn is_audio_url(url: &str) -> bool {
@@ -614,15 +615,24 @@ fn probe_mpv(app: &AppHandle) -> Option<TickInfo> {
 fn mpv_tick_info(app: &AppHandle, snap: &mpvipc::MpvSnapshot) -> TickInfo {
     let state = app.state::<AppState>();
     let matchers = state.matchers.lock().clone();
+    mpv_snapshot_info(&state.db, &matchers, snap)
+}
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn mpv_snapshot_info(
+    db: &crate::db::Db,
+    matchers: &[crate::recognize::Matcher],
+    snap: &mpvipc::MpvSnapshot,
+) -> TickInfo {
     let title = if snap.media_title.is_empty() {
         snap.filename.clone()
     } else {
         snap.media_title.clone()
     };
-    let matched = if is_audio_url(&snap.path) || is_audio_url(&snap.filename) {
+    let matched = if is_audio_url(&snap.filename) {
         None
     } else {
-        match_playing(app, &matchers, &title, &snap.path)
+        match_playing(db, matchers, &title, &snap.path)
     };
     let base = basename(&snap.path);
     let episode = matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
@@ -641,7 +651,7 @@ fn mpv_tick_info(app: &AppHandle, snap: &mpvipc::MpvSnapshot) -> TickInfo {
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 fn match_playing<'a>(
-    app: &AppHandle,
+    db: &crate::db::Db,
     matchers: &'a [crate::recognize::Matcher],
     title: &str,
     path: &str,
@@ -649,7 +659,10 @@ fn match_playing<'a>(
     &'a crate::recognize::Matcher,
     Option<library::LibraryBinding>,
 )> {
-    let bindings = match library::get_bindings(&app.state::<AppState>().db) {
+    if is_audio_url(path) {
+        return None;
+    }
+    let bindings = match library::get_bindings(db) {
         Ok(bindings) => bindings,
         Err(error) => {
             log::warn!("cannot read library bindings, skipping playback match: {error}");
@@ -733,11 +746,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
             let md = player.get_metadata().unwrap_or_default();
             let title = md.title().map(|t| t.to_string()).unwrap_or_default();
             let url = md.url().map(|u| u.to_string()).unwrap_or_default();
-            let matched = if is_audio_url(&url) {
-                None
-            } else {
-                match_playing(app, &matchers, &title, &url)
-            };
+            let matched = match_playing(&state.db, &matchers, &title, &url);
             let base = basename(&url);
             let episode =
                 matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
@@ -1495,6 +1504,80 @@ mod tests {
         assert!(!is_audio_url("file:///anime/Show.mp3.mkv"));
         assert!(is_audio_url("file:///music/Show.mkv.mp3"));
         assert!(!is_audio_url("file:///anime/movie.2024"));
+    }
+
+    #[test]
+    fn audio_only_containers_cannot_supply_recognizable_episode_titles() {
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&crate::models::Media {
+            id: 1,
+            title_english: Some("Some Show".into()),
+            episodes: Some(12),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&crate::models::ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let matchers = crate::recognize::build_matchers(&db);
+        let title = "Some Show - 03";
+        let folder = std::env::temp_dir().join(format!("kurisu-audio-only-{}", std::process::id()));
+        library::bind_path(&db, folder.to_str().unwrap(), 1, -12).unwrap();
+        let snapshot = |path: String, filename: String| mpvipc::MpvSnapshot {
+            playing: true,
+            path,
+            filename,
+            media_title: title.into(),
+            duration_us: 1_200_000_000,
+            position_us: 1_100_000_000,
+        };
+        let video = snapshot(
+            reqwest::Url::from_file_path(folder.join("ep13.mkv"))
+                .unwrap()
+                .into(),
+            "ep13.mkv".into(),
+        );
+        let recognized = mpv_snapshot_info(&db, &matchers, &video);
+        assert_eq!(recognized.media_id, Some(1));
+        assert_eq!(recognized.matched_title.as_deref(), Some("Some Show"));
+        assert_eq!(recognized.episode, Some(1));
+        for extension in [
+            "mka", "m4b", "aif", "aifc", "ape", "wv", "wvp", "tta", "oga",
+        ] {
+            let url: String =
+                reqwest::Url::from_file_path(folder.join(format!("ep13.{extension}")))
+                    .unwrap()
+                    .into();
+            let https = format!(
+                "https://example.com/Some%20Show%20-%2003.{}?token=1#part",
+                extension.to_ascii_uppercase()
+            );
+            for (path, filename) in [
+                (url.clone(), "video.mkv".into()),
+                (https, "video.mkv".into()),
+                (
+                    "https://example.com/stream".into(),
+                    format!("ep13.{extension}"),
+                ),
+            ] {
+                let info = mpv_snapshot_info(&db, &matchers, &snapshot(path.clone(), filename));
+                assert!(info.playing);
+                assert_eq!(info.title, title);
+                assert_eq!(info.length_us, 1_200_000_000);
+                assert_eq!(info.position_us, 1_100_000_000);
+                assert_eq!(info.media_id, None, "{path} reached episode recognition");
+                assert_eq!(info.matched_title, None);
+                assert_eq!(info.episode, None);
+            }
+            assert!(match_playing(&db, &matchers, title, &url).is_none());
+        }
+        db.set_setting("library_bindings", "{invalid").unwrap();
+        let unrecognized = mpv_snapshot_info(&db, &matchers, &video);
+        assert_eq!(unrecognized.media_id, None);
+        assert_eq!(unrecognized.episode, None);
     }
 
     #[test]

@@ -64,4 +64,6 @@ cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 
 AniList tokens are stored locally in plaintext. See [Privacy](PRIVACY.md) and [Terms](TERMS.md).
 
+Browser sign-in uses Kurisu's hosted authorization-code exchange. Its AniList client secret stays on the server and is not included in desktop builds.
+
 [MIT License](LICENSE)

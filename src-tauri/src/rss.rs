@@ -508,6 +508,47 @@ pub(crate) fn valid_info_hash(info_hash: &str) -> Option<&str> {
     valid.then_some(hash)
 }
 
+pub(crate) fn info_hash_aliases(info_hash: &str) -> Option<[String; 2]> {
+    let hash = valid_info_hash(info_hash)?;
+    let mut bytes = [0u8; 20];
+    if hash.len() == 40 {
+        for (byte, pair) in bytes.iter_mut().zip(hash.as_bytes().as_chunks::<2>().0) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+    } else {
+        for (group, output) in hash
+            .as_bytes()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(bytes.as_chunks_mut::<5>().0)
+        {
+            let mut bits = 0u64;
+            for byte in group {
+                let value = match byte.to_ascii_uppercase() {
+                    b'A'..=b'Z' => byte.to_ascii_uppercase() - b'A',
+                    b'2'..=b'7' => byte - b'2' + 26,
+                    _ => return None,
+                };
+                bits = (bits << 5) | u64::from(value);
+            }
+            output.copy_from_slice(&bits.to_be_bytes()[3..]);
+        }
+    }
+    let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut base32 = String::with_capacity(32);
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    for group in bytes.as_chunks::<5>().0 {
+        let bits = group
+            .iter()
+            .fold(0u64, |bits, byte| (bits << 8) | u64::from(*byte));
+        for shift in (0..8).rev() {
+            base32.push(ALPHABET[((bits >> (shift * 5)) & 31) as usize] as char);
+        }
+    }
+    Some([hex, base32])
+}
+
 /// Validate the hash before embedding it so feed text cannot inject magnet parameters.
 pub fn magnet_for(info_hash: &str, title: &str) -> Option<String> {
     let Some(hash) = valid_info_hash(info_hash) else {
@@ -752,6 +793,43 @@ mod tests {
         assert!(magnet_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "t")
             .unwrap()
             .starts_with("magnet:?xt=urn:btih:"));
+    }
+
+    #[test]
+    fn hash_aliases_preserve_the_same_twenty_bytes_in_both_encodings() {
+        for (hex, base32) in [
+            (
+                "abcdef0123456789abcdef0123456789abcdef01",
+                "vpg66ajdivtytk6n54asgrlhrgv433yb",
+            ),
+            (
+                "0000000000000000000000000000000000000000",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "ffffffffffffffffffffffffffffffffffffffff",
+                "77777777777777777777777777777777",
+            ),
+        ] {
+            for value in [
+                hex.to_string(),
+                base32.to_string(),
+                format!(" {} ", base32.to_uppercase()),
+            ] {
+                assert_eq!(info_hash_aliases(&value), Some([hex.into(), base32.into()]));
+            }
+        }
+        for invalid in ["", "not-a-hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"] {
+            assert!(info_hash_aliases(invalid).is_none());
+        }
+        assert_eq!(
+            crate::show_torrents::seen_guid_aliases("opaque-guid"),
+            ["opaque-guid"]
+        );
+        assert_eq!(
+            crate::show_torrents::seen_guid_aliases("nyaa-show\u{1}invalid"),
+            ["nyaa-show\u{1}invalid"]
+        );
     }
 
     #[test]

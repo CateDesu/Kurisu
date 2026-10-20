@@ -1,10 +1,11 @@
 # Privacy Policy
 
-Kurisu has no telemetry, analytics, or crash reporting and sends no data to its author.
+Kurisu has no telemetry, analytics, or crash reporting.
 
 The program connects to:
 
 - **AniList** for account and list sync using your OAuth token.
+- **Kurisu's sign-in service**, hosted on Vercel, during browser sign-in. It forwards your temporary authorization code to AniList and returns the access token to Kurisu. The service does not persist codes or tokens or request your anime list. The hosting provider processes network requests under its own privacy policy. Pasting an access token bypasses this service.
 - **Your local Discord client**, if Rich Presence is enabled, to share the current show and episode. Your client publishes it under your Discord settings.
 - **GitHub** for update checks and downloads. GitHub receives these requests like website visits.
 - **Configured torrent feeds** for RSS, and **nyaa.si** for searches, including your search text. Remote feeds and searches use HTTPS.

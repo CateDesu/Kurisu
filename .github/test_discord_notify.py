@@ -24,6 +24,9 @@ PNG = bytes.fromhex(
 
 class NotificationTests(unittest.TestCase):
     def setUp(self):
+        proxy_bypass = patch.dict(os.environ, {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"})
+        proxy_bypass.start()
+        self.addCleanup(proxy_bypass.stop)
         self.requests = []
         self.image_failures = 0
         self.image = PNG
@@ -153,7 +156,10 @@ class NotificationTests(unittest.TestCase):
     def test_manual_run_uses_the_selected_commit_message(self):
         self.env["COMMIT_SHA"] = "HEAD"
         self.env["COMMIT_MSG"] = ""
-        expected = subprocess.check_output(["git", "show", "-s", "--format=%s", "HEAD"], text=True).strip()
+        message = subprocess.check_output(["git", "show", "-s", "--format=%B", "HEAD"], text=True).strip()
+        expected = message.splitlines()[0] if message else self.env["REPO"]
+        if len(expected) > 256:
+            expected = expected[:255] + "…"
         notify.prepare(self.env, self.output)
         payload = json.loads((self.output / "discord-notification.json").read_text())
         self.assertEqual(payload["embeds"][0]["title"], expected)

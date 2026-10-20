@@ -499,9 +499,13 @@ impl Db {
 
     pub fn prune_rss_seen_keeping(&self, days: i64, keep: &[String]) -> Result<()> {
         let cutoff = chrono::Utc::now().timestamp() - days * 86_400;
+        let keep: Vec<_> = keep
+            .iter()
+            .flat_map(|guid| crate::show_torrents::seen_guid_aliases(guid))
+            .collect();
         self.0.lock().execute(
             "DELETE FROM rss_seen WHERE seen_at < ? AND guid NOT IN (SELECT value FROM json_each(?))",
-            rusqlite::params![cutoff, serde_json::to_string(keep)?],
+            rusqlite::params![cutoff, serde_json::to_string(&keep)?],
         )?;
         Ok(())
     }
@@ -1047,6 +1051,41 @@ mod tests {
         let seen = db.rss_seen_set().unwrap();
         assert!(!seen.contains("old-gone"));
         assert!(seen.contains("old-carried"));
+    }
+
+    #[test]
+    fn seen_prune_keeps_legacy_hash_encodings_for_current_releases() {
+        let hex = "nyaa-show\u{1}abcdef0123456789abcdef0123456789abcdef01";
+        let base32 = "nyaa-show\u{1}vpg66ajdivtytk6n54asgrlhrgv433yb";
+        let dir = std::env::temp_dir().join(format!("kurisu-seen-hash-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for (index, old_key) in [hex, base32].into_iter().enumerate() {
+            let path = dir.join(format!("{index}.db"));
+            let db = Db::open(&path).unwrap();
+            db.mark_rss_seen(&[old_key.into(), "old-gone".into()])
+                .unwrap();
+            db.0.lock()
+                .execute("UPDATE rss_seen SET seen_at = 1", [])
+                .unwrap();
+            db.prune_rss_seen_keeping(60, &[hex.into()]).unwrap();
+            drop(db);
+            let db = Db::open(&path).unwrap();
+            let seen = db.rss_seen_set().unwrap();
+            assert_eq!(seen, std::collections::HashSet::from([old_key.to_string()]));
+            for hash in [
+                "abcdef0123456789abcdef0123456789abcdef01",
+                "VPG66AJDIVTYTK6N54ASGRLHRGV433YB",
+            ] {
+                let release = crate::rss::RawItem {
+                    info_hash: Some(hash.into()),
+                    ..Default::default()
+                };
+                assert!(crate::show_torrents::was_seen(&release, &seen));
+            }
+            db.prune_rss_seen_keeping(60, &[]).unwrap();
+            assert!(db.rss_seen_set().unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

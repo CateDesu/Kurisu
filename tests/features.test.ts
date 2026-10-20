@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { emit } from "@tauri-apps/api/event";
 import { auth } from "./session.svelte";
 import { button, deferred, selectOption, settle } from "./helpers";
 
@@ -288,15 +287,57 @@ test("a queue refresh cannot overwrite newly saved currently watching progress",
   expect(document.body.textContent).toContain("Ep 5/12 on your list");
 });
 
-test("currently watching retains accepted progress when frontend event delivery fails", async () => {
+test("an older current-list response cannot undo accepted stepper completion", async () => {
+  const watching = { ...entry, progress: 11 };
+  mocks.api.localEntries.mockResolvedValue([watching]);
+  mocks.api.setProgress.mockResolvedValue({ ...watching, progress: 12, status: "COMPLETED" });
+  await render(Now);
+  const old = deferred<typeof entry[]>();
+  mocks.api.localEntries.mockReturnValueOnce(old.promise);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  await settle();
+  document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!.click();
+  await settle();
+  expect(document.body.textContent).not.toContain("Continue watching");
+  old.resolve([watching]);
+  await settle();
+  expect(document.body.textContent).not.toContain("Continue watching");
+
+  mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 4 }]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  await settle();
+  expect(document.body.textContent).toContain("Continue watching");
+  expect(document.body.textContent).toContain("4/12");
+});
+
+test("stepper completion updates playback progress and rejects its older entry read", async () => {
+  const watching = { ...entry, progress: 11 };
+  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 12, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  mocks.api.getEntry.mockResolvedValue(watching);
+  mocks.api.localEntries.mockResolvedValue([watching]);
+  mocks.api.setProgress.mockResolvedValue({ ...watching, progress: 12, status: "COMPLETED" });
+  await render(Now);
+  const old = deferred<typeof entry>();
+  mocks.api.getEntry.mockReturnValueOnce(old.promise);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  await settle();
+  document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!.click();
+  await settle();
+  expect(document.body.textContent).toContain("Ep 12/12 on your list");
+  old.resolve(watching);
+  await settle();
+  expect(document.body.textContent).toContain("Ep 12/12 on your list");
+  expect(document.body.textContent).not.toContain("Update to Ep 12");
+});
+
+test("currently watching retains accepted progress without receiving a list-update event", async () => {
   mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
-  vi.mocked(emit).mockRejectedValue(new Error("event bridge unavailable"));
   mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 4 });
   await render(Now);
   button("Update to Ep 4").click();
   await settle();
+  expect(mocks.api.setProgress).toHaveBeenCalledExactlyOnceWith(1, 4, 3);
   expect(document.body.textContent).toContain("Ep 4/12 on your list");
-  expect(document.body.textContent).not.toContain("event bridge unavailable");
 });
 
 test("currently watching reloads authoritative progress after a failed write", async () => {

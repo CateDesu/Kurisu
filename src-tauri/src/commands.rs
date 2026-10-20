@@ -347,14 +347,30 @@ pub async fn login_oauth(
         .map_err(|e| e.to_string())?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
+    if client_id != DEFAULT_CLIENT_ID || redirect_uri != DEFAULT_REDIRECT_URI {
+        return Err("Browser sign-in requires Kurisu's registered AniList client. Use an access token for a custom client.".into());
+    }
     let (oauth_state, _, rx) =
         start_oauth_callback(state.inner(), intent, anilist::OAUTH_PORT).await?;
     let url = anilist::authorize_url(&client_id, &redirect_uri, &oauth_state);
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())?;
-    let token = wait_for_oauth_token(state.inner(), intent, rx).await?;
-    login_with_token_inner(token, state.inner(), intent).await
+    finish_oauth_login(state.inner(), intent, rx).await
+}
+
+async fn finish_oauth_login(
+    state: &AppState,
+    intent: u64,
+    receiver: anilist::OAuthReceiver,
+) -> Result<User, String> {
+    let code = wait_for_oauth_code(state, intent, receiver).await?;
+    let api = state.anilist.lock().clone();
+    let token = tokio::select! {
+        result = api.exchange_code(&code) => result.map_err(|e| e.to_string())?,
+        _ = state.auth_intent_changed(intent) => return Err(AUTH_REPLACED.into()),
+    };
+    login_with_token_inner(token, state, intent).await
 }
 
 async fn start_oauth_callback(
@@ -383,20 +399,20 @@ async fn start_oauth_callback(
     unreachable!()
 }
 
-async fn wait_for_oauth_token(
+async fn wait_for_oauth_code(
     state: &AppState,
     intent: u64,
     receiver: anilist::OAuthReceiver,
 ) -> Result<String, String> {
     state.check_auth_intent(intent)?;
-    let token = tokio::select! {
+    let code = tokio::select! {
         result = tokio::time::timeout(std::time::Duration::from_secs(300), receiver) => result
             .map_err(|_| "Timed out waiting for AniList to redirect.".to_string())?
             .map_err(|_| "OAuth callback channel closed.".to_string())?,
         _ = state.auth_intent_changed(intent) => Err(AUTH_REPLACED.into()),
     }?;
     state.check_auth_intent(intent)?;
-    Ok(token)
+    Ok(code)
 }
 
 #[tauri::command]
@@ -2181,6 +2197,63 @@ mod regression_tests {
     }
 
     #[tokio::test]
+    async fn oauth_callback_exchanges_the_code_before_saving_the_verified_account() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"access_token":"exchanged-token"})),
+            (200, viewer_response(7, "Tester")),
+        ])
+        .await;
+        let state = state_with_api(api);
+        let intent = state.begin_auth_intent();
+        let (oauth_state, port, receiver) = start_oauth_callback(&state, intent, 0).await.unwrap();
+        let callback = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/?code=one-use-code&state={oauth_state}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(callback.status().is_success());
+        let user = finish_oauth_login(&state, intent, receiver).await.unwrap();
+        assert_eq!(user.id, 7);
+        assert_eq!(requests.recv().await.unwrap(), json!({"code":"one-use-code"}));
+        assert!(requests.recv().await.unwrap()["query"].as_str().unwrap().contains("Viewer"));
+        assert_eq!(state.db.get_setting(TOKEN_KEY).unwrap().as_deref(), Some("exchanged-token"));
+        assert_eq!(state.anilist.lock().token().as_deref(), Some("exchanged-token"));
+    }
+
+    #[tokio::test]
+    async fn failed_oauth_exchange_preserves_the_previous_session() {
+        let (api, mut requests) =
+            anilist::mock_api(vec![(400, json!({"error":"invalid_grant"}))]).await;
+        let state = state_with_api(api);
+        let intent = state.begin_auth_intent();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender.send(Ok("expired-code".into())).unwrap();
+        let error = finish_oauth_login(&state, intent, receiver).await.unwrap_err();
+        assert!(error.contains("Start sign-in again"));
+        assert_eq!(state.anilist.lock().token().as_deref(), Some("test-session"));
+        assert_eq!(requests.recv().await.unwrap(), json!({"code":"expired-code"}));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_superseded_oauth_callback_cannot_exchange_its_code() {
+        let (api, mut requests) = anilist::mock_api(vec![]).await;
+        let state = state_with_api(api);
+        let intent = state.begin_auth_intent();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender.send(Ok("old-code".into())).unwrap();
+        state.begin_auth_intent();
+        assert_eq!(
+            finish_oauth_login(&state, intent, receiver).await.unwrap_err(),
+            AUTH_REPLACED
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn the_latest_login_intent_owns_the_persisted_account() {
         let (api, mut requests) = anilist::mock_api(vec![
             (200, viewer_response(7, "Earlier")),
@@ -2243,7 +2316,7 @@ mod regression_tests {
         preconnect.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
         let first_state = state.clone();
         let first = tokio::spawn(async move {
-            wait_for_oauth_token(&first_state, first_intent, receiver).await
+            wait_for_oauth_code(&first_state, first_intent, receiver).await
         });
         let latest_intent = state.begin_auth_intent();
         let (_, replacement_port, receiver) = start_oauth_callback(&state, latest_intent, port)

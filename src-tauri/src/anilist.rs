@@ -12,6 +12,7 @@ use crate::models::{
 
 const GRAPHQL: &str = "https://graphql.anilist.co";
 const AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
+const OAUTH_EXCHANGE: &str = "https://kurisu-anilist-exchange.vercel.app/api/exchange";
 /// Must match the registered OAuth redirect port.
 pub const OAUTH_PORT: u16 = 39417;
 
@@ -154,6 +155,46 @@ impl AniList {
     }
     pub fn token(&self) -> Option<String> {
         self.token.clone()
+    }
+
+    pub async fn exchange_code(&self, code: &str) -> Result<String> {
+        let endpoint = OAUTH_EXCHANGE;
+        #[cfg(test)]
+        let endpoint = self.endpoint.as_deref().unwrap_or(endpoint);
+        let http = reqwest::Client::builder()
+            .user_agent("Kurisu")
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(25));
+        #[cfg(test)]
+        let http = http.no_proxy();
+        let response = http
+            .build()?
+            .post(endpoint)
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({ "code": code }))
+            .send()
+            .await
+            .map_err(|_| anyhow!("Could not reach Kurisu's sign-in service. Try again later."))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!(match status.as_u16() {
+                400 => "AniList rejected this authorization code. Start sign-in again.",
+                429 => "AniList is busy. Try signing in again later.",
+                _ => "Kurisu's sign-in service could not complete authorization. Try again later.",
+            }));
+        }
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+        }
+        let token: TokenResponse = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("Kurisu's sign-in service returned an invalid response."))?;
+        if token.access_token.trim().is_empty() || token.access_token.len() > 16384 {
+            return Err(anyhow!("Kurisu's sign-in service returned an invalid access token."));
+        }
+        Ok(token.access_token)
     }
 
     fn note_rate_headers(&self, h: &reqwest::header::HeaderMap) {
@@ -1568,17 +1609,16 @@ fn random_state() -> Result<String> {
 
 pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
     format!(
-        "{AUTHORIZE}?client_id={cid}&response_type=token&redirect_uri={redir}&state={state}",
+        "{AUTHORIZE}?client_id={cid}&response_type=code&redirect_uri={redir}&state={state}",
         cid = urlencoding::encode(client_id),
         redir = urlencoding::encode(redirect_uri),
         state = urlencoding::encode(state),
     )
 }
 
-/// Forward the URL fragment as a query because browsers do not send fragments to servers.
-const SHIM_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>body{font-family:sans-serif;text-align:center;padding:3em;color:#9aa3b2;background:#0f1115;margin:0}h2{color:#3ba55d;font-weight:600}</style></head><body><h2>Connecting to Kurisu…</h2><p>You can close this tab once the app opens.</p><script>(function(){var h=location.hash.charCodeAt(0)===35?location.hash.slice(1):location.hash;if(h.indexOf('access_token=')!==-1||h.indexOf('error=')!==-1){location.replace('/__capture__?'+h);}})();</script></body></html>";
+const WAIT_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2>Waiting for AniList.</h2><p>Finish signing in using the AniList tab opened by Kurisu.</p></body>";
 
-const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#3ba55d'>Connected to Kurisu.</h2><p>You can close this tab and return to the app.</p></body>";
+const OK_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#3ba55d'>Authorization received.</h2><p>Close this tab and return to Kurisu to see the connection result.</p><script>history.replaceState(null,'',location.pathname);</script></body>";
 const ERR_HTML: &str = "<!doctype html><body style='font-family:sans-serif;text-align:center;padding:3em;background:#0f1115;color:#9aa3b2'><h2 style='color:#e74c3c'>Authorization failed.</h2><p>Return to Kurisu for details.</p></body>";
 
 fn clip_for_log(s: &str) -> String {
@@ -1672,7 +1712,7 @@ pub fn start_callback_server_on(port: u16) -> Result<(String, u16, OAuthReceiver
                 };
 
                 let (outcome, body) =
-                    if (param("error").is_some() || param("access_token").is_some())
+                    if (param("error").is_some() || param("code").is_some())
                         && param("state").as_deref() != Some(expected.as_str())
                     {
                         (None, ERR_HTML)
@@ -1680,24 +1720,24 @@ pub fn start_callback_server_on(port: u16) -> Result<(String, u16, OAuthReceiver
                         let msg = param("error_description").unwrap_or(err);
                         log::warn!("OAuth callback: AniList denied access: {}", clip_for_log(&msg));
                         (Some(Err(format!("AniList authorization failed: {}", clip_for_log(&msg)))), ERR_HTML)
-                    } else if let Some(token) = param("access_token") {
-                        if token.trim().is_empty() {
-                            (Some(Err("AniList returned an empty access token.".into())), ERR_HTML)
+                    } else if let Some(code) = param("code") {
+                        if code.trim().is_empty() {
+                            (Some(Err("AniList returned an empty authorization code.".into())), ERR_HTML)
                         } else {
-                            (Some(Ok(token)), OK_HTML)
+                            (Some(Ok(code)), OK_HTML)
                         }
                     } else {
                         let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            SHIM_HTML.len(),
-                            SHIM_HTML
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            WAIT_HTML.len(),
+                            WAIT_HTML
                         );
                         let _ = sock.write_all(resp.as_bytes()).await;
                         let _ = sock.shutdown().await;
                         continue;
                     };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -1730,6 +1770,22 @@ pub(crate) mod urlencoding {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oauth_authorization_requests_a_code_and_preserves_parameters() {
+        let url = reqwest::Url::parse(&super::authorize_url(
+            "45266",
+            "http://127.0.0.1:39417/",
+            "state+with&reserved=characters",
+        ))
+        .unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["response_type"], "code");
+        assert_eq!(query["client_id"], "45266");
+        assert_eq!(query["redirect_uri"], "http://127.0.0.1:39417/");
+        assert_eq!(query["state"], "state+with&reserved=characters");
+        assert!(!query.contains_key("client_secret"));
+    }
+
     #[test]
     fn percent_decode_handles_escapes_plus_and_junk() {
         assert_eq!(super::percent_decode("abc-123_x.y~z"), "abc-123_x.y~z");
@@ -1821,42 +1877,47 @@ mod tests {
     }
 
     #[test]
-    fn oauth_callback_survives_probes_and_accepts_verified_token() {
-        let (state, port, rx) = super::start_callback_server_on(0).expect("bind callback listener");
+    fn oauth_callback_survives_probes_and_accepts_verified_code() {
+        let (state, port, mut rx) = super::start_callback_server_on(0).expect("bind callback listener");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio rt");
         rt.block_on(async move {
             let base = format!("http://127.0.0.1:{port}");
-            let http = reqwest::Client::new();
-            let r = http.get(&base).send().await.unwrap();
-            assert!(r.status().is_success());
-            let r = http
-                .get(format!("{base}/?error=access_denied"))
-                .send()
-                .await
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
                 .unwrap();
-            assert!(r.status().is_success());
-            let r = http
-                .get(format!("{base}/__capture__?access_token=bad&state=nope"))
-                .send()
-                .await
-                .unwrap();
-            assert!(r.status().is_success());
+            for path in ["/", "/?error=access_denied", "/?code=bad&state=nope"] {
+                let response = http.get(format!("{base}{path}")).send().await.unwrap();
+                assert!(response.status().is_success());
+                response.text().await.unwrap();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx)
+                        .await
+                        .is_err(),
+                    "unverified callback {path} must leave authorization pending"
+                );
+            }
             let r = http
                 .get(format!(
-                    "{base}/__capture__?access_token=good-token&state={state}"
+                    "{base}/?code=good-code&state={state}"
                 ))
                 .send()
                 .await
                 .unwrap();
             assert!(r.status().is_success());
-            let token = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            assert_eq!(r.headers()["cache-control"], "no-store");
+            let page = r.text().await.unwrap();
+            assert!(page.contains("Authorization received."));
+            assert!(!page.contains("good-code"));
+            let code = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
                 .await
                 .expect("listener must still be alive after the probes")
                 .unwrap();
-            assert_eq!(token.unwrap(), "good-token");
+            assert_eq!(code.unwrap(), "good-code");
         });
     }
 }
@@ -1887,8 +1948,16 @@ pub(crate) async fn mock_api(
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let (requests, received) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for (status, body) in responses {
-            let (mut socket, _) = listener.accept().await.unwrap();
+        let mut responses = responses.into_iter();
+        loop {
+            let response = responses.next();
+            let (mut socket, _) = tokio::select! {
+                _ = requests.closed(), if response.is_none() => return,
+                accepted = listener.accept() => accepted.unwrap(),
+            };
+            let (status, body) = response.unwrap_or_else(|| {
+                (400, serde_json::json!({"errors":[{"message":"Unexpected AniList test request","status":400}]}))
+            });
             let mut request = Vec::new();
             let body_start;
             loop {
@@ -1944,6 +2013,71 @@ pub(crate) async fn mock_api(
 mod regression_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn oauth_exchange_sends_only_the_code_to_the_service() {
+        let (api, mut requests) =
+            mock_api(vec![(200, json!({"access_token":"new-token"}))]).await;
+        assert_eq!(api.exchange_code("one-use-code").await.unwrap(), "new-token");
+        assert_eq!(requests.recv().await.unwrap(), json!({"code":"one-use-code"}));
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_errors_and_empty_tokens_without_echoing_responses() {
+        for (status, body) in [
+            (400, json!({"error":"invalid_grant", "message":"private-code"})),
+            (502, json!({"message":"private-secret"})),
+            (200, json!({"access_token":""})),
+            (200, json!({"access_token":null})),
+            (200, json!({"access_token":" ".repeat(10)})),
+            (200, json!({"access_token":"x".repeat(16385)})),
+        ] {
+            let (api, _requests) = mock_api(vec![(status, body)]).await;
+            let error = api.exchange_code("one-use-code").await.unwrap_err().to_string();
+            assert!(!error.contains("private-"));
+            assert!(!error.contains("one-use-code"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_oauth_code_finishes_with_an_error() {
+        let (state, port, receiver) = start_callback_server_on(0).unwrap();
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/?code=&state={state}"))
+            .send()
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("empty authorization code"));
+    }
+
+    #[tokio::test]
+    async fn unexpected_requests_stay_visible_to_negative_assertions() {
+        for scripted in [false, true] {
+            let response = json!({"data":{"Viewer":{"id":7,"name":"Tester"}}});
+            let (api, mut requests) = mock_api(if scripted {
+                vec![(200, response)]
+            } else {
+                vec![]
+            })
+            .await;
+            if scripted {
+                api.viewer().await.unwrap();
+                requests.recv().await.unwrap();
+            }
+            assert!(api.viewer().await.is_err());
+            let request = requests
+                .try_recv()
+                .expect("unexpected HTTP requests must remain observable");
+            assert!(request["query"].as_str().unwrap().contains("Viewer"));
+        }
+    }
 
     #[tokio::test]
     async fn a_verified_oauth_denial_finishes_the_login_attempt() {

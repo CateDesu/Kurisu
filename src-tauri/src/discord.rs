@@ -308,11 +308,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn read_frame(socket: &mut tokio::net::UnixStream) -> serde_json::Value {
+    async fn read_frame(socket: &mut tokio::net::UnixStream, opcode: u32) -> serde_json::Value {
         use tokio::io::AsyncReadExt;
         let mut header = [0; 8];
         socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()), opcode);
         let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        assert!(size <= 1024 * 1024);
         let mut body = vec![0; size];
         socket.read_exact(&mut body).await.unwrap();
         serde_json::from_slice(&body).unwrap()
@@ -347,7 +349,7 @@ mod tests {
             ));
             tokio::time::timeout(Duration::from_secs(2), async {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                assert_eq!(read_frame(&mut socket).await["v"], 1);
+                assert_eq!(read_frame(&mut socket, 0).await["v"], 1);
                 if disable {
                     tx.send_replace(None);
                 }
@@ -378,15 +380,15 @@ mod tests {
         ));
         tokio::time::timeout(Duration::from_secs(3), async {
             let (mut stale, _) = listener.accept().await.unwrap();
-            read_frame(&mut stale).await;
+            read_frame(&mut stale, 0).await;
             let mut latest = playing();
             latest.episode = Some(13);
             tx.send_replace(Some(latest));
             assert_eq!(stale.read(&mut [0]).await.unwrap(), 0);
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_frame(&mut socket).await;
+            read_frame(&mut socket, 0).await;
             ready(&mut socket).await;
-            let activity = read_frame(&mut socket).await;
+            let activity = read_frame(&mut socket, 1).await;
             assert_eq!(activity["cmd"], "SET_ACTIVITY");
             assert_eq!(activity["args"]["activity"]["state"], "Episode 13/28");
             tx.send_replace(None);
@@ -415,9 +417,9 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                read_frame(&mut socket).await;
+                read_frame(&mut socket, 0).await;
                 ready(&mut socket).await;
-                assert_eq!(read_frame(&mut socket).await["cmd"], "SET_ACTIVITY");
+                assert_eq!(read_frame(&mut socket, 1).await["cmd"], "SET_ACTIVITY");
                 drop(socket);
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 tx.send_replace(Some(playing()));
@@ -447,9 +449,9 @@ mod tests {
                 |_| Duration::from_secs(30),
             ));
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_frame(&mut socket).await;
+            read_frame(&mut socket, 0).await;
             ready(&mut socket).await;
-            read_frame(&mut socket).await;
+            read_frame(&mut socket, 1).await;
             if reject {
                 use tokio::io::AsyncWriteExt;
                 let body = br#"{"evt":"ERROR"}"#;
@@ -493,9 +495,9 @@ mod tests {
         ));
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_frame(&mut socket).await;
+            read_frame(&mut socket, 0).await;
             ready(&mut socket).await;
-            read_frame(&mut socket).await;
+            read_frame(&mut socket, 1).await;
             socket.write_all(&1u32.to_le_bytes()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
             tx.send_replace(Some(PresenceInfo {
@@ -503,7 +505,7 @@ mod tests {
                 ..playing()
             }));
             assert_eq!(
-                read_frame(&mut socket).await["args"]["activity"]["state"],
+                read_frame(&mut socket, 1).await["args"]["activity"]["state"],
                 "Episode 13/28"
             );
             let reply = br#"{"cmd":"SET_ACTIVITY"}"#;
@@ -562,7 +564,7 @@ mod tests {
             ));
             tokio::time::timeout(Duration::from_secs(2), async {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                read_frame(&mut socket).await;
+                read_frame(&mut socket, 0).await;
                 socket.write_all(&opcode.to_le_bytes()).await.unwrap();
                 socket.write_all(&size.to_le_bytes()).await.unwrap();
                 socket.write_all(body).await.unwrap();

@@ -433,8 +433,18 @@ mod tests {
 
     #[test]
     fn oversized_reply_lines_are_rejected() {
-        let line = " ".repeat(MAX_REPLY_BYTES + 1) + "\n";
-        assert!(query_lines(&line).0.is_none());
+        let replies = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, r#""/anime/Some Show - 03.mkv""#),
+            ok(IDX_TITLE, r#""Some Show - 03""#),
+            ok(IDX_FILENAME, r#""Some Show - 03.mkv""#),
+            ok(IDX_DURATION, "1200"),
+            ok(IDX_POSITION, "1100"),
+        ]
+        .concat();
+        assert!(query_lines(&replies).0.is_some());
+        let oversized = " ".repeat(MAX_REPLY_BYTES) + &replies;
+        assert!(query_lines(&oversized).0.is_none());
     }
 
     #[cfg(unix)]
@@ -668,18 +678,43 @@ mod tests {
     #[test]
     fn paused_and_playing_sockets_are_available_for_selection() {
         use std::os::unix::net::UnixListener;
+        struct SocketPath(std::path::PathBuf);
+        impl Drop for SocketPath {
+            fn drop(&mut self) {
+                std::fs::remove_file(&self.0).ok();
+            }
+        }
         let mut paths = Vec::new();
+        let mut sockets = Vec::new();
         let mut servers = Vec::new();
         for paused in [true, false] {
             let path = std::env::temp_dir()
                 .join(format!("kurisu-mpv-choice-{}-{paused}", std::process::id()));
             let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
             paths.push(path.to_str().unwrap().to_string());
+            sockets.push(SocketPath(path));
             servers.push(std::thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "MPV probe did not connect"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 for _ in PROPS {
-                    reader.read_line(&mut String::new()).unwrap();
+                    assert!(reader.read_line(&mut String::new()).unwrap() > 0);
                 }
                 let lines = [
                     ok(IDX_PAUSE, if paused { "true" } else { "false" }),
@@ -694,11 +729,10 @@ mod tests {
             }));
         }
         let snapshots = probe(&paths);
-        for server in servers {
-            server.join().unwrap();
-        }
-        for path in paths {
-            std::fs::remove_file(path).unwrap();
+        let joined: Vec<_> = servers.into_iter().map(|server| server.join()).collect();
+        drop(sockets);
+        for result in joined {
+            result.unwrap();
         }
         assert_eq!(snapshots.len(), 2);
         assert!(!snapshots[0].playing);

@@ -24,3 +24,5 @@ project-status.md
 .claude/
 audit-*.md
 AGENTS.md
+# Keep the AniList exchange service local.
+/Kurisu-AniList-Exchange/

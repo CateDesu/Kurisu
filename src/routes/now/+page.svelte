@@ -106,9 +106,14 @@
     }
   }
 
-  function applyEntry(entry: ListEntry) {
+  function applyEntry(updated: ListEntry) {
+    currentLoadId++;
+    if (np?.media_id === updated.media_id) {
+      entryLoadId++;
+      entry = { ...updated, media: updated.media ?? entry?.media ?? null };
+    }
     current = current
-      .map((x) => (x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x))
+      .map((x) => (x.media_id === updated.media_id ? { ...updated, media: updated.media ?? x.media } : x))
       .filter((x) => x.status === "CURRENT");
   }
 
