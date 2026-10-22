@@ -1,5 +1,5 @@
-import { flushPendingEdits } from "$lib/pendingEdits";
-import { api } from "$lib/api";
+import { flushPendingEdits } from "#lib/pendingEdits.ts";
+import { api } from "#lib/api.ts";
 
 let installing = $state(false);
 let restartPending = $state(false);

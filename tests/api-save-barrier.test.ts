@@ -4,14 +4,14 @@ import { button, deferred, settle } from "./helpers";
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("$lib/auth.svelte", () => ({ auth: { epoch: 0, isLoggedIn: true, offline: false } }));
-vi.mock("$lib/library.svelte", () => ({ library: { fileFor: () => undefined } }));
+vi.mock("#lib/auth.svelte.ts", () => ({ auth: { epoch: 0, isLoggedIn: true, offline: false } }));
+vi.mock("#lib/library.svelte.ts", () => ({ library: { fileFor: () => undefined } }));
 vi.mock("$app/navigation", () => ({ goto: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openPath: vi.fn() }));
 
-import { api } from "$lib/api";
-import { flushPendingEdits } from "$lib/pendingEdits";
-import EditEntry from "$lib/EditEntry.svelte";
+import { api } from "#lib/api.ts";
+import { flushPendingEdits } from "#lib/pendingEdits.ts";
+import EditEntry from "#lib/EditEntry.svelte";
 
 afterEach(() => { invoke.mockReset(); });
 

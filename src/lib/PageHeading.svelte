@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import Gearwork from "$lib/Gearwork.svelte";
+  import Gearwork from "#lib/Gearwork.svelte";
 
   let { section, title, description = "", compact = false, children }: {
     section: string;

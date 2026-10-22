@@ -7,8 +7,8 @@ const mocks = vi.hoisted(() => ({
   api: Object.fromEntries(["takePendingUpdate", "takeUpdateFailed", "checkUpdate", "installUpdate", "getTrackingConfig", "getAppSetting", "setProgress"].map((name) => [name, vi.fn()])),
   listener: null as ((event: { payload: unknown }) => void) | null,
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/auth.svelte", () => ({ auth: { user: { id: 1, name: "Example" }, isLoggedIn: true, epoch: 0 } }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/auth.svelte.ts", () => ({ auth: { user: { id: 1, name: "Example" }, isLoggedIn: true, epoch: 0 } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, callback: typeof mocks.listener) => {
   if (name === "kurisu://update-available") mocks.listener = callback;
   return () => {};
@@ -54,7 +54,7 @@ async function showSettings() {
 }
 
 async function showBanner(info = update) {
-  const { default: Updater } = await import("$lib/Updater.svelte");
+  const { default: Updater } = await import("#lib/Updater.svelte");
   instances.push(runtime.mount(Updater, { target: document.body }));
   await settle();
   mocks.listener!({ payload: info });
@@ -98,7 +98,7 @@ test("duplicate startup delivery cannot erase installation success", async () =>
 test("startup results wait until update listeners are ready", async () => {
   const ready = deferred<() => void>();
   vi.mocked(listen).mockReturnValue(ready.promise);
-  const { default: Updater } = await import("$lib/Updater.svelte");
+  const { default: Updater } = await import("#lib/Updater.svelte");
   instances.push(runtime.mount(Updater, { target: document.body }));
   await settle();
   expect(mocks.api.takePendingUpdate).not.toHaveBeenCalled();
@@ -131,8 +131,8 @@ test("periodic checks respect dismissal and show a later release", async () => {
 });
 
 test("install waits for pending progress before starting the installer", async () => {
-  const { registerPendingEdit } = await import("$lib/pendingEdits");
-  const { runInstallUpdate } = await import("$lib/update.svelte");
+  const { registerPendingEdit } = await import("#lib/pendingEdits.ts");
+  const { runInstallUpdate } = await import("#lib/update.svelte.ts");
   const saving = deferred<void>();
   const unregister = registerPendingEdit(async () => {
     await saving.promise;
@@ -147,8 +147,8 @@ test("install waits for pending progress before starting the installer", async (
 });
 
 test("a pending progress failure prevents the installer from starting", async () => {
-  const { registerPendingEdit } = await import("$lib/pendingEdits");
-  const { runInstallUpdate } = await import("$lib/update.svelte");
+  const { registerPendingEdit } = await import("#lib/pendingEdits.ts");
+  const { runInstallUpdate } = await import("#lib/update.svelte.ts");
   const unregister = registerPendingEdit(async () => { throw new Error("Disk is full"); });
   try {
     await expect(runInstallUpdate()).rejects.toThrow("Disk is full");
@@ -160,8 +160,8 @@ test("a pending progress failure prevents the installer from starting", async ()
 
 test("installing flushes progress and prevents new buffered clicks", async () => {
   vi.useFakeTimers();
-  const { default: Stepper } = await import("$lib/EpisodeStepper.svelte");
-  const { runInstallUpdate } = await import("$lib/update.svelte");
+  const { default: Stepper } = await import("#lib/EpisodeStepper.svelte");
+  const { runInstallUpdate } = await import("#lib/update.svelte.ts");
   const progress = deferred<{ media_id: number; progress: number }>();
   const installer = deferred<string>();
   mocks.api.setProgress.mockReturnValue(progress.promise);

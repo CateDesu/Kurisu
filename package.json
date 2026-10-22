@@ -3,6 +3,12 @@
   "version": "1.0.0",
   "description": "An anime tracking program for Linux and Windows with AniList sync",
   "type": "module",
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
+  },
+  "imports": {
+    "#lib/*": "./src/lib/*"
+  },
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
@@ -19,23 +25,21 @@
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
-    "@sveltejs/adapter-static": "^3.0.6",
-    "@sveltejs/kit": "^2.9.0",
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@sveltejs/adapter-static": "^4.0.0",
+    "@sveltejs/kit": "^3.1.0",
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tailwindcss/vite": "^4",
     "@tauri-apps/cli": "^2",
+    "@types/node": "^24.0.0",
     "jsdom": "^26.1.0",
-    "svelte": "^5.0.0",
+    "svelte": "^5.57.1",
     "svelte-check": "^4.0.0",
     "tailwindcss": "^4",
-    "typescript": "~5.6.2",
-    "vite": "^6.0.3",
-    "vitest": "^4.1.11"
+    "typescript": "~6.0.3",
+    "vite": "^8.3.5",
+    "vitest": "^4.1.12"
   },
   "allowScripts": {
     "esbuild@0.25.12": true
-  },
-  "overrides": {
-    "cookie": "^0.7.0"
   }
 }

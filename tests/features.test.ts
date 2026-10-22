@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { auth } from "./session.svelte";
+import { auth, page } from "./session.svelte";
 import { button, deferred, selectOption, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
@@ -11,15 +11,12 @@ const mocks = vi.hoisted(() => ({
   registration: null as Promise<void> | null,
   nowPlaying: null as null | Record<string, unknown>,
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/auth.svelte", async () => import("./session.svelte"));
-vi.mock("$lib/library.svelte", () => ({ library: { fileFor: () => undefined, ensureScan: async () => {} } }));
-vi.mock("$lib/nowplaying.svelte", () => ({ nowPlaying: () => mocks.nowPlaying }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
+vi.mock("#lib/library.svelte.ts", () => ({ library: { fileFor: () => undefined, ensureScan: async () => {} } }));
+vi.mock("#lib/nowplaying.svelte.ts", () => ({ nowPlaying: () => mocks.nowPlaying }));
 vi.mock("$app/navigation", () => ({ goto: vi.fn(), afterNavigate: (callback: () => void) => mocks.navigation.push(callback) }));
-vi.mock("$app/stores", async () => {
-  const { writable } = await import("svelte/store");
-  return { page: writable({ params: { id: "1" }, url: new URL("http://localhost/anime/1") }) };
-});
+vi.mock("$app/state", async () => import("./session.svelte"));
 vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn(), listen: vi.fn(async (event: string, callback: () => void) => {
   if (mocks.registration) await mocks.registration;
   const handlers = mocks.listeners.get(event) ?? new Set();
@@ -32,9 +29,9 @@ import Search from "../src/routes/search/+page.svelte";
 import Notifications from "../src/routes/notifications/+page.svelte";
 import Detail from "../src/routes/anime/[id]/+page.svelte";
 import Stats from "../src/routes/stats/+page.svelte";
-import EditEntry from "$lib/EditEntry.svelte";
+import EditEntry from "#lib/EditEntry.svelte";
 import Now from "../src/routes/now/+page.svelte";
-import { notificationUrl } from "$lib/types";
+import { notificationUrl } from "#lib/types.ts";
 
 const media = { id: 1, title_english: "First Show", episodes: 12 };
 const entry = { media_id: 1, status: "CURRENT", progress: 3, repeat: 0, score: 75, media };
@@ -52,6 +49,7 @@ function input(selector: string, value: string) {
 }
 beforeEach(() => {
   vi.resetAllMocks(); mocks.navigation.length = 0; mocks.listeners.clear(); mocks.registration = null;
+  page.params.id = "1";
   mocks.nowPlaying = null;
   auth.epoch = 0; auth.isLoggedIn = true; auth.offline = false;
   auth.user = { id: 1, name: "Example", score_format: "POINT_100" };
@@ -98,6 +96,22 @@ test("notifications retain older pages and mark unread only on an explicit click
   expect(mocks.api.markNotificationsRead).toHaveBeenCalledTimes(1);
   expect(document.body.textContent).toContain("0 unread on AniList");
   expect(notificationUrl({ ...comment, comment_url: "https://anilist.co.evil.test/comment" })).toBe("https://anilist.co/forum/thread/7");
+});
+
+test("detail follows route changes without remounting", async () => {
+  mocks.api.getMediaDetail.mockImplementation(async (id: number) => ({
+    media: { ...media, id, title_english: id === 1 ? "First Show" : "Second Show" },
+    relations: [], characters: [], staff: [],
+  }));
+  mocks.api.getEntry.mockResolvedValue(null);
+  await render(Detail);
+  expect(document.body.textContent).toContain("First Show");
+  page.params.id = "2";
+  await settle();
+  expect(mocks.api.getMediaDetail).toHaveBeenCalledWith(2);
+  expect(mocks.api.getEntry).toHaveBeenCalledWith(2);
+  expect(document.body.textContent).toContain("Second Show");
+  expect(document.body.textContent).not.toContain("First Show");
 });
 
 test("detail entry failure preserves anime content and prevents a misleading add", async () => {

@@ -10,17 +10,17 @@ const mocks = vi.hoisted(() => ({
   reset: vi.fn(),
   listeners: new Map<string, () => void | Promise<void>>(),
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/library.svelte", () => ({ library: { reset: mocks.reset } }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/library.svelte.ts", () => ({ library: { reset: mocks.reset } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (event: string, callback: () => void | Promise<void>) => {
   mocks.listeners.set(event, callback);
   return () => mocks.listeners.delete(event);
 }) }));
 
 let components: ReturnType<typeof mount>[] = [];
-import { auth } from "$lib/auth.svelte";
-import { flushPendingEdits } from "$lib/pendingEdits";
-import Stepper from "$lib/EpisodeStepper.svelte";
+import { auth } from "#lib/auth.svelte.ts";
+import { flushPendingEdits } from "#lib/pendingEdits.ts";
+import Stepper from "#lib/EpisodeStepper.svelte";
 import Settings from "../src/routes/settings/+page.svelte";
 
 beforeEach(async () => {

@@ -6,8 +6,8 @@ const mocks = vi.hoisted(() => ({
   reset: vi.fn(),
   listeners: new Map<string, () => Promise<void> | void>(),
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/library.svelte", () => ({ library: { reset: mocks.reset } }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/library.svelte.ts", () => ({ library: { reset: mocks.reset } }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (name: string, callback: () => Promise<void> | void) => {
     mocks.listeners.set(name, callback);
@@ -24,7 +24,7 @@ beforeEach(() => {
 
 test.each(["loginWithToken", "loginOauth"] as const)("%s clears matches from the previous account", async (method) => {
   mocks.api[method].mockResolvedValue({ id: 2, name: "Other" });
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   if (method === "loginWithToken") await auth.loginWithToken("token");
   else await auth.loginOauth();
@@ -34,7 +34,7 @@ test.each(["loginWithToken", "loginOauth"] as const)("%s clears matches from the
 
 test("a cached profile keeps the frontend offline until viewer recovery", async () => {
   mocks.api.currentUser.mockResolvedValue({ id: 1, name: "Example", score_format: "POINT_5", offline: true });
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   expect(auth.offline).toBe(true);
   expect(auth.user?.score_format).toBe("POINT_5");
@@ -47,7 +47,7 @@ test("a delayed OAuth result cannot replace a newer token login", async () => {
   const oauth = deferred<{ id: number; name: string }>();
   mocks.api.loginOauth.mockReturnValue(oauth.promise);
   mocks.api.loginWithToken.mockResolvedValue({ id: 2, name: "New account" });
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   const old = auth.loginOauth().catch(() => {});
   await settle();
@@ -62,7 +62,7 @@ test("logging out invalidates an unfinished sign-in", async () => {
   const signingIn = deferred<{ id: number; name: string }>();
   mocks.api.loginWithToken.mockReturnValue(signingIn.promise);
   mocks.api.logout.mockResolvedValue(undefined);
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   const pending = auth.loginWithToken("token").catch(() => {});
   await settle();
@@ -77,7 +77,7 @@ test("an older logout result cannot clear a newer login", async () => {
   const signingOut = deferred<void>();
   mocks.api.logout.mockReturnValue(signingOut.promise);
   mocks.api.loginWithToken.mockResolvedValue({ id: 2, name: "New account" });
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   const pending = auth.logout();
   await settle();
@@ -91,7 +91,7 @@ test("an older logout result cannot clear a newer login", async () => {
 test("an expiry event delivered after a new login keeps the authenticated session", async () => {
   mocks.api.loginWithToken.mockResolvedValue({ id: 2, name: "New account" });
   mocks.api.isLoggedIn.mockResolvedValue(true);
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   await auth.loginWithToken("new token");
   const epoch = auth.epoch;
@@ -105,7 +105,7 @@ test("an expiry check cannot clear a login accepted while it was pending", async
   const expired = deferred<boolean>();
   mocks.api.isLoggedIn.mockReturnValue(expired.promise);
   mocks.api.loginWithToken.mockResolvedValue({ id: 2, name: "New account" });
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   const checking = mocks.listeners.get("kurisu://auth-expired")!();
   await auth.loginWithToken("new token");
@@ -119,7 +119,7 @@ test("an expiry check cannot clear a login accepted while it was pending", async
 test("an expired backend session clears the cached frontend account", async () => {
   mocks.api.currentUser.mockResolvedValue({ id: 1, name: "Expired account" });
   mocks.api.isLoggedIn.mockResolvedValue(false);
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   const epoch = auth.epoch;
   await mocks.listeners.get("kurisu://auth-expired")!();
@@ -133,7 +133,7 @@ test("a failed replacement login cannot suppress a pending expiry check", async 
   mocks.api.currentUser.mockResolvedValue({ id: 1, name: "Expired account" });
   mocks.api.isLoggedIn.mockReturnValue(expired.promise);
   mocks.api.loginWithToken.mockRejectedValue(new Error("Invalid replacement token"));
-  const { auth } = await import("$lib/auth.svelte");
+  const { auth } = await import("#lib/auth.svelte.ts");
   await settle();
   const checking = mocks.listeners.get("kurisu://auth-expired")!();
   await expect(auth.loginWithToken("bad token")).rejects.toThrow("Invalid replacement token");

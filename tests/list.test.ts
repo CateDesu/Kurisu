@@ -1,9 +1,9 @@
 import { beforeEach, expect, test, vi } from "vitest";
 
 const api = vi.hoisted(() => ({ getEntry: vi.fn(), updateEntry: vi.fn() }));
-vi.mock("$lib/api", () => ({ api }));
-vi.mock("$lib/auth.svelte", async () => import("./session.svelte"));
-import { addToList, createListActions } from "$lib/list.svelte";
+vi.mock("#lib/api.ts", () => ({ api }));
+vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
+import { addToList, createListActions } from "#lib/list.svelte.ts";
 import { deferred } from "./helpers";
 
 beforeEach(() => { vi.resetAllMocks(); });

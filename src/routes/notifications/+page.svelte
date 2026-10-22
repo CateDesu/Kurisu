@@ -1,18 +1,18 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
   import {
     notificationIcon,
     notificationText,
     notificationUrl,
     timeAgo,
     type Notification,
-  } from "$lib/types";
-  import Login from "$lib/Login.svelte";
-  import Img from "$lib/Img.svelte";
+  } from "#lib/types.ts";
+  import Login from "#lib/Login.svelte";
+  import Img from "#lib/Img.svelte";
 
   let items = $state<Notification[]>([]);
   let loading = $state(true);

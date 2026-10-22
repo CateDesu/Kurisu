@@ -1,15 +1,15 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { untrack } from "svelte";
-  import { listenForListUpdates } from "$lib/list.svelte";
+  import { listenForListUpdates } from "#lib/list.svelte.ts";
   import { goto } from "$app/navigation";
-  import { api } from "$lib/api";
-  import { preferences } from "$lib/preferences";
-  import { auth } from "$lib/auth.svelte";
-  import { nowMs } from "$lib/now.svelte";
-  import { displayTitle, STATUS_LABEL, type AiringItem, type ListEntry } from "$lib/types";
-  import Login from "$lib/Login.svelte";
-  import Img from "$lib/Img.svelte";
+  import { api } from "#lib/api.ts";
+  import { preferences } from "#lib/preferences.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { nowMs } from "#lib/now.svelte.ts";
+  import { displayTitle, STATUS_LABEL, type AiringItem, type ListEntry } from "#lib/types.ts";
+  import Login from "#lib/Login.svelte";
+  import Img from "#lib/Img.svelte";
   import type { Snapshot } from "./$types";
 
   const MINE_KEY = "kurisu.cal.mine";

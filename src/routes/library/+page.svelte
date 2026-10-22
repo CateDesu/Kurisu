@@ -3,22 +3,22 @@
 </script>
 
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { open } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
   import { listen } from "@tauri-apps/api/event";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { library } from "$lib/library.svelte";
-  import { listenForListUpdates } from "$lib/list.svelte";
-  import { displayTitle, type LibraryFile, type ListEntry, type WatchHistoryItem } from "$lib/types";
-  import Confirm from "$lib/Confirm.svelte";
-  import Dialog from "$lib/Dialog.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import LinkAnime from "$lib/LinkAnime.svelte";
-  import Login from "$lib/Login.svelte";
-  import Img from "$lib/Img.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { library } from "#lib/library.svelte.ts";
+  import { listenForListUpdates } from "#lib/list.svelte.ts";
+  import { displayTitle, type LibraryFile, type ListEntry, type WatchHistoryItem } from "#lib/types.ts";
+  import Confirm from "#lib/Confirm.svelte";
+  import Dialog from "#lib/Dialog.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import LinkAnime from "#lib/LinkAnime.svelte";
+  import Login from "#lib/Login.svelte";
+  import Img from "#lib/Img.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let entriesLoaded = $state(false);

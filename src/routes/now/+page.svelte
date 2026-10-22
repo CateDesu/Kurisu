@@ -1,18 +1,18 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { untrack } from "svelte";
-  import { listenForListUpdates } from "$lib/list.svelte";
+  import { listenForListUpdates } from "#lib/list.svelte.ts";
   import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { library } from "$lib/library.svelte";
-  import { nowPlaying } from "$lib/nowplaying.svelte";
-  import { displayTitle, scoreLabel, type ListEntry } from "$lib/types";
-  import EpisodeStepper from "$lib/EpisodeStepper.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Img from "$lib/Img.svelte";
-  import Login from "$lib/Login.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { library } from "#lib/library.svelte.ts";
+  import { nowPlaying } from "#lib/nowplaying.svelte.ts";
+  import { displayTitle, scoreLabel, type ListEntry } from "#lib/types.ts";
+  import EpisodeStepper from "#lib/EpisodeStepper.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import Img from "#lib/Img.svelte";
+  import Login from "#lib/Login.svelte";
 
   let entry = $state<ListEntry | null>(null);
   let updating = $state(false);

@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
-import { api } from "$lib/api";
-import { auth } from "$lib/auth.svelte";
-import type { Media } from "$lib/types";
+import { api } from "#lib/api.ts";
+import { auth } from "#lib/auth.svelte.ts";
+import type { Media } from "#lib/types.ts";
 
 export function listenForListUpdates(
   refresh: () => void,

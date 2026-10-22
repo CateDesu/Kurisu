@@ -9,8 +9,8 @@ const mocks = vi.hoisted(() => ({
   auth: { epoch: 0, isLoggedIn: true },
   listeners: new Map<string, () => Promise<void>>(),
 }));
-vi.mock("$lib/api", () => ({ api: { setProgress: mocks.setProgress } }));
-vi.mock("$lib/auth.svelte", () => ({ auth: mocks.auth }));
+vi.mock("#lib/api.ts", () => ({ api: { setProgress: mocks.setProgress } }));
+vi.mock("#lib/auth.svelte.ts", () => ({ auth: mocks.auth }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => mocks }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -19,10 +19,10 @@ vi.mock("@tauri-apps/api/event", () => ({
     return () => mocks.listeners.delete(name);
   }),
 }));
-import Stepper from "$lib/EpisodeStepper.svelte";
-import TitleBar from "$lib/TitleBar.svelte";
-import Shutdown from "$lib/Shutdown.svelte";
-import { flushPendingEdits } from "$lib/pendingEdits";
+import Stepper from "#lib/EpisodeStepper.svelte";
+import TitleBar from "#lib/TitleBar.svelte";
+import Shutdown from "#lib/Shutdown.svelte";
+import { flushPendingEdits } from "#lib/pendingEdits.ts";
 
 let components: ReturnType<typeof mount>[] = [];
 let target: HTMLDivElement;

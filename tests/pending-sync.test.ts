@@ -2,21 +2,21 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount } from "svelte";
 import { auth } from "./session.svelte";
 import { button, deferred, settle } from "./helpers";
-import type { PendingChange } from "$lib/types";
+import type { PendingChange } from "#lib/types.ts";
 
 const mocks = vi.hoisted(() => ({
   api: { getPendingChanges: vi.fn(), syncPendingChanges: vi.fn(), resolvePendingChange: vi.fn() },
   listeners: new Map<string, () => void>(),
   registration: null as Promise<void> | null,
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/auth.svelte", async () => import("./session.svelte"));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, callback: () => void) => {
   if (mocks.registration) await mocks.registration;
   mocks.listeners.set(name, callback);
   return () => mocks.listeners.delete(name);
 }) }));
-import PendingSync from "$lib/PendingSync.svelte";
+import PendingSync from "#lib/PendingSync.svelte";
 
 let component: ReturnType<typeof mount> | undefined;
 const pending: PendingChange = {media_id:1,title:"Offline show",progress:4,status:null,score:null,repeat:null,error:"Newer progress on AniList",conflict:true,missing_media:false};

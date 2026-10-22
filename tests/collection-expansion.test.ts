@@ -11,9 +11,9 @@ const mocks = vi.hoisted(() => ({
   openUrl: vi.fn(),
   registration: null as Promise<void> | null,
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/auth.svelte", async () => import("./session.svelte"));
-vi.mock("$lib/library.svelte", () => ({ library: mocks.library }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
+vi.mock("#lib/library.svelte.ts", () => ({ library: mocks.library }));
 vi.mock("$app/navigation", () => ({ goto: vi.fn(), afterNavigate: (callback: () => void) => mocks.navigation.push(callback) }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event: string, callback: () => void) => {
@@ -32,7 +32,7 @@ import Collection from "../src/routes/+page.svelte";
 import Seasons from "../src/routes/seasons/+page.svelte";
 import Calendar from "../src/routes/calendar/+page.svelte";
 import Library from "../src/routes/library/+page.svelte";
-import TorrentRow from "$lib/TorrentRow.svelte";
+import TorrentRow from "#lib/TorrentRow.svelte";
 
 const media = { id: 1, title_english: "Example Show", episodes: 12, format: "TV" };
 const entry = { media_id: 1, status: "CURRENT", progress: 0, repeat: 0, media };

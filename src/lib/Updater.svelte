@@ -1,10 +1,10 @@
 <script lang="ts">
-  import Dialog from "$lib/Dialog.svelte";
+  import Dialog from "#lib/Dialog.svelte";
   import { listen } from "@tauri-apps/api/event";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { api } from "$lib/api";
-  import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "$lib/update.svelte";
-  import type { UpdateInfo } from "$lib/types";
+  import { api } from "#lib/api.ts";
+  import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "#lib/update.svelte.ts";
+  import type { UpdateInfo } from "#lib/types.ts";
 
   let update = $state<UpdateInfo | null>(null);
   let err = $state("");

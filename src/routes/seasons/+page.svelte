@@ -1,14 +1,14 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { onDestroy, untrack } from "svelte";
   import { afterNavigate } from "$app/navigation";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
-  import Login from "$lib/Login.svelte";
-  import AnimeCard from "$lib/AnimeCard.svelte";
-  import Select from "$lib/Select.svelte";
-  import { createListActions, listenForListUpdates } from "$lib/list.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "#lib/types.ts";
+  import Login from "#lib/Login.svelte";
+  import AnimeCard from "#lib/AnimeCard.svelte";
+  import Select from "#lib/Select.svelte";
+  import { createListActions, listenForListUpdates } from "#lib/list.svelte.ts";
   import type { Snapshot } from "./$types";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;

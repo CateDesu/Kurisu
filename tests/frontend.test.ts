@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { auth } from "./session.svelte";
+import { auth, page } from "./session.svelte";
 import { button, deferred, selectOption, settle } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
@@ -17,15 +17,12 @@ const mocks = vi.hoisted(() => ({
     foldersFailed: false, fileFor: vi.fn(), loadFolders: vi.fn(), scan: vi.fn(), ensureScan: vi.fn(),
   },
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/auth.svelte", async () => import("./session.svelte"));
-vi.mock("$lib/library.svelte", () => ({ library: mocks.library }));
-vi.mock("$lib/nowplaying.svelte", () => ({ nowPlaying: () => null }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
+vi.mock("#lib/library.svelte.ts", () => ({ library: mocks.library }));
+vi.mock("#lib/nowplaying.svelte.ts", () => ({ nowPlaying: () => null }));
 vi.mock("$app/navigation", () => ({ goto: vi.fn(), afterNavigate: (callback: () => void) => mocks.navigation.push(callback) }));
-vi.mock("$app/stores", async () => {
-  const { writable } = await import("svelte/store");
-  return { page: writable({ params: { id: "1" }, url: new URL("http://localhost/anime/1") }) };
-});
+vi.mock("$app/state", async () => import("./session.svelte"));
 vi.mock("@tauri-apps/api/event", () => ({
   emit: vi.fn(async () => {}),
   listen: vi.fn(async (event: string, handler: (event: { payload: unknown }) => void) => {
@@ -38,18 +35,18 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@tauri-apps/plugin-opener", () => ({ openPath: vi.fn(), openUrl: vi.fn(), revealItemInDir: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
-import Tracking from "$lib/Tracking.svelte";
-import LinkAnime from "$lib/LinkAnime.svelte";
-import EditEntry from "$lib/EditEntry.svelte";
+import Tracking from "#lib/Tracking.svelte";
+import LinkAnime from "#lib/LinkAnime.svelte";
+import EditEntry from "#lib/EditEntry.svelte";
 import Detail from "../src/routes/anime/[id]/+page.svelte";
 import Calendar from "../src/routes/calendar/+page.svelte";
 import Settings from "../src/routes/settings/+page.svelte";
 import Library from "../src/routes/library/+page.svelte";
 import Torrents from "../src/routes/torrents/+page.svelte";
 import Search from "../src/routes/search/+page.svelte";
-import ShowTorrentChoices from "$lib/ShowTorrentChoices.svelte";
-import EpisodeStepper from "$lib/EpisodeStepper.svelte";
-import type { ShowTorrents } from "$lib/types";
+import ShowTorrentChoices from "#lib/ShowTorrentChoices.svelte";
+import EpisodeStepper from "#lib/EpisodeStepper.svelte";
+import type { ShowTorrents } from "#lib/types.ts";
 
 const media = { id: 1, title_english: "Example Show", episodes: 12 };
 const entry = { media_id: 1, status: "CURRENT", progress: 0, repeat: 0, score: 75, media };
@@ -77,6 +74,7 @@ function event(name: string, payload: unknown) {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  page.params.id = "1";
   mocks.listeners.clear();
   mocks.navigation.length = 0;
   localStorage.clear();

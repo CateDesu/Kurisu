@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { rememberScroll } from "$lib/scroll";
+import { rememberScroll } from "#lib/scroll.ts";
 
 let node: HTMLElement;
 let memory: ReturnType<typeof rememberScroll>;

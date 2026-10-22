@@ -1,12 +1,12 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
-  import { page } from "$app/stores";
+  import PageHeading from "#lib/PageHeading.svelte";
+  import { page } from "$app/state";
   import { goto } from "$app/navigation";
   import { openPath, openUrl } from "@tauri-apps/plugin-opener";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { library } from "$lib/library.svelte";
-  import { addToList, listenForListUpdates } from "$lib/list.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { library } from "#lib/library.svelte.ts";
+  import { addToList, listenForListUpdates } from "#lib/list.svelte.ts";
   import {
     airingLabel,
     displayTitle,
@@ -19,14 +19,14 @@
     type ListEntry,
     type Media,
     type MediaDetail,
-  } from "$lib/types";
-  import EditEntry from "$lib/EditEntry.svelte";
-  import EpisodeStepper from "$lib/EpisodeStepper.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Img from "$lib/Img.svelte";
-  import Login from "$lib/Login.svelte";
+  } from "#lib/types.ts";
+  import EditEntry from "#lib/EditEntry.svelte";
+  import EpisodeStepper from "#lib/EpisodeStepper.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import Img from "#lib/Img.svelte";
+  import Login from "#lib/Login.svelte";
 
-  const id = $derived(Number($page.params.id));
+  const id = $derived(Number(page.params.id));
   const loggedIn = $derived(auth.isLoggedIn);
 
   let detail = $state<MediaDetail | null>(null);

@@ -39,7 +39,7 @@ On Linux, hardware acceleration is off by default. Enable **Settings → Perform
 <details>
 <summary>Build from source</summary>
 
-Requires Node.js 22, Rust, and a C toolchain. Linux also needs the WebKitGTK 4.1, GTK 3, Ayatana AppIndicator, and librsvg development packages. Windows needs the MSVC build tools and WebView2.
+Requires patched Node.js 22.23.4, 24.22.1 or 26.12.1 and newer releases in those lines, Rust, and a C toolchain. CI uses the version in `.node-version`. Linux also needs the WebKitGTK 4.1, GTK 3, Ayatana AppIndicator, and librsvg development packages. Windows needs the MSVC build tools and WebView2.
 
 ```sh
 npm ci

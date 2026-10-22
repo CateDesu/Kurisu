@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "$lib/types";
-  import Img from "$lib/Img.svelte";
+  import { displayTitle, STATUS_LABEL, type ListEntry, type Media } from "#lib/types.ts";
+  import Img from "#lib/Img.svelte";
 
   let { media, entry, adding, onadd, showYear = false, showListedActions = false }: {
     media: Media;

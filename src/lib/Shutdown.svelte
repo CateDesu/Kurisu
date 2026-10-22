@@ -1,8 +1,8 @@
 <script lang="ts">
-  import Dialog from "$lib/Dialog.svelte";
+  import Dialog from "#lib/Dialog.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { flushPendingEdits } from "$lib/pendingEdits";
+  import { flushPendingEdits } from "#lib/pendingEdits.ts";
 
   let saving = $state(false);
   let error = $state("");

@@ -1,20 +1,20 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { afterNavigate, goto } from "$app/navigation";
   import { onDestroy } from "svelte";
-  import { listenForListUpdates } from "$lib/list.svelte";
+  import { listenForListUpdates } from "#lib/list.svelte.ts";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { api } from "$lib/api";
-  import { preferences } from "$lib/preferences";
-  import { auth } from "$lib/auth.svelte";
-  import { displayTitle, STATUS_LABEL, type FeedFailure, type ListEntry, type ListStatus, type ShowTorrents, type TorrentItem } from "$lib/types";
-  import Confirm from "$lib/Confirm.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Login from "$lib/Login.svelte";
-  import Img from "$lib/Img.svelte";
-  import Select from "$lib/Select.svelte";
-  import TorrentRow from "$lib/TorrentRow.svelte";
-  import ShowTorrentChoices from "$lib/ShowTorrentChoices.svelte";
+  import { api } from "#lib/api.ts";
+  import { preferences } from "#lib/preferences.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { displayTitle, STATUS_LABEL, type FeedFailure, type ListEntry, type ListStatus, type ShowTorrents, type TorrentItem } from "#lib/types.ts";
+  import Confirm from "#lib/Confirm.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import Login from "#lib/Login.svelte";
+  import Img from "#lib/Img.svelte";
+  import Select from "#lib/Select.svelte";
+  import TorrentRow from "#lib/TorrentRow.svelte";
+  import ShowTorrentChoices from "#lib/ShowTorrentChoices.svelte";
   import type { Snapshot } from "./$types";
 
   const NEW_KEY = "kurisu.torrents.new";

@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { mount, unmount } from "svelte";
-import Confirm from "$lib/Confirm.svelte";
+import Confirm from "#lib/Confirm.svelte";
 import { button, settle } from "./helpers";
 
 const mounted: ReturnType<typeof mount>[] = [];

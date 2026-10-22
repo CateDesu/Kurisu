@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import { api } from "$lib/api";
+  import { api } from "#lib/api.ts";
 
   // Retain the reconciled account across route changes.
   let syncedFor: number | null = null;
@@ -16,12 +16,12 @@
 
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import PageHeading from "$lib/PageHeading.svelte";
-  import { listenForListUpdates } from "$lib/list.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
+  import { listenForListUpdates } from "#lib/list.svelte.ts";
   import { goto } from "$app/navigation";
-  import { preferences } from "$lib/preferences";
-  import { auth } from "$lib/auth.svelte";
-  import { nowMs } from "$lib/now.svelte";
+  import { preferences } from "#lib/preferences.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { nowMs } from "#lib/now.svelte.ts";
   import {
     airingLabel,
     displayTitle,
@@ -29,13 +29,13 @@
     STATUS_LABEL,
     timeAgo,
     type ListEntry,
-  } from "$lib/types";
-  import Login from "$lib/Login.svelte";
-  import EditEntry from "$lib/EditEntry.svelte";
-  import EpisodeStepper from "$lib/EpisodeStepper.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Img from "$lib/Img.svelte";
-  import Select from "$lib/Select.svelte";
+  } from "#lib/types.ts";
+  import Login from "#lib/Login.svelte";
+  import EditEntry from "#lib/EditEntry.svelte";
+  import EpisodeStepper from "#lib/EpisodeStepper.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import Img from "#lib/Img.svelte";
+  import Select from "#lib/Select.svelte";
 
   let entries = $state<ListEntry[]>([]);
   let loading = $state(false);

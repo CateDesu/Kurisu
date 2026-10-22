@@ -1,12 +1,12 @@
 <script lang="ts">
-  import Dialog from "$lib/Dialog.svelte";
+  import Dialog from "#lib/Dialog.svelte";
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { nowPlaying } from "$lib/nowplaying.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import type { TrackingPrompt } from "$lib/types";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { nowPlaying } from "#lib/nowplaying.svelte.ts";
+  import Icon from "#lib/Icon.svelte";
+  import type { TrackingPrompt } from "#lib/types.ts";
 
   let prompt = $state<TrackingPrompt | null>(null);
   let queued = $state<TrackingPrompt[]>([]);

@@ -7,7 +7,7 @@ const api = vi.hoisted(() => ({
   removeLibraryFolder: vi.fn(),
   scanLibrary: vi.fn(),
 }));
-vi.mock("$lib/api", () => ({ api }));
+vi.mock("#lib/api.ts", () => ({ api }));
 
 beforeEach(() => { vi.resetModules(); vi.resetAllMocks(); });
 
@@ -15,7 +15,7 @@ test("adding a folder invalidates older folder reads", async () => {
   const old = deferred<string[]>();
   api.getLibraryFolders.mockReturnValue(old.promise);
   api.addLibraryFolder.mockResolvedValue(["/anime/new"]);
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   const read = library.loadFolders();
   await library.addFolder("/anime/new");
   old.resolve([]);
@@ -28,7 +28,7 @@ test("reset rejects old folder reads and scans", async () => {
   const scan = deferred<{ files: unknown[]; unreadable: unknown[] }>();
   api.getLibraryFolders.mockReturnValue(folders.promise);
   api.scanLibrary.mockReturnValue(scan.promise);
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   const read = library.loadFolders();
   const scanning = library.scan();
   library.reset();
@@ -45,7 +45,7 @@ test("a queued account scan waits for its own result after an old scan fails", a
   const next = deferred<{ files: unknown[]; unreadable: unknown[] }>();
   api.scanLibrary.mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise);
   api.getLibraryFolders.mockResolvedValue(["/anime/new"]);
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   const previous = library.scan().catch(() => {});
   library.reset();
   let finished = false;
@@ -65,7 +65,7 @@ test("a queued account scan waits for its own result after an old scan fails", a
 test("a queued scan failure reaches the caller who requested it", async () => {
   const first = deferred<{ files: unknown[]; unreadable: unknown[] }>();
   api.scanLibrary.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error("new scan failed"));
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   const scanning = library.scan().catch(() => {});
   const queued = library.scan();
   const result = expect(queued).rejects.toThrow("new scan failed");
@@ -78,7 +78,7 @@ test("removing a folder during the first scan excludes its files", async () => {
   const first = deferred<{ files: unknown[]; unreadable: unknown[] }>();
   api.scanLibrary.mockReturnValueOnce(first.promise).mockResolvedValue({ files: [], unreadable: [] });
   api.removeLibraryFolder.mockResolvedValue([]);
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   const scanning = library.scan();
   const removing = library.removeFolder("/anime/old");
   await settle();
@@ -93,7 +93,7 @@ test("a later failed folder mutation cannot hide an earlier successful one", asy
   api.addLibraryFolder.mockReturnValue(add.promise);
   api.removeLibraryFolder.mockReturnValue(remove.promise);
   api.getLibraryFolders.mockResolvedValue(["/anime/new"]);
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   const adding = library.addFolder("/anime/new");
   const removing = library.removeFolder("/anime/missing").catch(() => {});
   add.resolve(["/anime/new"]);
@@ -106,7 +106,7 @@ test("a later failed folder mutation cannot hide an earlier successful one", asy
 test("removing an unscanned folder still scans the remaining roots", async () => {
   api.removeLibraryFolder.mockResolvedValue(["/anime/remaining"]);
   api.scanLibrary.mockResolvedValue({ files: [{ path: "/anime/remaining/episode.mkv", media_id: 1, episode: 1 }], unreadable: [] });
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   await library.removeFolder("/anime/old");
   expect(api.scanLibrary).toHaveBeenCalledOnce();
   expect(library.files[0]?.path).toBe("/anime/remaining/episode.mkv");
@@ -118,7 +118,7 @@ test("removing a scanned folder clears episode lookups before the next scan fini
     { path: "/anime/old/episode.mkv", media_id: 1, episode: 1 },
   ], unreadable: [] }).mockReturnValueOnce(next.promise);
   api.removeLibraryFolder.mockResolvedValue([]);
-  const { library } = await import("$lib/library.svelte");
+  const { library } = await import("#lib/library.svelte.ts");
   await library.scan();
   expect(library.fileFor(1, 1)).toBeDefined();
 

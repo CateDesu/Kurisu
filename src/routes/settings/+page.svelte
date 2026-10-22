@@ -1,11 +1,11 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "$lib/update.svelte";
-  import Confirm from "$lib/Confirm.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "#lib/update.svelte.ts";
+  import Confirm from "#lib/Confirm.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { TrackingConfig, UpdateInfo } from "$lib/types";
+  import type { TrackingConfig, UpdateInfo } from "#lib/types.ts";
 
   let cfg = $state<TrackingConfig>({ mode: "off", prompt_seconds: 120, auto_percent: 80, auto_ask: true, mpv_ipc_socket: "", discord_enabled: true });
   let trackingLoaded = $state(false);

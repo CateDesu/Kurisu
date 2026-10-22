@@ -1,9 +1,9 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { STATUS_LABEL, type UserStats } from "$lib/types";
-  import Login from "$lib/Login.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { STATUS_LABEL, type UserStats } from "#lib/types.ts";
+  import Login from "#lib/Login.svelte";
 
   let stats = $state<UserStats | null>(null);
   let loading = $state(true);

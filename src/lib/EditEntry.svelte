@@ -1,22 +1,22 @@
 <script module lang="ts">
-  import type { Media as MediaType } from "$lib/types";
+  import type { Media as MediaType } from "#lib/types.ts";
   const RECS_CACHE = new Map<number, MediaType[]>();
 </script>
 
 <script lang="ts">
-  import Dialog from "$lib/Dialog.svelte";
+  import Dialog from "#lib/Dialog.svelte";
   import { onDestroy, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { library } from "$lib/library.svelte";
-  import { trackPendingSave } from "$lib/pendingEdits";
-  import Select from "$lib/Select.svelte";
-  import ScoreInput from "$lib/ScoreInput.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Img from "$lib/Img.svelte";
-  import { displayTitle, STATUS_LABEL, type EntryDetails, type FuzzyDate, type ListEntry, type Media } from "$lib/types";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { library } from "#lib/library.svelte.ts";
+  import { trackPendingSave } from "#lib/pendingEdits.ts";
+  import Select from "#lib/Select.svelte";
+  import ScoreInput from "#lib/ScoreInput.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import Img from "#lib/Img.svelte";
+  import { displayTitle, STATUS_LABEL, type EntryDetails, type FuzzyDate, type ListEntry, type Media } from "#lib/types.ts";
 
   let {
     entry,

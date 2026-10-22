@@ -8,8 +8,8 @@ const mocks = vi.hoisted(() => ({
   goto: vi.fn(),
   listeners: new Map<string, (event?: { payload: unknown }) => void | Promise<void>>(),
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/library.svelte", () => ({ library: { fileFor: () => undefined, reset: vi.fn() } }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/library.svelte.ts", () => ({ library: { fileFor: () => undefined, reset: vi.fn() } }));
 vi.mock("$app/navigation", () => ({ goto: mocks.goto }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openPath: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
@@ -18,11 +18,11 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, cal
   return () => mocks.listeners.delete(name);
 }) }));
 
-import EditEntry from "$lib/EditEntry.svelte";
-import Shutdown from "$lib/Shutdown.svelte";
-import Tracking from "$lib/Tracking.svelte";
-import { auth } from "$lib/auth.svelte";
-import { runInstallUpdate } from "$lib/update.svelte";
+import EditEntry from "#lib/EditEntry.svelte";
+import Shutdown from "#lib/Shutdown.svelte";
+import Tracking from "#lib/Tracking.svelte";
+import { auth } from "#lib/auth.svelte.ts";
+import { runInstallUpdate } from "#lib/update.svelte.ts";
 
 const entry = { media_id: 1, status: "CURRENT", progress: 3, score: 75, repeat: 0, media: { id: 1, title_english: "Example Show", episodes: 12 } };
 const details = { notes: "Old note", started_at: null, completed_at: null, custom_lists: [], available_custom_lists: [] };

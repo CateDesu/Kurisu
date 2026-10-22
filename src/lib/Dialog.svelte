@@ -15,7 +15,7 @@
 
 <script lang="ts">
   import { onMount, type Snippet } from "svelte";
-  import { smoothScroll } from "$lib/smooth-scroll";
+  import { smoothScroll } from "#lib/smooth-scroll.ts";
 
   let { children, onclose, busy = false, size = "sm", layer = 50, closeOnBackdrop = true }: {
     children: Snippet;

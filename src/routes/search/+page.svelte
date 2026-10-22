@@ -1,13 +1,13 @@
 <script lang="ts">
-  import PageHeading from "$lib/PageHeading.svelte";
+  import PageHeading from "#lib/PageHeading.svelte";
   import { onDestroy } from "svelte";
   import { afterNavigate } from "$app/navigation";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import type { ListEntry, Media } from "$lib/types";
-  import Login from "$lib/Login.svelte";
-  import AnimeCard from "$lib/AnimeCard.svelte";
-  import { createListActions, listenForListUpdates } from "$lib/list.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import type { ListEntry, Media } from "#lib/types.ts";
+  import Login from "#lib/Login.svelte";
+  import AnimeCard from "#lib/AnimeCard.svelte";
+  import { createListActions, listenForListUpdates } from "#lib/list.svelte.ts";
   import type { Snapshot } from "./$types";
 
   let query = $state("");

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Dialog from "$lib/Dialog.svelte";
+  import Dialog from "#lib/Dialog.svelte";
   let {
     title,
     body = "",

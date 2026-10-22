@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { smoothScroll } from "$lib/smooth-scroll";
+import { smoothScroll } from "#lib/smooth-scroll.ts";
 
 let node: HTMLElement;
 let action: ReturnType<typeof smoothScroll>;

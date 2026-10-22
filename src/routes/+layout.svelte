@@ -1,23 +1,23 @@
 <script lang="ts">
   import "../app.css";
-  import { auth } from "$lib/auth.svelte";
-  import { page as pageStore } from "$app/stores";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { page as pageStore } from "$app/state";
   import { afterNavigate } from "$app/navigation";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { runClock } from "$lib/now.svelte";
-  import { bindNowPlaying } from "$lib/nowplaying.svelte";
-  import Shutdown from "$lib/Shutdown.svelte";
-  import TitleBar from "$lib/TitleBar.svelte";
-  import Tracking from "$lib/Tracking.svelte";
-  import PendingSync from "$lib/PendingSync.svelte";
-  import Updater from "$lib/Updater.svelte";
-  import Confirm from "$lib/Confirm.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Img from "$lib/Img.svelte";
-  import Gearwork from "$lib/Gearwork.svelte";
-  import { rememberScroll, type ScrollPosition } from "$lib/scroll";
-  import { smoothScroll } from "$lib/smooth-scroll";
+  import { runClock } from "#lib/now.svelte.ts";
+  import { bindNowPlaying } from "#lib/nowplaying.svelte.ts";
+  import Shutdown from "#lib/Shutdown.svelte";
+  import TitleBar from "#lib/TitleBar.svelte";
+  import Tracking from "#lib/Tracking.svelte";
+  import PendingSync from "#lib/PendingSync.svelte";
+  import Updater from "#lib/Updater.svelte";
+  import Confirm from "#lib/Confirm.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import Img from "#lib/Img.svelte";
+  import Gearwork from "#lib/Gearwork.svelte";
+  import { rememberScroll, type ScrollPosition } from "#lib/scroll.ts";
+  import { smoothScroll } from "#lib/smooth-scroll.ts";
   import type { Snapshot } from "./$types";
   let { children } = $props();
 
@@ -91,10 +91,11 @@
 
   /// Track program navigation because browser history includes the whole tab session.
   let navDepth = $state(0);
-  afterNavigate(({ type, to, from, delta }) => {
-    if (type === "popstate") navDepth = Math.max(0, navDepth + (delta ?? -1));
-    else if (type !== "enter" && to?.url.pathname !== from?.url.pathname) navDepth += 1;
-    if (type !== "popstate" && !to?.url.hash) scroll?.reset();
+  afterNavigate((navigation) => {
+    const { to, from } = navigation;
+    if (navigation.type === "popstate") navDepth = Math.max(0, navDepth + (navigation.delta ?? -1));
+    else if (navigation.type !== "enter" && to?.url.pathname !== from?.url.pathname) navDepth += 1;
+    if (navigation.type !== "popstate" && !to?.url.hash) scroll?.reset();
   });
   function back() {
     if (navDepth > 0) history.back();
@@ -142,7 +143,7 @@
             {#if index === 0 || index === 4 || index === 8}
               <div class="nav-heading eyebrow">{index === 0 ? 'Your shelf' : index === 4 ? 'Discover' : 'Program'}</div>
             {/if}
-            {@const active = $pageStore.url.pathname === item.href}
+            {@const active = pageStore.url.pathname === item.href}
             <a
               href={item.href}
               aria-current={active ? 'page' : undefined}
@@ -188,7 +189,7 @@
           <p class="px-4 py-2 text-sm text-red-400" role="alert">Log out failed: {logoutErr}</p>
         {/if}
       </aside>
-      <main use:trackScroll use:smoothScroll={$pageStore.url.pathname} class="flex-1 min-w-0 min-h-0 overflow-auto">
+      <main use:trackScroll use:smoothScroll={pageStore.url.pathname} class="flex-1 min-w-0 min-h-0 overflow-auto">
         {@render children?.()}
       </main>
       <!-- Keep the resize grip in flow so it cannot cover the scrollbar. -->

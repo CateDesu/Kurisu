@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { installInFlight } from "$lib/update.svelte";
-  import { isPendingEdit, registerPendingEdit, trackPendingSave } from "$lib/pendingEdits";
+  import { installInFlight } from "#lib/update.svelte.ts";
+  import { isPendingEdit, registerPendingEdit, trackPendingSave } from "#lib/pendingEdits.ts";
   import { untrack } from "svelte";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import type { ListEntry } from "$lib/types";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import type { ListEntry } from "#lib/types.ts";
 
   let {
     mediaId,

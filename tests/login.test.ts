@@ -8,12 +8,12 @@ const mocks = vi.hoisted(() => ({
     loginOauth: vi.fn(), loginWithToken: vi.fn(),
   },
 }));
-vi.mock("$lib/api", () => ({ api: mocks.api }));
-vi.mock("$lib/library.svelte", () => ({ library: { reset: vi.fn() } }));
+vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("#lib/library.svelte.ts", () => ({ library: { reset: vi.fn() } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 
-import Login from "$lib/Login.svelte";
-import { auth } from "$lib/auth.svelte";
+import Login from "#lib/Login.svelte";
+import { auth } from "#lib/auth.svelte.ts";
 
 let component: ReturnType<typeof mount>;
 const user = { id: 7, name: "Tester" };

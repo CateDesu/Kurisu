@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import type { ListEntry, ShowTorrents, TorrentItem } from "$lib/types";
-  import TorrentRow from "$lib/TorrentRow.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import type { ListEntry, ShowTorrents, TorrentItem } from "#lib/types.ts";
+  import TorrentRow from "#lib/TorrentRow.svelte";
 
   let { entry, category, filter, feedItems, seenLinks = new Set<string>(), seenIdentities = new Set<string>(), cache, onopen }: {
     entry: ListEntry;

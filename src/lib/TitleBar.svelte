@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
-  import { flushPendingEdits } from "$lib/pendingEdits";
+  import { flushPendingEdits } from "#lib/pendingEdits.ts";
 
   let closeError = $state("");
   let closing = $state(false);

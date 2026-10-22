@@ -1,10 +1,10 @@
 <script lang="ts">
-  import Dialog from "$lib/Dialog.svelte";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
+  import Dialog from "#lib/Dialog.svelte";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
   import { onDestroy, untrack } from "svelte";
-  import { displayTitle, STATUS_LABEL, type ListEntry } from "$lib/types";
-  import Img from "$lib/Img.svelte";
+  import { displayTitle, STATUS_LABEL, type ListEntry } from "#lib/types.ts";
+  import Img from "#lib/Img.svelte";
 
   let {
     path,

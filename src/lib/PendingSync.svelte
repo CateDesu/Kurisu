@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { api } from "$lib/api";
-  import { auth } from "$lib/auth.svelte";
-  import { STATUS_LABEL, type PendingChange } from "$lib/types";
+  import { api } from "#lib/api.ts";
+  import { auth } from "#lib/auth.svelte.ts";
+  import { STATUS_LABEL, type PendingChange } from "#lib/types.ts";
 
   let items = $state<PendingChange[]>([]);
   let expanded = $state(false);

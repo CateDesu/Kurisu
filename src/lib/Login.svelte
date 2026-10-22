@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { auth } from "$lib/auth.svelte";
-  import Gearwork from "$lib/Gearwork.svelte";
+  import { auth } from "#lib/auth.svelte.ts";
+  import Gearwork from "#lib/Gearwork.svelte";
 
   let token = $state("");
   let busy = $state<"oauth" | "token" | null>(null);

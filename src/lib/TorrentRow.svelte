@@ -1,7 +1,7 @@
 <script lang="ts">
-  import Icon from "$lib/Icon.svelte";
+  import Icon from "#lib/Icon.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { timeAgo, type TorrentItem } from "$lib/types";
+  import { timeAgo, type TorrentItem } from "#lib/types.ts";
 
   let { torrent: t, onopen }: { torrent: TorrentItem; onopen: (url: string) => void } = $props();
 
