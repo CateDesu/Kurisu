@@ -17,7 +17,7 @@ tauri-build = { version = "2", features = [] }
 tokio = { version = "1", features = ["test-util"] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -25,7 +25,7 @@ serde_json = "1"
 # system-proxy keeps AniList and update requests working on managed networks.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "io-util"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 directories = "5"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"

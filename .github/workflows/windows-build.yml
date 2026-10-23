@@ -32,11 +32,11 @@ jobs:
 
       - name: Rust tests
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
 
       - name: Clippy
         working-directory: src-tauri
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
 
       - name: Frontend typecheck
         run: npm run check
