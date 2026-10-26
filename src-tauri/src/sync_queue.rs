@@ -272,7 +272,7 @@ pub(crate) fn mark_media_missing(state: &AppState, media_id: i64) -> Result<()> 
     Ok(())
 }
 
-fn remote_entry(media_id: i64, remote: anilist::SavedEntry) -> ListEntry {
+pub(crate) fn remote_entry(media_id: i64, remote: anilist::SavedEntry) -> ListEntry {
     ListEntry {
         id: Some(remote.id),
         media_id,
@@ -297,7 +297,7 @@ pub(crate) fn publish(entry: &ListEntry) {
     }
 }
 
-fn conflict(pending: &Pending, remote: Option<&ListEntry>) -> bool {
+pub(crate) fn conflict(pending: &Pending, remote: Option<&ListEntry>) -> bool {
     let (Some(base), Some(remote)) = (&pending.base, remote) else {
         return pending.base.is_some() != remote.is_some();
     };
@@ -320,7 +320,7 @@ fn conflict(pending: &Pending, remote: Option<&ListEntry>) -> bool {
             && p.status.as_ref() != Some(&remote.status))
 }
 
-fn already_applied(pending: &Pending, remote: &ListEntry) -> bool {
+pub(crate) fn already_applied(pending: &Pending, remote: &ListEntry) -> bool {
     if pending.base.as_ref().is_some_and(|base| {
         base.id != remote.id
             || (pending.patch.progress.is_some()
@@ -1059,6 +1059,279 @@ mod tests {
         assert_eq!(restarted.db.get_entry(1).unwrap().unwrap().score, Some(9.0));
         drop(restarted);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn automatic_progress_checks_remote_changes_before_its_first_write() {
+        let mut rewatch = remote(0);
+        rewatch["status"] = json!("REPEATING");
+        rewatch["repeat"] = json!(1);
+        let mut paused = remote(3);
+        paused["status"] = json!("PAUSED");
+        let mut recreated = remote(3);
+        recreated["id"] = json!(23);
+        let mut another_cycle = remote(4);
+        another_cycle["repeat"] = json!(1);
+        for remote in [
+            remote(8),
+            remote(2),
+            rewatch,
+            paused,
+            recreated,
+            another_cycle,
+            json!(null),
+        ] {
+            let (api, mut requests) = anilist::mock_api(vec![(
+                200,
+                json!({"data":{"Media":{"mediaListEntry":remote}}}),
+            )])
+            .await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            let entry = crate::commands::watcher_set_progress(&state, 1, 4, Some("test-session"))
+                .await
+                .unwrap()
+                .unwrap();
+            let request = requests.recv().await.unwrap();
+            assert!(
+                !request["query"].as_str().unwrap().contains("mutation"),
+                "automatic tracking sent an unchecked write: {request}"
+            );
+            assert!(requests.try_recv().is_err(), "remote: {remote}");
+            let pending = state.db.pending(7).unwrap();
+            assert_eq!(pending.len(), 1, "remote: {remote}");
+            assert!(pending[0].conflict, "remote: {remote}");
+            assert_eq!(pending[0].base.as_ref().unwrap().progress, 3);
+            assert_eq!(pending[0].patch.progress, Some(4));
+            assert_eq!(entry.progress, 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_progress_requires_an_identified_account_before_writing() {
+        let (api, mut requests) = anilist::mock_api(vec![]).await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        state.db.delete_setting("anilist_user_id").unwrap();
+        let error = crate::commands::watcher_set_progress(&state, 1, 4, Some("test-session"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("Reconnect"));
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 3);
+        assert!(state.db.pending(7).unwrap().is_empty());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_progress_auth_rejection_preserves_previously_saved_changes() {
+        let (api, mut requests) = anilist::mock_api(vec![(
+            401,
+            json!({"errors":[{"message":"Invalid Token","status":401}]}),
+        )])
+        .await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        state
+            .db
+            .upsert_media(&Media {
+                id: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(23),
+                media_id: 2,
+                status: "CURRENT".into(),
+                progress: 2,
+                score: Some(8.0),
+                repeat: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, retained, _) = stage(
+            &state,
+            2,
+            Patch {
+                progress: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let error = crate::commands::watcher_set_progress(&state, 1, 4, Some("test-session"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("expired"));
+        assert!(!state.anilist.lock().has_token());
+        assert!(state.db.entries_with_media().unwrap().is_empty());
+        let pending = state.db.pending(7).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&pending[0]).unwrap(),
+            serde_json::to_value(retained).unwrap()
+        );
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_progress_preserves_remote_scores_and_completes_rewatches_once() {
+        for repeating in [false, true] {
+            let (progress, episode) = if repeating { (11, 12) } else { (3, 4) };
+            let mut before = remote(progress);
+            before["score"] = json!(9);
+            if repeating {
+                before["status"] = json!("REPEATING");
+                before["repeat"] = json!(2);
+            }
+            let mut after = before.clone();
+            after["progress"] = json!(episode);
+            if repeating {
+                after["status"] = json!("COMPLETED");
+                after["repeat"] = json!(3);
+            }
+            let (api, mut requests) = anilist::mock_api(vec![
+                (200, json!({"data":{"Media":{"mediaListEntry":before}}})),
+                (200, json!({"data":{"SaveMediaListEntry":after}})),
+            ])
+            .await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            if repeating {
+                let mut entry = state.db.get_entry(1).unwrap().unwrap();
+                entry.progress = progress;
+                entry.status = "REPEATING".into();
+                entry.repeat = 2;
+                state.db.upsert_entry(&entry).unwrap();
+            }
+            let entry =
+                crate::commands::watcher_set_progress(&state, 1, episode, Some("test-session"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let lookup = requests.recv().await.unwrap();
+            assert_eq!(lookup["variables"], json!({"mediaId":1}));
+            let saved = requests.recv().await.unwrap();
+            assert_eq!(
+                saved["variables"],
+                if repeating {
+                    json!({"id":22,"progress":12,"status":"COMPLETED","repeat":3})
+                } else {
+                    json!({"id":22,"progress":4})
+                }
+            );
+            assert_eq!(entry.score, Some(9.0));
+            assert_eq!(entry.repeat, if repeating { 3 } else { 0 });
+            let cached = state.db.get_entry(1).unwrap().unwrap();
+            assert_eq!(
+                (
+                    cached.status.as_str(),
+                    cached.progress,
+                    cached.score,
+                    cached.repeat
+                ),
+                (
+                    if repeating { "COMPLETED" } else { "CURRENT" },
+                    episode,
+                    Some(9.0),
+                    if repeating { 3 } else { 0 }
+                )
+            );
+            assert!(state.db.pending(7).unwrap().is_empty());
+            assert!(crate::commands::watcher_set_progress(
+                &state,
+                1,
+                episode,
+                Some("test-session")
+            )
+            .await
+            .unwrap()
+            .is_none());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_progress_acknowledges_a_remotely_completed_rewatch() {
+        let mut applied = remote(12);
+        applied["status"] = json!("COMPLETED");
+        applied["repeat"] = json!(3);
+        let (api, mut requests) = anilist::mock_api(vec![(
+            200,
+            json!({"data":{"Media":{"mediaListEntry":applied}}}),
+        )])
+        .await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.progress = 11;
+        entry.status = "REPEATING".into();
+        entry.repeat = 2;
+        state.db.upsert_entry(&entry).unwrap();
+        let saved = crate::commands::watcher_set_progress(&state, 1, 12, Some("test-session"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, "COMPLETED");
+        assert_eq!(saved.repeat, 3);
+        assert_eq!(saved.progress, 12);
+        let cached = state.db.get_entry(1).unwrap().unwrap();
+        assert_eq!(
+            (cached.status.as_str(), cached.progress, cached.repeat),
+            ("COMPLETED", 12, 3)
+        );
+        assert!(state.db.pending(7).unwrap().is_empty());
+        requests.recv().await.unwrap();
+        assert!(
+            crate::commands::watcher_set_progress(&state, 1, 12, Some("test-session"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_progress_keeps_removed_media_and_rejected_writes_distinct() {
+        for missing in [false, true] {
+            let mut replies = vec![];
+            if !missing {
+                replies.push((200, json!({"data":{"Media":{"mediaListEntry":remote(3)}}})));
+            }
+            replies.push(if missing {
+                (
+                    404,
+                    json!({"errors":[{"message":"Not Found","status":404}]}),
+                )
+            } else {
+                (
+                    400,
+                    json!({"errors":[{"message":"Invalid progress","status":400}]}),
+                )
+            });
+            let (api, mut requests) = anilist::mock_api(replies).await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            assert!(
+                crate::commands::watcher_set_progress(&state, 1, 4, Some("test-session"))
+                    .await
+                    .is_err()
+            );
+            let pending = state.db.pending(7).unwrap();
+            if missing {
+                assert!(pending[0].missing_media);
+                assert_eq!(pending[0].patch.progress, Some(4));
+                assert!(state.db.get_entry(1).unwrap().is_none());
+            } else {
+                assert!(pending.is_empty());
+                assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 3);
+                requests.recv().await.unwrap();
+            }
+            requests.recv().await.unwrap();
+            assert!(requests.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

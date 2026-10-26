@@ -856,6 +856,7 @@ pub async fn save_entry_inner(
                     if remote_rewatch { Some(0) } else { progress },
                     score,
                     repeat,
+                    false,
                 )
                 .await;
             }
@@ -893,7 +894,7 @@ pub async fn save_entry_inner(
     } else {
         drop(_write);
     }
-    save_entry_unlocked(state, media_id, status, progress, score, repeat).await
+    save_entry_unlocked(state, media_id, status, progress, score, repeat, false).await
 }
 
 fn complete_progress_edit(
@@ -933,6 +934,7 @@ async fn save_entry_unlocked(
     progress: Option<i64>,
     score: Option<f64>,
     repeat: Option<i64>,
+    check_remote: bool,
 ) -> Result<ListEntry, String> {
     let _write = state.entry_lock.lock().await;
     validate_entry_values(progress, score, repeat)?;
@@ -956,11 +958,56 @@ async fn save_entry_unlocked(
     if let Some((_, pending, true)) = &staged {
         return crate::sync_queue::local_entry(state, pending).map_err(|e| e.to_string());
     }
+    if check_remote && staged.is_none() {
+        return Err("Reconnect to AniList before tracking progress for this account.".into());
+    }
     let entry_id = before.as_ref().and_then(|entry| entry.id);
     drop(_write);
-    let saved = match entry_id {
-        Some(id) => al.save_entry_by_id(id, st, progress, score, repeat).await,
-        None => al.save_entry(media_id, st, progress, score, repeat).await,
+    // Automatic playback must respect the same baseline as queued retries.
+    let preflight = if let Some((account, pending, _)) = staged.as_ref().filter(|_| check_remote) {
+        match al.entry_by_media_id(media_id).await {
+            Ok(remote) => {
+                let snapshot = remote
+                    .as_ref()
+                    .map(|entry| crate::sync_queue::remote_entry(media_id, entry.clone()));
+                let _write = state.entry_lock.lock().await;
+                if snapshot
+                    .as_ref()
+                    .is_some_and(|entry| crate::sync_queue::already_applied(pending, entry))
+                {
+                    Ok(remote)
+                } else if crate::sync_queue::conflict(pending, snapshot.as_ref()) {
+                    let mut pending = pending.clone();
+                    pending.conflict = true;
+                    pending.error = Some("AniList changed before this playback update. Choose which version to keep.".into());
+                    state
+                        .db
+                        .put_pending(*account, &pending)
+                        .map_err(|e| e.to_string())?;
+                    return crate::sync_queue::local_entry(state, &pending)
+                        .map_err(|e| e.to_string());
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(error) if anilist::media_not_found(&error) => {
+                let _write = state.entry_lock.lock().await;
+                crate::sync_queue::mark_media_missing(state, media_id)
+                    .map_err(|e| e.to_string())?;
+                return Err(MEDIA_GONE.to_string());
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(None)
+    };
+    let saved = match preflight {
+        Err(error) => Err(error),
+        Ok(Some(saved)) => Ok(saved),
+        Ok(None) => match entry_id {
+            Some(id) => al.save_entry_by_id(id, st, progress, score, repeat).await,
+            None => al.save_entry(media_id, st, progress, score, repeat).await,
+        },
     };
     let _write = state.entry_lock.lock().await;
     let saved = match saved {
@@ -1111,6 +1158,7 @@ pub async fn set_progress_inner(
         Some(w.progress),
         None,
         w.send_repeat.then_some(w.repeat),
+        false,
     )
     .await
 }
@@ -1153,6 +1201,7 @@ pub async fn watcher_set_progress(
         Some(w.progress),
         None,
         w.send_repeat.then_some(w.repeat),
+        true,
     )
     .await
     .map(Some)
@@ -4142,6 +4191,7 @@ mod persistence_tests {
             "sync",
             "queue",
             "save",
+            "playback",
         ] {
             let (api, mut requests) = anilist::mock_api(vec![
                 (429, json!({})),
@@ -4149,6 +4199,12 @@ mod persistence_tests {
             ])
             .await;
             let state = Arc::new(state(api));
+            if operation == "playback" {
+                let mut entry = state.db.get_entry(1).unwrap().unwrap();
+                entry.status = "CURRENT".into();
+                entry.progress = 11;
+                state.db.upsert_entry(&entry).unwrap();
+            }
             if operation == "queue" {
                 crate::sync_queue::stage(
                     &state,
@@ -4173,12 +4229,15 @@ mod persistence_tests {
                         let _remote = worker_state.remote_lock.lock().await;
                         crate::sync_queue::flush_unlocked(&worker_state).await
                     }
+                    "playback" => watcher_set_progress(&worker_state, 1, 12, Some("test-session"))
+                        .await
+                        .map(|_| ()),
                     _ => save_entry_inner(&worker_state, 1, None, None, Some(80.0), None)
                         .await
                         .map(|_| ()),
                 }
             });
-            requests.recv().await.unwrap();
+            let first = requests.recv().await.unwrap();
             tokio::time::timeout(Duration::from_millis(200), async {
                 assert_eq!(current_user_inner(&state).await.unwrap().unwrap().id, 7);
                 assert_eq!(local_entries_inner(&state).await.unwrap()[0].progress, 12);
@@ -4195,7 +4254,38 @@ mod persistence_tests {
                 !worker.is_finished(),
                 "fixture must still be retrying {operation}"
             );
-            let _ = worker.await.unwrap();
+            let retry = tokio::time::timeout(Duration::from_secs(3), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry, first, "retry changed the {operation} request");
+            let result = worker.await.unwrap();
+            if matches!(operation, "save" | "playback") {
+                result.unwrap();
+            } else {
+                assert!(result.unwrap_err().contains("Unavailable"), "{operation}");
+            }
+            assert!(
+                requests.try_recv().is_err(),
+                "extra request for {operation}"
+            );
+            let pending = state.db.pending(7).unwrap();
+            if matches!(operation, "queue" | "save" | "playback") {
+                assert_eq!(pending.len(), 1, "{operation}");
+                assert!(!pending[0].conflict);
+                assert!(pending[0].error.as_deref().unwrap().contains("Unavailable"));
+                let base = pending[0].base.as_ref().unwrap();
+                assert_eq!(base.progress, if operation == "playback" { 11 } else { 12 });
+                if operation == "playback" {
+                    assert!(!first["query"].as_str().unwrap().contains("mutation"));
+                    assert_eq!(pending[0].patch.progress, Some(12));
+                    assert_eq!(pending[0].patch.status.as_deref(), Some("COMPLETED"));
+                } else {
+                    assert_eq!(pending[0].patch.score, Some(80.0));
+                }
+            } else {
+                assert!(pending.is_empty(), "{operation}");
+            }
         }
     }
 

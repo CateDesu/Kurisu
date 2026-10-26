@@ -57,6 +57,8 @@ npm run check
 npm test
 node --test .github/release-version.test.mjs
 cargo test --locked --manifest-path src-tauri/Cargo.toml
+npm run build
+cargo test --locked --release --manifest-path src-tauri/Cargo.toml --test glib_variant_iter
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 

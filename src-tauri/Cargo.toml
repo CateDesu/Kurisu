@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.53.3", features = ["test-util"] }
 
 [dependencies]
 tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # system-proxy keeps AniList and update requests working on managed networks.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "io-util"] }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "io-util"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 directories = "5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -42,6 +42,7 @@ mpris = "2.0"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 dbus = "0.9"
+glib = "0.18.5"
 
 [target.'cfg(unix)'.dependencies]
 socket2 = "0.6"
@@ -52,3 +53,6 @@ windows = { version = "0.62", features = [
     "Foundation_Collections",
     "Media_Control",
 ] }
+
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }

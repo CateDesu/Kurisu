@@ -34,6 +34,13 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
+      - name: Build frontend for optimized tests
+        run: npm run build
+
+      - name: Optimized GLib regression
+        working-directory: src-tauri
+        run: cargo test --locked --release --test glib_variant_iter
+
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy --locked -- -D warnings

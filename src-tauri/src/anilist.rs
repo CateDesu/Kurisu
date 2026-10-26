@@ -102,7 +102,7 @@ impl From<AniMedia> for Media {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SavedEntry {
     pub id: i64,
     pub status: String,
