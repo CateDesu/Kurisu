@@ -1,5 +1,5 @@
 # Main pushes advance the rolling version. Tags publish named releases.
-# Keep releases as drafts until both platforms finish. Clean orphan drafts manually.
+# Keep drafts until both platform builds finish.
 name: Release build
 
 on:
@@ -119,7 +119,7 @@ jobs:
             echo "::error::release tag $TAG points to another commit"
             exit 1
           fi
-          # Only overwrite draft assets. A failed rerun must not damage a published release.
+          # Published assets must survive failed reruns.
           if STATE=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$STATE" != "true" ]; then
               echo "::error::release $TAG is already published; refusing to overwrite its assets." \
@@ -174,7 +174,7 @@ jobs:
         shell: bash
         run: sha256sum kurisu.exe > kurisu.exe.sha256
 
-      # Upload without editing the draft flag. The publish job owns that transition.
+      # Only the publish job may clear the draft flag.
       - name: Upload Windows build to release
         shell: bash
         run: |
@@ -236,7 +236,7 @@ jobs:
           gh release edit -R "${{ github.repository }}" "$TAG" --draft=false
           echo "Published $TAG"
 
-  # Prune only older rolling tags after publication. Keep named releases and drafts.
+  # After publication, prune only older rolling releases.
   prune-rolling:
     needs: [meta, publish]
     if: needs.meta.outputs.rolling == 'true'

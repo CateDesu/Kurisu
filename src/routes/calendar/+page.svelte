@@ -100,7 +100,7 @@
     void refreshEntries();
   }
 
-  // Restore invalidates the mount fetch. Captures during loading must refetch the selected week.
+  // Restore invalidates the mount fetch. Refetch if captured while loading.
   export const snapshot: Snapshot<{ weekOffset: number; anchorDay: number; items: AiringItem[] }> = {
     capture: () => ({ weekOffset, anchorDay, items: loading ? [] : items }),
     restore: (v) => {

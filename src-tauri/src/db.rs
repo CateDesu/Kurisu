@@ -292,7 +292,7 @@ impl Db {
     pub fn entries_with_media(&self) -> Result<Vec<ListEntry>> {
         let c = self.0.lock();
         let mut stmt = c.prepare(
-            // Keep the row_to_media_offset column layout without loading large details.
+            // NULLs preserve row_to_media_offset's layout without loading details.
             "SELECT e.media_id,e.entry_id,e.status,e.progress,e.score,e.repeat,e.updated_at,
                     m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
                     m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,

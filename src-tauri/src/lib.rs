@@ -99,7 +99,7 @@ fn migrate_legacy_db(legacy: &std::path::Path, db_path: &std::path::Path) -> std
         for (from, _) in &staged {
             let _ = std::fs::remove_file(from);
         }
-        // Leave the destination free so a failed migration can retry next launch.
+        // Leave the destination free to retry migration next launch.
         let _ = std::fs::remove_file(db_path);
         for suffix in ["-wal", "-shm"] {
             let mut dst_side = db_path.as_os_str().to_os_string();

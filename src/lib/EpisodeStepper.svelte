@@ -70,7 +70,8 @@
     if (!isPendingEdit(editKey, flush)) return Promise.resolve();
     inFlight = trackPendingSave(save().finally(() => {
       inFlight = null;
-      if (!current() || pending === saved) {
+      // A failed removal can restore this edit and still needs its cleanup.
+      if ((!current() || pending === saved) && isPendingEdit(editKey, flush)) {
         unregister?.();
         unregister = undefined;
       }

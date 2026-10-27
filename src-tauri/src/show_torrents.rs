@@ -9,10 +9,10 @@ use crate::recognize::{self, Matcher};
 use crate::rss::{self, RawItem};
 
 static RANGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[^\w.])(?P<range>(?:(?P<season>s[0-9]{1,2})?e|ep(?:isode)?[.\s_-]*|#)?(?P<first>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<last>[0-9]{1,4})(?:v[0-9]+)?)(?:$|[^\w.])").unwrap()
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}.])(?P<range>(?:(?P<season>s[0-9]{1,2})?e|ep(?:isode)?[.\s_-]*|#)?(?P<first>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<last>[0-9]{1,4})(?:v[0-9]+)?)(?:$|[^\p{L}\p{N}.])").unwrap()
 });
 static CROSS_SEASON_RANGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bs([0-9]{1,2})e[0-9]{1,4}\s*[-~–]\s*s([0-9]{1,2})e[0-9]{1,4}\b").unwrap()
+    Regex::new(r"(?i)\bs([0-9]{1,2})e[0-9]{1,4}(?:v[0-9]+)?\s*[-~–]\s*s([0-9]{1,2})e[0-9]{1,4}(?:v[0-9]+)?\b").unwrap()
 });
 static SPECIAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(ova|oad|sp|specials?|ncop|nced|op|ed|pv|ost|trailer|preview|sample|creditless)(?:\b|[0-9])").unwrap()
@@ -576,7 +576,7 @@ fn classify(entry: &ListEntry, matchers: &[Matcher], items: Vec<RawItem>) -> Sho
     for raw in items {
         let masked = mask_title(&raw.title, &title_patterns);
         if CROSS_SEASON_RANGE
-            .captures_iter(&masked)
+            .captures_iter(&masked.replace('_', " "))
             .any(|c| c[1].parse::<u32>().ok() != c[2].parse::<u32>().ok())
         {
             continue;
@@ -968,6 +968,69 @@ mod tests {
         );
         assert!(already_watched.batches.is_empty());
         assert_eq!(already_watched.other.len(), 1);
+    }
+
+    #[test]
+    fn underscore_delimited_ranges_keep_episode_bounds() {
+        let entry = entry();
+        let matchers = matchers(&entry);
+        let titles = [
+            "[A] Some Show [01-12_1080p]",
+            "[B] Some Show [01-04_1080p]",
+            "[C] Some Show [01-24_1080p]",
+            "[D] Some Show [1080p_01-04]",
+            "[E] Some Show [1080p_01-24]",
+            "[F] Some Show [S01E01-S01E12_1080p]",
+            "[G] Some Show [S01E01v2-S01E12v3_1080p]",
+        ];
+        let results = titles.map(|title| {
+            let result = classify(&entry, &matchers, vec![raw(title, 100)]);
+            for item in result.batches.iter().chain(&result.other) {
+                assert_eq!(item.title, title);
+                assert_eq!(item.media_id, Some(1));
+                assert_eq!(item.episode, None);
+            }
+            (
+                result.next_episode,
+                result.batches.len(),
+                result.episodes.len(),
+                result.other.len(),
+            )
+        });
+        assert_eq!(
+            results,
+            [
+                (Some(5), 1, 0, 0),
+                (Some(5), 0, 0, 1),
+                (Some(5), 0, 0, 0),
+                (Some(5), 0, 0, 1),
+                (Some(5), 0, 0, 0),
+                (Some(5), 1, 0, 0),
+                (Some(5), 1, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_season_ranges_are_excluded_with_metadata_and_revisions() {
+        let entry = entry();
+        let matchers = matchers(&entry);
+        for title in [
+            "[A] Some Show [S01E01-S02E12_1080p]",
+            "[B] Some Show [1080p_S01E01-S02E12]",
+            "[C] Some Show [1080p_S01E01-S02E12_BD]",
+            "[D] Some Show [S01E01-S01E04_S01E05-S02E12]",
+            "[E] Some Show [S01E01-S01E04 S01E05-S02E12]",
+            "[F] Some Show [S01E01v2-S02E12]",
+            "[G] Some Show [S01E01-S02E12v3]",
+            "[H] Some Show [S01E01v2-S02E12v3_1080p]",
+        ] {
+            let result = classify(&entry, &matchers, vec![raw(title, 100)]);
+            assert!(
+                result.batches.is_empty() && result.episodes.is_empty() && result.other.is_empty(),
+                "{title}: {result:?}"
+            );
+        }
     }
 
     #[test]

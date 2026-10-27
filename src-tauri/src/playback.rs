@@ -1078,6 +1078,86 @@ mod tests {
     }
 
     #[test]
+    fn separated_release_titles_keep_episode_numbers_in_scans_and_playback() {
+        struct Folder(std::path::PathBuf);
+        impl Drop for Folder {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_media(&crate::models::Media {
+            id: 1,
+            title_english: Some("Some Show".into()),
+            episodes: Some(12),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&crate::models::ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let folder = Folder(
+            std::env::temp_dir().join(format!("kurisu-separated-titles-{}", std::process::id())),
+        );
+        std::fs::create_dir(&folder.0).unwrap();
+        let cases = [
+            ("Some.Show.-.05.-.Part.2.mkv", Some(5)),
+            ("Some_Show_-_05_-_Part_2.mkv", Some(5)),
+            ("Some_Show_-_05_-_1-2-3_Go.mkv", Some(5)),
+            ("Some_Show_01-12.mkv", None),
+            ("Some Show_01-12.mkv", None),
+            ("Some_Show_E01-E12.mkv", None),
+            ("Some_Show_01-12_1080p.mkv", None),
+            ("Some.Show.mkv", None),
+            ("Some_Show.mkv", None),
+        ];
+        for (filename, _) in cases {
+            std::fs::write(folder.0.join(filename), []).unwrap();
+        }
+        let scan = library::ScanCache::default().scan(
+            &[folder.0.to_str().unwrap().into()],
+            &matchers,
+            &Default::default(),
+        );
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files.len(), cases.len());
+        for file in scan.files {
+            let filename = std::path::Path::new(&file.path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let expected = cases.iter().find(|(name, _)| *name == filename).unwrap().1;
+            assert_eq!(file.media_id, Some(1), "{}", file.path);
+            assert_eq!(file.episode, expected, "{}", file.path);
+            assert!(!file.bound);
+            for title in ["", "Some Show"] {
+                let info = mpv_snapshot_info(
+                    &db,
+                    &matchers,
+                    &mpvipc::MpvSnapshot {
+                        playing: true,
+                        path: file.path.clone(),
+                        media_title: title.into(),
+                        filename: filename.into(),
+                        duration_us: 1_200_000_000,
+                        position_us: 1_100_000_000,
+                    },
+                );
+                assert_eq!(
+                    (info.media_id, info.episode),
+                    (Some(1), expected),
+                    "{filename}, title: {title}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bound_playback_uses_library_numbering_despite_embedded_titles() {
         let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
         db.upsert_media(&crate::models::Media {

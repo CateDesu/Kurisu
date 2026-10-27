@@ -41,7 +41,7 @@ static RE_BRACKET_EP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[\[(【]\s*(?:(?:ep(?:isode)?\.?|e)\s*)?(\d{1,4})(?:v\d+)?\s*[\])】]").unwrap()
 });
 static RE_EP_RANGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[^\w.])(?P<marker>s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<start>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<end>[0-9]{1,4})(?:v[0-9]+)?(?:$|[^\w.])").unwrap()
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}.])(?P<marker>s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<start>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<end>[0-9]{1,4})(?:v[0-9]+)?(?:$|[^\p{L}\p{N}.])").unwrap()
 });
 static RE_HALF_EPISODE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[^\p{L}\p{N}.])(?:s[0-9]{1,2}\s*e|ep(?:isode)?[.\s_-]*|e[.\s_-]*|#)?[0-9]{1,4}\.5(?:v[0-9]+)?(?:$|[^\p{L}\p{N}.])").unwrap()
@@ -60,6 +60,33 @@ pub(crate) struct Matcher {
     norms: Vec<String>,
     status_rank: u8,
     title_patterns: OnceLock<Vec<Regex>>,
+}
+
+impl Matcher {
+    fn title_patterns(&self) -> &[Regex] {
+        self.title_patterns.get_or_init(|| {
+            let mut variants = self.variants.iter().collect::<Vec<_>>();
+            variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+            variants
+                .into_iter()
+                .filter_map(|variant| {
+                    let words = variant
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|word| !word.is_empty())
+                        .map(regex::escape)
+                        .collect::<Vec<_>>();
+                    if words.is_empty() {
+                        return None;
+                    }
+                    Regex::new(&format!(
+                        r"(?i)(?:^|[^\p{{L}}\p{{N}}]){}(?:$|[^\p{{L}}\p{{N}}])",
+                        words.join(r"[^\p{L}\p{N}]+")
+                    ))
+                    .ok()
+                })
+                .collect()
+        })
+    }
 }
 
 fn status_rank(status: &str) -> u8 {
@@ -336,7 +363,7 @@ pub(crate) fn clean_title(s: &str) -> String {
 fn clean_title_inner(s: &str, strip_channels: bool) -> String {
     let s = strip_ext(s);
     let s = RE_BRACKETS.replace_all(&s, " ");
-    // Strip channel layouts before the episode tail so AAC2.0 cannot leave a false episode zero.
+    // Strip channels before episode tails to avoid reading AAC2.0 as episode zero.
     let s = if strip_channels {
         RE_CHANNEL.replace_all(&s, " ")
     } else {
@@ -394,7 +421,7 @@ fn canon_ordinal(s: &str) -> &str {
 }
 
 fn season_ordinals(normed: &str) -> String {
-    // Collapse S02E03 first, before the bare S02 rule.
+    // Collapse S02E03 before the bare S02 rule.
     let out = RE_SEASON_EP.replace_all(normed, |c: &regex::Captures| {
         canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string()
     });
@@ -504,7 +531,14 @@ pub(crate) fn parse_episode_guess(s: &str) -> Option<i64> {
 pub(crate) fn resolve_episode(matched: &Matcher, candidates: &[&str]) -> Option<i64> {
     let mut variant_hit = false;
     for cand in candidates {
-        match parse_episode_after(cand, &matched.variants) {
+        let episode = parse_episode_after(cand, &matched.variants).or_else(|| {
+            let pattern = matched
+                .title_patterns()
+                .iter()
+                .find(|pattern| pattern.is_match(cand))?;
+            Some(parse_episode_number(&pattern.replace(cand, " "), true))
+        });
+        match episode {
             Some(Some(n)) => return Some(n),
             Some(None) => variant_hit = true,
             None => {
@@ -545,29 +579,8 @@ pub(crate) fn excluded_playback_release(matched: &Matcher, candidate: &str) -> b
     {
         return false;
     }
-    let title_patterns = matched.title_patterns.get_or_init(|| {
-        let mut variants = matched.variants.iter().collect::<Vec<_>>();
-        variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
-        variants
-            .into_iter()
-            .filter_map(|variant| {
-                let words = variant
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|word| !word.is_empty())
-                    .map(regex::escape)
-                    .collect::<Vec<_>>();
-                if words.is_empty() {
-                    return None;
-                }
-                Regex::new(&format!(
-                    r"(?i)(?:^|[^\p{{L}}\p{{N}}]){}(?:$|[^\p{{L}}\p{{N}}])",
-                    words.join(r"[^\p{L}\p{N}]+")
-                ))
-                .ok()
-            })
-            .collect()
-    });
-    let remainder = title_patterns
+    let remainder = matched
+        .title_patterns()
         .iter()
         .find(|pattern| pattern.is_match(candidate))
         .map_or(Cow::Borrowed(candidate), |pattern| {

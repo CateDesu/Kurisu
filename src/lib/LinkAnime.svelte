@@ -41,7 +41,7 @@
   let episodeOffset = $state(0);
   let busy = $state<number | null>(null);
   let err = $state("");
-  // Wait for the existing binding before allowing a pick that might replace it.
+  // Wait for the existing binding before allowing a replacement.
   let currentBinding = $state<number | null>(null);
   let currentTitle = $state("");
   let pendingRelink = $state<number | null>(null);

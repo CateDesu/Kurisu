@@ -781,7 +781,15 @@ mod tests {
         })
         .unwrap();
         let matchers = crate::recognize::build_matchers(&db);
-        for filename in ["Some Show - 01-12.mkv", "[01-12].mkv", "E01-E12.mkv"] {
+        for filename in [
+            "Some_Show_01-12.mkv",
+            "Some Show_01-12.mkv",
+            "Some_Show_E01-E12.mkv",
+            "Some_Show_01-12_1080p.mkv",
+            "Some Show - 01-12.mkv",
+            "[01-12].mkv",
+            "E01-E12.mkv",
+        ] {
             assert_eq!(
                 super::resolve_bound_episode(
                     &matchers[0],

@@ -691,6 +691,114 @@ mod tests {
         json!({"id":22,"status":"CURRENT","progress":progress,"score":0,"repeat":0})
     }
 
+    async fn wrong_entry_save_reply_preserves_pending(action: &str) {
+        let mut baseline = remote(3);
+        baseline["score"] = json!(37);
+        let mut applied = baseline.clone();
+        applied["progress"] = json!(4);
+        let mut unrelated = remote(4);
+        unrelated["id"] = json!(999);
+        unrelated["score"] = json!(91);
+        unrelated["repeat"] = json!(6);
+        let mut replies = vec![];
+        if action != "save" {
+            replies.push((200, json!({"data":{"Media":{"mediaListEntry":baseline}}})));
+        }
+        replies.push((200, json!({"data":{"SaveMediaListEntry":unrelated}})));
+        replies.push((200, json!({"data":{"Media":{"mediaListEntry":applied}}})));
+        let (api, mut requests) = anilist::mock_api(replies).await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.score = Some(37.0);
+        state.db.upsert_entry(&entry).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            if action == "save" {
+                let saved = crate::commands::save_entry_inner(&state, 1, None, Some(4), None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(saved.id, Some(22));
+            } else {
+                let (_, pending, _) = stage(
+                    &state,
+                    1,
+                    Patch {
+                        progress: Some(4),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                local_entry(&state, &pending).unwrap();
+                let result = if action == "retry" {
+                    let _remote = state.remote_lock.lock().await;
+                    flush_unlocked(&state).await
+                } else {
+                    resolve_pending_inner(1, true, &state).await
+                };
+                assert!(result.unwrap_err().contains("entry 999 instead of 22"));
+                let lookup = requests.recv().await.unwrap();
+                assert_eq!(lookup["variables"], json!({"mediaId":1}));
+            }
+            let cached = state.db.get_entry(1).unwrap().unwrap();
+            assert_eq!(
+                (cached.id, cached.progress, cached.repeat),
+                (Some(22), 4, 0)
+            );
+            assert_eq!(cached.score, Some(37.0));
+            let mut changes = state.db.pending(7).unwrap();
+            assert_eq!(changes.len(), 1);
+            let pending = changes.remove(0);
+            assert_eq!(pending.base.as_ref().unwrap().id, Some(22));
+            assert_eq!(pending.patch.progress, Some(4));
+            assert!(!pending.conflict);
+            assert!(!pending.missing_media);
+            assert!(pending.error.unwrap().contains("entry 999 instead of 22"));
+            assert_eq!(
+                state.anilist.lock().token().as_deref(),
+                Some("test-session")
+            );
+            assert_eq!(state.db.cached_user().unwrap().unwrap().id, 7);
+            assert_eq!(
+                requests.recv().await.unwrap()["variables"],
+                json!({"id":22,"progress":4})
+            );
+            {
+                let _remote = state.remote_lock.lock().await;
+                flush_unlocked(&state).await.unwrap();
+            }
+            assert!(state.db.pending(7).unwrap().is_empty());
+            let cached = state.db.get_entry(1).unwrap().unwrap();
+            assert_eq!(
+                (cached.id, cached.progress, cached.repeat),
+                (Some(22), 4, 0)
+            );
+            assert_eq!(cached.score, Some(37.0));
+            assert_eq!(
+                requests.recv().await.unwrap()["variables"],
+                json!({"mediaId":1})
+            );
+            assert!(requests.try_recv().is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_entry_reply_during_save_keeps_the_identity_and_pending_intent() {
+        wrong_entry_save_reply_preserves_pending("save").await;
+    }
+
+    #[tokio::test]
+    async fn wrong_entry_reply_during_retry_keeps_the_identity_and_pending_intent() {
+        wrong_entry_save_reply_preserves_pending("retry").await;
+    }
+
+    #[tokio::test]
+    async fn wrong_entry_reply_during_resolution_keeps_the_identity_and_pending_intent() {
+        wrong_entry_save_reply_preserves_pending("resolve").await;
+    }
+
     #[tokio::test]
     async fn incomplete_remote_lookup_cannot_discard_saved_progress() {
         for reply in [

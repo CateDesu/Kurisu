@@ -1172,14 +1172,24 @@ impl AniList {
         score: Option<f64>,
         repeat: Option<i64>,
     ) -> Result<SavedEntry> {
-        self.save_entry_target(
-            serde_json::json!({"id": entry_id}),
-            status,
-            progress,
-            score,
-            repeat,
-        )
-        .await
+        let entry = self
+            .save_entry_target(
+                serde_json::json!({"id": entry_id}),
+                status,
+                progress,
+                score,
+                repeat,
+            )
+            .await?;
+        if entry.id != entry_id {
+            return Err(ApiError {
+                status: reqwest::StatusCode::OK,
+                from_json: false,
+                message: format!("AniList returned entry {} instead of {entry_id}", entry.id),
+            }
+            .into());
+        }
+        Ok(entry)
     }
 
     async fn save_entry_target(
@@ -1510,7 +1520,7 @@ fn parse_entry_details(raw: &serde_json::Value) -> Result<EntryDetails> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Details {
-        // Selected fields may be null, but missing fields are an incomplete response.
+        // Selected fields may be null, but must be present.
         #[serde(deserialize_with = "Option::deserialize")]
         notes: Option<String>,
         #[serde(deserialize_with = "Option::deserialize")]

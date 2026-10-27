@@ -55,7 +55,7 @@ def shorten(text, limit):
 def notification(repo, ref, actor, message, commit_url, has_image):
     message = message.strip()
     header = f"📦 Push to **{repo}** ({ref}) by {actor}\n\n"
-    # Suppress the automatic unfurl when the original card is attached explicitly.
+    # Avoid a duplicate unfurl when attaching the preview.
     link = f"<{commit_url}>" if has_image else commit_url
     content = header + shorten(message, 2000 - len(header) - len(link) - 1) + "\n" + link
     payload = {"content": content, "username": repo.rsplit("/", 1)[-1]}

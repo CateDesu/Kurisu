@@ -109,7 +109,7 @@
   let syncedFlash = $state(false);
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
   function markSynced() {
-    // Use the shared clock so the saved time cannot be ahead of relative labels.
+    // The shared clock keeps saved time aligned with relative labels.
     syncedAt = nowMs();
     preferences.set("kurisu.list.synced", String(syncedAt));
     syncedFlash = true;

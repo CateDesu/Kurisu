@@ -11,7 +11,7 @@
   import { api } from "#lib/api.ts";
   import { auth } from "#lib/auth.svelte.ts";
   import { library } from "#lib/library.svelte.ts";
-  import { trackPendingSave } from "#lib/pendingEdits.ts";
+  import { discardPendingEditAfter, trackPendingSave } from "#lib/pendingEdits.ts";
   import Select from "#lib/Select.svelte";
   import ScoreInput from "#lib/ScoreInput.svelte";
   import Icon from "#lib/Icon.svelte";
@@ -185,7 +185,7 @@
         if (!sameSession()) return;
         if (alive) applyDetails(saved);
       }
-      // Send only edited fields to preserve newer changes from tracking or other clients.
+      // Send only edited fields to preserve newer tracking and client changes.
       if (basicTouched) await api.updateEntry(
         entry.media_id,
         statusBeforeCompletion === null && (status !== snap.status || (statusChosen && progressTouched)) ? status : null,
@@ -217,7 +217,7 @@
     removing = true;
     err = "";
     try {
-      await trackPendingSave(api.deleteEntry(entry.media_id));
+      await trackPendingSave(discardPendingEditAfter(`${epoch}:${entry.media_id}`, api.deleteEntry(entry.media_id)));
       if (current()) onclose();
     } catch (e) {
       if (current()) err = String(e);
