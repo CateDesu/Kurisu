@@ -17,7 +17,6 @@
   import Img from "#lib/Img.svelte";
   import Gearwork from "#lib/Gearwork.svelte";
   import { rememberScroll, type ScrollPosition } from "#lib/scroll.ts";
-  import { smoothScroll } from "#lib/smooth-scroll.ts";
   import type { Snapshot } from "./$types";
   let { children } = $props();
 
@@ -138,7 +137,7 @@
             <Icon name="back" />
           </button>
         </div>
-        <nav use:smoothScroll class="sidebar-nav flex-1 overflow-auto" aria-label="Main navigation">
+        <nav class="sidebar-nav flex-1 overflow-auto" aria-label="Main navigation">
           {#each nav as item, index}
             {#if index === 0 || index === 4 || index === 8}
               <div class="nav-heading eyebrow">{index === 0 ? 'Your shelf' : index === 4 ? 'Discover' : 'Program'}</div>
@@ -189,7 +188,7 @@
           <p class="px-4 py-2 text-sm text-red-400" role="alert">Log out failed: {logoutErr}</p>
         {/if}
       </aside>
-      <main use:trackScroll use:smoothScroll={pageStore.url.pathname} class="flex-1 min-w-0 min-h-0 overflow-auto">
+      <main use:trackScroll class="flex-1 min-w-0 min-h-0 overflow-auto">
         {@render children?.()}
       </main>
       <!-- Keep the resize grip in flow so it cannot cover the scrollbar. -->

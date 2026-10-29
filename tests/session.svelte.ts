@@ -1,5 +1,7 @@
 export const page = $state({ params: { id: "1" }, url: new URL("http://localhost/anime/1") });
 
+export const playback = $state({ info: null as Record<string, unknown> | null });
+
 export const auth = $state({
   epoch: 0,
   isLoggedIn: true,

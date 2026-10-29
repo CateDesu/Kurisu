@@ -209,19 +209,22 @@ fn min_watch_time(length_us: i64) -> Duration {
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut active: Option<ActiveTrack> = None;
+        let mut recognition = RecognitionCache::default();
         loop {
             tokio::time::sleep(TICK).await;
             let app_tick = app.clone();
             let prev = active.take();
+            let mut cache = std::mem::take(&mut recognition);
             let joined = tauri::async_runtime::spawn(async move {
                 let mut track = prev;
-                let result = tick(&app_tick, &mut track).await;
-                (track, result)
+                let result = tick(&app_tick, &mut track, &mut cache).await;
+                (track, cache, result)
             })
             .await;
             match joined {
-                Ok((track, result)) => {
+                Ok((track, cache, result)) => {
                     active = track;
+                    recognition = cache;
                     if let Err(e) = result {
                         log::debug!("playback tick error: {e}");
                     }
@@ -266,11 +269,22 @@ impl TickInfo {
     }
 }
 
-async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Result<()> {
+async fn tick(
+    app: &AppHandle,
+    active: &mut Option<ActiveTrack>,
+    recognition: &mut RecognitionCache,
+) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
     let expected_token = state.anilist.lock().token();
     let app_for_blocking = app.clone();
-    let info = tokio::task::spawn_blocking(move || read_now(&app_for_blocking)).await??;
+    let mut cache = std::mem::take(recognition);
+    let (cache, info) = tokio::task::spawn_blocking(move || {
+        let info = read_now(&app_for_blocking, &mut cache);
+        (cache, info)
+    })
+    .await?;
+    *recognition = cache;
+    let info = info?;
     let _session_guard = state.entry_lock.lock().await;
     if state.anilist.lock().token() != expected_token {
         *active = None;
@@ -318,18 +332,23 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     track.last_tick = Instant::now();
 
     let cfg = read_config(app);
+    let entry = info
+        .media_id
+        .filter(|_| cfg.discord_enabled || info.episode.is_some())
+        .and_then(|media_id| state.db.get_entry(media_id).ok().flatten());
 
     let desired = if cfg.discord_enabled {
         match (info.matched_title.as_ref(), info.media_id) {
-            (Some(title), Some(media_id)) => {
-                let (cover_url, total_episodes) = app
-                    .state::<AppState>()
-                    .db
-                    .get_entry(media_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|e| e.media)
-                    .map(|m| (m.cover_large.or(m.cover_medium), m.episodes))
+            (Some(title), Some(_)) => {
+                let (cover_url, total_episodes) = entry
+                    .as_ref()
+                    .and_then(|e| e.media.as_ref())
+                    .map(|m| {
+                        (
+                            m.cover_large.clone().or_else(|| m.cover_medium.clone()),
+                            m.episodes,
+                        )
+                    })
                     .unwrap_or_default();
                 Some(discord::PresenceInfo {
                     title: title.clone(),
@@ -354,14 +373,7 @@ async fn tick(app: &AppHandle, active: &mut Option<ActiveTrack>) -> anyhow::Resu
     let Some(episode) = info.episode else {
         return Ok(());
     };
-    let progress = app
-        .state::<AppState>()
-        .db
-        .get_entry(media_id)
-        .ok()
-        .flatten()
-        .map(|e| e.progress)
-        .unwrap_or(0);
+    let progress = entry.as_ref().map_or(0, |e| e.progress);
 
     // Auto ask is independent of mode and consumes the prompt to avoid asking twice.
     if cfg.auto_ask
@@ -596,10 +608,26 @@ fn idle() -> NowPlaying {
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-fn probe_mpv(app: &AppHandle) -> Option<TickInfo> {
-    let cfg = read_config(app);
+fn probe_mpv(app: &AppHandle, matches: &PlaybackMatches<'_>) -> Option<TickInfo> {
+    let paths = mpv_socket_paths(&app.state::<AppState>().db);
+    preferred_source(
+        mpvipc::probe(&paths)
+            .iter()
+            .map(|s| mpv_snapshot_info(matches, s)),
+    )
+}
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn mpv_socket_paths(db: &crate::db::Db) -> Vec<String> {
+    let socket = match db.get_setting("tracking_mpv_socket") {
+        Ok(socket) => socket.unwrap_or_default(),
+        Err(error) => {
+            log::warn!("MPV socket read failed, using defaults: {error}");
+            String::new()
+        }
+    };
     let mut paths: Vec<String> = Vec::new();
-    let custom = cfg.mpv_ipc_socket.trim().to_string();
+    let custom = socket.trim().to_string();
     if !custom.is_empty() {
         paths.push(custom);
     }
@@ -608,22 +636,11 @@ fn probe_mpv(app: &AppHandle) -> Option<TickInfo> {
             paths.push(p);
         }
     }
-    preferred_source(mpvipc::probe(&paths).iter().map(|s| mpv_tick_info(app, s)))
+    paths
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-fn mpv_tick_info(app: &AppHandle, snap: &mpvipc::MpvSnapshot) -> TickInfo {
-    let state = app.state::<AppState>();
-    let matchers = state.matchers.lock().clone();
-    mpv_snapshot_info(&state.db, &matchers, snap)
-}
-
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-fn mpv_snapshot_info(
-    db: &crate::db::Db,
-    matchers: &[crate::recognize::Matcher],
-    snap: &mpvipc::MpvSnapshot,
-) -> TickInfo {
+fn mpv_snapshot_info(matches: &PlaybackMatches<'_>, snap: &mpvipc::MpvSnapshot) -> TickInfo {
     let title = if snap.media_title.is_empty() {
         snap.filename.clone()
     } else {
@@ -632,7 +649,7 @@ fn mpv_snapshot_info(
     let matched = if is_audio_url(&snap.filename) {
         None
     } else {
-        match_playing(db, matchers, &title, &snap.path)
+        matches.match_playing(&title, &snap.path)
     };
     let base = basename(&snap.path);
     let episode = matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
@@ -650,28 +667,138 @@ fn mpv_snapshot_info(
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-fn match_playing<'a>(
-    db: &crate::db::Db,
-    matchers: &'a [crate::recognize::Matcher],
-    title: &str,
-    path: &str,
-) -> Option<(
-    &'a crate::recognize::Matcher,
-    Option<library::LibraryBinding>,
-)> {
-    if is_audio_url(path) {
-        return None;
+#[derive(Default)]
+struct RecognitionCache {
+    // Weak identity prevents address reuse without retaining old matchers.
+    matchers: std::sync::Weak<Vec<crate::recognize::Matcher>>,
+    account: Option<i64>,
+    entries: std::collections::VecDeque<RecognizedTitle>,
+    #[cfg(test)]
+    recognitions: usize,
+}
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+struct RecognizedTitle {
+    title: String,
+    path: String,
+    index: Option<usize>,
+    created: Instant,
+}
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+impl RecognitionCache {
+    const CAPACITY: usize = 16;
+    const LIFETIME: Duration = Duration::from_secs(60);
+
+    fn prepare(
+        &mut self,
+        matchers: &std::sync::Arc<Vec<crate::recognize::Matcher>>,
+        account: Option<i64>,
+    ) {
+        let identity = std::sync::Arc::downgrade(matchers);
+        if !self.matchers.ptr_eq(&identity) || self.account != account {
+            self.entries.clear();
+            self.matchers = identity;
+            self.account = account;
+        }
     }
-    let bindings = match library::get_bindings(db) {
-        Ok(bindings) => bindings,
-        Err(error) => {
-            log::warn!("cannot read library bindings, skipping playback match: {error}");
+
+    fn match_unbound<'a>(
+        &mut self,
+        matchers: &'a [crate::recognize::Matcher],
+        title: &str,
+        path: &str,
+    ) -> Option<&'a crate::recognize::Matcher> {
+        let now = Instant::now();
+        self.entries
+            .retain(|entry| now.duration_since(entry.created) < Self::LIFETIME);
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.title == title && entry.path == path)
+        {
+            return entry.index.and_then(|index| matchers.get(index));
+        }
+        #[cfg(test)]
+        {
+            self.recognitions += 1;
+        }
+        let matched = match_title(matchers, title, path);
+        let index = matched.and_then(|matched| {
+            matchers
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, matched))
+        });
+        if self.entries.len() == Self::CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(RecognizedTitle {
+            title: title.into(),
+            path: path.into(),
+            index,
+            created: now,
+        });
+        matched
+    }
+}
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+struct PlaybackMatches<'a> {
+    db: &'a crate::db::Db,
+    matchers: &'a [crate::recognize::Matcher],
+    bindings: std::cell::OnceCell<Option<library::BindingPaths>>,
+    recognition: std::cell::RefCell<&'a mut RecognitionCache>,
+}
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+impl<'a> PlaybackMatches<'a> {
+    // Recreate each poll so edits and filesystem changes become visible.
+    fn new(
+        db: &'a crate::db::Db,
+        matchers: &'a std::sync::Arc<Vec<crate::recognize::Matcher>>,
+        recognition: &'a mut RecognitionCache,
+    ) -> Self {
+        recognition.prepare(matchers, crate::sync_queue::account_id(db));
+        Self {
+            db,
+            matchers,
+            bindings: std::cell::OnceCell::new(),
+            recognition: std::cell::RefCell::new(recognition),
+        }
+    }
+
+    fn match_unbound(&self, title: &str, path: &str) -> Option<&'a crate::recognize::Matcher> {
+        self.recognition
+            .borrow_mut()
+            .match_unbound(self.matchers, title, path)
+    }
+
+    fn match_playing(
+        &self,
+        title: &str,
+        path: &str,
+    ) -> Option<(
+        &'a crate::recognize::Matcher,
+        Option<library::LibraryBinding>,
+    )> {
+        if is_audio_url(path) {
             return None;
         }
-    };
-    library::bound_match(matchers, &bindings, path)
-        .map(|(m, binding)| (m, Some(binding)))
-        .or_else(|| match_title(matchers, title, path).map(|m| (m, None)))
+        let bindings = self
+            .bindings
+            .get_or_init(|| match library::get_bindings(self.db) {
+                Ok(bindings) => Some(library::BindingPaths::new(&bindings)),
+                Err(error) => {
+                    log::warn!("cannot read library bindings, skipping playback match: {error}");
+                    None
+                }
+            })
+            .as_ref()?;
+        bindings
+            .bound_match(self.matchers, path)
+            .map(|(m, binding)| (m, Some(binding)))
+            .or_else(|| self.match_unbound(title, path).map(|m| (m, None)))
+    }
 }
 
 fn playing_episode(
@@ -729,11 +856,12 @@ fn mpris_timeline(player: &mpris::Player, metadata: &mpris::Metadata) -> (i64, i
 }
 
 #[cfg(target_os = "linux")]
-fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
+fn read_now(app: &AppHandle, cache: &mut RecognitionCache) -> anyhow::Result<Option<TickInfo>> {
+    let state = app.state::<AppState>();
+    let matchers = state.matchers.lock().clone();
+    let matches = PlaybackMatches::new(&state.db, &matchers, cache);
     let mut sources = Vec::new();
     if let Ok(finder) = PlayerFinder::new() {
-        let state = app.state::<AppState>();
-        let matchers = state.matchers.lock().clone();
         for player in mpris_players(&finder)
             .into_iter()
             .filter(|p| !is_browser(p))
@@ -746,7 +874,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
             let md = player.get_metadata().unwrap_or_default();
             let title = md.title().map(|t| t.to_string()).unwrap_or_default();
             let url = md.url().map(|u| u.to_string()).unwrap_or_default();
-            let matched = match_playing(&state.db, &matchers, &title, &url);
+            let matched = matches.match_playing(&title, &url);
             let base = basename(&url);
             let episode =
                 matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
@@ -764,7 +892,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
             });
         }
     }
-    sources.extend(probe_mpv(app));
+    sources.extend(probe_mpv(app, &matches));
     Ok(preferred_source(sources))
 }
 
@@ -804,38 +932,184 @@ fn windows_timeline(start: Option<i64>, end: Option<i64>, position: Option<i64>)
     )
 }
 
+#[cfg(any(windows, test))]
+fn is_windows_game_client(id: &str) -> bool {
+    let id = id.to_lowercase();
+    let app = id.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    const CLIENTS: &[&str] = &[
+        "vrchat",
+        "vrchatinc.vrchat",
+        "com.vrchat",
+        "riotclient",
+        "riotclientservices",
+        "riotclientux",
+        "riotclientuxrender",
+        "leagueclient",
+        "leagueclientux",
+        "leagueclientuxrender",
+        "com.riotgames",
+        "riotgames",
+        "steam",
+        "steamwebhelper",
+        "steamvr",
+        "com.valvesoftware.steam",
+        "valve.steam",
+        "epicgameslauncher",
+        "epicwebhelper",
+        "epic games launcher",
+        "com.epicgames",
+        "battle.net",
+        "blizzard battle.net",
+        "blizzard.battlenet",
+        "blizzardentertainment.battle.net",
+        "com.blizzard",
+        "eadesktop",
+        "ealauncher",
+        "eabackgroundservice",
+        "ea desktop",
+        "ea app",
+        "origin",
+        "originwebhelperservice",
+        "com.ea",
+        "ubisoftconnect",
+        "ubisoftgamelauncher",
+        "ubisoft connect",
+        "uplay",
+        "uplaywebcore",
+        "com.ubisoft",
+        "galaxyclient",
+        "gog galaxy",
+        "gog.galaxy",
+        "com.gog.galaxy",
+        "microsoft.gamingapp",
+        "microsoft.xboxapp",
+        "microsoft.xboxgamingoverlay",
+        "xbox",
+        "itch",
+        "io.itch",
+        "playnite",
+        "prismlauncher",
+        "multimc",
+        "minecraftlauncher",
+        "minecraft launcher",
+        "com.mojang.minecraftlauncher",
+        "robloxplayerbeta",
+        "robloxplayerlauncher",
+        "robloxcorporation.roblox",
+        "rockstargameslauncher",
+        "rockstar games launcher",
+        "com.rockstargames.launcher",
+        "amazon games",
+        "amazongames",
+        "hoyoplay",
+        "oculusclient",
+    ];
+    CLIENTS.iter().any(|name| {
+        app.strip_prefix(name).is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with(['.', '_', '!', '-', ' '])
+        })
+    })
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMediaType {
+    Video,
+    Music,
+    Other,
+}
+
+#[cfg(any(windows, test))]
+fn windows_video_session(
+    player: &str,
+    title: &str,
+    video_types: [Option<SessionMediaType>; 2],
+) -> bool {
+    let player = player.to_lowercase();
+    let app = player.rsplit(['/', '\\']).next().unwrap_or_default();
+    if app.trim().is_empty()
+        || title.trim().is_empty()
+        || is_browser_str(app)
+        || is_windows_game_client(app)
+        || is_audio_url(title)
+    {
+        return false;
+    }
+    let vlc = matches!(app, "vlc" | "vlc.exe" | "vlc media player")
+        || app
+            .strip_prefix("videolan.vlc")
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['_', '!']));
+    if video_types.contains(&Some(SessionMediaType::Other))
+        || video_types.contains(&Some(SessionMediaType::Music)) && !vlc
+    {
+        return false;
+    }
+    // VLC's SMTC plugin labels video metadata as Music to display the artist.
+    video_types.contains(&Some(SessionMediaType::Video))
+        || vlc
+        || KNOWN_VIDEO_PLAYERS.iter().any(|name| app.contains(name))
+}
+
 #[cfg(windows)]
-fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
+fn read_now(app: &AppHandle, cache: &mut RecognitionCache) -> anyhow::Result<Option<TickInfo>> {
     use windows::Media::Control::{
         GlobalSystemMediaTransportControlsSessionManager as SessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
     };
+    use windows::Media::MediaPlaybackType;
+    let state = app.state::<AppState>();
+    let matchers = state.matchers.lock().clone();
+    let matches = PlaybackMatches::new(&state.db, &matchers, cache);
     let mut sources = Vec::new();
     let sessions = SessionManager::RequestAsync()
         .and_then(|request| request.join())
         .and_then(|manager| manager.GetSessions());
     if let Ok(sessions) = sessions {
-        let state = app.state::<AppState>();
-        let matchers = state.matchers.lock().clone();
         for session in sessions {
             let player = session
                 .SourceAppUserModelId()
                 .map(|h| h.to_string_lossy())
                 .unwrap_or_default();
-            if is_browser_str(&player) {
+            let app = player.rsplit(['/', '\\']).next().unwrap_or_default();
+            if is_browser_str(app) || is_windows_game_client(app) {
                 continue;
             }
-            let playing = match session.GetPlaybackInfo().and_then(|i| i.PlaybackStatus()) {
+            let Ok(playback) = session.GetPlaybackInfo() else {
+                continue;
+            };
+            let playing = match playback.PlaybackStatus() {
                 Ok(PlaybackStatus::Playing) => true,
                 Ok(PlaybackStatus::Paused) => false,
                 _ => continue,
             };
-            let title = session
+            let Ok(properties) = session
                 .TryGetMediaPropertiesAsync()
                 .and_then(|op| op.join())
-                .and_then(|props| props.Title())
+            else {
+                continue;
+            };
+            let title = properties
+                .Title()
                 .map(|h| h.to_string_lossy())
                 .unwrap_or_default();
+            let video_type = |kind: Option<MediaPlaybackType>| {
+                kind.filter(|kind| *kind != MediaPlaybackType::Unknown)
+                    .map(|kind| match kind {
+                        MediaPlaybackType::Video => SessionMediaType::Video,
+                        MediaPlaybackType::Music => SessionMediaType::Music,
+                        _ => SessionMediaType::Other,
+                    })
+            };
+            if !windows_video_session(
+                &player,
+                &title,
+                [
+                    video_type(playback.PlaybackType().and_then(|kind| kind.Value()).ok()),
+                    video_type(properties.PlaybackType().and_then(|kind| kind.Value()).ok()),
+                ],
+            ) {
+                continue;
+            }
             let timeline = session.GetTimelineProperties().ok();
             let (length_us, position_us) = windows_timeline(
                 timeline
@@ -851,7 +1125,7 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
                     .and_then(|t| t.Position().ok())
                     .map(|t| t.Duration),
             );
-            let matched = match_title(&matchers, &title, "");
+            let matched = matches.match_unbound(&title, "");
             let episode =
                 matched.and_then(|m| library::resolve_bound_episode(m, &[title.as_str()], None));
             sources.push(TickInfo {
@@ -867,18 +1141,284 @@ fn read_now(app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
             });
         }
     }
-    sources.extend(probe_mpv(app));
+    sources.extend(probe_mpv(app, &matches));
     Ok(preferred_source(sources))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn read_now(_app: &AppHandle) -> anyhow::Result<Option<TickInfo>> {
+fn read_now(_app: &AppHandle, _cache: &mut RecognitionCache) -> anyhow::Result<Option<TickInfo>> {
     Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SqlCount<'a> {
+        db: &'a crate::db::Db,
+        count: Box<std::cell::Cell<usize>>,
+    }
+
+    impl<'a> SqlCount<'a> {
+        fn new(db: &'a crate::db::Db) -> Self {
+            unsafe extern "C" fn record(
+                _: u32,
+                context: *mut std::ffi::c_void,
+                _: *mut std::ffi::c_void,
+                _: *mut std::ffi::c_void,
+            ) -> i32 {
+                let count = unsafe { &*context.cast::<std::cell::Cell<usize>>() };
+                count.set(count.get() + 1);
+                0
+            }
+            let mut trace = Self {
+                db,
+                count: Box::default(),
+            };
+            let result = unsafe {
+                rusqlite::ffi::sqlite3_trace_v2(
+                    db.0.lock().handle(),
+                    rusqlite::ffi::SQLITE_TRACE_STMT,
+                    Some(record),
+                    std::ptr::from_mut(trace.count.as_mut()).cast(),
+                )
+            };
+            assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+            trace
+        }
+    }
+
+    impl Drop for SqlCount<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                rusqlite::ffi::sqlite3_trace_v2(
+                    self.db.0.lock().handle(),
+                    0,
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mpv_socket_discovery_reads_one_fresh_setting_instead_of_six() {
+        let db = playback_binding_db();
+        let defaults = mpvipc::default_socket_paths();
+        assert_eq!(mpv_socket_paths(&db), defaults);
+        for custom in ["  \t\n", " /custom/mpv.sock \n", " /changed/mpv.sock "] {
+            db.set_setting("tracking_mpv_socket", custom).unwrap();
+            let trace = SqlCount::new(&db);
+            let config = TrackingConfig::load(&db);
+            assert_eq!(trace.count.get(), 6);
+            let paths = mpv_socket_paths(&db);
+            assert_eq!(trace.count.get(), 7);
+            let mut expected = defaults.clone();
+            if !custom.trim().is_empty() {
+                expected.insert(0, custom.trim().into());
+            }
+            assert_eq!(paths, expected);
+            assert_eq!(config.mpv_ipc_socket, custom);
+        }
+        if let Some(default) = defaults.first() {
+            db.set_setting("tracking_mpv_socket", default).unwrap();
+            assert_eq!(mpv_socket_paths(&db), defaults);
+        }
+        db.0.lock()
+            .execute(
+                "UPDATE settings SET value=X'FF' WHERE key='tracking_mpv_socket'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(mpv_socket_paths(&db), defaults);
+        db.set_setting("tracking_mpv_socket", "/recovered/mpv.sock")
+            .unwrap();
+        db.set_setting("tracking_mode", "auto").unwrap();
+        assert_eq!(mpv_socket_paths(&db)[0], "/recovered/mpv.sock");
+        assert_eq!(TrackingConfig::load(&db).mode, "auto");
+        db.delete_setting("tracking_mpv_socket").unwrap();
+        assert_eq!(mpv_socket_paths(&db), defaults);
+        db.0.lock().execute_batch("DROP TABLE settings").unwrap();
+        assert_eq!(mpv_socket_paths(&db), defaults);
+        println!("MPV socket discovery: 1 settings query instead of 6");
+    }
+
+    #[test]
+    fn unchanged_sources_reuse_recognition_but_keep_timing_and_selection_fresh() {
+        let db = playback_binding_db();
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        for poll in 0..10 {
+            let matches = PlaybackMatches::new(&db, &matchers, &mut cache);
+            let sources = [
+                ("Some Show - 03", Some(1), Some(3)),
+                ("Other Show - 07", Some(2), Some(7)),
+                ("Unknown Program", None, None),
+            ]
+            .map(|(title, media_id, episode)| {
+                let snapshot = mpvipc::MpvSnapshot {
+                    playing: poll % 2 == 1 && media_id == Some(2),
+                    path: format!("/videos/{title}.mkv"),
+                    media_title: title.into(),
+                    filename: format!("{title}.mkv"),
+                    duration_us: 1_200_000_000 + poll,
+                    position_us: poll * 5_000_000,
+                };
+                let info = mpv_snapshot_info(&matches, &snapshot);
+                assert_eq!((info.media_id, info.episode), (media_id, episode));
+                assert_eq!(info.playing, snapshot.playing);
+                assert_eq!(info.length_us, snapshot.duration_us);
+                assert_eq!(info.position_us, snapshot.position_us);
+                info
+            });
+            assert_eq!(
+                preferred_source(sources).unwrap().media_id,
+                Some(if poll % 2 == 0 { 1 } else { 2 })
+            );
+            assert_eq!(cache.recognitions, 3);
+        }
+        assert_eq!(cache.entries.len(), 3);
+        assert!(cache.entries.iter().any(|entry| entry.index.is_none()));
+        println!("3 sources over 10 polls: 3 recognitions instead of 30");
+    }
+
+    #[test]
+    fn recognition_cache_tracks_exact_titles_paths_matchers_and_accounts() {
+        let db = playback_binding_db();
+        let mut matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let lookup = |matchers: &std::sync::Arc<Vec<crate::recognize::Matcher>>,
+                      cache: &mut RecognitionCache,
+                      title: &str,
+                      path: &str| {
+            PlaybackMatches::new(&db, matchers, cache)
+                .match_playing(title, path)
+                .map(|(matched, _)| matched.media_id)
+        };
+        for (title, path) in [
+            ("Some Show - 03", "/video.mkv"),
+            ("Some Show - 04", "/video.mkv"),
+            ("Some Show - 04", "/alternate.mkv"),
+            ("Some Show - 04 ", "/alternate.mkv"),
+        ] {
+            assert_eq!(lookup(&matchers, &mut cache, title, path), Some(1));
+        }
+        assert_eq!(cache.recognitions, 4);
+        for account in [Some("7"), Some("8"), None, Some("invalid"), Some("7")] {
+            if let Some(account) = account {
+                db.set_setting("anilist_user_id", account).unwrap();
+            } else {
+                db.delete_setting("anilist_user_id").unwrap();
+            }
+            let before = cache.recognitions;
+            assert_eq!(
+                lookup(&matchers, &mut cache, "Some Show - 04", "/alternate.mkv"),
+                Some(1)
+            );
+            assert_eq!(
+                cache.recognitions - before,
+                usize::from(account != Some("invalid"))
+            );
+        }
+        let old = std::sync::Arc::downgrade(&matchers);
+        db.delete_entry(1).unwrap();
+        matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        assert!(old.upgrade().is_none());
+        let before = cache.recognitions;
+        assert_eq!(
+            lookup(&matchers, &mut cache, "Some Show - 04", "/alternate.mkv"),
+            None
+        );
+        assert_eq!(cache.recognitions, before + 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(std::sync::Arc::strong_count(&matchers), 1);
+        db.upsert_entry(&crate::models::ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        assert_eq!(
+            lookup(&matchers, &mut cache, "Some Show - 04", "/alternate.mkv"),
+            Some(1)
+        );
+        assert_eq!(cache.recognitions, before + 2);
+    }
+
+    #[test]
+    fn recognition_cache_bounds_capacity_and_age_including_misses() {
+        let db = playback_binding_db();
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        for index in 0..=RecognitionCache::CAPACITY {
+            assert!(PlaybackMatches::new(&db, &matchers, &mut cache)
+                .match_playing(&format!("Unknown Program {index}"), "")
+                .is_none());
+            assert!(cache.entries.len() <= RecognitionCache::CAPACITY);
+        }
+        let before = cache.recognitions;
+        assert!(PlaybackMatches::new(&db, &matchers, &mut cache)
+            .match_playing("Unknown Program 0", "")
+            .is_none());
+        assert_eq!(cache.recognitions, before + 1);
+        assert_eq!(cache.entries.len(), RecognitionCache::CAPACITY);
+        for entry in &mut cache.entries {
+            entry.created = Instant::now() - RecognitionCache::LIFETIME;
+        }
+        assert!(PlaybackMatches::new(&db, &matchers, &mut cache)
+            .match_playing("Unknown Program 0", "")
+            .is_none());
+        assert_eq!(cache.recognitions, before + 2);
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn cached_recognition_preserves_seasons_ranges_and_single_episode_movies() {
+        let db = playback_binding_db();
+        for (id, title, episodes, format) in [
+            (3, "Some Show Season 2", 12, "TV"),
+            (4, "Example Movie", 1, "MOVIE"),
+        ] {
+            db.upsert_media(&crate::models::Media {
+                id,
+                title_english: Some(title.into()),
+                episodes: Some(episodes),
+                format: Some(format.into()),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&crate::models::ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let cases = [
+            ("Some Show - 03", Some(1), Some(3)),
+            ("Some Show S02E04", Some(3), Some(4)),
+            ("Some Show - 01-12", Some(1), None),
+            ("Example Movie", Some(4), Some(1)),
+        ];
+        for _ in 0..3 {
+            let matches = PlaybackMatches::new(&db, &matchers, &mut cache);
+            for (title, media_id, episode) in cases {
+                let path = format!("/videos/{title}.mkv");
+                let matched = matches.match_playing(title, &path);
+                let actual_episode = matched
+                    .and_then(|(m, binding)| playing_episode(m, title, &basename(&path), binding));
+                assert_eq!(
+                    (matched.map(|(m, _)| m.media_id), actual_episode),
+                    (media_id, episode),
+                    "{title}"
+                );
+            }
+            assert_eq!(cache.recognitions, cases.len());
+        }
+    }
 
     #[test]
     fn windows_media_timestamps_are_relative_to_the_start_of_the_item() {
@@ -1100,6 +1640,7 @@ mod tests {
         })
         .unwrap();
         let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
         let folder = Folder(
             std::env::temp_dir().join(format!("kurisu-separated-titles-{}", std::process::id())),
         );
@@ -1137,8 +1678,7 @@ mod tests {
             assert!(!file.bound);
             for title in ["", "Some Show"] {
                 let info = mpv_snapshot_info(
-                    &db,
-                    &matchers,
+                    &PlaybackMatches::new(&db, &matchers, &mut cache),
                     &mpvipc::MpvSnapshot {
                         playing: true,
                         path: file.path.clone(),
@@ -1173,7 +1713,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let matchers = crate::recognize::build_matchers(&db);
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
         let binding = Some(library::LibraryBinding {
             media_id: 1,
             episode_offset: -12,
@@ -1194,6 +1734,182 @@ mod tests {
         );
     }
 
+    struct BindingFolder(std::path::PathBuf);
+
+    impl BindingFolder {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-playback-bindings-{label}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for BindingFolder {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn playback_binding_db() -> crate::db::Db {
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+        for (id, title) in [(1, "Some Show"), (2, "Other Show")] {
+            db.upsert_media(&crate::models::Media {
+                id,
+                title_english: Some(title.into()),
+                episodes: Some(12),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&crate::models::ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn playback_binding_snapshots_refresh_edits_and_failed_reads_each_poll() {
+        let db = playback_binding_db();
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let folder = BindingFolder::new("edits");
+        let path = folder.0.join("ep13.mkv");
+        std::fs::write(&path, []).unwrap();
+        let snapshot = mpvipc::MpvSnapshot {
+            playing: false,
+            path: path.to_str().unwrap().into(),
+            media_title: "Other Show - 03".into(),
+            filename: "ep13.mkv".into(),
+            duration_us: 1_200_000_000,
+            position_us: 1_100_000_000,
+        };
+        let bind = |offset| {
+            let bindings = std::collections::HashMap::from([(
+                folder.0.to_str().unwrap(),
+                library::LibraryBinding {
+                    media_id: 1,
+                    episode_offset: offset,
+                },
+            )]);
+            db.set_setting(
+                "library_bindings",
+                &serde_json::to_string(&bindings).unwrap(),
+            )
+            .unwrap();
+        };
+        let result = |matches: &PlaybackMatches<'_>| {
+            let info = mpv_snapshot_info(matches, &snapshot);
+            assert!(!info.playing);
+            (info.media_id, info.episode)
+        };
+
+        assert_eq!(
+            result(&PlaybackMatches::new(&db, &matchers, &mut cache)),
+            (Some(2), Some(3))
+        );
+        assert_eq!(cache.recognitions, 1);
+        bind(-12);
+        let first_poll = PlaybackMatches::new(&db, &matchers, &mut cache);
+        assert_eq!(result(&first_poll), (Some(1), Some(1)));
+        bind(-11);
+        assert_eq!(result(&first_poll), (Some(1), Some(1)));
+        assert_eq!(
+            result(&PlaybackMatches::new(&db, &matchers, &mut cache)),
+            (Some(1), Some(2))
+        );
+
+        db.set_setting("library_bindings", "{invalid").unwrap();
+        let failed_poll = PlaybackMatches::new(&db, &matchers, &mut cache);
+        assert_eq!(result(&failed_poll), (None, None));
+        bind(-12);
+        assert_eq!(result(&failed_poll), (None, None));
+        assert_eq!(
+            result(&PlaybackMatches::new(&db, &matchers, &mut cache)),
+            (Some(1), Some(1))
+        );
+
+        library::unbind_media(&db, 1).unwrap();
+        assert_eq!(
+            result(&PlaybackMatches::new(&db, &matchers, &mut cache)),
+            (Some(2), Some(3))
+        );
+        assert_eq!(cache.recognitions, 1);
+        bind(-12);
+        let current_matchers = std::sync::Arc::new(
+            crate::recognize::build_matchers(&db)
+                .into_iter()
+                .filter(|matcher| matcher.media_id == 2)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            result(&PlaybackMatches::new(&db, &current_matchers, &mut cache)),
+            (Some(2), Some(3))
+        );
+        assert_eq!(cache.recognitions, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn playback_binding_snapshots_refresh_symlinks_and_missing_paths() {
+        use std::os::unix::fs::symlink;
+
+        let db = playback_binding_db();
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let folder = BindingFolder::new("symlinks");
+        let first = folder.0.join("first");
+        let second = folder.0.join("second");
+        let alias = folder.0.join("alias");
+        for dir in [&first, &second] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("ep13.mkv"), []).unwrap();
+        }
+        symlink(&first, &alias).unwrap();
+        library::bind_path(&db, alias.to_str().unwrap(), 1, -12).unwrap();
+        let matched = |matches: &PlaybackMatches<'_>, path: &std::path::Path| {
+            matches
+                .match_playing("", path.to_str().unwrap())
+                .map(|(matcher, binding)| (matcher.media_id, binding.unwrap().episode_offset))
+        };
+        let first_poll = PlaybackMatches::new(&db, &matchers, &mut cache);
+        assert_eq!(
+            matched(&first_poll, &alias.join("ep13.mkv")),
+            Some((1, -12))
+        );
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        assert_eq!(matched(&first_poll, &alias.join("ep13.mkv")), None);
+
+        let next_poll = PlaybackMatches::new(&db, &matchers, &mut cache);
+        assert_eq!(matched(&next_poll, &first.join("ep13.mkv")), None);
+        assert_eq!(
+            matched(&next_poll, &second.join("ep13.mkv")),
+            Some((1, -12))
+        );
+        std::fs::remove_file(&alias).unwrap();
+        assert_eq!(
+            matched(
+                &PlaybackMatches::new(&db, &matchers, &mut cache),
+                &second.join("ep13.mkv")
+            ),
+            None
+        );
+        symlink(&first, &alias).unwrap();
+        assert_eq!(
+            matched(
+                &PlaybackMatches::new(&db, &matchers, &mut cache),
+                &first.join("ep13.mkv")
+            ),
+            Some((1, -12))
+        );
+    }
+
     fn source(
         player: &str,
         playing: bool,
@@ -1211,6 +1927,333 @@ mod tests {
             matched_title: media_id.map(|_| "Anime".into()),
             episode,
         }
+    }
+
+    #[test]
+    fn windows_sessions_reject_riot_clients_even_when_previews_claim_to_be_video() {
+        for player in [
+            "com.riotgames.RiotGames.RiotClient",
+            "RiotClientServices.exe",
+            "LeagueClientUx.exe",
+            "COM.RIOTGAMES.RIOTGAMES.RIOTCLIENT",
+        ] {
+            for title in ["", "League of Legends", "Some Show - 03"] {
+                for types in [
+                    [None, None],
+                    [Some(SessionMediaType::Video), None],
+                    [Some(SessionMediaType::Video), Some(SessionMediaType::Video)],
+                ] {
+                    assert!(
+                        !windows_video_session(player, title, types),
+                        "{player}: {title}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_sessions_reject_game_clients_and_vrchat() {
+        for player in [
+            "VRChat",
+            "VRCHAT.EXE",
+            "com.vrchat.client",
+            "VRChatInc.VRChat!App",
+            r"C:\Program Files (x86)\Steam\steamapps\common\VRChat\VRChat.exe",
+            "Steam.exe",
+            "Steam.Client!App",
+            "steamwebhelper.exe",
+            "com.valvesoftware.steam",
+            "SteamVR.exe",
+            "EpicGamesLauncher.exe",
+            "EpicWebHelper.exe",
+            "com.epicgames.launcher",
+            "Battle.net.exe",
+            "Blizzard Battle.net Launcher",
+            "com.blizzard.battlenet",
+            "EADesktop.exe",
+            "EALauncher.exe",
+            "EABackgroundService.exe",
+            "EA Desktop",
+            "Origin.exe",
+            "OriginWebHelperService.exe",
+            "com.ea.origin",
+            "UbisoftConnect.exe",
+            "UbisoftGameLauncher.exe",
+            "Ubisoft Connect",
+            "uplay.exe",
+            "UplayWebCore.exe",
+            "com.ubisoft.connect",
+            "GalaxyClient.exe",
+            "GOG Galaxy",
+            "com.gog.galaxy",
+            "Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App",
+            "Microsoft.XboxApp_8wekyb3d8bbwe!Microsoft.XboxApp",
+            "Microsoft.XboxGamingOverlay_8wekyb3d8bbwe!App",
+            "Xbox.exe",
+            "itch.exe",
+            "io.itch.itch",
+            "Playnite.DesktopApp.exe",
+            "Playnite.FullscreenApp.exe",
+            "PrismLauncher.exe",
+            "MultiMC.exe",
+            "MinecraftLauncher.exe",
+            "com.mojang.minecraftlauncher",
+            "RobloxPlayerBeta.exe",
+            "RobloxPlayerLauncher.exe",
+            "ROBLOXCORPORATION.ROBLOX_55nm5eh3cm0pr!App",
+            "Rockstar Games Launcher",
+            "com.rockstargames.launcher",
+            "Amazon Games",
+            "HoYoPlay.exe",
+            "OculusClient.exe",
+        ] {
+            for types in [
+                [None, None],
+                [Some(SessionMediaType::Video), None],
+                [None, Some(SessionMediaType::Video)],
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Video)],
+            ] {
+                assert!(
+                    !windows_video_session(player, "Some Show - 03", types),
+                    "{player}: {types:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_sessions_game_exclusions_do_not_match_folders_or_video_titles() {
+        for player in [
+            r"C:\Users\VRChat\Programs\vlc.exe",
+            r"C:\Program Files (x86)\Steam\steamapps\common\Video Player\mpv.exe",
+            r"C:\Users\EpicGamesLauncher\Programs\CustomVideoPlayer.exe",
+            "OriginStoryPlayer.exe",
+            "SteamshipVideo.exe",
+            "itchyPlayer.exe",
+        ] {
+            for title in ["VRChat", "Steam - 03", "Origin - 04", "League of Legends"] {
+                assert!(
+                    windows_video_session(player, title, [Some(SessionMediaType::Video), None]),
+                    "{player}: {title}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_sessions_game_clients_cannot_displace_video_playback() {
+        let clients = ["VRChat.exe", "Steam.exe", "EpicGamesLauncher.exe"];
+        let filter = |info: &TickInfo| {
+            windows_video_session(
+                &info.player,
+                &info.title,
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Video)],
+            )
+        };
+        for client in clients {
+            let selected = preferred_source(
+                [
+                    source(client, true, Some(1), Some(3)),
+                    source("VLC", false, Some(1), Some(3)),
+                ]
+                .into_iter()
+                .filter(filter),
+            )
+            .unwrap();
+            assert_eq!(selected.player, "VLC", "{client}");
+            assert!(!selected.playing);
+        }
+        assert!(preferred_source(
+            clients
+                .into_iter()
+                .map(|client| source(client, true, Some(1), Some(3)))
+                .filter(filter)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn windows_sessions_require_video_evidence_and_usable_titles() {
+        assert!(!windows_video_session(
+            "",
+            "Some Show - 03",
+            [Some(SessionMediaType::Video), None]
+        ));
+        for title in ["", " \t\n", "\u{2003}"] {
+            assert!(!windows_video_session(
+                "VLC",
+                title,
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Video)]
+            ));
+        }
+        for title in ["Some Show - 03", "League of Legends"] {
+            assert!(!windows_video_session("UnknownApp", title, [None, None]));
+            assert!(windows_video_session(
+                "CustomVideoPlayer",
+                title,
+                [Some(SessionMediaType::Video), None]
+            ));
+            assert!(windows_video_session(
+                "CustomVideoPlayer",
+                title,
+                [None, Some(SessionMediaType::Video)]
+            ));
+        }
+        assert!(windows_video_session(
+            r"C:\Users\opera\Programs\CustomVideoPlayer.exe",
+            "Some Show - 03",
+            [Some(SessionMediaType::Video), None],
+        ));
+        for player in [
+            "VLC media player",
+            "mpv.net",
+            "MPC-HC64.exe",
+            "MPC-BE64.exe",
+            "PotPlayerMini64.exe",
+        ] {
+            assert!(
+                windows_video_session(player, "Unlisted Show - 03", [None, None]),
+                "{player}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_sessions_use_application_names_instead_of_parent_folders() {
+        assert!(windows_video_session(
+            r"C:\Users\RiotGames\AppData\mpv.net\mpvnet.exe",
+            "Some Show - 03",
+            [None, None],
+        ));
+        assert!(!windows_video_session(
+            r"C:\Users\mpv\Games\UnknownGame.exe",
+            "Some Show - 03",
+            [None, None],
+        ));
+        for player in [
+            r"C:\Users\mpv\Programs\msedge.exe",
+            r"C:\Users\vlc\Programs\foobar2000.exe",
+            r"C:\Riot Games\RiotClientServices.exe",
+            "RiotGames.RiotClient!App",
+        ] {
+            assert!(!windows_video_session(
+                player,
+                "Some Show - 03",
+                [Some(SessionMediaType::Video), None]
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_sessions_reject_music_images_and_conflicting_media_types() {
+        for player in ["CustomVideoPlayer", "Microsoft.ZuneMusic"] {
+            for types in [
+                [Some(SessionMediaType::Music), None],
+                [None, Some(SessionMediaType::Music)],
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Music)],
+                [Some(SessionMediaType::Music), Some(SessionMediaType::Video)],
+            ] {
+                assert!(
+                    !windows_video_session(player, "Some Show - 03", types),
+                    "{player}: {types:?}"
+                );
+            }
+        }
+        for player in [
+            "Firefox",
+            "308046B0AF4A39CB",
+            "msedge.exe",
+            "Spotify",
+            "foobar2000",
+        ] {
+            assert!(!windows_video_session(
+                player,
+                "Some Show - 03",
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Video)]
+            ));
+        }
+        assert!(!windows_video_session(
+            "VLC",
+            "Some Show - 03.flac",
+            [None, None]
+        ));
+        assert!(windows_video_session(
+            "VLC",
+            "Some Show - 03.mkv",
+            [None, None]
+        ));
+    }
+
+    #[test]
+    fn windows_sessions_accept_vlc_plugin_music_metadata_but_not_images_or_audio_files() {
+        for player in [
+            "VLC",
+            "vlc.exe",
+            "VLC media player",
+            "VideoLAN.VLC_paz6r1rewnh0a!App",
+        ] {
+            for types in [
+                [None, Some(SessionMediaType::Music)],
+                [Some(SessionMediaType::Music), None],
+                [Some(SessionMediaType::Music), Some(SessionMediaType::Music)],
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Music)],
+            ] {
+                assert!(
+                    windows_video_session(player, "Some Show - 03", types),
+                    "{player}: {types:?}"
+                );
+                assert!(!windows_video_session(player, "Some Show - 03.flac", types));
+            }
+            assert!(!windows_video_session(
+                player,
+                "Some Show - 03",
+                [Some(SessionMediaType::Other), None]
+            ));
+            assert!(!windows_video_session(
+                player,
+                "Some Show - 03",
+                [Some(SessionMediaType::Music), Some(SessionMediaType::Other)]
+            ));
+        }
+        assert!(!windows_video_session(
+            "SomeVlcGame.exe",
+            "Some Show - 03",
+            [Some(SessionMediaType::Music), None]
+        ));
+    }
+
+    #[test]
+    fn windows_sessions_do_not_let_a_playing_launcher_displace_a_paused_video() {
+        let mut riot = source("com.riotgames.RiotGames.RiotClient", true, None, None);
+        riot.title = "Some Show - 03".into();
+        riot.length_us = 10_000_000;
+        let paused = source("VLC", false, Some(1), Some(3));
+        let accepted = [riot, paused].into_iter().filter(|info| {
+            windows_video_session(
+                &info.player,
+                &info.title,
+                [Some(SessionMediaType::Video), Some(SessionMediaType::Video)],
+            )
+        });
+        let selected = preferred_source(accepted).unwrap();
+        assert_eq!(selected.player, "VLC");
+        assert!(!selected.playing);
+        assert!(preferred_source(
+            [source(
+                "com.riotgames.RiotGames.RiotClient",
+                true,
+                None,
+                None
+            )]
+            .into_iter()
+            .filter(|info| windows_video_session(
+                &info.player,
+                &info.title,
+                [None, None]
+            ))
+        )
+        .is_none());
     }
 
     #[test]
@@ -1602,7 +2645,8 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let matchers = crate::recognize::build_matchers(&db);
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
         let title = "Some Show - 03";
         let folder = std::env::temp_dir().join(format!("kurisu-audio-only-{}", std::process::id()));
         library::bind_path(&db, folder.to_str().unwrap(), 1, -12).unwrap();
@@ -1620,7 +2664,8 @@ mod tests {
                 .into(),
             "ep13.mkv".into(),
         );
-        let recognized = mpv_snapshot_info(&db, &matchers, &video);
+        let recognized =
+            mpv_snapshot_info(&PlaybackMatches::new(&db, &matchers, &mut cache), &video);
         assert_eq!(recognized.media_id, Some(1));
         assert_eq!(recognized.matched_title.as_deref(), Some("Some Show"));
         assert_eq!(recognized.episode, Some(1));
@@ -1643,7 +2688,10 @@ mod tests {
                     format!("ep13.{extension}"),
                 ),
             ] {
-                let info = mpv_snapshot_info(&db, &matchers, &snapshot(path.clone(), filename));
+                let info = mpv_snapshot_info(
+                    &PlaybackMatches::new(&db, &matchers, &mut cache),
+                    &snapshot(path.clone(), filename),
+                );
                 assert!(info.playing);
                 assert_eq!(info.title, title);
                 assert_eq!(info.length_us, 1_200_000_000);
@@ -1652,10 +2700,13 @@ mod tests {
                 assert_eq!(info.matched_title, None);
                 assert_eq!(info.episode, None);
             }
-            assert!(match_playing(&db, &matchers, title, &url).is_none());
+            assert!(PlaybackMatches::new(&db, &matchers, &mut cache)
+                .match_playing(title, &url)
+                .is_none());
         }
         db.set_setting("library_bindings", "{invalid").unwrap();
-        let unrecognized = mpv_snapshot_info(&db, &matchers, &video);
+        let unrecognized =
+            mpv_snapshot_info(&PlaybackMatches::new(&db, &matchers, &mut cache), &video);
         assert_eq!(unrecognized.media_id, None);
         assert_eq!(unrecognized.episode, None);
     }

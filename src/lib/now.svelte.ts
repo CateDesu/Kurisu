@@ -5,8 +5,13 @@ export function nowMs(): number {
 }
 
 export function runClock(intervalMs = 30_000): () => void {
-  const t = setInterval(() => {
-    now = Date.now();
-  }, intervalMs);
-  return () => clearInterval(t);
+  const publish = () => {
+    if (document.visibilityState === "visible") now = Date.now();
+  };
+  const t = setInterval(publish, intervalMs);
+  document.addEventListener("visibilitychange", publish);
+  return () => {
+    clearInterval(t);
+    document.removeEventListener("visibilitychange", publish);
+  };
 }

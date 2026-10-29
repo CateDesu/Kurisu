@@ -17,7 +17,9 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import PageHeading from "#lib/PageHeading.svelte";
-  import { listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
+  import { createTitleSorter, matchesListQuery, reconcileListEntries } from "#lib/myList.ts";
+  import { expiredAiringCutoff } from "#lib/airingSort.ts";
   import { goto } from "$app/navigation";
   import { preferences } from "#lib/preferences.ts";
   import { auth } from "#lib/auth.svelte.ts";
@@ -35,9 +37,20 @@
   import EpisodeStepper from "#lib/EpisodeStepper.svelte";
   import Icon from "#lib/Icon.svelte";
   import Img from "#lib/Img.svelte";
+  import WindowedList from "#lib/WindowedList.svelte";
+  import type { WindowedGeometry } from "#lib/windowedList.ts";
+  import type { Snapshot } from "./$types";
+
+  let windowed = $state.raw<{ capture: () => WindowedGeometry } | undefined>(undefined);
+  let savedGeometry = $state.raw<{ epoch: number; geometry: WindowedGeometry } | null>(null);
+  export const snapshot: Snapshot<typeof savedGeometry> = {
+    capture: () => windowed ? { epoch: auth.epoch, geometry: windowed.capture() } : null,
+    restore: (saved) => { savedGeometry = saved; },
+  };
   import Select from "#lib/Select.svelte";
 
-  let entries = $state<ListEntry[]>([]);
+  let entries = $state.raw<ListEntry[]>([]);
+  let entriesLoaded = false;
   let loading = $state(false);
   let syncing = $state(false);
   let error = $state("");
@@ -81,7 +94,11 @@
     return v !== null && statuses.includes(v) ? v : "CURRENT";
   }
   let filter = $state(readFilter());
-  let q = $state(preferences.get("kurisu.list.q") ?? "");
+  let savedQuery = preferences.get("kurisu.list.q") ?? "";
+  let q = $state(savedQuery);
+  // Navigation can destroy the page before its render batch commits.
+  let queryDraft = savedQuery;
+  let queryTimer: ReturnType<typeof setTimeout> | null = null;
   let sortKey = $state<SortKey>(readSort());
   let sortDesc = $state(readDesc(readSort()));
   function persistSort() {
@@ -98,7 +115,23 @@
   }
   $effect(() => {
     preferences.set("kurisu.list.filter", filter);
-    preferences.set("kurisu.list.q", q);
+  });
+  function persistQuery() {
+    if (queryTimer) clearTimeout(queryTimer);
+    queryTimer = null;
+    if (queryDraft === savedQuery) return;
+    preferences.set("kurisu.list.q", queryDraft);
+    savedQuery = queryDraft;
+  }
+  function changeQuery(value: string) {
+    q = value;
+    queryDraft = value;
+    if (queryTimer) clearTimeout(queryTimer);
+    queryTimer = value === savedQuery ? null : setTimeout(persistQuery, 300);
+  }
+  $effect(() => {
+    window.addEventListener("pagehide", persistQuery);
+    return () => window.removeEventListener("pagehide", persistQuery);
   });
 
   function readSyncedAt(): number {
@@ -109,8 +142,7 @@
   let syncedFlash = $state(false);
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
   function markSynced() {
-    // The shared clock keeps saved time aligned with relative labels.
-    syncedAt = nowMs();
+    syncedAt = Date.now();
     preferences.set("kurisu.list.synced", String(syncedAt));
     syncedFlash = true;
     if (flashTimer) clearTimeout(flashTimer);
@@ -125,16 +157,15 @@
     return t === "just now" ? "Synced just now" : `Synced ${t} ago`;
   });
 
-  function matchesQuery(e: ListEntry, needle: string): boolean {
-    const m = e.media;
-    if (!m) return false;
-    return [m.title_english, m.title_romaji, m.title_native].some((t) =>
-      t?.toLowerCase().includes(needle)
-    );
-  }
-
   const titleCmp = (a: ListEntry, b: ListEntry) =>
     COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
+  const sortTitles = createTitleSorter((a, b) => COLLATOR.compare(a, b));
+
+  const statusEntries = $derived(entries.filter((e) => e.status === filter));
+  const airingExpiries = $derived(sortKey === "airing"
+    ? statusEntries.flatMap((e) => e.media?.next_airing_at ? [e.media.next_airing_at * 1000] : []).sort((a, b) => a - b)
+    : []);
+  const airingCutoff = $derived(sortKey === "airing" ? expiredAiringCutoff(airingExpiries, nowMs()) : -Infinity);
 
   function keyVal(e: ListEntry): number | null {
     switch (sortKey) {
@@ -146,21 +177,16 @@
         return e.updated_at ?? null;
       case "airing": {
         const at = e.media?.next_airing_at;
-        return at && at * 1000 > nowMs() ? at : null;
+        return at && at * 1000 > airingCutoff ? at : null;
       }
       default:
         return null;
     }
   }
 
-  const visible = $derived.by(() => {
-    const needle = q.trim().toLowerCase();
-    const filtered = entries.filter(
-      (e) => e.status === filter && (!needle || matchesQuery(e, needle))
-    );
-    if (sortKey === "title") {
-      return filtered.sort((a, b) => (sortDesc ? -titleCmp(a, b) : titleCmp(a, b)));
-    }
+  const sorted = $derived.by(() => {
+    if (sortKey === "title") return sortTitles(statusEntries, sortDesc);
+    const filtered = [...statusEntries];
     return filtered.sort((a, b) => {
       const va = keyVal(a);
       const vb = keyVal(b);
@@ -171,24 +197,37 @@
       return r !== 0 ? r : titleCmp(a, b);
     });
   });
+  const needle = $derived(q.trim().toLowerCase());
+  const visible = $derived(needle ? sorted.filter((entry) => matchesListQuery(entry, needle)) : sorted);
+
+  function replaceEntries(list: ListEntry[]) {
+    const next = reconcileListEntries(entries, list);
+    if (next !== entries) entries = next;
+  }
 
   let loadId = 0;
   let syncId = 0;
   let alive = true;
-  onDestroy(() => { alive = false; });
-  async function load() {
+  onDestroy(() => { alive = false; persistQuery(); });
+  function syncIsStale(now: number): boolean {
+    return auth.epoch !== autoSyncedEpoch || !autoSynced || !syncedAt || now - syncedAt >= SYNC_AGE;
+  }
+  async function load(automatic = false) {
     if (!auth.isLoggedIn) return;
-    const id = ++loadId;
     const epoch = auth.epoch;
+    const uid = auth.user?.id ?? null;
+    const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
+    const checkedAt = Date.now();
+    if (automatic && entriesLoaded && !switched && epoch === autoSyncedEpoch && pendingSync?.epoch !== epoch
+      && (!syncIsStale(checkedAt) || checkedAt - lastSyncAttemptAt < 60_000)) return;
+    const id = ++loadId;
     const current = () => id === loadId && epoch === auth.epoch && auth.isLoggedIn;
     loading = true;
     error = "";
-    const uid = auth.user?.id ?? null;
-    const switched = uid !== null && syncedFor !== null && uid !== syncedFor;
     if (switched) {
       entries = [];
       filter = "CURRENT";
-      q = "";
+      changeQuery("");
       syncedAt = 0;
       preferences.remove("kurisu.list.filter");
       preferences.remove("kurisu.list.q");
@@ -206,7 +245,8 @@
         await load();
         return;
       }
-      entries = list;
+      replaceEntries(list);
+      entriesLoaded = true;
       syncedFor = uid;
       if (auth.epoch !== autoSyncedEpoch) {
         autoSynced = false;
@@ -214,13 +254,16 @@
         lastSyncAttemptAt = 0;
       }
       const now = Date.now();
-      const stale = !autoSynced || !syncedAt || now - syncedAt >= SYNC_AGE;
+      const stale = syncIsStale(now);
       if (!auth.offline && (switched || (stale && now - lastSyncAttemptAt >= 60_000))) {
         autoSynced = true;
         await sync();
       }
     } catch (e) {
-      if (current()) error = String(e);
+      if (current()) {
+        entriesLoaded = false;
+        error = String(e);
+      }
     } finally {
       if (current()) loading = false;
     }
@@ -249,7 +292,8 @@
       if (current()) {
         loadId++;
         loading = false;
-        entries = list;
+        replaceEntries(list);
+        entriesLoaded = true;
         syncedFor = auth.user?.id ?? null;
         markSynced();
       }
@@ -269,15 +313,39 @@
     pendingSync = null;
     loading = false;
     syncing = false;
-    entries = entries.map((x) =>
+    replaceEntries(entries.map((x) =>
       x.media_id === entry.media_id ? { ...entry, media: entry.media ?? x.media } : x
-    );
+    ));
+  }
+
+  async function refreshEntries(mediaIds?: readonly number[]) {
+    if (!mediaIds || !entriesLoaded) return load();
+    if (!auth.isLoggedIn) return;
+    const id = ++loadId;
+    const epoch = auth.epoch;
+    const revision = listRevision;
+    const current = () => alive && id === loadId && epoch === auth.epoch && auth.isLoggedIn;
+    try {
+      const update = await readListUpdate(mediaIds);
+      if (current() && revision === listRevision) {
+        replaceEntries(applyListUpdate(entries, update));
+        error = "";
+      }
+    } catch (e) {
+      if (current() && revision === listRevision) {
+        entriesLoaded = false;
+        error = String(e);
+      }
+    } finally {
+      if (current()) loading = false;
+    }
   }
 
   $effect(() => {
     auth.epoch;
     loggedIn;
     entries = [];
+    entriesLoaded = false;
     editing = null;
     loading = false;
     syncing = false;
@@ -291,34 +359,19 @@
   $effect(() => {
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
-    let alive = true;
-    let debounce: ReturnType<typeof setTimeout> | null = null;
-    const refresh = () => {
-      if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
-      listRevision++;
-      if (debounce) clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        debounce = null;
-        if (alive && epoch === auth.epoch && auth.isLoggedIn) void load();
-      }, 300);
-    };
-    const stop = listenForListUpdates(
-      refresh,
+    return listenForListUpdates(
+      (mediaIds) => { if (epoch === auth.epoch) return refreshEntries(mediaIds); },
       (e) => { if (epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`; },
-      () => { if (epoch === auth.epoch) void load(); },
+      () => { if (epoch === auth.epoch) return load(); },
+      { invalidate: () => { listRevision++; }, revision: () => listRevision, delayMs: 300 },
     );
-    return () => {
-      alive = false;
-      stop();
-      if (debounce) clearTimeout(debounce);
-    };
   });
 
   $effect(() => {
     const epoch = auth.epoch;
     if (!auth.isLoggedIn || auth.offline) return;
     const refresh = () => {
-      if (epoch === auth.epoch && document.visibilityState === "visible" && !loading && !syncing) void load();
+      if (epoch === auth.epoch && document.visibilityState === "visible" && !loading && !syncing) void load(true);
     };
     window.addEventListener("focus", refresh);
     const timer = setInterval(refresh, 60_000);
@@ -338,7 +391,7 @@
         <Icon name="search" size={15} />
         <span class="sr-only">Filter your list</span>
       <input
-        bind:value={q}
+        bind:value={() => q, changeQuery}
         placeholder="Find a title on your shelf…"
         class="min-w-0 w-full bg-transparent text-sm focus:outline-none"
       />
@@ -402,62 +455,67 @@
     {:else}
       <div class="list-columns eyebrow" aria-hidden="true"><span>Title / {STATUS_LABEL[filter]}</span><span>Episode progress</span></div>
       <div class="collection-rows">
-        {#each visible as e, index (e.media_id)}
-          {@const air = airingLabel(e.media)}
-          {@const sc = scoreLabel(e.score, auth.user?.score_format)}
-          <div
-            onclick={() => (editing = e)}
-            onkeydown={(ev) => {
-              // Let nested buttons handle their own keyboard activation.
-              if (ev.currentTarget !== ev.target) return;
-              if (ev.key === "Enter" || ev.key === " ") {
-                ev.preventDefault();
-                editing = e;
-              }
-            }}
-            role="button"
-            tabindex="0"
-            class="cv-row collection-row cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
-          >
-            <span class="row-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
-            {#if e.media?.cover_medium}
-              <button
-                type="button"
-                onclick={(ev) => {
-                  ev.stopPropagation();
-                  goto(`/anime/${e.media_id}`);
-                }}
-                title="Open details"
-                class="shrink-0"
-              >
-                <Img src={e.media.cover_medium} class="list-cover object-cover" />
-              </button>
-            {:else}
-              <div class="list-cover empty-cover shrink-0" aria-hidden="true">ク</div>
-            {/if}
-            <div class="flex-1 min-w-0">
-              <div class="row-title">{displayTitle(e.media)}</div>
-              <div class="row-meta flex flex-wrap items-center gap-x-2 gap-y-1">
-                {#if e.media?.format}<span>{e.media.format.replaceAll('_', ' ')}</span>{/if}
-                {#if e.media?.season_year}<span>{e.media.season_year}</span>{/if}
-                {#if sc}<span class="row-score">{sc}</span>{/if}
-                {#if air}<span class="row-airing">{air}</span>{/if}
+        <WindowedList items={visible} bind:this={windowed} geometry={savedGeometry?.epoch === auth.epoch ? savedGeometry.geometry : undefined}>
+          {#snippet children(e, index, retain)}
+            {@const air = airingLabel(e.media)}
+            {@const sc = scoreLabel(e.score, auth.user?.score_format)}
+            <div
+              onclick={() => (editing = e)}
+              onkeydown={(ev) => {
+                // Let nested buttons handle their own keyboard activation.
+                if (ev.currentTarget !== ev.target) return;
+                if (ev.key === "Enter" || ev.key === " ") {
+                  ev.preventDefault();
+                  editing = e;
+                }
+              }}
+              role="button"
+              tabindex="0"
+              data-staged-index={index}
+              class="cv-row collection-row cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <span class="row-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+              {#if e.media?.cover_medium}
+                <button
+                  type="button"
+                  onclick={(ev) => {
+                    ev.stopPropagation();
+                    goto(`/anime/${e.media_id}`);
+                  }}
+                  title="Open details"
+                  class="shrink-0"
+                  data-measured-cover
+                >
+                  <Img src={e.media.cover_medium} class="list-cover object-cover" />
+                </button>
+              {:else}
+                <div class="list-cover empty-cover shrink-0" aria-hidden="true">ク</div>
+              {/if}
+              <div class="flex-1 min-w-0">
+                <div class="row-title">{displayTitle(e.media)}</div>
+                <div class="row-meta flex flex-wrap items-center gap-x-2 gap-y-1">
+                  {#if e.media?.format}<span>{e.media.format.replaceAll('_', ' ')}</span>{/if}
+                  {#if e.media?.season_year}<span>{e.media.season_year}</span>{/if}
+                  {#if sc}<span class="row-score">{sc}</span>{/if}
+                  {#if air}<span class="row-airing">{air}</span>{/if}
+                </div>
+              </div>
+              <div class="row-progress shrink-0">
+                <EpisodeStepper
+                  mediaId={e.media_id}
+                  progress={e.progress}
+                  total={e.media?.episodes ?? null}
+                  onchange={(entry) => { stepError = ""; applyEntry(entry); }}
+                  onerror={(msg) => { stepError = msg; }}
+                  onpendingchange={retain}
+                />
+                {#if e.media?.episodes && e.media.episodes > 0}
+                  <div class="episode-track" aria-hidden="true"><span style:width="{Math.min(100, e.progress / e.media.episodes * 100)}%" style:background={statusColors[filter]}></span></div>
+                {/if}
               </div>
             </div>
-            <div class="row-progress shrink-0">
-              <EpisodeStepper
-                mediaId={e.media_id}
-                progress={e.progress}
-                total={e.media?.episodes ?? null}
-                onchange={(entry) => { stepError = ""; applyEntry(entry); }}
-                onerror={(msg) => { stepError = msg; }}
-              />
-              {#if e.media?.episodes && e.media.episodes > 0}
-                <div class="episode-track" aria-hidden="true"><span style:width="{Math.min(100, e.progress / e.media.episodes * 100)}%" style:background={statusColors[filter]}></span></div>
-              {/if}
-            </div>
-          </div>
-        {/each}
+          {/snippet}
+        </WindowedList>
       </div>
     {/if}
     <footer class="collection-footer eyebrow">

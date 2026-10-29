@@ -326,14 +326,21 @@ impl AniList {
             }
             .into());
         }
+        Self::decode_data(body, status)
+    }
+
+    fn decode_data<T: for<'de> serde::Deserialize<'de>>(
+        mut body: serde_json::Value,
+        status: reqwest::StatusCode,
+    ) -> Result<T> {
         let data = body
-            .get("data")
+            .get_mut("data")
             .ok_or_else(|| ApiError {
                 status,
                 from_json: false,
                 message: "AniList: no data field".into(),
             })?
-            .clone();
+            .take();
         serde_json::from_value(data).map_err(|error| {
             ApiError {
                 status,
@@ -1781,6 +1788,95 @@ pub(crate) mod urlencoding {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn decoded_list_reuses_response_strings() {
+        #[derive(serde::Deserialize)]
+        struct Page {
+            media: Vec<super::AniMedia>,
+        }
+        let mut media = (1..=1000).map(super::mock_media).collect::<Vec<_>>();
+        for row in &mut media {
+            row["title"]["english"] = serde_json::json!("Example");
+            row["description"] = serde_json::json!("Synthetic description. ".repeat(100));
+        }
+        let body = serde_json::json!({"data":{"media":media}});
+        let buffers = body["data"]["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let title = row["title"]["english"].as_str().unwrap();
+                let description = row["description"].as_str().unwrap();
+                (
+                    title.as_ptr(),
+                    description.as_ptr(),
+                    title.len() + description.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let decoded: Page = super::AniList::decode_data(body, reqwest::StatusCode::OK).unwrap();
+        assert_eq!(decoded.media.len(), 1000);
+        let mut reused = 0;
+        for (index, (row, (title_ptr, description_ptr, bytes))) in
+            decoded.media.into_iter().zip(buffers).enumerate()
+        {
+            let row = super::Media::from(row);
+            assert_eq!(row.id, index as i64 + 1);
+            assert_eq!(row.title_english.as_deref(), Some("Example"));
+            let description = row.description.as_ref().unwrap();
+            assert_eq!(description, &"Synthetic description. ".repeat(100));
+            if row.title_english.as_ref().unwrap().as_ptr() == title_ptr
+                && description.as_ptr() == description_ptr
+            {
+                reused += bytes;
+            }
+        }
+        println!("decoded 1000 media rows, reused {reused} title and description bytes");
+        assert_eq!(reused, 2_307_000);
+    }
+
+    #[test]
+    fn decoded_data_preserves_missing_null_and_malformed_errors() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::Value::Null,
+        ] {
+            let error =
+                super::AniList::decode_data::<serde_json::Value>(body, reqwest::StatusCode::OK)
+                    .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "AniList (200 OK): AniList: no data field"
+            );
+            assert!(super::is_retryable(&error));
+            assert!(!super::is_auth_rejection(&error));
+            assert!(!super::media_not_found(&error));
+        }
+        let explicit_null: Option<String> =
+            super::AniList::decode_data(serde_json::json!({"data":null}), reqwest::StatusCode::OK)
+                .unwrap();
+        assert_eq!(explicit_null, None);
+        for data in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("wrong type"),
+        ] {
+            let error = super::AniList::decode_data::<Vec<super::AniMedia>>(
+                serde_json::json!({"data":data}),
+                reqwest::StatusCode::OK,
+            )
+            .err()
+            .unwrap();
+            assert!(error
+                .to_string()
+                .contains("AniList returned unusable data:"));
+            assert!(super::is_retryable(&error));
+            assert!(!super::is_auth_rejection(&error));
+            assert!(!super::media_not_found(&error));
+        }
+    }
+
+    #[test]
     fn oauth_authorization_requests_a_code_and_preserves_parameters() {
         let url = reqwest::Url::parse(&super::authorize_url(
             "45266",
@@ -1953,6 +2049,17 @@ pub(crate) async fn mock_api(
     AniList,
     tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
 ) {
+    mock_api_gated(responses, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn mock_api_gated(
+    responses: Vec<(u16, serde_json::Value)>,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+) -> (
+    AniList,
+    tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2002,6 +2109,9 @@ pub(crate) async fn mock_api(
             let request =
                 serde_json::from_slice(&request[body_start..body_start + length]).unwrap();
             let _ = requests.send(request);
+            if let Some(gate) = &gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let body = body.to_string();
             let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             socket.write_all(response.as_bytes()).await.unwrap();

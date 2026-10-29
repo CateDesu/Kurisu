@@ -218,17 +218,29 @@ fn bound_resolved_path_id(
         .map(|(_, _, id)| *id)
 }
 
+pub(crate) struct BindingPaths(Vec<BindingPath>);
+
+impl BindingPaths {
+    pub(crate) fn new(bindings: &HashMap<String, LibraryBinding>) -> Self {
+        Self(binding_paths(bindings))
+    }
+
+    pub(crate) fn bound_match<'a>(
+        &self,
+        matchers: &'a [Matcher],
+        path: &str,
+    ) -> Option<(&'a Matcher, LibraryBinding)> {
+        match_bound_path(matchers, &self.0, path, &resolved_path(path))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn bound_match<'a>(
     matchers: &'a [Matcher],
     bindings: &std::collections::HashMap<String, LibraryBinding>,
     path: &str,
 ) -> Option<(&'a Matcher, LibraryBinding)> {
-    match_bound_path(
-        matchers,
-        &binding_paths(bindings),
-        path,
-        &resolved_path(path),
-    )
+    BindingPaths::new(bindings).bound_match(matchers, path)
 }
 
 fn match_bound_path<'a>(
@@ -292,6 +304,11 @@ pub struct ScanCache {
 }
 
 impl ScanCache {
+    #[cfg(test)]
+    pub(crate) fn recognized_count(&self) -> usize {
+        self.recognized
+    }
+
     /// Call from spawn_blocking.
     pub fn scan(
         &mut self,
@@ -437,8 +454,12 @@ fn collect_videos(
                 continue;
             }
             let path = entry.path();
-            let meta = match std::fs::metadata(&path) {
-                Ok(meta) => meta,
+            let file_type = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => Ok(kind),
+                _ => followed_file_type(&path),
+            };
+            let file_type = match file_type {
+                Ok(kind) => kind,
                 Err(error) => {
                     unreadable.push(UnreadableFolder {
                         path: path.to_string_lossy().into_owned(),
@@ -447,9 +468,9 @@ fn collect_videos(
                     continue;
                 }
             };
-            if meta.is_dir() {
+            if file_type.is_dir() {
                 pending.push_back((path, depth + 1));
-            } else if meta.is_file()
+            } else if file_type.is_file()
                 && path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -467,6 +488,17 @@ fn collect_videos(
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRAVERSAL_METADATA_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn followed_file_type(path: &std::path::Path) -> std::io::Result<std::fs::FileType> {
+    #[cfg(test)]
+    TRAVERSAL_METADATA_READS.set(TRAVERSAL_METADATA_READS.get() + 1);
+    std::fs::metadata(path).map(|metadata| metadata.file_type())
 }
 
 #[cfg(test)]
@@ -502,6 +534,103 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+    }
+
+    #[test]
+    fn traversal_preserves_sorted_order_and_filters_hidden_and_nonvideo_files() {
+        let dir = cache_folder("traversal-order");
+        for folder in ["b-dir", "a-dir", "nested.mkv", ".hidden-dir"] {
+            std::fs::create_dir(dir.join(folder)).unwrap();
+        }
+        for path in [
+            "z.mkv",
+            "a.MP4",
+            "notes.txt",
+            ".hidden.mkv",
+            "a-dir/z.mkv",
+            "a-dir/a.mkv",
+            "b-dir/b.mkv",
+            "nested.mkv/c.MKV",
+            ".hidden-dir/hidden.mkv",
+        ] {
+            std::fs::write(dir.join(path), []).unwrap();
+        }
+        let before = super::TRAVERSAL_METADATA_READS.get();
+        let mut paths = Vec::new();
+        let mut unreadable = Vec::new();
+        super::collect_videos(&dir, 0, &mut paths, &mut unreadable);
+        assert_eq!(
+            paths,
+            [
+                "a.MP4",
+                "z.mkv",
+                "a-dir/a.mkv",
+                "a-dir/z.mkv",
+                "b-dir/b.mkv",
+                "nested.mkv/c.MKV",
+            ]
+            .map(|path| dir.join(path).to_str().unwrap().to_owned())
+        );
+        assert!(unreadable.is_empty());
+        assert_eq!(super::TRAVERSAL_METADATA_READS.get(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_follows_symlink_types_and_reports_broken_targets_once() {
+        use std::os::unix::fs::symlink;
+        let dir = cache_folder("traversal-links");
+        let root = dir.join("scan");
+        let target = dir.join("target");
+        std::fs::create_dir_all(root.join("f-dir")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(dir.join("target.txt"), []).unwrap();
+        std::fs::write(dir.join("target.mkv"), []).unwrap();
+        std::fs::write(target.join("ep.MKV"), []).unwrap();
+        std::fs::write(root.join("f-dir/ep02.mkv"), []).unwrap();
+        symlink(dir.join("target.txt"), root.join("a.MP4")).unwrap();
+        symlink(dir.join("target.mkv"), root.join("b.txt")).unwrap();
+        symlink(&target, root.join("c.mkv")).unwrap();
+        symlink(dir.join("missing"), root.join("d.mkv")).unwrap();
+        symlink(&root, root.join("e-loop")).unwrap();
+        symlink(dir.join("missing"), root.join(".hidden")).unwrap();
+        let before = super::TRAVERSAL_METADATA_READS.get();
+        let mut paths = Vec::new();
+        let mut unreadable = Vec::new();
+        super::collect_videos(&root, 0, &mut paths, &mut unreadable);
+        assert_eq!(
+            paths,
+            ["a.MP4", "c.mkv/ep.MKV", "f-dir/ep02.mkv"].map(|path| root
+                .join(path)
+                .to_str()
+                .unwrap()
+                .to_owned())
+        );
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].path, root.join("d.mkv").to_str().unwrap());
+        assert!(!unreadable[0].error.is_empty());
+        assert_eq!(super::TRAVERSAL_METADATA_READS.get() - before, 5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traversal_large_directory_uses_no_explicit_metadata_for_ordinary_entries() {
+        let dir = cache_folder("traversal-work");
+        for file in 0..1000 {
+            let extension = if file % 2 == 0 { "mkv" } else { "txt" };
+            std::fs::write(dir.join(format!("{file:04}.{extension}")), []).unwrap();
+        }
+        let before = super::TRAVERSAL_METADATA_READS.get();
+        let mut paths = Vec::new();
+        let mut unreadable = Vec::new();
+        super::collect_videos(&dir, 0, &mut paths, &mut unreadable);
+        assert_eq!(paths.len(), 500);
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(unreadable.is_empty());
+        assert_eq!(super::TRAVERSAL_METADATA_READS.get(), before);
+        println!("traversal: 1000 ordinary entries, 500 videos, 0 explicit metadata reads");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

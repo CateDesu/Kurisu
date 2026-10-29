@@ -7,11 +7,12 @@
   import type { ListEntry, Media } from "#lib/types.ts";
   import Login from "#lib/Login.svelte";
   import AnimeCard from "#lib/AnimeCard.svelte";
-  import { createListActions, listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, createListActions, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
+  import { measuredRows } from "#lib/measuredRows.ts";
   import type { Snapshot } from "./$types";
 
   let query = $state("");
-  let results = $state<Media[]>([]);
+  let results = $state.raw<Media[]>([]);
   let searching = $state(false);
   let error = $state("");
   const actions = createListActions();
@@ -20,6 +21,7 @@
   // Reassign for reactive badge lookups.
   let listByMedia = $state(new Map<number, ListEntry>());
   let listLoadId = 0;
+  let listLoaded = false;
   let searchId = 0;
   let alive = true;
   let submittedQuery = $state("");
@@ -28,13 +30,16 @@
   let searched = $state(false);
   let resume: { term: string; more: boolean } | null = null;
 
-  async function loadList() {
+  async function loadList(mediaIds?: readonly number[]) {
     const id = ++listLoadId;
     const epoch = auth.epoch;
     const current = () => alive && id === listLoadId && epoch === auth.epoch && auth.isLoggedIn;
     try {
-      const es = await api.localEntries();
-      if (current()) listByMedia = new Map(es.map((e) => [e.media_id, e]));
+      const update = await readListUpdate(listLoaded ? mediaIds : undefined);
+      if (current()) {
+        listByMedia = new Map(applyListUpdate([...listByMedia.values()], update).map((e) => [e.media_id, e]));
+        listLoaded = true;
+      }
     } catch (e) {
       if (current()) error = String(e);
     }
@@ -44,6 +49,7 @@
     auth.epoch;
     loggedIn;
     listByMedia = new Map();
+    listLoaded = false;
     error = "";
     actions.reset();
     searching = false;
@@ -55,8 +61,10 @@
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
     return listenForListUpdates(
-      () => { if (epoch === auth.epoch) void loadList(); },
+      (mediaIds) => { if (epoch === auth.epoch) return loadList(mediaIds); },
       (e) => { if (epoch === auth.epoch) error = String(e); },
+      undefined,
+      { invalidate: () => { listLoadId++; }, revision: () => listLoadId },
     );
   });
 
@@ -122,8 +130,9 @@
     error = "";
     const entry = await actions.add(m, status);
     if (!entry || !alive) return;
+    listLoadId++;
     listByMedia = new Map(listByMedia).set(m.id, entry);
-    void loadList();
+    if (!listLoaded) void loadList();
   }
 
   onDestroy(() => { alive = false; });
@@ -158,7 +167,7 @@
   {#if searched && results.length === 0 && !searching && !error}
     <p class="text-ink-dim text-center py-10">No anime found for “{submittedQuery}”. Try another title.</p>
   {/if}
-  <div class="media-grid">
+  <div class="media-grid" use:measuredRows>
     {#each results as m (m.id)}
       <AnimeCard media={m} entry={listByMedia.get(m.id)} adding={actions.pending(m.id)} onadd={add} showYear showListedActions />
     {/each}

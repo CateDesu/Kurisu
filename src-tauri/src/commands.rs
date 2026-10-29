@@ -34,14 +34,33 @@ pub struct AppState {
     pub entry_lock: tokio::sync::Mutex<()>,
     /// Serialize remote mutations, snapshots and account replacement.
     pub remote_lock: tokio::sync::Mutex<()>,
-    /// Rebuild after list changes that affect recognition.
+    /// Refresh after list changes that affect recognition.
     pub matchers: Mutex<Arc<Vec<recognize::Matcher>>>,
     pub library_cache: Arc<Mutex<library::ScanCache>>,
 }
 
 impl AppState {
+    /// Caller serializes list writes with entry_lock.
     pub fn refresh_matchers(&self) {
-        *self.matchers.lock() = Arc::new(recognize::build_matchers(&self.db));
+        let previous = self.matchers.lock().clone();
+        let matchers = recognize::refresh_matchers(&self.db, &previous, None);
+        *self.matchers.lock() = matchers;
+    }
+
+    fn invalidate_matchers(&self) {
+        let matchers = recognize::build_matchers(&self.db);
+        *self.matchers.lock() = Arc::new(matchers);
+    }
+
+    fn cache_media_batch(&self, media: &[Media]) {
+        let _ = self.db.upsert_media_batch(media);
+        self.refresh_media_matchers(&media.iter().map(|item| item.id).collect::<Vec<_>>());
+    }
+
+    fn refresh_media_matchers(&self, ids: &[i64]) {
+        let previous = self.matchers.lock().clone();
+        let matchers = recognize::refresh_matchers(&self.db, &previous, Some(ids));
+        *self.matchers.lock() = matchers;
     }
 
     fn begin_auth_intent(&self) -> u64 {
@@ -109,7 +128,7 @@ fn clear_rejected_session(state: &AppState) {
     if let Err(e) = state.db.clear_entries() {
         log::warn!("failed to clear the cached list of the rejected session: {e}");
     }
-    state.refresh_matchers();
+    state.invalidate_matchers();
     emit_auth_expired();
 }
 
@@ -259,7 +278,7 @@ pub fn is_logged_in(state: State<'_, AppState>) -> bool {
 }
 
 /// Keep credentials out of generic settings access.
-const APP_SETTING_KEYS: &[&str] = &["close_to_tray", "auto_update", "hardware_acceleration"];
+const APP_SETTING_KEYS: &[&str] = &["close_to_tray", "auto_update"];
 
 fn check_app_setting_key(key: &str) -> Result<(), String> {
     if APP_SETTING_KEYS.contains(&key) {
@@ -321,10 +340,11 @@ async fn login_with_token_inner(
         .db
         .replace_account(&token, &user)
         .map_err(|e| e.to_string())?;
+    let session_changed = state.anilist.lock().token().as_ref() != Some(&token);
     state.anilist.lock().set_token(Some(token));
     *state.user.lock() = Some(user.clone());
-    if account_changed {
-        state.refresh_matchers();
+    if account_changed || session_changed {
+        state.invalidate_matchers();
     }
     Ok(user)
 }
@@ -452,7 +472,7 @@ async fn logout_inner(state: &AppState, intent: u64) -> Result<(), String> {
         .db
         .delete_setting(PROFILE_KEY)
         .map_err(|e| e.to_string())?;
-    state.refresh_matchers();
+    state.invalidate_matchers();
     if let Some(e) = scrub_failure {
         return Err(format!(
             "signed out, but the token could not be scrubbed from the local database: {e}"
@@ -495,7 +515,7 @@ async fn current_user_inner(state: &AppState) -> Result<Option<User>, String> {
                 .replace_account(token_used.as_deref().unwrap(), &u)
                 .map_err(|e| e.to_string())?
             {
-                state.refresh_matchers();
+                state.invalidate_matchers();
             }
             u
         }
@@ -542,8 +562,7 @@ pub async fn search_anime_page(
         .await
         .map_err(|e| e.to_string())?;
     let _write = state.entry_lock.lock().await;
-    let _ = state.db.upsert_media_batch(&result.items);
-    state.refresh_matchers();
+    state.cache_media_batch(&result.items);
     Ok(result)
 }
 
@@ -559,8 +578,7 @@ pub async fn get_season(
         .await
         .map_err(|e| e.to_string())?;
     let _write = state.entry_lock.lock().await;
-    let _ = state.db.upsert_media_batch(&media);
-    state.refresh_matchers();
+    state.cache_media_batch(&media);
     Ok(media)
 }
 
@@ -575,8 +593,7 @@ pub async fn get_recommendations(
         .await
         .map_err(|e| e.to_string())?;
     let _write = state.entry_lock.lock().await;
-    let _ = state.db.upsert_media_batch(&media);
-    state.refresh_matchers();
+    state.cache_media_batch(&media);
     Ok(media)
 }
 
@@ -593,7 +610,7 @@ pub async fn get_media(id: i64, state: State<'_, AppState>) -> Result<Media, Str
     };
     let _write = state.entry_lock.lock().await;
     state.db.upsert_media(&v).map_err(|e| e.to_string())?;
-    state.refresh_matchers();
+    state.refresh_media_matchers(&[v.id]);
     Ok(v)
 }
 
@@ -623,7 +640,10 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
                     .map(|r| r.media.clone())
                     .collect::<Vec<_>>(),
             );
-            state.refresh_matchers();
+            let ids = std::iter::once(detail.media.id)
+                .chain(detail.relations.iter().map(|relation| relation.media.id))
+                .collect::<Vec<_>>();
+            state.refresh_media_matchers(&ids);
             if let Some(old) = cached {
                 for section in &detail.unavailable_sections {
                     match section.as_str() {
@@ -708,7 +728,13 @@ pub async fn get_airing_schedule(
             let _ = state.db.upsert_media(&item.media);
         }
     }
-    state.refresh_matchers();
+    state.refresh_media_matchers(
+        &items
+            .iter()
+            .filter(|item| on_list.contains(&item.media.id))
+            .map(|item| item.media.id)
+            .collect::<Vec<_>>(),
+    );
     Ok(items)
 }
 
@@ -766,8 +792,89 @@ async fn local_entries_inner(state: &AppState) -> Result<Vec<ListEntry>, String>
 }
 
 #[tauri::command]
-pub fn get_entry(media_id: i64, state: State<'_, AppState>) -> Result<Option<ListEntry>, String> {
-    state.db.get_entry(media_id).map_err(|e| e.to_string())
+pub async fn local_entry_updates(
+    media_ids: Vec<i64>,
+    account_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<Option<ListEntry>>, String> {
+    local_entry_updates_inner(state.inner(), &media_ids, account_id).await
+}
+
+async fn local_entry_updates_inner(
+    state: &AppState,
+    media_ids: &[i64],
+    account_id: i64,
+) -> Result<Vec<Option<ListEntry>>, String> {
+    let token = state.anilist.lock().token();
+    let _write = state.entry_lock.lock().await;
+    if token.is_none()
+        || state.anilist.lock().token() != token
+        || crate::sync_queue::account_id(&state.db) != Some(account_id)
+    {
+        return Err("Account changed".into());
+    }
+    let mut matchers_changed = false;
+    let entries = media_ids
+        .iter()
+        .map(|&media_id| {
+            let stored = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
+            let pending = state
+                .db
+                .pending_change(account_id, media_id)
+                .map_err(|e| e.to_string())?;
+            let Some(pending) = pending else {
+                return Ok(stored);
+            };
+            if pending.missing_media {
+                if stored.is_some() {
+                    state.db.delete_entry(media_id).map_err(|e| e.to_string())?;
+                    matchers_changed = true;
+                }
+                return Ok(None);
+            }
+            let mut entry = stored
+                .clone()
+                .or_else(|| pending.base.clone())
+                .unwrap_or(ListEntry {
+                    media_id,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                });
+            pending.patch.apply(&mut entry);
+            if stored.is_none() {
+                entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
+            }
+            if stored.as_ref().is_none_or(|stored| {
+                stored.status != entry.status
+                    || stored.progress != entry.progress
+                    || stored.score != entry.score
+                    || stored.repeat != entry.repeat
+            }) {
+                state.db.upsert_entry(&entry).map_err(|e| e.to_string())?;
+                matchers_changed |= stored
+                    .as_ref()
+                    .is_none_or(|stored| stored.status != entry.status);
+            }
+            Ok(Some(entry))
+        })
+        .collect::<Result<Vec<_>, String>>();
+    if matchers_changed {
+        state.refresh_matchers();
+    }
+    entries
+}
+
+#[tauri::command]
+pub async fn get_entry(
+    media_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<ListEntry>, String> {
+    let Some(account) = crate::sync_queue::account_id(&state.db) else {
+        return Ok(None);
+    };
+    local_entry_updates_inner(state.inner(), &[media_id], account)
+        .await
+        .map(|mut entries| entries.remove(0))
 }
 
 const MEDIA_GONE: &str =
@@ -1338,21 +1445,52 @@ async fn delete_entry_inner(media_id: i64, state: &AppState) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn get_library_folders(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    library::get_folders(&state.db).map_err(|e| e.to_string())
+pub async fn get_library_folders(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    get_library_folders_inner(state.inner()).await
+}
+
+async fn library_db_work<T: Send + 'static>(
+    db: Arc<Db>,
+    work: impl FnOnce(&Db) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || work(&db))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+async fn get_library_folders_inner(state: &AppState) -> Result<Vec<String>, String> {
+    library_db_work(state.db.clone(), library::get_folders).await
 }
 
 #[tauri::command]
-pub fn add_library_folder(path: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    library::add_folder(&state.db, &path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn remove_library_folder(
+pub async fn add_library_folder(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    library::remove_folder(&state.db, &path).map_err(|e| e.to_string())
+    add_library_folder_inner(path, state.inner()).await
+}
+
+async fn add_library_folder_inner(path: String, state: &AppState) -> Result<Vec<String>, String> {
+    library_db_work(state.db.clone(), move |db| library::add_folder(db, &path)).await
+}
+
+#[tauri::command]
+pub async fn remove_library_folder(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    remove_library_folder_inner(path, state.inner()).await
+}
+
+async fn remove_library_folder_inner(
+    path: String,
+    state: &AppState,
+) -> Result<Vec<String>, String> {
+    library_db_work(state.db.clone(), move |db| {
+        library::remove_folder(db, &path)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1367,61 +1505,110 @@ pub async fn scan_library(state: State<'_, AppState>) -> Result<LibraryScan, Str
 }
 
 #[tauri::command]
-pub fn bind_library_path(
+pub async fn bind_library_path(
     path: String,
     media_id: i64,
     episode_offset: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if state
-        .db
-        .get_entry(media_id)
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
-        return Err("only shows on your list can be linked".to_string());
-    }
-    library::bind_path(&state.db, &path, media_id, episode_offset.unwrap_or(0))
-        .map_err(|e| e.to_string())
+    bind_library_path_inner(path, media_id, episode_offset, state.inner()).await
+}
+
+async fn bind_library_path_inner(
+    path: String,
+    media_id: i64,
+    episode_offset: Option<i64>,
+    state: &AppState,
+) -> Result<(), String> {
+    let expected_token = state.anilist.lock().token();
+    let _write = state.entry_lock.lock().await;
+    check_write_session(state, &expected_token)?;
+    library_db_work(state.db.clone(), move |db| {
+        if db.get_entry(media_id)?.is_none() {
+            return Err(anyhow::anyhow!("only shows on your list can be linked"));
+        }
+        library::bind_path(db, &path, media_id, episode_offset.unwrap_or(0))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn library_binding_for(
+pub async fn library_binding_for(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Option<i64>, String> {
-    library::binding_for_exact(&state.db, &path)
-        .map(|binding| binding.map(|b| b.media_id))
-        .map_err(|e| e.to_string())
+    library_binding_for_inner(path, state.inner()).await
+}
+
+async fn library_binding_for_inner(path: String, state: &AppState) -> Result<Option<i64>, String> {
+    library_db_work(state.db.clone(), move |db| {
+        library::binding_for_exact(db, &path).map(|binding| binding.map(|b| b.media_id))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn library_binding_details(
+pub async fn library_binding_details(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Option<library::LibraryBinding>, String> {
-    library::effective_binding(&state.db, &path).map_err(|e| e.to_string())
+    library_binding_details_inner(path, state.inner()).await
+}
+
+async fn library_binding_details_inner(
+    path: String,
+    state: &AppState,
+) -> Result<Option<library::LibraryBinding>, String> {
+    let expected_token = state.anilist.lock().token();
+    let _write = state.entry_lock.lock().await;
+    check_write_session(state, &expected_token)?;
+    library_db_work(state.db.clone(), move |db| {
+        library::effective_binding(db, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_watch_history(
+pub async fn get_watch_history(
     limit: Option<i64>,
     before: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::sync_queue::WatchHistoryItem>, String> {
-    let Some(account) = crate::sync_queue::account_id(&state.db) else {
-        return Ok(vec![]);
-    };
-    state
-        .db
-        .watch_history(account, limit.unwrap_or(50).clamp(1, 100), before)
-        .map_err(|e| e.to_string())
+    get_watch_history_inner(limit, before, state.inner()).await
+}
+
+async fn get_watch_history_inner(
+    limit: Option<i64>,
+    before: Option<i64>,
+    state: &AppState,
+) -> Result<Vec<crate::sync_queue::WatchHistoryItem>, String> {
+    let expected_token = state.anilist.lock().token();
+    let _write = state.entry_lock.lock().await;
+    check_write_session(state, &expected_token)?;
+    library_db_work(state.db.clone(), move |db| {
+        let Some(account) = crate::sync_queue::account_id(db) else {
+            return Ok(vec![]);
+        };
+        db.watch_history(account, limit.unwrap_or(50).clamp(1, 100), before)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn unbind_library_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    library::unbind_media(&state.db, media_id).map_err(|e| e.to_string())
+pub async fn unbind_library_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    unbind_library_media_inner(media_id, state.inner()).await
 }
+
+async fn unbind_library_media_inner(media_id: i64, state: &AppState) -> Result<(), String> {
+    library_db_work(state.db.clone(), move |db| {
+        library::unbind_media(db, media_id)
+    })
+    .await
+}
+
+#[cfg(test)]
+#[path = "library_command_tests.rs"]
+mod library_command_tests;
 
 #[tauri::command]
 pub fn get_rss_feeds(state: State<'_, AppState>) -> Result<Vec<String>, String> {
@@ -1943,15 +2130,13 @@ mod tests {
     #[test]
     fn app_settings_distinguish_missing_values_from_read_failures() {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(read_app_setting(&db, "hardware_acceleration"), Ok(None));
-        db.set_setting("hardware_acceleration", "1").unwrap();
-        assert_eq!(
-            read_app_setting(&db, "hardware_acceleration"),
-            Ok(Some("1".into()))
-        );
+        assert_eq!(read_app_setting(&db, "close_to_tray"), Ok(None));
+        db.set_setting("close_to_tray", "1").unwrap();
+        assert_eq!(read_app_setting(&db, "close_to_tray"), Ok(Some("1".into())));
         assert!(read_app_setting(&db, TOKEN_KEY).is_err());
-        db.0.lock().execute_batch("DROP TABLE settings").unwrap();
         assert!(read_app_setting(&db, "hardware_acceleration").is_err());
+        db.0.lock().execute_batch("DROP TABLE settings").unwrap();
+        assert!(read_app_setting(&db, "close_to_tray").is_err());
     }
 
     fn test_state() -> AppState {
@@ -1965,6 +2150,420 @@ mod tests {
             matchers: Mutex::new(Arc::new(vec![])),
             library_cache: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn local_entry_updates_read_requested_rows_and_repair_their_pending_overlays() {
+        let state = test_state();
+        state
+            .anilist
+            .lock()
+            .set_token(Some("synthetic-session".into()));
+        state
+            .db
+            .replace_account(
+                "synthetic-session",
+                &User {
+                    id: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        seed(&state, Some(12), "CURRENT", 3, 0);
+        let pending = crate::sync_queue::Pending {
+            media_id: 1,
+            base: state.db.get_entry(1).unwrap(),
+            patch: crate::sync_queue::Patch {
+                status: Some("REPEATING".into()),
+                progress: Some(8),
+                score: Some(90.0),
+                repeat: Some(4),
+            },
+            error: Some("Synthetic conflict".into()),
+            conflict: true,
+            missing_media: false,
+        };
+        state.db.put_pending(7, &pending).unwrap();
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                media_id: 2,
+                status: "CURRENT".into(),
+                progress: 3,
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .db
+            .put_pending(
+                7,
+                &crate::sync_queue::Pending {
+                    media_id: 2,
+                    missing_media: true,
+                    ..pending.clone()
+                },
+            )
+            .unwrap();
+        state
+            .db
+            .put_pending(
+                8,
+                &crate::sync_queue::Pending {
+                    media_id: 3,
+                    ..pending.clone()
+                },
+            )
+            .unwrap();
+        state
+            .db
+            .put_pending(
+                7,
+                &crate::sync_queue::Pending {
+                    media_id: 4,
+                    base: None,
+                    ..pending
+                },
+            )
+            .unwrap();
+        state.db.0.lock().execute_batch(
+            "INSERT INTO list_entry (media_id,status,progress,repeat) VALUES (99,'CURRENT','invalid',0)"
+        ).unwrap();
+
+        let result = local_entry_updates_inner(&state, &[1, 2, 3, 4, 5], 7)
+            .await
+            .unwrap();
+        let first = result[0].as_ref().unwrap();
+        assert_eq!(
+            (
+                first.media_id,
+                first.status.as_str(),
+                first.progress,
+                first.score,
+                first.repeat
+            ),
+            (1, "REPEATING", 8, Some(90.0), 4)
+        );
+        assert_eq!(first.media.as_ref().unwrap().episodes, Some(12));
+        assert!(result[1].is_none());
+        assert!(state.db.get_entry(2).unwrap().is_none());
+        assert!(set_progress_inner(&state, 2, 4, Some(3)).await.is_err());
+        assert!(result[2].is_none());
+        assert_eq!(result[3].as_ref().unwrap().media_id, 4);
+        assert_eq!(result[3].as_ref().unwrap().progress, 8);
+        assert!(result[4].is_none());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 8);
+        assert_eq!(state.db.get_entry(4).unwrap().unwrap().progress, 8);
+        let changes = state.db.0.lock().total_changes();
+        local_entry_updates_inner(&state, &[1, 2, 3, 4, 5], 7)
+            .await
+            .unwrap();
+        assert_eq!(state.db.0.lock().total_changes(), changes);
+        assert!(state.db.entries_with_media().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_entry_updates_restore_the_expected_baseline_for_the_next_progress_edit() {
+        for stored in [false, true] {
+            let state = test_state();
+            state
+                .anilist
+                .lock()
+                .set_token(Some("synthetic-session".into()));
+            state
+                .db
+                .replace_account(
+                    "synthetic-session",
+                    &User {
+                        id: 7,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            seed(&state, Some(12), "CURRENT", 3, 0);
+            let base = state.db.get_entry(1).unwrap();
+            state
+                .db
+                .put_pending(
+                    7,
+                    &crate::sync_queue::Pending {
+                        media_id: 1,
+                        base,
+                        patch: crate::sync_queue::Patch {
+                            progress: Some(8),
+                            ..Default::default()
+                        },
+                        error: None,
+                        conflict: false,
+                        missing_media: false,
+                    },
+                )
+                .unwrap();
+            if !stored {
+                state.db.delete_entry(1).unwrap();
+            }
+            let entry = local_entry_updates_inner(&state, &[1], 7)
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
+            assert_eq!(entry.progress, 8);
+            let next = set_progress_inner(&state, 1, 9, Some(entry.progress))
+                .await
+                .unwrap();
+            assert_eq!(next.progress, 9);
+            assert_eq!(
+                state
+                    .db
+                    .pending_change(7, 1)
+                    .unwrap()
+                    .unwrap()
+                    .patch
+                    .progress,
+                Some(9)
+            );
+            let stale = set_progress_inner(&state, 1, 10, Some(entry.progress))
+                .await
+                .unwrap();
+            assert_eq!(stale.progress, 9);
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 9);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_entry_updates_refresh_repaired_matchers_before_a_later_row_error() {
+        let state = test_state();
+        state
+            .anilist
+            .lock()
+            .set_token(Some("synthetic-session".into()));
+        state
+            .db
+            .replace_account(
+                "synthetic-session",
+                &User {
+                    id: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        seed(&state, Some(12), "CURRENT", 3, 0);
+        let mut media = state.db.get_media(1).unwrap().unwrap();
+        media.title_english = Some("Synthetic Show".into());
+        state.db.upsert_media(&media).unwrap();
+        state.refresh_matchers();
+        let before = state.matchers.lock().clone();
+        assert_eq!(before.len(), 1);
+        state
+            .db
+            .put_pending(
+                7,
+                &crate::sync_queue::Pending {
+                    media_id: 1,
+                    base: state.db.get_entry(1).unwrap(),
+                    patch: crate::sync_queue::Patch {
+                        status: Some("REPEATING".into()),
+                        ..Default::default()
+                    },
+                    error: None,
+                    conflict: false,
+                    missing_media: false,
+                },
+            )
+            .unwrap();
+        state.db.0.lock().execute_batch(
+            "INSERT INTO list_entry (media_id,status,progress,repeat) VALUES (99,'CURRENT','invalid',0)"
+        ).unwrap();
+
+        assert!(local_entry_updates_inner(&state, &[1, 99], 7)
+            .await
+            .is_err());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().status, "REPEATING");
+        let repaired = state.matchers.lock().clone();
+        assert!(!Arc::ptr_eq(&before, &repaired));
+        state.refresh_matchers();
+        assert!(Arc::ptr_eq(&repaired, &state.matchers.lock()));
+    }
+
+    #[tokio::test]
+    async fn local_entry_updates_reject_a_different_account_or_logout() {
+        let state = test_state();
+        state
+            .anilist
+            .lock()
+            .set_token(Some("synthetic-session".into()));
+        state
+            .db
+            .replace_account(
+                "synthetic-session",
+                &User {
+                    id: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        seed(&state, Some(12), "CURRENT", 3, 0);
+        assert!(local_entry_updates_inner(&state, &[1], 8).await.is_err());
+        state.anilist.lock().set_token(None);
+        assert!(local_entry_updates_inner(&state, &[1], 7).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn local_entry_updates_wait_for_writes_and_recheck_the_session() {
+        let state = test_state();
+        state
+            .anilist
+            .lock()
+            .set_token(Some("synthetic-session".into()));
+        state
+            .db
+            .replace_account(
+                "synthetic-session",
+                &User {
+                    id: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        seed(&state, Some(12), "CURRENT", 3, 0);
+        let guard = state.entry_lock.lock().await;
+        let read = local_entry_updates_inner(&state, &[1], 7);
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            result = &mut read => panic!("read bypassed the write lock: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        state
+            .anilist
+            .lock()
+            .set_token(Some("replacement-session".into()));
+        drop(guard);
+        assert_eq!(read.await.unwrap_err(), "Account changed");
+
+        let guard = state.entry_lock.lock().await;
+        let read = local_entry_updates_inner(&state, &[1], 7);
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            result = &mut read => panic!("read bypassed the write lock: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.progress = 6;
+        state.db.upsert_entry(&entry).unwrap();
+        drop(guard);
+        assert_eq!(read.await.unwrap()[0].as_ref().unwrap().progress, 6);
+    }
+
+    #[test]
+    fn unchanged_search_cache_writes_preserve_matchers_and_scanned_recognition() {
+        let state = test_state();
+        let mut media = Media {
+            id: 1,
+            title_english: Some("Some Show".into()),
+            episodes: Some(12),
+            format: Some("TV".into()),
+            ..Default::default()
+        };
+        state.db.upsert_media(&media).unwrap();
+        let mut entry = ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        };
+        state.db.upsert_entry(&entry).unwrap();
+        state.refresh_matchers();
+        let original = state.matchers.lock().clone();
+        let dir = std::env::temp_dir().join(format!(
+            "kurisu-matcher-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("Some Show - 03.mkv"), []).unwrap();
+        let folders = vec![dir.to_str().unwrap().to_string()];
+        let bindings = std::collections::HashMap::new();
+        let first = state
+            .library_cache
+            .lock()
+            .scan(&folders, &original, &bindings);
+        assert_eq!(first.files[0].episode, Some(3));
+
+        let before = recognize::matcher_work_counts();
+        state.cache_media_batch(&[Media {
+            id: 2,
+            title_english: Some("Unlisted Show".into()),
+            ..Default::default()
+        }]);
+        assert_eq!(recognize::matcher_work_counts(), before);
+        for _ in 0..3 {
+            state.cache_media_batch(&[media.clone()]);
+        }
+        media.source = Some("MANGA".into());
+        media.cover_large = Some("synthetic-cover".into());
+        media.next_airing_episode = Some(4);
+        state.cache_media_batch(&[media.clone()]);
+        assert_eq!(recognize::matcher_work_counts(), (before.0 + 4, before.1));
+        entry.id = Some(10);
+        entry.progress = 2;
+        entry.score = Some(8.0);
+        entry.repeat = 3;
+        entry.updated_at = Some(123);
+        state.db.upsert_entry(&entry).unwrap();
+        state.refresh_matchers();
+        let unchanged = state.matchers.lock().clone();
+        assert!(Arc::ptr_eq(&original, &unchanged));
+        assert_eq!(recognize::matcher_work_counts().1, before.1);
+        let second = state
+            .library_cache
+            .lock()
+            .scan(&folders, &unchanged, &bindings);
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(second).unwrap()
+        );
+        assert_eq!(state.library_cache.lock().recognized_count(), 1);
+
+        media.episodes = Some(2);
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_cache BEFORE INSERT ON media BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .unwrap();
+        state.cache_media_batch(&[media.clone()]);
+        assert!(Arc::ptr_eq(&original, &state.matchers.lock()));
+        assert_eq!(state.db.get_media(1).unwrap().unwrap().episodes, Some(12));
+        assert_eq!(recognize::matcher_work_counts().1, before.1);
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch("DROP TRIGGER fail_cache")
+            .unwrap();
+        state.cache_media_batch(&[media]);
+        let changed = state.matchers.lock().clone();
+        assert!(!Arc::ptr_eq(&original, &changed));
+        let scan = state
+            .library_cache
+            .lock()
+            .scan(&folders, &changed, &bindings);
+        assert_eq!(scan.files[0].episode, None);
+        assert_eq!(state.library_cache.lock().recognized_count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_sessions_invalidate_even_an_empty_matcher_cache() {
+        let state = test_state();
+        let before = state.matchers.lock().clone();
+        clear_rejected_session(&state);
+        assert!(!Arc::ptr_eq(&before, &state.matchers.lock()));
     }
 
     fn seed(state: &AppState, episodes: Option<i64>, status: &str, progress: i64, repeat: i64) {
@@ -2259,17 +2858,31 @@ mod regression_tests {
             .no_proxy()
             .build()
             .unwrap()
-            .get(format!("http://127.0.0.1:{port}/?code=one-use-code&state={oauth_state}"))
+            .get(format!(
+                "http://127.0.0.1:{port}/?code=one-use-code&state={oauth_state}"
+            ))
             .send()
             .await
             .unwrap();
         assert!(callback.status().is_success());
         let user = finish_oauth_login(&state, intent, receiver).await.unwrap();
         assert_eq!(user.id, 7);
-        assert_eq!(requests.recv().await.unwrap(), json!({"code":"one-use-code"}));
-        assert!(requests.recv().await.unwrap()["query"].as_str().unwrap().contains("Viewer"));
-        assert_eq!(state.db.get_setting(TOKEN_KEY).unwrap().as_deref(), Some("exchanged-token"));
-        assert_eq!(state.anilist.lock().token().as_deref(), Some("exchanged-token"));
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            json!({"code":"one-use-code"})
+        );
+        assert!(requests.recv().await.unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .contains("Viewer"));
+        assert_eq!(
+            state.db.get_setting(TOKEN_KEY).unwrap().as_deref(),
+            Some("exchanged-token")
+        );
+        assert_eq!(
+            state.anilist.lock().token().as_deref(),
+            Some("exchanged-token")
+        );
     }
 
     #[tokio::test]
@@ -2280,10 +2893,18 @@ mod regression_tests {
         let intent = state.begin_auth_intent();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         sender.send(Ok("expired-code".into())).unwrap();
-        let error = finish_oauth_login(&state, intent, receiver).await.unwrap_err();
+        let error = finish_oauth_login(&state, intent, receiver)
+            .await
+            .unwrap_err();
         assert!(error.contains("Start sign-in again"));
-        assert_eq!(state.anilist.lock().token().as_deref(), Some("test-session"));
-        assert_eq!(requests.recv().await.unwrap(), json!({"code":"expired-code"}));
+        assert_eq!(
+            state.anilist.lock().token().as_deref(),
+            Some("test-session")
+        );
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            json!({"code":"expired-code"})
+        );
         assert!(requests.try_recv().is_err());
     }
 
@@ -2296,7 +2917,9 @@ mod regression_tests {
         sender.send(Ok("old-code".into())).unwrap();
         state.begin_auth_intent();
         assert_eq!(
-            finish_oauth_login(&state, intent, receiver).await.unwrap_err(),
+            finish_oauth_login(&state, intent, receiver)
+                .await
+                .unwrap_err(),
             AUTH_REPLACED
         );
         assert!(requests.try_recv().is_err());
@@ -2364,9 +2987,10 @@ mod regression_tests {
             .unwrap();
         preconnect.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
         let first_state = state.clone();
-        let first = tokio::spawn(async move {
-            wait_for_oauth_code(&first_state, first_intent, receiver).await
-        });
+        let first =
+            tokio::spawn(
+                async move { wait_for_oauth_code(&first_state, first_intent, receiver).await },
+            );
         let latest_intent = state.begin_auth_intent();
         let (_, replacement_port, receiver) = start_oauth_callback(&state, latest_intent, port)
             .await

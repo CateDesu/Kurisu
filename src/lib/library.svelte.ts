@@ -1,7 +1,7 @@
 import { api } from "./api";
 import type { LibraryFile, UnreadableFolder } from "./types";
 
-let files = $state<LibraryFile[]>([]);
+let files = $state.raw<LibraryFile[]>([]);
 const filesByEpisode = $derived.by(() => {
   const byMedia = new Map<number, Map<number, LibraryFile>>();
   for (const file of files) {
@@ -27,6 +27,24 @@ let folderRequest = 0;
 let folderGeneration = 0;
 let folderQueue = Promise.resolve();
 const SCAN_AGE = 60_000;
+
+function sameFile(previous: LibraryFile, next: LibraryFile): boolean {
+  return previous.path === next.path
+    && previous.media_id === next.media_id
+    && previous.matched === next.matched
+    && previous.episode === next.episode
+    && (previous.bound ?? false) === (next.bound ?? false);
+}
+
+function reconcileFiles(next: LibraryFile[]): LibraryFile[] {
+  if (files.length === next.length && files.every((file, index) => sameFile(file, next[index]))) return files;
+  if (files.length === 0 || next.length === 0) return next;
+  const previousByPath = new Map(files.map((file) => [file.path, file]));
+  return next.map((file) => {
+    const previous = previousByPath.get(file.path);
+    return previous && sameFile(previous, file) ? previous : file;
+  });
+}
 
 async function loadFolders() {
   const request = ++folderRequest;
@@ -80,7 +98,7 @@ async function scan() {
   try {
     const result = await api.scanLibrary();
     if (gen !== scanGen) return;
-    files = result.files;
+    files = reconcileFiles(result.files);
     unreadable = result.unreadable;
     lastScanAt = Date.now();
   } finally {

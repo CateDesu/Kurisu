@@ -1,4 +1,5 @@
 import { flushSync, tick } from "svelte";
+import { vi } from "vitest";
 
 export function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -11,6 +12,13 @@ export async function settle() {
   for (let i = 0; i < 8; i++) await Promise.resolve();
   flushSync();
   await tick();
+}
+
+export async function settleListUpdates() {
+  await settle();
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(16);
+  else await new Promise((resolve) => setTimeout(resolve, 16));
+  await settle();
 }
 
 export function button(text: string, scope: ParentNode = document): HTMLButtonElement {

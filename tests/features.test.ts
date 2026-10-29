@@ -1,23 +1,25 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { auth, page } from "./session.svelte";
-import { button, deferred, selectOption, settle } from "./helpers";
+import { auth, page, playback } from "./session.svelte";
+import { button, deferred, selectOption, settle, settleListUpdates } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
-  api: Object.fromEntries(["localEntries", "searchAnimePage", "getNotificationsPage", "markNotificationsRead", "getMediaDetail", "getEntry", "getRecommendations", "getUserStats", "getEntryDetails", "updateEntryDetails", "updateEntry", "setProgress"].map((name) => [name, vi.fn()])),
+  api: Object.fromEntries(["localEntries", "localEntryUpdates", "searchAnimePage", "getNotificationsPage", "markNotificationsRead", "getMediaDetail", "getEntry", "getRecommendations", "getUserStats", "getEntryDetails", "updateEntryDetails", "updateEntry", "setProgress"].map((name) => [name, vi.fn()])),
   navigation: [] as (() => void)[],
-  listeners: new Map<string, Set<() => void>>(),
+  listeners: new Map<string, Set<(message?: { payload: unknown }) => void>>(),
   registration: null as Promise<void> | null,
-  nowPlaying: null as null | Record<string, unknown>,
 }));
 vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
 vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
 vi.mock("#lib/library.svelte.ts", () => ({ library: { fileFor: () => undefined, ensureScan: async () => {} } }));
-vi.mock("#lib/nowplaying.svelte.ts", () => ({ nowPlaying: () => mocks.nowPlaying }));
+vi.mock("#lib/nowplaying.svelte.ts", async () => {
+  const { playback } = await import("./session.svelte");
+  return { nowPlaying: () => playback.info };
+});
 vi.mock("$app/navigation", () => ({ goto: vi.fn(), afterNavigate: (callback: () => void) => mocks.navigation.push(callback) }));
 vi.mock("$app/state", async () => import("./session.svelte"));
-vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn(), listen: vi.fn(async (event: string, callback: () => void) => {
+vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn(), listen: vi.fn(async (event: string, callback: (message?: { payload: unknown }) => void) => {
   if (mocks.registration) await mocks.registration;
   const handlers = mocks.listeners.get(event) ?? new Set();
   handlers.add(callback);
@@ -50,16 +52,17 @@ function input(selector: string, value: string) {
 beforeEach(() => {
   vi.resetAllMocks(); mocks.navigation.length = 0; mocks.listeners.clear(); mocks.registration = null;
   page.params.id = "1";
-  mocks.nowPlaying = null;
+  playback.info = null;
   auth.epoch = 0; auth.isLoggedIn = true; auth.offline = false;
   auth.user = { id: 1, name: "Example", score_format: "POINT_100" };
   mocks.api.localEntries.mockResolvedValue([]);
   mocks.api.getEntry.mockResolvedValue(entry);
+  mocks.api.localEntryUpdates.mockResolvedValue([entry]);
   mocks.api.getMediaDetail.mockResolvedValue({ media, relations: [], characters: [], staff: [] });
   mocks.api.getRecommendations.mockResolvedValue([]);
   mocks.api.getEntryDetails.mockResolvedValue(details);
 });
-afterEach(async () => { for (const instance of mounted) await unmount(instance); mounted = []; document.body.replaceChildren(); });
+afterEach(async () => { for (const instance of mounted) await unmount(instance); mounted = []; document.body.replaceChildren(); vi.useRealTimers(); });
 
 test("search appends further pages, retains results on failure, and can retry", async () => {
   mocks.api.searchAnimePage.mockResolvedValueOnce({ items: [media], page: 1, has_next_page: true })
@@ -162,7 +165,7 @@ test("entry refresh retains an editor draft and the current detailed total", asy
   input("#ed-progress", "7");
   mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 5, media: { ...media, episodes: 10 } });
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.querySelector("#ed-notes")).toBe(draft);
   expect((draft as HTMLTextAreaElement).value).toBe("Keep my unsaved note");
   expect((document.querySelector("#ed-progress") as HTMLInputElement).value).toBe("7");
@@ -202,13 +205,13 @@ test("detail drops a discarded queue entry when AniList has removed it", async (
   expect(document.body.textContent).toContain("3/12");
   mocks.api.getEntry.mockResolvedValue(null);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Add to list:");
   expect(document.body.textContent).not.toContain("3/12");
 });
 
 test("currently watching drops a discarded queue entry from playback and the current list", async () => {
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   mocks.api.localEntries.mockResolvedValue([entry]);
   await render(Now);
   expect(document.body.textContent).toContain("Ep 3/12 on your list");
@@ -216,7 +219,7 @@ test("currently watching drops a discarded queue entry from playback and the cur
   mocks.api.localEntries.mockResolvedValue([]);
   mocks.api.getEntry.mockResolvedValue(null);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).not.toContain("Ep 3/12 on your list");
   expect(document.body.textContent).not.toContain("Continue watching");
   expect(document.body.textContent).not.toContain("Update to Ep 4");
@@ -234,7 +237,7 @@ test("currently watching catches changes during initial list listener registrati
 });
 
 test("currently watching discards old account queue refresh responses", async () => {
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 8, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 8, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   mocks.api.localEntries.mockResolvedValue([entry]);
   await render(Now);
   const oldEntry = deferred<typeof entry | null>();
@@ -242,13 +245,14 @@ test("currently watching discards old account queue refresh responses", async ()
   mocks.api.getEntry.mockReturnValueOnce(oldEntry.promise).mockResolvedValue({ ...entry, progress: 7 });
   mocks.api.localEntries.mockReturnValueOnce(oldList.promise).mockResolvedValue([]);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  await settleListUpdates();
   auth.epoch++;
   auth.user = { ...auth.user!, id: 2 };
   await settle();
   await settle();
   oldEntry.resolve(entry);
   oldList.resolve([entry]);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Ep 7/12 on your list");
   expect(document.body.textContent).not.toContain("Ep 3/12 on your list");
   expect(document.body.textContent).not.toContain("Continue watching");
@@ -279,25 +283,27 @@ test("currently watching still loads when listener registration fails", async ()
 });
 
 test("a queue refresh cannot overwrite newly saved currently watching progress", async () => {
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   await render(Now);
+  const old = deferred<typeof entry>();
+  mocks.api.getEntry.mockReturnValueOnce(old.promise);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  await settleListUpdates();
   const write = deferred<typeof entry>();
   mocks.api.setProgress.mockReturnValue(write.promise);
   button("Update to Ep 4").click();
   await settle();
-  const old = deferred<typeof entry>();
-  mocks.api.getEntry.mockReturnValueOnce(old.promise);
-  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
   write.resolve({ ...entry, progress: 4 });
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Ep 4/12 on your list");
+  mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 4 });
   old.resolve(entry);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Ep 4/12 on your list");
   expect(document.body.textContent).not.toContain("Update to Ep 4");
   mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 5 });
   for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Ep 5/12 on your list");
 });
 
@@ -309,24 +315,25 @@ test("an older current-list response cannot undo accepted stepper completion", a
   const old = deferred<typeof entry[]>();
   mocks.api.localEntries.mockReturnValueOnce(old.promise);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!.click();
   await settle();
   expect(document.body.textContent).not.toContain("Continue watching");
+  mocks.api.localEntries.mockResolvedValue([{ ...watching, status: "COMPLETED", progress: 12 }]);
   old.resolve([watching]);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).not.toContain("Continue watching");
 
   mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 4 }]);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Continue watching");
   expect(document.body.textContent).toContain("4/12");
 });
 
 test("stepper completion updates playback progress and rejects its older entry read", async () => {
   const watching = { ...entry, progress: 11 };
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 12, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 12, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   mocks.api.getEntry.mockResolvedValue(watching);
   mocks.api.localEntries.mockResolvedValue([watching]);
   mocks.api.setProgress.mockResolvedValue({ ...watching, progress: 12, status: "COMPLETED" });
@@ -334,18 +341,20 @@ test("stepper completion updates playback progress and rejects its older entry r
   const old = deferred<typeof entry>();
   mocks.api.getEntry.mockReturnValueOnce(old.promise);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   document.querySelector<HTMLButtonElement>('[aria-label="One more episode"]')!.click();
   await settle();
   expect(document.body.textContent).toContain("Ep 12/12 on your list");
+  mocks.api.getEntry.mockResolvedValue({ ...watching, progress: 12, status: "COMPLETED" });
+  mocks.api.localEntries.mockResolvedValue([{ ...watching, progress: 12, status: "COMPLETED" }]);
   old.resolve(watching);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Ep 12/12 on your list");
   expect(document.body.textContent).not.toContain("Update to Ep 12");
 });
 
 test("currently watching retains accepted progress without receiving a list-update event", async () => {
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 4 });
   await render(Now);
   button("Update to Ep 4").click();
@@ -355,37 +364,35 @@ test("currently watching retains accepted progress without receiving a list-upda
 });
 
 test("currently watching reloads authoritative progress after a failed write", async () => {
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   await render(Now);
   const write = deferred<typeof entry>();
   mocks.api.setProgress.mockReturnValue(write.promise);
   button("Update to Ep 4").click();
   await settle();
-  const old = deferred<typeof entry>();
-  mocks.api.getEntry.mockReturnValueOnce(old.promise).mockResolvedValue({ ...entry, progress: 2 });
+  mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 2 });
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
   write.reject(new Error("save rejected"));
-  await settle();
-  old.resolve(entry);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Ep 2/12 on your list");
   expect(document.body.textContent).toContain("save rejected");
   expect(button("Update to Ep 4").disabled).toBe(false);
 });
 
 test("currently watching keeps a confirmed removal when an older entry read settles", async () => {
-  mocks.nowPlaying = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100_000_000, position_us: 10_000_000 };
   await render(Now);
   const fresh = deferred<typeof entry | null>();
   const old = deferred<typeof entry>();
-  mocks.api.getEntry.mockReturnValueOnce(fresh.promise).mockReturnValueOnce(old.promise);
+  mocks.api.getEntry.mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise).mockResolvedValue(null);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  await settleListUpdates();
   button("Update to Ep 4").click();
   await settle();
-  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
   fresh.resolve(null);
-  await settle();
+  await settleListUpdates();
   old.resolve(entry);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("This show is no longer on your list");
   expect(document.body.textContent).not.toContain("Ep 3/12 on your list");
   expect(document.body.textContent).not.toContain("Update to Ep 4");
@@ -400,7 +407,7 @@ test("search updates list badges after resolving a queued change", async () => {
   expect(document.body.textContent).toContain("Watching · 3/12");
   mocks.api.localEntries.mockResolvedValue([]);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).not.toContain("Watching · 3/12");
 });
 
@@ -409,11 +416,11 @@ test("late detail queue reload cannot restore an entry removed by a newer reload
   const old = deferred<typeof entry | null>();
   mocks.api.getEntry.mockReturnValueOnce(old.promise).mockResolvedValue(null);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   old.resolve(entry);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).toContain("Add to list:");
   expect(document.body.textContent).not.toContain("3/12");
 });
@@ -426,11 +433,11 @@ test("a search list refresh from the old account cannot replace the new account 
   const old = deferred<typeof entry[]>();
   mocks.api.localEntries.mockReturnValueOnce(old.promise).mockResolvedValue([{ ...entry, status: "PLANNING", progress: 0 }]);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   auth.epoch++;
   await settle();
   old.resolve([entry]);
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).not.toContain("Watching · 3/12");
   expect(document.querySelector(".anime-card")?.textContent).toContain("Plan to Watch");
 });
@@ -476,7 +483,7 @@ test("late initial listener registration cannot read a departed account", async 
   auth.epoch++;
   await settle();
   registration.resolve();
-  await settle();
+  await settleListUpdates();
   expect(mocks.api.localEntries).toHaveBeenCalledOnce();
   expect(mocks.listeners.get("kurisu://pending-changed")?.size).toBe(1);
   expect(mocks.listeners.get("kurisu://episode-updated")?.size).toBe(1);
@@ -570,4 +577,154 @@ test("a previous account notification page cannot replace the new unread count",
   await settle();
   expect(document.body.textContent).toContain("8 unread on AniList");
   expect(document.body.textContent).not.toContain("Old account friend");
+});
+
+test("search reads changed badges and removals without replacing unrelated cards", async () => {
+  const secondMedia = { ...media, id: 2, title_english: "Second Show" };
+  const second = { ...entry, media_id: 2, media: secondMedia };
+  mocks.api.localEntries.mockResolvedValue([entry, second]);
+  mocks.api.searchAnimePage.mockResolvedValue({ items: [media, secondMedia], page: 1, has_next_page: false });
+  await render(Search);
+  input('[aria-label="Anime title"]', "show"); button("Search").click(); await settle();
+  const cards = [...document.querySelectorAll(".anime-card")];
+  mocks.api.localEntries.mockClear();
+  mocks.api.localEntryUpdates.mockResolvedValue([null, { ...second, progress: 7 }]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1, 2] } });
+  await settleListUpdates();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1, 2], 1);
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+  expect([...document.querySelectorAll(".anime-card")]).toEqual(cards);
+  expect(cards[0].textContent).not.toContain("Watching · 3/12");
+  expect(cards[1].textContent).toContain("Watching · 7/12");
+});
+
+test("an accepted search write preserves a different ID from an invalidated targeted read", async () => {
+  const secondMedia = { ...media, id: 2, title_english: "Second Show" };
+  const second = { ...entry, media_id: 2, media: secondMedia };
+  mocks.api.localEntries.mockResolvedValue([entry, second]);
+  mocks.api.searchAnimePage.mockResolvedValue({ items: [media, secondMedia], page: 1, has_next_page: false });
+  await render(Search);
+  input('[aria-label="Anime title"]', "show"); button("Search").click(); await settle();
+  const old = deferred<unknown[]>();
+  mocks.api.localEntryUpdates.mockReturnValueOnce(old.promise).mockResolvedValue([{ ...second, progress: 7 }]);
+  mocks.api.localEntries.mockClear();
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [2] } });
+  await settleListUpdates();
+  mocks.api.updateEntry.mockResolvedValue({ ...entry, progress: 6 });
+  button("Watching", document.querySelector(".anime-card")!).click();
+  await settle();
+  old.resolve([{ ...second, progress: 4 }]);
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("Watching · 6/12");
+  expect(document.body.textContent).toContain("Watching · 7/12");
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(2);
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+});
+
+test("detail skips unrelated scopes and still refreshes a scoped removal", async () => {
+  await render(Detail);
+  mocks.api.getEntry.mockClear();
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [2] } });
+  await settleListUpdates();
+  expect(mocks.api.getEntry).not.toHaveBeenCalled();
+  mocks.api.getEntry.mockResolvedValue(null);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(mocks.api.getEntry).toHaveBeenCalledExactlyOnceWith(1);
+  expect(document.body.textContent).toContain("Add to list:");
+});
+
+test("currently watching batches the playing entry read across separate IPC tasks", async () => {
+  vi.useFakeTimers();
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 5, player: "mpv", length_us: 100, position_us: 0 };
+  await render(Now);
+  mocks.api.getEntry.mockClear();
+  mocks.api.localEntries.mockClear();
+  mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 4 });
+  for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback({ payload: entry });
+  setTimeout(() => {
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  }, 0);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(mocks.api.getEntry).not.toHaveBeenCalled();
+  expect(mocks.api.localEntryUpdates).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(16);
+  await settle();
+  expect(mocks.api.getEntry).toHaveBeenCalledExactlyOnceWith(1);
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1], 1);
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain("Ep 4/12 on your list");
+  vi.useRealTimers();
+});
+
+test("currently watching skips playing entry reads for unrelated scoped changes", async () => {
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 5, player: "mpv", length_us: 100, position_us: 0 };
+  mocks.api.localEntries.mockResolvedValue([entry]);
+  await render(Now);
+  mocks.api.getEntry.mockClear();
+  mocks.api.localEntries.mockClear();
+  mocks.api.localEntryUpdates.mockResolvedValue([{ ...entry, media_id: 2, media: { ...media, id: 2, title_english: "Second Show" } }]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [2] } });
+  await settleListUpdates();
+  expect(mocks.api.getEntry).not.toHaveBeenCalled();
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain("Second Show");
+  expect(document.body.textContent).toContain("Ep 3/12 on your list");
+});
+
+test("a delayed playing entry read cannot overwrite a playback switch", async () => {
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 5, player: "mpv", length_us: 100, position_us: 0 };
+  await render(Now);
+  const old = deferred<typeof entry>();
+  mocks.api.getEntry.mockReturnValueOnce(old.promise);
+  for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback({ payload: entry });
+  await settleListUpdates();
+  mocks.api.getEntry.mockResolvedValue({ ...entry, media_id: 2, progress: 7 });
+  playback.info = { ...playback.info, media_id: 2, matched: "Second Show" };
+  await settle();
+  expect(document.body.textContent).toContain("Ep 7/12 on your list");
+  old.resolve({ ...entry, progress: 11 });
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("Ep 7/12 on your list");
+  expect(document.body.textContent).not.toContain("Ep 11/12 on your list");
+});
+
+test("an accepted playback write retains a queued broad change and reads current progress", async () => {
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100, position_us: 0 };
+  await render(Now);
+  mocks.api.getEntry.mockClear();
+  mocks.api.getEntry.mockResolvedValueOnce(entry).mockResolvedValue({ ...entry, progress: 4 });
+  mocks.api.localEntries.mockClear();
+  mocks.api.setProgress.mockResolvedValue({ ...entry, progress: 4 });
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
+  button("Update to Ep 4").click();
+  await settleListUpdates();
+  expect(mocks.api.getEntry).toHaveBeenCalledTimes(2);
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(document.body.textContent).toContain("Ep 4/12 on your list");
+});
+
+test.each([false, true])("a playback update preserves the initial current list after an overlapping failure %s", async (failedRefresh) => {
+  const initial = deferred<typeof entry[]>();
+  const second = { ...entry, media_id: 2, media: { ...media, id: 2, title_english: "Second Show" } };
+  playback.info = { active: true, media_id: 1, matched: "First Show", episode: 4, player: "mpv", length_us: 100, position_us: 0 };
+  mocks.api.localEntries.mockReturnValueOnce(initial.promise);
+  if (failedRefresh) mocks.api.localEntries.mockRejectedValueOnce(new Error("temporary list failure"));
+  mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 4 }, second]);
+  await render(Now);
+  if (failedRefresh) {
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+    await settleListUpdates();
+    expect(document.body.textContent).toContain("temporary list failure");
+  }
+  mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 4 });
+  button("Update to Ep 4").click();
+  await settle();
+  expect(mocks.api.setProgress).not.toHaveBeenCalled();
+  initial.resolve([entry, second]);
+  await settleListUpdates();
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(failedRefresh ? 3 : 2);
+  expect(document.body.textContent).toContain("Second Show");
+  expect(document.body.textContent).toContain("Ep 4/12 on your list");
+  expect(document.body.textContent).not.toContain("temporary list failure");
 });

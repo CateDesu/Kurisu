@@ -1,0 +1,7 @@
+{
+  "name": "@kurisu/deepmerge",
+  "version": "4.3.1",
+  "private": true,
+  "main": "index.cjs",
+  "license": "MIT"
+}

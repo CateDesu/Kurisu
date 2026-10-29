@@ -2,12 +2,12 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { auth, page } from "./session.svelte";
-import { button, deferred, selectOption, settle } from "./helpers";
+import { button, deferred, selectOption, settle, settleListUpdates } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries([
     "getEntry", "setProgress", "updateEntry", "deleteEntry", "getMedia", "getMediaDetail", "getRecommendations",
-    "localEntries", "getAiringSchedule", "getTrackingConfig", "getAppSetting", "setTrackingConfig",
+    "localEntries", "localEntryUpdates", "getSeason", "getAiringSchedule", "getTrackingConfig", "getAppSetting", "setTrackingConfig",
     "getLibraryBinding", "bindLibraryPath", "getRssFeeds", "fetchTorrents", "searchTorrents", "findShowTorrents", "markTorrentsSeen", "setAppSetting",
   ].map((name) => [name, vi.fn()])),
   listeners: new Map<string, Set<(event: { payload: unknown }) => void>>(),
@@ -40,6 +40,8 @@ import LinkAnime from "#lib/LinkAnime.svelte";
 import EditEntry from "#lib/EditEntry.svelte";
 import Detail from "../src/routes/anime/[id]/+page.svelte";
 import Calendar from "../src/routes/calendar/+page.svelte";
+import Seasons from "../src/routes/seasons/+page.svelte";
+import Now from "../src/routes/now/+page.svelte";
 import Settings from "../src/routes/settings/+page.svelte";
 import Library from "../src/routes/library/+page.svelte";
 import Torrents from "../src/routes/torrents/+page.svelte";
@@ -47,6 +49,41 @@ import Search from "../src/routes/search/+page.svelte";
 import ShowTorrentChoices from "#lib/ShowTorrentChoices.svelte";
 import EpisodeStepper from "#lib/EpisodeStepper.svelte";
 import type { ShowTorrents } from "#lib/types.ts";
+
+test("link search reuses ordering while preserving status, ties, native titles and the row limit", async () => {
+  mocks.api.getLibraryBinding.mockResolvedValue(null);
+  const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+  const compareTitles = collator.compare;
+  const statuses = ["CURRENT", "REPEATING", "PLANNING", "PAUSED", "DROPPED", "COMPLETED"];
+  const entries = Array.from({ length: 260 }, (_, index) => ({
+    ...entry, media_id: index + 1, status: statuses[index % statuses.length],
+    media: { id: index + 1, title_english: `${index % 2 ? "Épisode" : "Episode"} ${index % 12}`, title_native: `作品 ${index}` },
+  }));
+  const original = entries.slice();
+  const compare = vi.fn(compareTitles);
+  const spy = vi.spyOn(Intl.Collator.prototype, "compare", "get").mockReturnValue(compare);
+  try {
+    await render(LinkAnime, { path: "/synthetic/episode.mkv", roots: [], entries, onclose: vi.fn(), onlinked: vi.fn() });
+    expect(compare).toHaveBeenCalled();
+    compare.mockClear();
+    const input = document.querySelector<HTMLInputElement>('input[placeholder="Search your list…"]')!;
+    for (const query of ["e", "episode", "作品", "作品 25", "no matches", ""]) {
+      input.value = query;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await settle();
+      const expected = entries.filter((item) => !query || [item.media.title_english, item.media.title_native].some((title) => title.toLowerCase().includes(query)))
+        .sort((a, b) => statuses.indexOf(a.status) - statuses.indexOf(b.status) || compareTitles(a.media.title_english, b.media.title_english))
+        .slice(0, 100);
+      const choices = [...document.querySelectorAll<HTMLButtonElement>('button.cv-row')];
+      expect(choices.map((choice) => choice.querySelector("span.flex-1")!.textContent!.trim())).toEqual(expected.map((item) => item.media.title_english));
+      expect(choices).toHaveLength(expected.length);
+    }
+    expect(compare).not.toHaveBeenCalled();
+    expect(entries).toEqual(original);
+  } finally {
+    spy.mockRestore();
+  }
+});
 
 const media = { id: 1, title_english: "Example Show", episodes: 12 };
 const entry = { media_id: 1, status: "CURRENT", progress: 0, repeat: 0, score: 75, media };
@@ -90,6 +127,7 @@ beforeEach(() => {
   mocks.library.ensureScan.mockResolvedValue(undefined);
   mocks.api.getEntry.mockResolvedValue({ ...entry });
   mocks.api.localEntries.mockResolvedValue([{ ...entry }]);
+  mocks.api.localEntryUpdates.mockResolvedValue([{ ...entry }]);
   mocks.api.getMedia.mockResolvedValue(media);
   mocks.api.getMediaDetail.mockResolvedValue({ media, relations: [], characters: [], staff: [] });
   mocks.api.getRecommendations.mockResolvedValue([]);
@@ -105,6 +143,38 @@ afterEach(async () => {
   for (const instance of mounted) await unmount(instance);
   mounted = [];
   document.body.replaceChildren();
+});
+
+test.each([["calendar", Calendar], ["seasons", Seasons], ["now", Now], ["torrents", Torrents]] as const)("%s recovers a failed title update before accepting a different scope", async (name, component) => {
+  const second = { ...entry, media_id: 2, media: { ...media, id: 2, title_english: "Second Show" } };
+  const latest = [{ ...entry, status: "DROPPED" }, { ...second, progress: 5 }];
+  mocks.api.localEntries.mockResolvedValue([entry, second]);
+  mocks.api.getSeason.mockResolvedValue([media, second.media]);
+  mocks.api.getAiringSchedule.mockResolvedValue([media, second.media].map((media) => ({ media, episode: 6, airing_at: Date.now() / 1000 })));
+  await render(component);
+  if (name === "seasons") { selectOption("#season-list-status", "CURRENT"); await settle(); }
+  expect(document.body.textContent).toContain("Example Show");
+  const first = [...document.querySelectorAll<HTMLElement>(".cv-row, .cv-card, .cv-group")]
+    .find((node) => node.textContent?.includes("Example Show"))!;
+  expect(first).toBeDefined();
+  const recovery = deferred<typeof latest>();
+  mocks.api.localEntries.mockClear().mockReturnValue(recovery.promise);
+  mocks.api.localEntryUpdates.mockRejectedValueOnce("temporary entry failure").mockResolvedValue([latest[1]]);
+  event("kurisu://pending-changed", { media_ids: [1] });
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("temporary entry failure");
+  expect(first.isConnected).toBe(true);
+  expect(document.body.textContent).toContain("Second Show");
+  event("kurisu://pending-changed", { media_ids: [2] });
+  await settleListUpdates();
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1], 1);
+  expect(first.isConnected).toBe(true);
+  recovery.resolve(latest);
+  await settle();
+  expect(document.body.textContent).not.toContain("temporary entry failure");
+  expect(document.body.textContent).not.toContain("Example Show");
+  expect(document.body.textContent).toContain("Second Show");
 });
 
 test("tracking cannot confirm a prompt from a previous account", async () => {
@@ -351,7 +421,7 @@ test("anime detail reflects tracking updates", async () => {
   await render(Detail);
   mocks.api.getEntry.mockResolvedValue({ ...entry, progress: 3 });
   event("kurisu://episode-updated", { ...entry, progress: 3 });
-  await settle();
+  await settleListUpdates();
   const stepper = document.querySelector('[aria-label="One more episode"]')?.parentElement;
   expect(stepper?.textContent?.replace(/\s/g, "")).toContain("3/12");
 });
@@ -904,9 +974,9 @@ test("tracking progress refreshes the next episode download choices", async () =
   (button("Example Show").closest('[role="button"]') as HTMLElement).click();
   await settle();
   expect(document.body.textContent).toContain("Episode one choice");
-  mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 1 }]);
+  mocks.api.localEntryUpdates.mockResolvedValue([{ ...entry, progress: 1 }]);
   event("kurisu://episode-updated", { ...entry, progress: 1 });
-  await settle();
+  await settleListUpdates();
   expect(mocks.api.findShowTorrents).toHaveBeenCalledTimes(2);
   expect(document.body.textContent).toContain("Next episode · 2");
   expect(document.body.textContent).toContain("Episode two choice");
@@ -996,70 +1066,18 @@ test("settings toggles cannot race while a save is pending", async () => {
   expect(tray.disabled).toBe(false);
 });
 
-test("hardware acceleration starts off and saves an explicit opt in for the next launch", async () => {
-  const userAgent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Linux");
+test.each(["Linux", "Windows NT 10.0"])("settings has no hardware acceleration preference on %s", async (platform) => {
+  const userAgent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(platform);
   try {
-    const saving = deferred<void>();
-    mocks.api.setAppSetting.mockReturnValue(saving.promise);
     await render(Settings);
-    const acceleration = [...document.querySelectorAll("label")].find((label) => label.textContent?.includes("Use hardware acceleration"))!.querySelector("input")!;
-    expect(acceleration.checked).toBe(false);
-    acceleration.click();
-    await settle();
-    expect(mocks.api.setAppSetting).toHaveBeenCalledWith("hardware_acceleration", "1");
-    expect(acceleration.disabled).toBe(true);
-    expect(document.body.textContent).not.toContain("Saved. Quit and reopen Kurisu to apply.");
-    saving.resolve(undefined);
-    await settle();
-    expect(acceleration.checked).toBe(true);
-    expect(acceleration.disabled).toBe(false);
-    expect(document.body.textContent).toContain("Saved. Quit and reopen Kurisu to apply.");
-  } finally {
-    userAgent.mockRestore();
-  }
-});
-
-test("hardware acceleration loads the saved opt in and restores it when a save fails", async () => {
-  const userAgent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Linux");
-  try {
-    mocks.api.getAppSetting.mockImplementation(async (key: string) => key === "hardware_acceleration" ? "1" : null);
-    mocks.api.setAppSetting.mockRejectedValueOnce(new Error("disk unavailable")).mockResolvedValue(undefined);
-    await render(Settings);
-    const acceleration = [...document.querySelectorAll("label")].find((label) => label.textContent?.includes("Use hardware acceleration"))!.querySelector("input")!;
-    expect(acceleration.checked).toBe(true);
-    acceleration.click();
-    await settle();
-    expect(acceleration.checked).toBe(true);
-    expect(document.body.textContent).toContain("disk unavailable");
-    expect(document.body.textContent).not.toContain("Saved. Quit and reopen Kurisu to apply.");
-    acceleration.click();
-    await settle();
-    expect(mocks.api.setAppSetting).toHaveBeenLastCalledWith("hardware_acceleration", "0");
-    expect(acceleration.checked).toBe(false);
-    expect(document.body.textContent).not.toContain("disk unavailable");
-  } finally {
-    userAgent.mockRestore();
-  }
-});
-
-test("hardware acceleration stays disabled after a read failure until Retry loads the preference", async () => {
-  const userAgent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Linux");
-  try {
-    mocks.api.getAppSetting.mockImplementation(async (key: string) => {
-      if (key === "hardware_acceleration") throw new Error("rendering preference unavailable");
-      return null;
-    });
-    await render(Settings);
-    const acceleration = [...document.querySelectorAll("label")].find((label) => label.textContent?.includes("Use hardware acceleration"))!.querySelector("input")!;
-    expect(acceleration.disabled).toBe(true);
-    acceleration.click();
-    expect(mocks.api.setAppSetting).not.toHaveBeenCalled();
-    mocks.api.getAppSetting.mockResolvedValue("1");
-    button("Retry").click();
-    await settle();
-    expect(acceleration.disabled).toBe(false);
-    expect(acceleration.checked).toBe(true);
-    expect(document.body.textContent).not.toContain("rendering preference unavailable");
+    expect(document.body.textContent).not.toMatch(/hardware acceleration|Performance/i);
+    for (const text of ["Hide to system tray", "Automatically check for updates"]) {
+      const toggle = [...document.querySelectorAll("label")].find((label) => label.textContent?.includes(text))!.querySelector("input")!;
+      toggle.click();
+      await settle();
+    }
+    expect(mocks.api.getAppSetting.mock.calls).toEqual([["close_to_tray"], ["auto_update"]]);
+    expect(mocks.api.setAppSetting.mock.calls).toEqual([["close_to_tray", "1"], ["auto_update", "0"]]);
   } finally {
     userAgent.mockRestore();
   }
@@ -1148,7 +1166,7 @@ test("torrent groups reload when queue resolution removes a show", async () => {
   mocks.api.localEntries.mockResolvedValueOnce([entry]).mockResolvedValue([]);
   await render(Torrents);
   expect(document.querySelector('[aria-controls="torrents-CURRENT"]')!.textContent).toContain("1 show");
-  event("kurisu://pending-changed", undefined); await settle();
+  event("kurisu://pending-changed", undefined); await settleListUpdates();
   expect(document.querySelector('[aria-controls="torrents-CURRENT"]')!.textContent).toContain("0 shows");
   expect(document.body.textContent).not.toContain("Example Show");
 });
@@ -1203,7 +1221,7 @@ test.each(["kurisu://episode-updated", "kurisu://pending-changed"])("torrent lis
 
   mocks.api.localEntries.mockResolvedValue([]);
   event(activeEvent, undefined);
-  await settle();
+  await settleListUpdates();
   expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
   expect(document.querySelector('[aria-controls="torrents-CURRENT"]')!.textContent).toContain("0 shows");
 
@@ -1211,7 +1229,7 @@ test.each(["kurisu://episode-updated", "kurisu://pending-changed"])("torrent lis
   mounted = mounted.filter((item) => item !== instance);
   expect(mocks.listeners.get(activeEvent)?.size).toBe(0);
   event(activeEvent, undefined);
-  await settle();
+  await settleListUpdates();
   expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
 });
 

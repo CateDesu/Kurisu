@@ -28,7 +28,7 @@
 </script>
 
 <div class="anime-card cv-card bg-panel border border-edge overflow-hidden flex flex-col">
-  <button type="button" onclick={() => goto(`/anime/${media.id}`)} title="Open details" class="block">
+  <button type="button" onclick={() => goto(`/anime/${media.id}`)} title="Open details" class="block" data-measured-cover>
     {#if media.cover_large}
       <Img src={media.cover_large} class="w-full h-44 object-cover" />
     {:else}

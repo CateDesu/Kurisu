@@ -151,6 +151,10 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked --lib mpvipc::tests
 
+      - name: Windows media session regression tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib playback::tests::windows_
+
       - name: Build
         run: npx tauri build --bundles nsis
         env:

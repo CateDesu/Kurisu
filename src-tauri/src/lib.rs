@@ -136,7 +136,7 @@ pub fn run() {
 
     let context = tauri::generate_context!();
     #[cfg(target_os = "linux")]
-    rendering::configure(&context.config().identifier);
+    rendering::configure();
 
     // One instance prevents duplicate trackers and competing database writes.
     let instance_guard = match std::net::TcpListener::bind(SINGLE_INSTANCE_ADDR) {
@@ -196,6 +196,7 @@ pub fn run() {
             commands::get_airing_schedule,
             commands::sync_my_list,
             commands::local_entries,
+            commands::local_entry_updates,
             commands::get_entry,
             commands::update_entry,
             commands::set_progress,

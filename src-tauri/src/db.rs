@@ -4,9 +4,19 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::{ListEntry, Media};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 pub struct Db(pub Mutex<Connection>);
+
+#[cfg(test)]
+thread_local! {
+    static DURABLE_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn durable_commit_count() -> usize {
+    DURABLE_COMMITS.get()
+}
 
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -43,7 +53,10 @@ impl Db {
         let result: Result<()> = (|| {
             let tx = conn.transaction()?;
             write(&tx)?;
-            Ok(tx.commit()?)
+            tx.commit()?;
+            #[cfg(test)]
+            DURABLE_COMMITS.set(DURABLE_COMMITS.get() + 1);
+            Ok(())
         })();
         let reset = conn.pragma_update(None, "synchronous", "NORMAL");
         result?;
@@ -138,6 +151,18 @@ impl Db {
                     media_id INTEGER NOT NULL, episode INTEGER NOT NULL,
                     watched_at INTEGER NOT NULL
                 );",
+            )?;
+        }
+        if version < 6 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS watch_history_duplicate
+                 ON watch_history (account_id,path,media_id,episode,watched_at);",
+            )?;
+        }
+        if version < 7 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS watch_history_account_id
+                 ON watch_history (account_id,id);",
             )?;
         }
         if version < SCHEMA_VERSION {
@@ -261,9 +286,17 @@ impl Db {
         let tx = c.transaction()?;
         {
             let mut statement = tx.prepare_cached(
-                "INSERT OR REPLACE INTO list_entry
+                "INSERT INTO list_entry
                  (media_id,entry_id,status,progress,score,repeat,updated_at)
-                 VALUES (?,?,?,?,?,?,?)",
+                 VALUES (?,?,?,?,?,?,?)
+                 ON CONFLICT(media_id) DO UPDATE SET
+                  entry_id=excluded.entry_id, status=excluded.status,
+                  progress=excluded.progress, score=excluded.score,
+                  repeat=excluded.repeat, updated_at=excluded.updated_at
+                 WHERE (list_entry.entry_id,list_entry.status,list_entry.progress,
+                        list_entry.score,list_entry.repeat,list_entry.updated_at)
+                   IS NOT (excluded.entry_id,excluded.status,excluded.progress,
+                           excluded.score,excluded.repeat,excluded.updated_at)",
             )?;
             for e in entries {
                 if let Some(m) = &e.media {
@@ -727,6 +760,176 @@ mod tests {
         assert!(db.entries_with_media().unwrap().is_empty());
     }
 
+    #[test]
+    fn replace_list_snapshot_skips_unchanged_entries() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut entries: Vec<_> = (0..1000)
+            .map(|media_id| ListEntry {
+                media_id,
+                id: Some(media_id + 1000),
+                status: "CURRENT".into(),
+                progress: 3,
+                score: (media_id % 2 == 0).then_some(8.5),
+                updated_at: Some(123),
+                ..Default::default()
+            })
+            .collect();
+        db.replace_list_snapshot(&entries).unwrap();
+        let changes = || db.0.lock().total_changes();
+        let before = changes();
+        db.replace_list_snapshot(&entries).unwrap();
+        assert_eq!(changes() - before, 0, "unchanged entries need no writes");
+
+        entries[0].id = None;
+        entries[1].status = "PLANNING".into();
+        entries[2].progress = 4;
+        entries[3].score = Some(7.5);
+        entries[4].repeat = 1;
+        entries[5].updated_at = None;
+        let before = changes();
+        db.replace_list_snapshot(&entries).unwrap();
+        assert_eq!(changes() - before, 6);
+        for e in &entries[..6] {
+            assert_eq!(
+                serde_json::to_value(db.get_entry(e.media_id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(e).unwrap()
+            );
+        }
+
+        entries[0].id = Some(2000);
+        entries[3].score = None;
+        entries[5].updated_at = Some(456);
+        entries.pop();
+        entries.push(ListEntry {
+            media_id: 1000,
+            status: "COMPLETED".into(),
+            progress: 12,
+            ..Default::default()
+        });
+        let before = changes();
+        db.replace_list_snapshot(&entries).unwrap();
+        assert_eq!(
+            changes() - before,
+            5,
+            "three updates, one insert, one deletion"
+        );
+        assert!(db.get_entry(999).unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(db.entries_with_media().unwrap()).unwrap(),
+            serde_json::to_value(&entries).unwrap()
+        );
+
+        let mut duplicate = entries[0].clone();
+        duplicate.progress = 8;
+        entries.push(duplicate.clone());
+        db.replace_list_snapshot(&entries).unwrap();
+        assert_eq!(db.get_entry(0).unwrap().unwrap().progress, 8);
+        assert_eq!(db.entries_with_media().unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn replace_list_snapshot_refreshes_media_without_rewriting_entries() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut entries: Vec<_> = (0..1000)
+            .map(|id| ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                media: Some(Media {
+                    id,
+                    id_mal: Some(id + 1000),
+                    title_romaji: Some(format!("Show {id}")),
+                    description: Some("Cached description".into()),
+                    next_airing_episode: Some(4),
+                    next_airing_at: Some(1234),
+                    banner_image: Some("banner.jpg".into()),
+                    genres: Some(vec!["Action".into()]),
+                    duration: Some(24),
+                    source: Some("MANGA".into()),
+                    studios: Some(vec!["Studio".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        db.replace_list_snapshot(&entries).unwrap();
+        let mut expected = entries[0].media.clone().unwrap();
+        expected.id_mal = None;
+        expected.description = None;
+        expected.next_airing_episode = None;
+        expected.next_airing_at = None;
+        for e in &mut entries {
+            e.media = Some(Media {
+                id: e.media_id,
+                title_romaji: Some(format!("Show {}", e.media_id)),
+                ..Default::default()
+            });
+        }
+        db.0.lock()
+            .execute("UPDATE media SET cached_at = 1", [])
+            .unwrap();
+        let before = db.0.lock().total_changes();
+        let started = chrono::Utc::now().timestamp();
+        db.replace_list_snapshot(&entries).unwrap();
+        assert_eq!(db.0.lock().total_changes() - before, 1000);
+        assert_eq!(
+            serde_json::to_value(db.get_media(0).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        let (oldest, newest): (i64, i64) =
+            db.0.lock()
+                .query_row(
+                    "SELECT min(cached_at), max(cached_at) FROM media",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+        assert!(oldest >= started);
+        assert!(newest <= chrono::Utc::now().timestamp());
+        db.replace_list_snapshot(&[]).unwrap();
+        assert_eq!(db.prune_media_cache(30).unwrap(), 0);
+        assert!(db.get_media(999).unwrap().is_some());
+    }
+
+    #[test]
+    fn replace_list_snapshot_rolls_back_updates_and_deletions_together() {
+        for trigger in [
+            "CREATE TRIGGER fail BEFORE UPDATE ON media WHEN NEW.id = 2 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            "CREATE TRIGGER fail BEFORE INSERT ON list_entry WHEN NEW.media_id = 2 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            "CREATE TRIGGER fail BEFORE DELETE ON list_entry WHEN OLD.media_id = 3 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        ] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            let mut entries: Vec<_> = (1..=3).map(|id| ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                media: Some(Media {
+                    id,
+                    title_romaji: Some(format!("Show {id}")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }).collect();
+            db.replace_list_snapshot(&entries).unwrap();
+            db.0.lock().execute("UPDATE media SET cached_at = 1", []).unwrap();
+            let before = serde_json::to_value(db.entries_with_media().unwrap()).unwrap();
+            entries.pop();
+            for e in &mut entries {
+                e.progress = 4;
+                e.media.as_mut().unwrap().title_romaji = Some("Changed".into());
+            }
+            db.0.lock().execute_batch(trigger).unwrap();
+            assert!(db.replace_list_snapshot(&entries).is_err());
+            assert_eq!(serde_json::to_value(db.entries_with_media().unwrap()).unwrap(), before);
+            let refreshed: i64 = db.0.lock().query_row(
+                "SELECT count(*) FROM media WHERE cached_at != 1", [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(refreshed, 0);
+            db.0.lock().execute_batch("DROP TRIGGER fail").unwrap();
+            db.replace_list_snapshot(&entries).unwrap();
+            assert_eq!(db.get_entry(1).unwrap().unwrap().progress, 4);
+            assert!(db.get_entry(3).unwrap().is_none());
+        }
+    }
+
     /// Keep this historical schema independent of the current migrations.
     const V1_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS media (
         id              INTEGER PRIMARY KEY,
@@ -798,6 +1001,28 @@ mod tests {
             )
             .unwrap();
         }
+        if version >= 5 {
+            conn.execute_batch(
+                "CREATE TABLE pending_change (
+                    account_id INTEGER NOT NULL, media_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(account_id, media_id)
+                );
+                CREATE TABLE watch_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL, path TEXT NOT NULL,
+                    media_id INTEGER NOT NULL, episode INTEGER NOT NULL,
+                    watched_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        if version >= 6 {
+            conn.execute_batch(
+                "CREATE INDEX watch_history_duplicate
+                 ON watch_history (account_id,path,media_id,episode,watched_at);",
+            )
+            .unwrap();
+        }
         conn.execute(
             "INSERT INTO media (id,title_romaji,episodes,cached_at) VALUES (7,'Old Show',12,1)",
             [],
@@ -855,7 +1080,11 @@ mod tests {
             drop(db);
             let db = Db::open(&path).unwrap();
             let pending = db.pending(7).unwrap();
-            assert_eq!(pending.len(), 1, "upgrade from v{from} lost pending changes");
+            assert_eq!(
+                pending.len(),
+                1,
+                "upgrade from v{from} lost pending changes"
+            );
             assert_eq!(pending[0].media_id, 7);
             assert_eq!(pending[0].patch.progress, Some(4));
             assert_eq!(pending[0].base.as_ref().unwrap().progress, 3);
@@ -868,6 +1097,233 @@ mod tests {
             drop(db);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    #[test]
+    fn history_index_migration_preserves_existing_rows_and_pending_intent() {
+        for from in [5, 6] {
+            check_history_index_migration(from);
+        }
+    }
+
+    fn check_history_index_migration(from: i64) {
+        let path = temp_db_path(&format!("history-index-v{from}"));
+        let _ = std::fs::remove_file(&path);
+        build_db_at_version(&path, from);
+        let payload = serde_json::to_string(&crate::sync_queue::Pending {
+            media_id: 7,
+            base: None,
+            patch: crate::sync_queue::Patch {
+                progress: Some(4),
+                ..Default::default()
+            },
+            error: Some("synthetic outage".into()),
+            conflict: false,
+            missing_media: false,
+        })
+        .unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO watch_history (id,account_id,path,media_id,episode,watched_at) VALUES
+                    (41,7,'episode.mkv',7,4,1000),
+                    (42,7,'episode.mkv',7,4,1000),
+                    (43,9,'episode.mkv',7,4,1000);
+                 INSERT INTO watched_file VALUES ('legacy.mkv',7,3,900);
+                 INSERT INTO settings VALUES ('anilist_user_id','7');",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO pending_change VALUES (7,7,?)", [&payload])
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let conn = db.0.lock();
+            let rows = conn
+                .prepare("SELECT id,account_id,path,media_id,episode,watched_at FROM watch_history ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    (41, 7, "episode.mkv".into(), 7, 4, 1000),
+                    (42, 7, "episode.mkv".into(), 7, 4, 1000),
+                    (43, 9, "episode.mkv".into(), 7, 4, 1000),
+                ]
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT payload FROM pending_change WHERE account_id=7 AND media_id=7",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                payload
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT watched_at FROM watched_file WHERE path='legacy.mkv'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                900
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='watch_history'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                43
+            );
+            assert_eq!(conn.query_row("SELECT \"unique\" FROM pragma_index_list('watch_history') WHERE name='watch_history_duplicate'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            let columns = conn
+                .prepare(
+                    "SELECT name FROM pragma_index_info('watch_history_duplicate') ORDER BY seqno",
+                )
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                columns,
+                ["account_id", "path", "media_id", "episode", "watched_at"]
+            );
+            assert_eq!(conn.query_row("SELECT \"unique\" FROM pragma_index_list('watch_history') WHERE name='watch_history_account_id'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            let paging_columns = conn
+                .prepare(
+                    "SELECT name FROM pragma_index_info('watch_history_account_id') ORDER BY seqno",
+                )
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(paging_columns, ["account_id", "id"]);
+            drop(conn);
+            assert_eq!(
+                db.get_setting("anilist_user_id").unwrap().as_deref(),
+                Some("7")
+            );
+            assert_eq!(db.pending(7).unwrap()[0].patch.progress, Some(4));
+            assert_eq!(db.watch_history(7, 10, None).unwrap().len(), 2);
+            assert_eq!(db.watch_history(9, 10, None).unwrap().len(), 1);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn future_schema_is_not_rewritten_or_downgraded() {
+        let path = temp_db_path("future-history-index");
+        let _ = std::fs::remove_file(&path);
+        build_db_at_version(&path, 6);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE future_state (value TEXT);
+                 INSERT INTO future_state VALUES ('preserved');
+                 PRAGMA user_version = 999;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let conn = db.0.lock();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            999
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM future_state", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='watch_history_account_id'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='watch_history_duplicate'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        assert_eq!(db.get_entry(7).unwrap().unwrap().progress, 3);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn history_duplicate_lookup_uses_a_covering_range_without_scanning_history() {
+        use rusqlite::StatementStatus;
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let conn = db.0.lock();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50000)
+             INSERT INTO watch_history (account_id,path,media_id,episode,watched_at)
+             SELECT i%10,'episode-' || i || '.mkv',i%100,1,1000+i FROM n;",
+        )
+        .unwrap();
+        let sql = "SELECT EXISTS(SELECT 1 FROM watch_history
+                   WHERE account_id=? AND path=? AND media_id=? AND episode=? AND watched_at>?)";
+        let plans = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(
+                rusqlite::params![7, "episode-49997.mkv", 97, 1, 50996],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plans.iter().any(|p| p
+                .contains("SEARCH watch_history USING COVERING INDEX watch_history_duplicate")
+                && p.contains("watched_at>?")),
+            "{plans:?}"
+        );
+        let measure = |sql: &str, path: &str, cutoff: i64| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let exists: bool = stmt
+                .query_row(rusqlite::params![7, path, 97, 1, cutoff], |r| r.get(0))
+                .unwrap();
+            (
+                exists,
+                stmt.get_status(StatementStatus::FullscanStep),
+                stmt.get_status(StatementStatus::VmStep),
+            )
+        };
+        let indexed = measure(sql, "episode-49997.mkv", 50996);
+        let missing = measure(sql, "absent.mkv", 50996);
+        let expired = measure(sql, "episode-49997.mkv", 50997);
+        let unindexed = measure(
+            &sql.replace("FROM watch_history", "FROM watch_history NOT INDEXED"),
+            "episode-49997.mkv",
+            50996,
+        );
+        assert!(indexed.0);
+        assert!(!missing.0);
+        assert!(!expired.0);
+        assert_eq!((indexed.1, missing.1, expired.1), (0, 0, 0));
+        assert!(unindexed.1 >= 49996);
+        assert!(indexed.2 < unindexed.2 / 100);
+        println!("history lookup over 50000 rows: indexed {indexed:?}, missing {missing:?}, expired {expired:?}, unindexed {unindexed:?}");
     }
 
     #[test]

@@ -29,9 +29,9 @@
   const id = $derived(Number(page.params.id));
   const loggedIn = $derived(auth.isLoggedIn);
 
-  let detail = $state<MediaDetail | null>(null);
+  let detail = $state.raw<MediaDetail | null>(null);
   let entry = $state<ListEntry | null>(null);
-  let recs = $state<Media[]>([]);
+  let recs = $state.raw<Media[]>([]);
   let loading = $state(true);
   let error = $state("");
   let editing = $state(false);
@@ -192,9 +192,10 @@
     }
     loading = true;
     return listenForListUpdates(
-      () => { if (epoch === auth.epoch && mediaId === id) void reloadEntry(); },
+      (mediaIds) => { if (epoch === auth.epoch && mediaId === id && (!mediaIds || mediaIds.includes(mediaId))) return reloadEntry(); },
       console.error,
-      () => { if (epoch === auth.epoch && mediaId === id) void load(mediaId); },
+      () => { if (epoch === auth.epoch && mediaId === id) return load(mediaId); },
+      { invalidate: (mediaIds) => { if (!mediaIds || mediaIds.includes(mediaId)) entryLoadId++; }, revision: () => entryLoadId },
     );
   });
 

@@ -15,7 +15,6 @@
 
 <script lang="ts">
   import { onMount, type Snippet } from "svelte";
-  import { smoothScroll } from "#lib/smooth-scroll.ts";
 
   let { children, onclose, busy = false, size = "sm", layer = 50, closeOnBackdrop = true }: {
     children: Snippet;
@@ -97,7 +96,6 @@
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     bind:this={dialog}
-    use:smoothScroll
     class="dialog-sheet bg-panel border border-edge rounded-xl p-6 w-full mx-4 shadow-2xl {size === 'md' ? 'max-w-lg' : 'max-w-md'}"
     onclick={(event) => event.stopPropagation()}
     role="dialog"

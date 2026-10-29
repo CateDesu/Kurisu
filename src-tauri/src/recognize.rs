@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use regex::Regex;
 
@@ -51,6 +51,17 @@ const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
 
 const MAX_SEASON: u32 = 50;
 
+#[cfg(test)]
+thread_local! {
+    static MATCHER_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static ORDINAL_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn matcher_work_counts() -> (usize, usize) {
+    MATCHER_WORK.get()
+}
+
 pub(crate) struct Matcher {
     pub media_id: i64,
     pub display: String,
@@ -58,8 +69,20 @@ pub(crate) struct Matcher {
     pub episodes: Option<i64>,
     format: Option<String>,
     norms: Vec<String>,
+    norm_seasons: Vec<Option<u32>>,
     status_rank: u8,
     title_patterns: OnceLock<Vec<Regex>>,
+    // Include rows whose titles cannot produce a matcher.
+    source: Option<Arc<Vec<MatcherInput>>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct MatcherInput {
+    media_id: i64,
+    titles: [Option<String>; 3],
+    episodes: Option<i64>,
+    format: Option<String>,
+    status_rank: u8,
 }
 
 impl Matcher {
@@ -101,26 +124,117 @@ fn status_rank(status: &str) -> u8 {
 }
 
 pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
-    let entries = match db.entries_with_media() {
-        Ok(v) => v,
+    build_matchers_from_inputs(read_matcher_inputs(db, None).unwrap_or_else(|e| {
+        log_matcher_read_error(&e);
+        Vec::new()
+    }))
+}
+
+fn log_matcher_read_error(e: &anyhow::Error) {
+    log::warn!(
+        "matcher build could not read the list, matching is off until the next list mutation: {e}"
+    );
+}
+
+fn read_matcher_inputs(db: &Db, media_ids: Option<&[i64]>) -> anyhow::Result<Vec<MatcherInput>> {
+    let c = db.0.lock();
+    let query =
+        "SELECT m.id,m.title_english,m.title_romaji,m.title_native,m.episodes,m.format,e.status
+                 FROM list_entry e JOIN media m ON m.id = e.media_id";
+    let query = if media_ids.is_some() {
+        format!("{query} WHERE e.media_id IN (SELECT value FROM json_each(?1))")
+    } else {
+        format!("{query} WHERE ?1 IS NULL")
+    };
+    let mut statement = c.prepare_cached(&query)?;
+    let ids = media_ids.map(serde_json::to_string).transpose()?;
+    let mut inputs = statement
+        .query_map([ids], |row| {
+            #[cfg(test)]
+            MATCHER_WORK.set((MATCHER_WORK.get().0 + 1, MATCHER_WORK.get().1));
+            Ok(MatcherInput {
+                media_id: row.get(0)?,
+                titles: [row.get(1)?, row.get(2)?, row.get(3)?],
+                episodes: row.get(4)?,
+                format: row.get(5)?,
+                status_rank: status_rank(&row.get::<_, String>(6)?),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    drop(c);
+    inputs.sort_by_key(|input| (input.status_rank, input.media_id));
+    Ok(inputs)
+}
+
+/// media_ids limits checks to media upserts. List changes require None.
+pub(crate) fn refresh_matchers(
+    db: &Db,
+    previous: &Arc<Vec<Matcher>>,
+    media_ids: Option<&[i64]>,
+) -> Arc<Vec<Matcher>> {
+    if media_ids.is_some_and(<[i64]>::is_empty) {
+        return previous.clone();
+    }
+    let inputs = match read_matcher_inputs(db, media_ids) {
+        Ok(inputs) => inputs,
         Err(e) => {
-            log::warn!("matcher build could not read the list, matching is off until the next list mutation: {e}");
-            Vec::new()
+            log_matcher_read_error(&e);
+            return Arc::new(Vec::new());
         }
     };
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let Some(m) = e.media else { continue };
+    if media_ids.is_some() {
+        if previous
+            .first()
+            .and_then(|matcher| matcher.source.as_ref())
+            .is_some_and(|source| {
+                inputs.iter().all(|input| {
+                    source
+                        .binary_search_by_key(&(input.status_rank, input.media_id), |old| {
+                            (old.status_rank, old.media_id)
+                        })
+                        .is_ok_and(|index| source[index] == *input)
+                })
+            })
+        {
+            return previous.clone();
+        }
+        return refresh_matchers(db, previous, None);
+    }
+    if previous
+        .first()
+        .and_then(|matcher| matcher.source.as_ref())
+        .is_some_and(|source| source.as_ref() == &inputs)
+    {
+        return previous.clone();
+    }
+    let matchers = build_matchers_from_inputs(inputs);
+    if matchers.is_empty() && previous.is_empty() {
+        previous.clone()
+    } else {
+        Arc::new(matchers)
+    }
+}
+
+fn build_matchers_from_inputs(inputs: Vec<MatcherInput>) -> Vec<Matcher> {
+    // Keep construction synchronous with the list write without starving the runtime.
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return tokio::task::block_in_place(|| normalize_matcher_inputs(inputs));
+    }
+    normalize_matcher_inputs(inputs)
+}
+
+fn normalize_matcher_inputs(inputs: Vec<MatcherInput>) -> Vec<Matcher> {
+    #[cfg(test)]
+    MATCHER_WORK.set((MATCHER_WORK.get().0, MATCHER_WORK.get().1 + inputs.len()));
+    let inputs = Arc::new(inputs);
+    let mut out = Vec::with_capacity(inputs.len());
+    for input in inputs.iter() {
         let mut variants = Vec::new();
         let mut norms = Vec::new();
-        for v in [
-            m.title_english.as_deref(),
-            m.title_romaji.as_deref(),
-            m.title_native.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for v in input.titles.iter().flatten() {
             if !v.trim().is_empty() {
                 // List title numbers belong to the name. Only releases lose episode suffixes.
                 let n = norm_title(v);
@@ -134,17 +248,24 @@ pub(crate) fn build_matchers(db: &Db) -> Vec<Matcher> {
             continue;
         }
         out.push(Matcher {
-            media_id: m.id,
-            display: m.display_title(),
+            media_id: input.media_id,
+            display: input
+                .titles
+                .iter()
+                .flatten()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", input.media_id)),
             variants,
-            episodes: m.episodes,
-            format: m.format,
+            episodes: input.episodes,
+            format: input.format.clone(),
+            norm_seasons: norms.iter().map(|norm| norm_season_ordinal(norm)).collect(),
             norms,
-            status_rank: status_rank(&e.status),
+            status_rank: input.status_rank,
             title_patterns: OnceLock::new(),
+            source: Some(inputs.clone()),
         });
     }
-    out.sort_by_key(|m| (m.status_rank, m.media_id));
     out
 }
 
@@ -220,6 +341,8 @@ fn parse_season_token(raw: &str) -> Option<u32> {
 }
 
 fn norm_season_ordinal(norm: &str) -> Option<u32> {
+    #[cfg(test)]
+    ORDINAL_PARSES.set(ORDINAL_PARSES.get() + 1);
     let words: Vec<&str> = norm.split_whitespace().collect();
     for w in &words {
         if let Some(n) = roman_to_u32(w) {
@@ -320,10 +443,11 @@ pub(crate) fn match_title<'a>(
                 }
             }
             let expected_season = cand_ord.unwrap_or(1);
-            if !m.norms.iter().any(|x| {
-                let ord = norm_season_ordinal(x);
-                ord == Some(expected_season) || (expected_season == 1 && ord.is_none())
-            }) {
+            if !m
+                .norm_seasons
+                .iter()
+                .any(|ord| *ord == Some(expected_season) || (expected_season == 1 && ord.is_none()))
+            {
                 continue;
             }
             if let Some((tier, nlen)) = m
@@ -338,8 +462,7 @@ pub(crate) fn match_title<'a>(
                 })
                 .max()
             {
-                let season_match = cand_season
-                    .is_some_and(|cs| m.norms.iter().any(|n| norm_season_ordinal(n) == Some(cs)));
+                let season_match = cand_season.is_some_and(|cs| m.norm_seasons.contains(&Some(cs)));
                 let key = (
                     season_match,
                     tier,
@@ -761,6 +884,332 @@ fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_refresh_inputs(db: &Db) {
+        for (id, title) in [(1, "Some Show"), (2, "[Group]")] {
+            db.upsert_media(&crate::models::Media {
+                id,
+                title_english: Some(title.into()),
+                title_romaji: (id == 1).then(|| "Some Show Romaji".into()),
+                title_native: (id == 1).then(|| "!!!".into()),
+                episodes: Some(12),
+                format: Some("TV".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&crate::models::ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn matcher_refresh_reuses_raw_sources_including_unmatchable_titles() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        let before = Arc::new(build_matchers(&db));
+        assert_eq!(before.len(), 1);
+        before[0].title_patterns();
+        let work = matcher_work_counts();
+        let parses = ORDINAL_PARSES.get();
+        let after = refresh_matchers(&db, &before, None);
+        let after = refresh_matchers(&db, &after, Some(&[1, 2]));
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(after[0].title_patterns.get().is_some());
+        assert_eq!(matcher_work_counts(), (work.0 + 4, work.1));
+        assert_eq!(ORDINAL_PARSES.get(), parses);
+    }
+
+    #[test]
+    fn matcher_refresh_invalidates_each_recognition_input() {
+        for sql in [
+            "UPDATE media SET title_english = 'Some_Show' WHERE id = 1",
+            "UPDATE media SET title_english = NULL WHERE id = 1",
+            "UPDATE media SET title_romaji = 'New Romaji' WHERE id = 1",
+            "UPDATE media SET title_native = '???' WHERE id = 1",
+            "UPDATE media SET title_english = '[Other Group]' WHERE id = 2",
+            "UPDATE media SET episodes = 1 WHERE id = 1",
+            "UPDATE media SET episodes = NULL WHERE id = 1",
+            "UPDATE media SET format = 'MOVIE' WHERE id = 1",
+            "UPDATE list_entry SET status = 'PAUSED' WHERE media_id = 1",
+            "DELETE FROM list_entry WHERE media_id = 1",
+            "DELETE FROM list_entry WHERE media_id = 2",
+            "DELETE FROM media WHERE id = 1",
+            "INSERT INTO media(id,title_english,cached_at) VALUES(3,'New Show',0);
+             INSERT INTO list_entry(media_id,status) VALUES(3,'CURRENT')",
+        ] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            seed_refresh_inputs(&db);
+            let before = Arc::new(build_matchers(&db));
+            db.0.lock().execute_batch(sql).unwrap();
+            let after = refresh_matchers(&db, &before, None);
+            assert!(!Arc::ptr_eq(&before, &after), "{sql}");
+            let fresh = build_matchers(&db);
+            let snapshot = |matchers: &[Matcher]| {
+                matchers
+                    .iter()
+                    .map(|matcher| {
+                        (
+                            matcher.media_id,
+                            matcher.display.clone(),
+                            matcher.variants.clone(),
+                            matcher.norms.clone(),
+                            matcher.norm_seasons.clone(),
+                            matcher.episodes,
+                            matcher.format.clone(),
+                            matcher.status_rank,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(snapshot(&after), snapshot(&fresh), "{sql}");
+            assert!(
+                Arc::ptr_eq(&after, &refresh_matchers(&db, &after, None)),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_media_refresh_invalidates_changed_titles_and_preserves_empty_results() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        let before = Arc::new(build_matchers(&db));
+        db.0.lock()
+            .execute(
+                "UPDATE media SET title_english = 'Other Show' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        let after = refresh_matchers(&db, &before, Some(&[1]));
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after[0].display, "Other Show");
+        db.clear_entries().unwrap();
+        let empty = refresh_matchers(&db, &after, None);
+        assert!(empty.is_empty());
+        assert!(Arc::ptr_eq(&empty, &refresh_matchers(&db, &empty, None)));
+    }
+
+    #[test]
+    fn matcher_refresh_limits_upsert_checks_and_requires_full_checks_for_membership() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        let before = Arc::new(build_matchers(&db));
+        db.0.lock()
+            .execute_batch("DELETE FROM list_entry WHERE media_id = 1")
+            .unwrap();
+        let work = matcher_work_counts();
+        let scoped = refresh_matchers(&db, &before, Some(&[2]));
+        assert!(Arc::ptr_eq(&before, &scoped));
+        assert_eq!(matcher_work_counts(), (work.0 + 1, work.1));
+        let full = refresh_matchers(&db, &scoped, None);
+        assert!(!Arc::ptr_eq(&scoped, &full));
+        assert!(full.is_empty());
+    }
+
+    #[test]
+    fn matcher_read_failures_disable_matching_and_full_refresh_recovers() {
+        for ids in [None, Some(&[1][..])] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            seed_refresh_inputs(&db);
+            let before = Arc::new(build_matchers(&db));
+            db.0.lock()
+                .execute_batch("ALTER TABLE list_entry RENAME TO unavailable_list")
+                .unwrap();
+            let failed = refresh_matchers(&db, &before, ids);
+            assert!(failed.is_empty());
+            assert!(!Arc::ptr_eq(&before, &failed));
+            assert!(build_matchers(&db).is_empty());
+            db.0.lock()
+                .execute_batch("ALTER TABLE unavailable_list RENAME TO list_entry")
+                .unwrap();
+            let recovered = refresh_matchers(&db, &failed, None);
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].media_id, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_unmatchable_titles_disable_the_snapshot_and_recover() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        let before = Arc::new(build_matchers(&db));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].source.as_ref().unwrap().len(), 2);
+        db.0.lock()
+            .execute("UPDATE media SET title_english = X'FF' WHERE id = 2", [])
+            .unwrap();
+        let parses = ORDINAL_PARSES.get();
+        let failed = refresh_matchers(&db, &before, Some(&[2]));
+        assert!(failed.is_empty());
+        assert_eq!(ORDINAL_PARSES.get(), parses);
+        assert!(match_title(&failed, "Some Show - 03", "").is_none());
+        db.0.lock()
+            .execute(
+                "UPDATE media SET title_english = 'Other Show II' WHERE id = 2",
+                [],
+            )
+            .unwrap();
+        let recovered = refresh_matchers(&db, &failed, None);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[1].norm_seasons, [Some(2)]);
+        assert_eq!(
+            match_title(&recovered, "Other Show S02E04", "").map(|matcher| matcher.media_id),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cached_season_ordinals_preserve_cold_scan_and_playback_matches() {
+        let fixtures = [
+            (10, "CURRENT", "Example Saga", Some("Rei Monogatari"), None),
+            (
+                20,
+                "COMPLETED",
+                "Example Saga Season 2",
+                Some("Rei Monogatari II"),
+                Some("例の物語 II"),
+            ),
+            (
+                30,
+                "PAUSED",
+                "Example Saga Season 3",
+                Some("Rei Monogatari III"),
+                None,
+            ),
+            (40, "CURRENT", "86", Some("Eighty Six"), None),
+            (50, "CURRENT", "91 Days", None, None),
+            (60, "PAUSED", "Tie Show", None, None),
+            (55, "CURRENT", "Tie Show", None, None),
+            (54, "CURRENT", "Tie Show", None, None),
+            (70, "CURRENT", "Some Movie", None, None),
+            (80, "CURRENT", "[Group]", Some("!!!"), Some(" ")),
+            (81, "CURRENT", "I", None, None),
+        ];
+        let cases = [
+            ("Example Saga S01E03", "", Some(10), Some(3)),
+            ("EXAMPLE SAGA S02E04", "", Some(20), Some(4)),
+            ("Rei Monogatari II - 04", "", Some(20), Some(4)),
+            ("例の物語 II - 04", "", Some(20), Some(4)),
+            (
+                "",
+                "file:///shows/Example.Saga.S03E05.mkv",
+                Some(30),
+                Some(5),
+            ),
+            ("Example Saga S04E03", "", None, None),
+            ("Example Saga - 03", "", Some(10), Some(3)),
+            ("Tie Show - 02", "", Some(54), Some(2)),
+            ("86 - 03", "", Some(40), Some(3)),
+            ("91 Days - 05", "", Some(50), Some(5)),
+            ("I - 02", "", Some(81), Some(2)),
+            ("Some Movie.mkv", "", Some(70), Some(1)),
+            ("No Such Show - 03", "", None, None),
+            (
+                "",
+                "file:///shows/Example%20Saga%20S02E04.mkv?S03E99",
+                Some(20),
+                Some(4),
+            ),
+        ];
+        for filler_count in [0, 100, 1000] {
+            let mut inputs = fixtures
+                .iter()
+                .map(|(id, status, english, romaji, native)| MatcherInput {
+                    media_id: *id,
+                    titles: [
+                        Some((*english).into()),
+                        romaji.map(String::from),
+                        native.map(String::from),
+                    ],
+                    episodes: Some(if *id == 70 { 1 } else { 12 }),
+                    format: Some(if *id == 70 { "MOVIE" } else { "TV" }.into()),
+                    status_rank: status_rank(status),
+                })
+                .collect::<Vec<_>>();
+            inputs.extend((0..filler_count).map(|id| MatcherInput {
+                media_id: 1000 + id,
+                titles: [Some(format!("Unrelated serial {}", 100 + id)), None, None],
+                episodes: Some(12),
+                format: Some("TV".into()),
+                status_rank: 0,
+            }));
+            let parses = ORDINAL_PARSES.get();
+            let matchers = build_matchers_from_inputs(inputs);
+            let norms = matchers
+                .iter()
+                .map(|matcher| matcher.norms.len())
+                .sum::<usize>();
+            assert_eq!(ORDINAL_PARSES.get() - parses, norms);
+            assert_eq!(matchers.len(), fixtures.len() - 1 + filler_count as usize);
+            assert_eq!(
+                matchers[0].source.as_ref().unwrap().len(),
+                fixtures.len() + filler_count as usize
+            );
+            for matcher in &matchers {
+                assert_eq!(
+                    matcher.norm_seasons,
+                    matcher
+                        .norms
+                        .iter()
+                        .map(|norm| norm_season_ordinal(norm))
+                        .collect::<Vec<_>>()
+                );
+            }
+            for (title, url, expected_id, expected_episode) in cases {
+                let parses = ORDINAL_PARSES.get();
+                assert!(match_title(&[], title, url).is_none());
+                let input_parses = ORDINAL_PARSES.get() - parses;
+                for _ in 0..8 {
+                    let parses = ORDINAL_PARSES.get();
+                    let matched = match_title(&matchers, title, url);
+                    assert_eq!(
+                        matched.map(|matcher| matcher.media_id),
+                        expected_id,
+                        "{title} {url}"
+                    );
+                    assert_eq!(
+                        ORDINAL_PARSES.get() - parses,
+                        input_parses,
+                        "matcher parsing for {title} {url}"
+                    );
+                    let base = basename(url);
+                    assert_eq!(
+                        matched.and_then(|matcher| resolve_playback_episode(
+                            matcher,
+                            &[title, &base],
+                            false
+                        )),
+                        expected_episode,
+                        "{title} {url}"
+                    );
+                    let cold_episode =
+                        matched.and_then(|matcher| resolve_episode(matcher, &[title, &base]));
+                    assert_eq!(
+                        cold_episode,
+                        if expected_id == Some(70) {
+                            None
+                        } else {
+                            expected_episode
+                        },
+                        "cold scan {title} {url}"
+                    );
+                }
+            }
+            println!("{} matchers, {norms} construction ordinal parses: 0 extra matcher parses across 112 scan/playback matches", matchers.len());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn matcher_construction_supports_the_multithread_runtime() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        let before = Arc::new(build_matchers(&db));
+        assert!(Arc::ptr_eq(&before, &refresh_matchers(&db, &before, None)));
+    }
 
     #[test]
     fn television_bonus_clips_are_not_regular_episodes() {
@@ -1263,10 +1712,12 @@ mod tests {
             display: "91 Days".into(),
             variants: vec!["91 Days".into()],
             norms: vec!["91 days".into()],
+            norm_seasons: vec![None],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            source: None,
         };
         assert_eq!(
             resolve_episode(&days, &["91 Days", "91 Days [BD 1080p]"]),
@@ -1281,10 +1732,12 @@ mod tests {
             display: "Re:Zero".into(),
             variants: vec!["Re:Zero kara Hajimeru Isekai Seikatsu".into()],
             norms: vec!["re zero kara hajimeru isekai seikatsu".into()],
+            norm_seasons: vec![None],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            source: None,
         };
         assert_eq!(
             resolve_episode(&rezero, &["Re Zero - 05", "Re Zero - 05"]),
@@ -1299,10 +1752,12 @@ mod tests {
             display: "Frieren".into(),
             variants: vec!["Sousou no Frieren".into()],
             norms: vec!["sousou no frieren".into()],
+            norm_seasons: vec![None],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            source: None,
         };
         let matchers = vec![m];
         assert!(match_title(&matchers, "Sousou no Frieren - 28", "").is_some());
@@ -1333,10 +1788,12 @@ mod tests {
             display: title.into(),
             variants: vec![title.into()],
             norms: vec![norm_title(title)],
+            norm_seasons: vec![norm_season_ordinal(&norm_title(title))],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            source: None,
         }
     }
 
@@ -1701,10 +2158,15 @@ mod tests {
                 display: (*en).into(),
                 variants: vec![(*en).into(), rom_by_id[id].into()],
                 norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                norm_seasons: vec![
+                    norm_season_ordinal(&norm_title(en)),
+                    norm_season_ordinal(&norm_title(rom_by_id[id])),
+                ],
                 episodes: None,
                 format: None,
                 status_rank: status_rank(status),
                 title_patterns: OnceLock::new(),
+                source: None,
             })
             .collect();
         for raw in [
@@ -1760,10 +2222,15 @@ mod tests {
                 display: (*en).into(),
                 variants: vec![(*en).into(), rom_by_id[id].into()],
                 norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                norm_seasons: vec![
+                    norm_season_ordinal(&norm_title(en)),
+                    norm_season_ordinal(&norm_title(rom_by_id[id])),
+                ],
                 episodes: None,
                 format: None,
                 status_rank: status_rank(status),
                 title_patterns: OnceLock::new(),
+                source: None,
             })
             .collect();
         let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")
@@ -1782,20 +2249,24 @@ mod tests {
                 display: "Mushoku Tensei: Jobless Reincarnation Season 2".into(),
                 variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 2".into()],
                 norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 2")],
+                norm_seasons: vec![Some(2)],
                 episodes: None,
                 format: None,
                 status_rank: status_rank("CURRENT"),
                 title_patterns: OnceLock::new(),
+                source: None,
             },
             Matcher {
                 media_id: 178789,
                 display: "Mushoku Tensei: Jobless Reincarnation Season 3".into(),
                 variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 3".into()],
                 norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 3")],
+                norm_seasons: vec![Some(3)],
                 episodes: None,
                 format: None,
                 status_rank: status_rank("PAUSED"),
                 title_patterns: OnceLock::new(),
+                source: None,
             },
         ];
         let m = match_title(&matchers, "[Judas] Mushoku Tensei - S03E05.mkv", "")

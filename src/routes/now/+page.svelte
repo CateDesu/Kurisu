@@ -1,7 +1,7 @@
 <script lang="ts">
   import PageHeading from "#lib/PageHeading.svelte";
   import { untrack } from "svelte";
-  import { listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
   import { goto } from "$app/navigation";
   import { openPath } from "@tauri-apps/plugin-opener";
   import { api } from "#lib/api.ts";
@@ -19,7 +19,7 @@
   let error = $state("");
   let stepError = $state("");
 
-  let current = $state<ListEntry[]>([]);
+  let current = $state.raw<ListEntry[]>([]);
   let currentError = $state("");
   let listeningReady = $state(false);
   const loggedIn = $derived(auth.isLoggedIn);
@@ -40,11 +40,12 @@
   // Share this guard across reads, events and writes so stale responses cannot win.
   let entryLoadId = 0;
   let currentLoadId = 0;
+  let currentLoaded = false;
   let updateId = 0;
   async function loadEntry(mediaId: number) {
     const lid = ++entryLoadId;
     const epoch = auth.epoch;
-    const active = () => lid === entryLoadId && epoch === auth.epoch && auth.isLoggedIn;
+    const active = () => lid === entryLoadId && epoch === auth.epoch && auth.isLoggedIn && np?.media_id === mediaId;
     try {
       const e = await api.getEntry(mediaId);
       if (active()) entry = e;
@@ -66,6 +67,7 @@
     auth.epoch;
     loggedIn;
     current = [];
+    currentLoaded = false;
     currentError = "";
     error = "";
     stepError = "";
@@ -89,19 +91,20 @@
     });
   });
 
-  async function loadCurrent() {
+  async function loadCurrent(mediaIds?: readonly number[]) {
     if (!auth.isLoggedIn) return;
     const id = ++currentLoadId;
     const epoch = auth.epoch;
     const active = () => id === currentLoadId && epoch === auth.epoch && auth.isLoggedIn;
     try {
-      const all = await api.localEntries();
+      const update = await readListUpdate(currentLoaded ? mediaIds : undefined);
       if (!active()) return;
-      current = all.filter((e) => e.status === "CURRENT");
+      current = applyListUpdate(current, update).filter((e) => e.status === "CURRENT");
+      currentLoaded = true;
       currentError = "";
     } catch (e) {
       if (!active()) return;
-      current = [];
+      currentLoaded = false;
       currentError = String(e);
     }
   }
@@ -112,8 +115,8 @@
       entryLoadId++;
       entry = { ...updated, media: updated.media ?? entry?.media ?? null };
     }
-    current = current
-      .map((x) => (x.media_id === updated.media_id ? { ...updated, media: updated.media ?? x.media } : x))
+    const saved = { ...updated, media: updated.media ?? current.find((item) => item.media_id === updated.media_id)?.media };
+    current = applyListUpdate(current, { mediaIds: [updated.media_id], entries: [saved] })
       .filter((x) => x.status === "CURRENT");
   }
 
@@ -121,13 +124,13 @@
     const epoch = auth.epoch;
     listeningReady = false;
     if (!auth.isLoggedIn) return;
-    const refresh = () => {
+    const refresh = (mediaIds?: readonly number[]) => {
       if (epoch !== auth.epoch || !auth.isLoggedIn) return;
-      const id = np?.media_id ?? null;
-      if (id != null) {
-        void loadEntry(id);
-      }
-      void loadCurrent();
+      const id = np?.media_id;
+      return Promise.all([
+        loadCurrent(mediaIds),
+        id != null && !updating && (!mediaIds || mediaIds.includes(id)) ? loadEntry(id) : undefined,
+      ]);
     };
     return listenForListUpdates(
       refresh,
@@ -135,7 +138,14 @@
       () => {
         if (epoch !== auth.epoch || !auth.isLoggedIn) return;
         listeningReady = true;
-        void loadCurrent();
+        return loadCurrent();
+      },
+      {
+        invalidate: (mediaIds) => {
+          currentLoadId++;
+          if (!mediaIds || playingId != null && mediaIds.includes(playingId)) entryLoadId++;
+        },
+        revision: () => currentLoadId,
       },
     );
   });
@@ -147,6 +157,7 @@
     const epoch = auth.epoch;
     const active = () => request === updateId && epoch === auth.epoch && auth.isLoggedIn && np?.media_id === id;
     entryLoadId++;
+    currentLoadId++;
     updating = true;
     error = "";
     let fresh: ListEntry | null = null;
@@ -155,26 +166,29 @@
       if (!active()) return;
       entryLoadId++;
       if (!fresh) {
+        currentLoadId++;
+        current = current.filter((item) => item.media_id !== id);
         entry = null;
         error = "This show is no longer on your list.";
         return;
       }
       if (fresh.progress >= episode) {
-        entry = fresh;
+        applyEntry(fresh);
         return;
       }
       entry = { ...fresh, progress: episode };
       const saved = await api.setProgress(id, episode, fresh.progress);
       if (!active()) return;
-      entryLoadId++;
-      entry = saved;
-      if (active()) await loadCurrent();
+      applyEntry(saved);
     } catch (e) {
       if (!active()) return;
       error = String(e);
       await loadEntry(id);
     } finally {
-      if (active()) updating = false;
+      if (active()) {
+        updating = false;
+        if (!currentLoaded) void loadCurrent();
+      }
     }
   }
 
@@ -316,7 +330,8 @@
 
     {#if currentError}
       <p class="text-sm text-amber-400">{currentError}</p>
-    {:else if current.length > 0}
+    {/if}
+    {#if current.length > 0}
       <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Continue watching</h2>
       <div class="grid grid-cols-1 gap-2">
         {#each current as e (e.media_id)}

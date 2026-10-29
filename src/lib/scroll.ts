@@ -2,10 +2,16 @@ export type ScrollPosition = { left: number; top: number };
 
 export function rememberScroll(node: HTMLElement) {
   let stopRestoring: (() => void) | undefined;
+  let releaseAnchor: (() => void) | undefined;
 
-  function stop() {
+  function stopWaiting() {
     stopRestoring?.();
     stopRestoring = undefined;
+  }
+
+  function stop() {
+    stopWaiting();
+    releaseAnchor?.();
   }
 
   function capture(): ScrollPosition {
@@ -15,16 +21,37 @@ export function rememberScroll(node: HTMLElement) {
 
   function restore(position: ScrollPosition) {
     stop();
+    const anchor = node.style.getPropertyValue("overflow-anchor");
+    const priority = node.style.getPropertyPriority("overflow-anchor");
+    let frame = 0;
+    node.style.setProperty("overflow-anchor", "none", priority);
+    const release = () => {
+      cancelAnimationFrame(frame);
+      if (anchor) node.style.setProperty("overflow-anchor", anchor, priority);
+      else node.style.removeProperty("overflow-anchor");
+      if (releaseAnchor === release) releaseAnchor = undefined;
+    };
+    releaseAnchor = release;
+    const complete = () => {
+      stopWaiting();
+      // Let restored content paint before browser anchoring resumes.
+      frame = requestAnimationFrame(() => { frame = requestAnimationFrame(release); });
+    };
     const apply = () => {
+      if (node.querySelector("[data-pending-rows]")) return false;
       node.scrollLeft = position.left;
       node.scrollTop = position.top;
       return Math.abs(node.scrollLeft - position.left) < 1 &&
         Math.abs(node.scrollTop - position.top) < 1;
     };
-    if (apply()) return;
+    if (apply()) {
+      complete();
+      return;
+    }
 
     // Cached rows can arrive after navigation finishes.
-    const retry = () => { if (apply()) stop(); };
+    let waiting = true;
+    const retry = () => { if (waiting && apply()) complete(); };
     const sizes = new ResizeObserver(retry);
     const children = new Set<Element>();
     const observeChildren = () => {
@@ -42,7 +69,7 @@ export function rememberScroll(node: HTMLElement) {
       }
     };
     const mutations = new MutationObserver(() => { observeChildren(); retry(); });
-    mutations.observe(node, { childList: true, subtree: true, characterData: true });
+    mutations.observe(node, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["data-pending-rows"] });
     sizes.observe(node);
     observeChildren();
     node.addEventListener("wheel", stop, { passive: true });
@@ -50,6 +77,7 @@ export function rememberScroll(node: HTMLElement) {
     node.addEventListener("touchstart", stop, { passive: true });
     window.addEventListener("keydown", stop);
     stopRestoring = () => {
+      waiting = false;
       mutations.disconnect();
       sizes.disconnect();
       node.removeEventListener("wheel", stop);

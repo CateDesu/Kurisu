@@ -11,7 +11,9 @@
   import { api } from "#lib/api.ts";
   import { auth } from "#lib/auth.svelte.ts";
   import { library } from "#lib/library.svelte.ts";
-  import { listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
+  import { reconcileListEntries } from "#lib/myList.ts";
+  import { measuredRows } from "#lib/measuredRows.ts";
   import { displayTitle, type LibraryFile, type ListEntry, type WatchHistoryItem } from "#lib/types.ts";
   import Confirm from "#lib/Confirm.svelte";
   import Dialog from "#lib/Dialog.svelte";
@@ -20,7 +22,7 @@
   import Login from "#lib/Login.svelte";
   import Img from "#lib/Img.svelte";
 
-  let entries = $state<ListEntry[]>([]);
+  let entries = $state.raw<ListEntry[]>([]);
   let entriesLoaded = $state(false);
   let error = $state("");
   let linking = $state<string | null>(null);
@@ -44,7 +46,7 @@
   const offsetFolderAllowed = $derived(Boolean(offsetFolder) && !library.folders.some((root) => root.replace(/[\\/]+$/, "") === offsetFolder));
   const offsetTarget = $derived(numbering ? offsetScope === "folder" && offsetFolderAllowed ? offsetFolder : numbering.path : "");
   let historyOpen = $state(false);
-  let historyItems = $state<WatchHistoryItem[]>([]);
+  let historyItems = $state.raw<WatchHistoryItem[]>([]);
   let historyLoading = $state(false);
   let historyError = $state("");
   let historyMore = $state(false);
@@ -64,8 +66,11 @@
     files: LibraryFile[];
   }
 
-  const groups = $derived.by(() => {
-    const entriesByMedia = new Map(entries.map((entry) => [entry.media_id, entry]));
+  let previousFiles = new Map<number, { source: LibraryFile[]; group: Group }>();
+  let previousOrder: Group[] = [];
+  let previousMatched: Group[] = [];
+  let previousUnmatched: LibraryFile[] = [];
+  const fileGroups = $derived.by(() => {
     const byMedia = new Map<number, Group>();
     const unmatched: LibraryFile[] = [];
     for (const f of library.files) {
@@ -75,29 +80,62 @@
       }
       let g = byMedia.get(f.media_id);
       if (!g) {
-        const entry = entriesByMedia.get(f.media_id);
-        g = { mediaId: f.media_id, title: f.matched ?? `#${f.media_id}`, entry, files: [] };
+        g = { mediaId: f.media_id, title: f.matched ?? `#${f.media_id}`, files: [] };
         byMedia.set(f.media_id, g);
       }
       g.files.push(f);
     }
-    for (const g of byMedia.values()) {
-      g.files.sort((a, b) => (a.episode ?? 9999) - (b.episode ?? 9999));
-    }
-    const matched = [...byMedia.values()].sort((a, b) =>
-      COLLATOR.compare(a.title, b.title)
+    const nextFiles = new Map<number, { source: LibraryFile[]; group: Group }>();
+    const order = [...byMedia.values()].map((group) => {
+      const old = previousFiles.get(group.mediaId);
+      if (old && old.group.title === group.title && old.source.length === group.files.length &&
+          old.source.every((file, index) => file === group.files[index])) {
+        nextFiles.set(group.mediaId, old);
+        byMedia.set(group.mediaId, old.group);
+        return old.group;
+      }
+      const source = group.files.slice();
+      group.files.sort((a, b) => (a.episode ?? 9999) - (b.episode ?? 9999));
+      nextFiles.set(group.mediaId, { source, group });
+      return group;
+    });
+    const sameOrder = order.length === previousOrder.length && order.every((group, index) =>
+      group.mediaId === previousOrder[index].mediaId && group.title === previousOrder[index].title
     );
-    return { matched, unmatched };
+    const matched = sameOrder
+      ? previousMatched.map((group) => byMedia.get(group.mediaId)!)
+      : [...order].sort((a, b) => COLLATOR.compare(a.title, b.title));
+    if (matched.length !== previousMatched.length || matched.some((group, index) => group !== previousMatched[index])) previousMatched = matched;
+    if (unmatched.length !== previousUnmatched.length || unmatched.some((file, index) => file !== previousUnmatched[index])) previousUnmatched = unmatched;
+    previousFiles = nextFiles;
+    previousOrder = order;
+    return { matched: previousMatched, unmatched: previousUnmatched };
+  });
+
+  const entryGroups = new WeakMap<Group, Group>();
+  const groups = $derived.by(() => {
+    const entriesByMedia = new Map(entries.map((entry) => [entry.media_id, entry]));
+    return {
+      matched: fileGroups.matched.map((group) => {
+        const entry = entriesByMedia.get(group.mediaId);
+        const previous = entryGroups.get(group);
+        if (previous && previous.entry === entry) return previous;
+        const next = { ...group, entry };
+        entryGroups.set(group, next);
+        return next;
+      }),
+      unmatched: fileGroups.unmatched,
+    };
   });
 
   let entryLoadId = 0;
-  async function refreshEntries() {
+  async function refreshEntries(mediaIds?: readonly number[]) {
     const id = ++entryLoadId;
     const epoch = auth.epoch;
     try {
-      const fresh = await api.localEntries();
+      const update = await readListUpdate(entriesLoaded ? mediaIds : undefined);
       if (id !== entryLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
-      entries = fresh;
+      entries = update.mediaIds ? applyListUpdate(entries, update) : reconcileListEntries(entries, applyListUpdate(entries, update));
       entriesLoaded = true;
     } catch (e) {
       if (id === entryLoadId && epoch === auth.epoch && auth.isLoggedIn) throw e;
@@ -323,16 +361,17 @@
     scannedAt = 0;
     if (!loggedIn) return;
     let alive = true;
-    const updateEntries = () => {
+    const updateEntries = (mediaIds?: readonly number[]) => {
       if (!alive || epoch !== auth.epoch) return;
-      refreshEntries().catch((e) => {
+      return refreshEntries(mediaIds).catch((e) => {
         if (alive && epoch === auth.epoch) error = String(e);
       });
     };
     const stop = listenForListUpdates(
       updateEntries,
       (e) => { if (epoch === auth.epoch) error = String(e); },
-      () => { if (epoch === auth.epoch) void load(); },
+      () => { if (epoch === auth.epoch) return load(); },
+      { invalidate: () => { entryLoadId++; }, revision: () => entryLoadId },
     );
     return () => {
       alive = false;
@@ -439,7 +478,7 @@
     {:else if library.hasScan && groups.matched.length === 0 && groups.unmatched.length === 0}
       <div class="text-ink-dim py-10 text-center">No video files found in those folders.</div>
     {:else}
-      <div class="space-y-4">
+      <div class="space-y-4" use:measuredRows>
         {#each groups.matched as g (g.mediaId)}
           {@const next = nextFile(g)}
           {@const cov = cover(g)}
@@ -475,6 +514,7 @@
                   }}
                   title="Open details"
                   class="shrink-0"
+                  data-measured-cover
                 >
                   <Img src={cov} class="w-10 h-14 object-cover rounded" />
                 </button>
@@ -528,7 +568,7 @@
               {/if}
             </div>
             {#if isOpen}
-              <div class="divide-y divide-edge/60">
+              <div class="divide-y divide-edge/60" use:measuredRows>
                 {#each g.files as f (f.path)}
                   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
                   <div
@@ -584,7 +624,7 @@
             <div class="px-3 py-2 border-b border-edge text-sm font-medium text-ink-dim">
               Unmatched — {groups.unmatched.length} file{groups.unmatched.length === 1 ? "" : "s"}
             </div>
-            <div class="divide-y divide-edge/60">
+            <div class="divide-y divide-edge/60" use:measuredRows>
               {#each groups.unmatched as f (f.path)}
                 <div class="cv-row flex items-center gap-2 px-3 py-1.5 text-sm">
                   <span class="flex-1 min-w-0 text-ink-dim">{basename(f.path)}</span>

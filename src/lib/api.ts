@@ -70,6 +70,8 @@ export const api = {
 
   syncMyList: () => invoke<ListEntry[]>("sync_my_list"),
   localEntries: () => invoke<ListEntry[]>("local_entries"),
+  localEntryUpdates: (mediaIds: readonly number[], accountId: number) =>
+    invoke<(ListEntry | null)[]>("local_entry_updates", { mediaIds, accountId }),
   updateEntry: (
     mediaId: number,
     status: string | null,

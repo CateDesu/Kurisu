@@ -1,7 +1,7 @@
 <script lang="ts">
   import PageHeading from "#lib/PageHeading.svelte";
   import { untrack } from "svelte";
-  import { listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
   import { goto } from "$app/navigation";
   import { api } from "#lib/api.ts";
   import { preferences } from "#lib/preferences.ts";
@@ -21,29 +21,32 @@
   let anchorDay = $state(startOfToday());
   let weekOffset = $state(0);
   let watchingOnly = $state(preferences.get(MINE_KEY) !== "0");
-  let items = $state<AiringItem[]>([]);
-  let entries = $state<ListEntry[]>([]);
+  let items = $state.raw<AiringItem[]>([]);
+  let entries = $state.raw<ListEntry[]>([]);
   let entriesLoading = $state(false);
   let entriesLoaded = $state(false);
+  let entriesStale = true;
   let entriesError = $state("");
   let loading = $state(false);
   let error = $state("");
 
   let entriesLoadId = 0;
-  async function refreshEntries() {
+  async function refreshEntries(mediaIds?: readonly number[]) {
     const id = ++entriesLoadId;
     const epoch = auth.epoch;
     entriesLoading = true;
-    entriesLoaded = false;
     entriesError = "";
-    entries = [];
     try {
-      const fresh = await api.localEntries();
+      const update = await readListUpdate(entriesStale ? undefined : mediaIds);
       if (id !== entriesLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
-      entries = fresh;
+      entries = applyListUpdate(entries, update);
       entriesLoaded = true;
+      entriesStale = false;
     } catch (e) {
-      if (id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn) entriesError = String(e);
+      if (id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn) {
+        entriesStale = true;
+        entriesError = String(e);
+      }
     } finally {
       if (id === entriesLoadId && epoch === auth.epoch) entriesLoading = false;
     }
@@ -161,13 +164,16 @@
     loadedOnce = false;
     loading = false;
     entriesLoaded = false;
+    entriesStale = true;
     entriesLoading = false;
     entriesError = "";
     error = "";
     if (!loggedIn) return;
     const stop = listenForListUpdates(
-      () => { if (epoch === auth.epoch) void refreshEntries(); },
+      (mediaIds) => { if (epoch === auth.epoch) return refreshEntries(mediaIds); },
       (e) => { if (epoch === auth.epoch) error = `Could not listen for list updates: ${String(e)}`; },
+      undefined,
+      { invalidate: () => { entriesLoadId++; }, revision: () => entriesLoadId },
     );
     return () => {
       stop();

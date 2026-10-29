@@ -8,7 +8,8 @@
   import Login from "#lib/Login.svelte";
   import AnimeCard from "#lib/AnimeCard.svelte";
   import Select from "#lib/Select.svelte";
-  import { createListActions, listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, createListActions, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
+  import { measuredRows } from "#lib/measuredRows.ts";
   import type { Snapshot } from "./$types";
 
   const SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"] as const;
@@ -31,12 +32,13 @@
   let titleFilter = $state("");
   let formatFilter = $state("ALL");
   let listFilter = $state("ALL");
-  let media = $state<Media[]>([]);
-  let entries = $state<ListEntry[]>([]);
+  let media = $state.raw<Media[]>([]);
+  let entries = $state.raw<ListEntry[]>([]);
   let loading = $state(false);
   let error = $state("");
   let entriesError = $state("");
   let entriesLoaded = $state(false);
+  let entriesStale = true;
   const actions = createListActions();
   const loggedIn = $derived(auth.isLoggedIn);
 
@@ -83,16 +85,16 @@
   let navigationReady = false;
   let alive = true;
 
-  async function refreshEntries() {
+  async function refreshEntries(mediaIds?: readonly number[]) {
     const id = ++entriesLoadId;
     const epoch = auth.epoch;
     const current = () => alive && id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn;
     entriesError = "";
     try {
-      const list = await api.localEntries();
-      if (current()) { entries = list; entriesLoaded = true; }
+      const update = await readListUpdate(entriesStale ? undefined : mediaIds);
+      if (current()) { entries = applyListUpdate(entries, update); entriesLoaded = true; entriesStale = false; }
     } catch (e) {
-      if (current()) entriesError = String(e);
+      if (current()) { entriesStale = true; entriesError = String(e); }
     }
   }
 
@@ -149,8 +151,9 @@
     error = "";
     const entry = await actions.add(m, status);
     if (!entry || !alive) return;
+    entriesLoadId++;
     entries = [...entries.filter((e) => e.media_id !== m.id), entry];
-    void refreshEntries();
+    if (entriesStale) void refreshEntries();
   }
 
   $effect(() => {
@@ -163,6 +166,7 @@
       if (loading) loadedOnce = false;
       entries = [];
       entriesLoaded = false;
+      entriesStale = true;
       loading = false;
       error = "";
       entriesError = "";
@@ -192,8 +196,10 @@
     const epoch = auth.epoch;
     if (!auth.isLoggedIn) return;
     return listenForListUpdates(
-      () => { if (epoch === auth.epoch) void refreshEntries(); },
+      (mediaIds) => { if (epoch === auth.epoch) return refreshEntries(mediaIds); },
       (e) => { if (epoch === auth.epoch) entriesError = String(e); },
+      undefined,
+      { invalidate: () => { entriesLoadId++; }, revision: () => entriesLoadId },
     );
   });
 
@@ -252,7 +258,7 @@
         <div class="text-ink-dim py-10 text-center">{media.length ? "No shows match these filters." : "Nothing found for this season."}</div>
       {/if}
     {:else}
-      <div class="media-grid">
+      <div class="media-grid" use:measuredRows>
         {#each visible as m (m.id)}
           <AnimeCard media={m} entry={onList.get(m.id)} adding={actions.pending(m.id)} onadd={add} />
         {/each}

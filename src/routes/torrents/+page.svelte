@@ -2,7 +2,7 @@
   import PageHeading from "#lib/PageHeading.svelte";
   import { afterNavigate, goto } from "$app/navigation";
   import { onDestroy } from "svelte";
-  import { listenForListUpdates } from "#lib/list.svelte.ts";
+  import { applyListUpdate, listenForListUpdates, readListUpdate } from "#lib/list.svelte.ts";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api } from "#lib/api.ts";
   import { preferences } from "#lib/preferences.ts";
@@ -59,11 +59,12 @@
     return new Set(Array.isArray(saved) ? STATUS_ORDER.filter((status) => saved.includes(status)) : ["CURRENT"]);
   }
 
-  let items = $state<TorrentItem[]>([]);
+  let items = $state.raw<TorrentItem[]>([]);
   let feedFailures = $state<FeedFailure[]>([]);
-  let entries = $state<ListEntry[]>([]);
+  let entries = $state.raw<ListEntry[]>([]);
   let entriesLoading = $state(false);
   let entriesLoaded = $state(false);
+  let entriesStale = true;
   let entriesError = $state("");
   let feeds = $state<string[]>([]);
   let feedsLoaded = $state(false);
@@ -116,18 +117,22 @@
   let loadId = 0;
   let feedsLoadId = 0;
   let entriesLoadId = 0;
-  async function refreshEntries() {
+  async function refreshEntries(mediaIds?: readonly number[]) {
     const id = ++entriesLoadId;
     const epoch = auth.epoch;
     entriesLoading = true;
     entriesError = "";
     try {
-      const fresh = await api.localEntries();
+      const update = await readListUpdate(entriesStale ? undefined : mediaIds);
       if (id !== entriesLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
-      entries = fresh;
+      entries = applyListUpdate(entries, update);
       entriesLoaded = true;
+      entriesStale = false;
     } catch (e) {
-      if (id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn) entriesError = String(e);
+      if (id === entriesLoadId && epoch === auth.epoch && auth.isLoggedIn) {
+        entriesStale = true;
+        entriesError = String(e);
+      }
     } finally {
       if (id === entriesLoadId && epoch === auth.epoch) entriesLoading = false;
     }
@@ -153,6 +158,7 @@
     const epoch = auth.epoch;
     const configuration = loadFeeds();
     entriesLoaded = false;
+    entriesStale = true;
     entries = [];
     void refreshEntries();
     loading = true;
@@ -275,7 +281,7 @@
   let searchQ = $state("");
   let searching = $state(false);
   let searched = $state(false);
-  let results = $state<TorrentItem[]>([]);
+  let results = $state.raw<TorrentItem[]>([]);
   let submittedQuery = $state("");
   const seenResults = $derived(results.map((item) => seenLinks.has(item.link) || seenGuids(item).some((guid) => seenIdentities.has(guid)) ? { ...item, seen: true } : item));
   const filteredResults = $derived(seenResults.filter(matchesFilters));
@@ -427,6 +433,7 @@
     items = [];
     entries = [];
     entriesLoaded = false;
+    entriesStale = true;
     entriesLoading = false;
     entriesError = "";
     expanded = new Set();
@@ -452,13 +459,15 @@
     if (!loggedIn) return;
     const failures: string[] = [];
     const stop = listenForListUpdates(
-      () => { if (epoch === auth.epoch) void refreshEntries(); },
+      (mediaIds) => { if (epoch === auth.epoch) return refreshEntries(mediaIds); },
       (e) => { failures.push(String(e)); },
       () => {
         if (epoch !== auth.epoch) return;
-        void load();
+        const request = load();
         if (failures.length) error = `Could not listen for list updates: ${failures.join("; ")}`;
+        return request;
       },
+      { invalidate: () => { entriesLoadId++; }, revision: () => entriesLoadId },
     );
     return () => {
       stop();

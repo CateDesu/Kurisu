@@ -34,7 +34,7 @@ Restart MPV afterward. Set custom socket paths in **Settings → Playback tracki
 
 In Library, use **Episode numbering** to adjust files that continue numbering from an earlier season. An offset of `-12` maps file 13 to episode 1. Known single-episode movies can be recognized without a numbered filename. **Watch history** shows local playback that reached the watch threshold and was accepted for tracking, or was already marked watched on your list.
 
-On Linux, hardware acceleration is off by default. Enable **Settings → Performance → Use hardware acceleration** to try smoother scrolling, then quit and reopen Kurisu. If your graphics driver causes a blank window or crashes, launch with `KURISU_DMABUF=0 ./kurisu` and turn the setting off.
+On Linux, hardware acceleration is enabled by default. If your graphics driver causes a blank window or crashes, launch with `KURISU_DMABUF=0 ./kurisu`.
 
 <details>
 <summary>Build from source</summary>
@@ -61,6 +61,8 @@ npm run build
 cargo test --locked --release --manifest-path src-tauri/Cargo.toml --test glib_variant_iter
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
+
+If you launch `src-tauri/target/release/kurisu` directly, run `npx tauri build --no-bundle` after the Cargo checks. Release Cargo tests can replace that executable with a build that expects the development server.
 
 </details>
 

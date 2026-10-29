@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mount, unmount, type Component } from "svelte";
 import { auth } from "./session.svelte";
-import { button, deferred, selectOption, settle } from "./helpers";
+import { button, deferred, selectOption, settle, settleListUpdates } from "./helpers";
 
 const mocks = vi.hoisted(() => ({
-  api: Object.fromEntries(["localEntries", "syncMyList", "setProgress", "getSeason", "getAiringSchedule", "getLibraryBindingDetails", "bindLibraryPath", "getWatchHistory"].map((name) => [name, vi.fn()])),
+  api: Object.fromEntries(["localEntries", "localEntryUpdates", "syncMyList", "setProgress", "getSeason", "getAiringSchedule", "getLibraryBindingDetails", "bindLibraryPath", "getWatchHistory"].map((name) => [name, vi.fn()])),
   library: { files: [] as unknown[], folders: [] as string[], unreadable: [], foldersFailed: false, scanning: false, hasScan: true, ensureScan: vi.fn(), scan: vi.fn(), fileFor: vi.fn() },
-  listeners: new Map<string, Set<() => void>>(),
+  listeners: new Map<string, Set<(message?: { payload: unknown }) => void>>(),
   navigation: [] as (() => void)[],
   openUrl: vi.fn(),
   registration: null as Promise<void> | null,
@@ -16,7 +16,7 @@ vi.mock("#lib/auth.svelte.ts", async () => import("./session.svelte"));
 vi.mock("#lib/library.svelte.ts", () => ({ library: mocks.library }));
 vi.mock("$app/navigation", () => ({ goto: vi.fn(), afterNavigate: (callback: () => void) => mocks.navigation.push(callback) }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async (event: string, callback: () => void) => {
+  listen: vi.fn(async (event: string, callback: (message?: { payload: unknown }) => void) => {
     if (mocks.registration) await mocks.registration;
     const handlers = mocks.listeners.get(event) ?? new Set();
     handlers.add(callback);
@@ -414,9 +414,12 @@ test("seasons re-evaluates its list filter when a queued entry is discarded", as
   selectOption("#season-list-status", "CURRENT");
   await settle();
   expect(document.body.textContent).toContain("Example Show");
-  mocks.api.localEntries.mockResolvedValue([]);
-  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  mocks.api.localEntries.mockClear();
+  mocks.api.localEntryUpdates.mockResolvedValue([null]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1], 1);
   expect(document.body.textContent).not.toContain("Example Show");
   expect(document.body.textContent).toContain("No shows match these filters.");
 });
@@ -427,7 +430,7 @@ test("calendar watching view drops a discarded queued entry", async () => {
   expect(document.body.textContent).toContain("Example Show");
   mocks.api.localEntries.mockResolvedValue([]);
   for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback();
-  await settle();
+  await settleListUpdates();
   expect(document.body.textContent).not.toContain("Example Show");
 });
 

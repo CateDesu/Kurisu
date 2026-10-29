@@ -8,6 +8,7 @@ use crate::models::FeedFailure;
 const FEEDS_KEY: &str = "rss_feeds";
 const DEFAULT_FEEDS: &[&str] = &["https://nyaa.si/?page=rss&c=1_2&f=0"];
 static FEEDS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static HTTP_CLIENT: parking_lot::Mutex<Option<reqwest::Client>> = parking_lot::Mutex::new(None);
 static FETCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 #[derive(Debug, Default, Clone)]
@@ -93,7 +94,11 @@ pub struct FeedFetch {
     pub failures: Vec<FeedFailure>,
 }
 
-pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
+fn http_client() -> Result<reqwest::Client> {
+    let mut cached = HTTP_CLIENT.lock();
+    if let Some(http) = cached.as_ref() {
+        return Ok(http.clone());
+    }
     let http = reqwest::Client::builder()
         .user_agent("Kurisu")
         .timeout(std::time::Duration::from_secs(20))
@@ -105,7 +110,12 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
             }
         }))
         .build()?;
+    *cached = Some(http.clone());
+    Ok(http)
+}
 
+pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
+    let http = http_client()?;
     let mut tasks = Vec::with_capacity(feeds.len());
     for feed in feeds {
         let http = http.clone();
@@ -217,6 +227,10 @@ fn search_url(query: &str, category: &str, filter: &str) -> Result<String> {
         return Err(anyhow!("unsupported torrent filter"));
     }
     let mut url = reqwest::Url::parse("https://nyaa.si/")?;
+    #[cfg(test)]
+    if let Ok(origin) = tests::SEARCH_ORIGIN.try_with(Clone::clone) {
+        url = origin;
+    }
     url.query_pairs_mut()
         .append_pair("page", "rss")
         .append_pair("c", category)
@@ -1000,6 +1014,223 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    tokio::task_local! {
+        pub(super) static SEARCH_ORIGIN: reqwest::Url;
+    }
+
+    struct PersistentFeedServer {
+        origin: reqwest::Url,
+        requests: std::sync::Arc<parking_lot::Mutex<Vec<(usize, String)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl PersistentFeedServer {
+        async fn start(responses: Vec<String>) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin =
+                reqwest::Url::parse(&format!("http://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+            let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let received = requests.clone();
+            let responses = std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::VecDeque::from(responses),
+            ));
+            let task = tokio::spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
+                let mut connections = 0;
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted.unwrap();
+                            connections += 1;
+                            let connection = connections;
+                            let received = received.clone();
+                            let responses = responses.clone();
+                            handlers.spawn(async move {
+                                let mut socket = BufReader::new(socket);
+                                loop {
+                                    let mut request = String::new();
+                                    loop {
+                                        let mut line = String::new();
+                                        if socket.read_line(&mut line).await.unwrap() == 0 {
+                                            return;
+                                        }
+                                        request.push_str(&line);
+                                        if line == "\r\n" {
+                                            break;
+                                        }
+                                    }
+                                    received.lock().push((connection, request));
+                                    let response = responses.lock().pop_front().unwrap();
+                                    socket.get_mut().write_all(response.as_bytes()).await.unwrap();
+                                    if response.is_empty() || response.contains("\r\nConnection: close\r\n") {
+                                        return;
+                                    }
+                                }
+                            });
+                        }
+                        Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                            result.unwrap();
+                        }
+                    }
+                }
+            });
+            Self {
+                origin,
+                requests,
+                task,
+            }
+        }
+    }
+
+    impl Drop for PersistentFeedServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn persistent_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn sequential_refreshes_and_searches_share_one_connection() {
+        let server = PersistentFeedServer::start(vec![persistent_response(SAMPLE); 6]).await;
+        let feeds = [server.origin.join("rss").unwrap().into()];
+        SEARCH_ORIGIN
+            .scope(server.origin.clone(), async {
+                for _ in 0..2 {
+                    let fetched = fetch_all(&feeds).await.unwrap();
+                    assert_eq!(fetched.items.len(), 3);
+                    assert!(fetched.failures.is_empty());
+                }
+                for query in ["First search", "Second search"] {
+                    assert_eq!(search(query, "1_2", "2").await.unwrap().len(), 3);
+                }
+                for query in ["First show", "Second show"] {
+                    let fetched = search_variants(&[query.into()], "1_2", "2").await.unwrap();
+                    assert_eq!(fetched.items.len(), 3);
+                    assert!(fetched.failures.is_empty());
+                }
+                assert!(search("Invalid", "0_0", "2").await.is_err());
+                assert!(search_variants(&["Invalid".into()], "1_2", "3")
+                    .await
+                    .is_err());
+            })
+            .await;
+        let requests = server.requests.lock();
+        assert_eq!(requests.len(), 6);
+        let connections: std::collections::HashSet<_> = requests.iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            connections.len(),
+            1,
+            "six calls must share one HTTP/1 connection"
+        );
+        for (_, request) in requests.iter() {
+            assert!(request.lines().next().unwrap().ends_with(" HTTP/1.1"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("\r\nuser-agent: kurisu\r\n"));
+        }
+        for (index, query) in ["First search", "Second search", "First show", "Second show"]
+            .iter()
+            .enumerate()
+        {
+            let target = requests[index + 2].1.split_whitespace().nth(1).unwrap();
+            let url = server.origin.join(target).unwrap();
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(pairs["q"], *query);
+            assert_eq!(pairs["page"], "rss");
+            assert_eq!(pairs["c"], "1_2");
+            assert_eq!(pairs["f"], "2");
+            if index >= 2 {
+                assert_eq!(pairs["s"], "seeders");
+                assert_eq!(pairs["o"], "desc");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_client_recovers_after_transport_failure_and_connection_close() {
+        let closed = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SAMPLE}",
+            SAMPLE.len()
+        );
+        let server = PersistentFeedServer::start(vec![
+            String::new(),
+            closed,
+            persistent_response(SAMPLE),
+            persistent_response(SAMPLE),
+        ])
+        .await;
+        let feeds = [server.origin.join("rss").unwrap().into()];
+        assert!(fetch_all(&feeds).await.is_err());
+        for _ in 0..3 {
+            let fetched = fetch_all(&feeds).await.unwrap();
+            assert_eq!(fetched.items.len(), 3);
+            assert!(fetched.failures.is_empty());
+        }
+        let requests = server.requests.lock();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [1, 2, 3, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_failures_do_not_poison_later_requests() {
+        let unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        let truncated =
+            "<rss><channel><item><title>Recovered</title><link>https://example.com/1</link></item>";
+        let server = PersistentFeedServer::start(vec![
+            unavailable.into(),
+            persistent_response("<html><body>Unavailable</body></html>"),
+            persistent_response(SAMPLE),
+            unavailable.into(),
+            persistent_response(truncated),
+            persistent_response(SAMPLE),
+        ])
+        .await;
+        SEARCH_ORIGIN
+            .scope(server.origin.clone(), async {
+                assert!(search("HTTP failure", "1_2", "0")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("503"));
+                assert!(search("Invalid feed", "1_2", "0")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not an RSS feed"));
+                assert_eq!(search("Recovered", "1_2", "0").await.unwrap().len(), 3);
+                assert!(search_variants(&["HTTP failure".into()], "1_2", "0")
+                    .await
+                    .is_err());
+                let partial = search_variants(&["Partial".into()], "1_2", "0")
+                    .await
+                    .unwrap();
+                assert_eq!(partial.items.len(), 1);
+                assert_eq!(partial.items[0].title, "Recovered");
+                assert_eq!(partial.failures.len(), 1);
+                let recovered = search_variants(&["Recovered".into()], "1_2", "0")
+                    .await
+                    .unwrap();
+                assert_eq!(recovered.items.len(), 3);
+                assert!(recovered.failures.is_empty());
+            })
+            .await;
+        let requests = server.requests.lock();
+        assert_eq!(requests.len(), 6);
+        assert!(requests.iter().all(|(id, _)| *id == 1));
     }
 
     #[tokio::test]

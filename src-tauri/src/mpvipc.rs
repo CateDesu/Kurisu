@@ -75,7 +75,7 @@ fn probe_one(path: &str) -> Option<MpvSnapshot> {
 
     struct Pipe<'a> {
         socket: NamedPipeClient,
-        runtime: &'a tokio::runtime::Runtime,
+        runtime: &'a ProbeRuntime,
         deadline: tokio::time::Instant,
     }
 
@@ -117,13 +117,10 @@ fn probe_one(path: &str) -> Option<MpvSnapshot> {
         }
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
+    let runtime = probe_runtime()?;
     let deadline = std::time::Instant::now() + QUERY_DEADLINE;
     let socket = {
-        let _guard = runtime.enter();
+        let _guard = runtime.handle().enter();
         ClientOptions::new().open(path).ok()?
     };
     // Dropping overlapped I/O closes a stalled pipe so the next probe can retry.
@@ -133,6 +130,44 @@ fn probe_one(path: &str) -> Option<MpvSnapshot> {
         deadline: deadline.into(),
     };
     query(BufReader::new(&pipe), &pipe, deadline)
+}
+
+#[cfg(any(windows, test))]
+enum ProbeRuntime {
+    Shared(tokio::runtime::Handle),
+    Local(tokio::runtime::Runtime),
+}
+
+#[cfg(any(windows, test))]
+impl ProbeRuntime {
+    fn handle(&self) -> &tokio::runtime::Handle {
+        match self {
+            Self::Shared(handle) => handle,
+            Self::Local(runtime) => runtime.handle(),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        match self {
+            Self::Shared(handle) => handle.block_on(future),
+            Self::Local(runtime) => runtime.block_on(future),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn probe_runtime() -> Option<ProbeRuntime> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return Some(ProbeRuntime::Shared(handle));
+        }
+    }
+    // A current-thread handle alone cannot drive pipe I/O or deadlines.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    Some(ProbeRuntime::Local(runtime))
 }
 
 fn query<R: BufRead, W: Write>(
@@ -261,13 +296,72 @@ mod tests {
     use std::io::Cursor;
     use std::time::Duration;
 
+    #[test]
+    fn synchronous_probes_keep_a_local_runtime_alive() {
+        let runtime = probe_runtime().unwrap();
+        assert!(matches!(runtime, ProbeRuntime::Local(_)));
+        let _entered = runtime.handle().enter();
+        runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_probes_reuse_the_running_runtime_and_its_timer_driver() {
+        let local_runtimes = tokio::task::spawn_blocking(|| {
+            let mut local_runtimes = 0;
+            for _ in 0..20 {
+                let runtime = probe_runtime().unwrap();
+                local_runtimes += usize::from(matches!(runtime, ProbeRuntime::Local(_)));
+                let _entered = runtime.handle().enter();
+                runtime.block_on(async {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                });
+            }
+            local_runtimes
+        })
+        .await
+        .unwrap();
+        assert_eq!(local_runtimes, 0);
+    }
+
+    #[tokio::test]
+    async fn current_thread_callers_keep_the_local_driver_fallback() {
+        tokio::task::spawn_blocking(|| {
+            let runtime = probe_runtime().unwrap();
+            assert!(matches!(runtime, ProbeRuntime::Local(_)));
+            let _entered = runtime.handle().enter();
+            runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+        })
+        .await
+        .unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_stalled_windows_pipe_closes_and_recovers_without_restarting() {
+        windows_pipe_recovery(false);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_stalled_windows_pipe_recovers_on_the_shared_runtime() {
+        tokio::task::spawn_blocking(|| windows_pipe_recovery(true))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn windows_pipe_recovery(shared: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         use tokio::net::windows::named_pipe::ServerOptions;
 
-        let path = format!(r"\\.\pipe\kurisu-mpv-recovery-{}", std::process::id());
+        let path = format!(
+            r"\\.\pipe\kurisu-mpv-recovery-{}-{shared}",
+            std::process::id()
+        );
         let server_path = path.clone();
         let (ready, wait) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {

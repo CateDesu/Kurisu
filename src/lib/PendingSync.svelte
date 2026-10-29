@@ -11,10 +11,49 @@
   let error = $state("");
   let loadId = 0;
   let mounted = true;
-  onDestroy(() => { mounted = false; loadId++; });
+  let refreshQueued = false;
+  let refreshTask: Promise<void> | undefined;
+  let actionActive = false;
+  onDestroy(() => { mounted = false; loadId++; refreshQueued = false; });
+
+  function refresh(invalidate = true): Promise<void> {
+    if (!mounted || !auth.isLoggedIn) return Promise.resolve();
+    if (invalidate) {
+      loadId++;
+      refreshQueued = true;
+    } else if (!refreshTask && !actionActive) refreshQueued = true;
+    if (!refreshTask && !actionActive) refreshTask = drainRefreshes();
+    return refreshTask ?? Promise.resolve();
+  }
+
+  async function drainRefreshes() {
+    await Promise.resolve();
+    try {
+      while (refreshQueued && mounted && auth.isLoggedIn && !actionActive) {
+        refreshQueued = false;
+        const id = loadId;
+        const epoch = auth.epoch;
+        const current = () => mounted && epoch === auth.epoch && auth.isLoggedIn && id === loadId;
+        try {
+          const result = await api.getPendingChanges();
+          if (current()) {
+            items = result;
+            if (!busy) error = "";
+          }
+        } catch (e) {
+          if (current()) error = String(e);
+        }
+      }
+    } finally {
+      refreshTask = undefined;
+    }
+  }
 
   $effect(() => {
     const epoch = auth.epoch;
+    loadId++;
+    refreshQueued = false;
+    actionActive = false;
     items = [];
     error = "";
     busy = false;
@@ -23,30 +62,28 @@
     let alive = true;
     let unlisten: (() => void) | undefined;
     const current = () => alive && epoch === auth.epoch && auth.isLoggedIn;
-    async function load() {
-      const id = ++loadId;
-      try {
-        const result = await api.getPendingChanges();
-        if (current() && id === loadId) { items = result; error = ""; }
-      } catch (e) {
-        if (current() && id === loadId) error = String(e);
-      }
-    }
-    const timer = setInterval(() => void load(), 30_000);
-    listen("kurisu://pending-changed", () => void load()).then((stop) => {
+    const changed = () => { if (current()) void refresh(); };
+    const visible = () => { if (document.visibilityState === "visible") changed(); };
+    const timer = setInterval(() => {
+      if (current() && document.visibilityState === "visible") void refresh(false);
+    }, 30_000);
+    listen("kurisu://pending-changed", changed).then((stop) => {
       if (current()) unlisten = stop;
       else stop();
     }).catch((e) => { if (current()) error = String(e); }).then(() => {
-      if (current()) void load();
+      changed();
     });
-    const online = () => void retry();
+    const online = () => { if (current()) void retry(); };
     window.addEventListener("online", online);
+    document.addEventListener("visibilitychange", visible);
     return () => {
       alive = false;
       loadId++;
+      refreshQueued = false;
       clearInterval(timer);
       unlisten?.();
       window.removeEventListener("online", online);
+      document.removeEventListener("visibilitychange", visible);
     };
   });
 
@@ -55,6 +92,8 @@
     const epoch = auth.epoch;
     const current = () => mounted && epoch === auth.epoch && auth.isLoggedIn;
     busy = true;
+    actionActive = true;
+    loadId++;
     error = "";
     try {
       await action();
@@ -62,13 +101,8 @@
       if (current()) error = String(e);
     } finally {
       if (current()) {
-        const id = ++loadId;
-        try {
-          const result = await api.getPendingChanges();
-          if (current() && id === loadId) items = result;
-        } catch (e) {
-          if (current() && id === loadId) error = String(e);
-        }
+        actionActive = false;
+        await refresh();
         if (current()) busy = false;
       }
     }

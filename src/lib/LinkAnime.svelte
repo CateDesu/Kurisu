@@ -63,20 +63,19 @@
   };
   const COLLATOR = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
   const MAX_ROWS = 100;
+  const ordered = $derived([...entries].sort((a, b) => {
+    const status = (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9);
+    return status || COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
+  }));
   const candidates = $derived.by(() => {
     const needle = q.trim().toLowerCase();
-    return entries
+    return ordered
       .filter((e) => {
         if (!needle) return true;
         const m = e.media;
         return [m?.title_english, m?.title_romaji, m?.title_native].some((t) =>
           t?.toLowerCase().includes(needle)
         );
-      })
-      .sort((a, b) => {
-        const s = (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9);
-        if (s !== 0) return s;
-        return COLLATOR.compare(displayTitle(a.media), displayTitle(b.media));
       })
       .slice(0, MAX_ROWS);
   });

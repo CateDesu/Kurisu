@@ -14,7 +14,7 @@
   import Login from "#lib/Login.svelte";
   import Img from "#lib/Img.svelte";
 
-  let items = $state<Notification[]>([]);
+  let items = $state.raw<Notification[]>([]);
   let loading = $state(true);
   let error = $state("");
   let unread = $state<number | null>(null);

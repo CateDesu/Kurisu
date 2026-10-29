@@ -14,18 +14,14 @@
   let trackingError = $state("");
 
   let closeToTray = $state(false);
-  const isLinux = typeof navigator !== "undefined" && navigator.userAgent.includes("Linux");
   const isWindows = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
   const defaultMpvSocket = isWindows ? String.raw`\\.\pipe\mpvsocket` : "/tmp/mpvsocket";
-  let hardwareAcceleration = $state(false);
-  let renderingSaved = $state(false);
 
   let autoUpdate = $state(true);
-  type ToggleKey = "close_to_tray" | "auto_update" | "hardware_acceleration";
+  type ToggleKey = "close_to_tray" | "auto_update";
   const toggles = $state({
     close_to_tray: { loaded: false, loading: false, saving: false, error: "" },
     auto_update: { loaded: false, loading: false, saving: false, error: "" },
-    hardware_acceleration: { loaded: false, loading: false, saving: false, error: "" },
   });
   let update = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
@@ -61,8 +57,7 @@
     try {
       const value = await api.getAppSetting(key);
       if (key === "close_to_tray") closeToTray = value === "1";
-      else if (key === "auto_update") autoUpdate = value !== "0";
-      else hardwareAcceleration = value === "1";
+      else autoUpdate = value !== "0";
       state.loaded = true;
     } catch (e) {
       state.error = String(e);
@@ -141,17 +136,14 @@
   async function toggleSetting(key: ToggleKey) {
     const state = toggles[key];
     if (!state.loaded || state.saving) return;
-    const value = key === "close_to_tray" ? closeToTray : key === "auto_update" ? autoUpdate : hardwareAcceleration;
+    const value = key === "close_to_tray" ? closeToTray : autoUpdate;
     state.saving = true;
     state.error = "";
-    if (key === "hardware_acceleration") renderingSaved = false;
     try {
       await api.setAppSetting(key, value ? "1" : "0");
-      if (key === "hardware_acceleration") renderingSaved = true;
     } catch (e) {
       if (key === "close_to_tray") closeToTray = !value;
-      else if (key === "auto_update") autoUpdate = !value;
-      else hardwareAcceleration = !value;
+      else autoUpdate = !value;
       state.error = String(e);
     } finally {
       state.saving = false;
@@ -184,7 +176,6 @@
   load();
   void loadToggle("close_to_tray");
   void loadToggle("auto_update");
-  if (isLinux) void loadToggle("hardware_acceleration");
 </script>
 
 <div class="page-content space-y-5">
@@ -358,37 +349,6 @@
       </p>
     {/if}
   </section>
-
-  {#if isLinux}
-    <section class="pt-4 border-t border-edge">
-      <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Performance</h2>
-      <label class="flex items-center gap-2 text-sm cursor-pointer">
-        <input
-          type="checkbox"
-          bind:checked={hardwareAcceleration}
-          disabled={!toggles.hardware_acceleration.loaded || toggles.hardware_acceleration.saving}
-          onchange={() => toggleSetting("hardware_acceleration")}
-          class="accent-accent"
-        />
-        Use hardware acceleration
-      </label>
-      <p class="text-xs text-ink-dim mt-1">
-        Off by default. Uses your graphics card and may make scrolling smoother.
-        Restart Kurisu after changing this setting. Turn it off if you see graphics problems.
-      </p>
-      {#if renderingSaved}
-        <p class="text-xs text-accent mt-2" role="status">Saved. Quit and reopen Kurisu to apply.</p>
-      {/if}
-      {#if toggles.hardware_acceleration.error}
-        <p class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mt-2">
-          Rendering setting: {toggles.hardware_acceleration.error}
-          {#if !toggles.hardware_acceleration.loaded}
-            <button onclick={() => loadToggle("hardware_acceleration")} disabled={toggles.hardware_acceleration.loading} class="underline ml-2">Retry</button>
-          {/if}
-        </p>
-      {/if}
-    </section>
-  {/if}
 
   <section class="pt-4 border-t border-edge">
     <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Updates</h2>

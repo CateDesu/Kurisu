@@ -8,6 +8,13 @@ let top: number;
 let resize: ResizeObserverCallback;
 let disconnect: ReturnType<typeof vi.fn>;
 let observed: Set<Element>;
+let frames: Map<number, FrameRequestCallback>;
+
+function paint() {
+  const callbacks = [...frames.values()];
+  frames.clear();
+  for (const callback of callbacks) callback(0);
+}
 
 async function updateContent() {
   node.append(document.createElement("div"));
@@ -19,6 +26,13 @@ beforeEach(() => {
   top = 0;
   disconnect = vi.fn();
   observed = new Set();
+  frames = new Map();
+  let nextFrame = 0;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    frames.set(++nextFrame, callback);
+    return nextFrame;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
   vi.stubGlobal("ResizeObserver", class {
     constructor(callback: ResizeObserverCallback) { resize = callback; }
     observe(element: Element) { observed.add(element); }
@@ -52,6 +66,35 @@ test("restores immediately when the content is already available", () => {
   memory.restore({ left: 20, top: 1200 });
   expect(memory.capture()).toEqual({ left: 20, top: 1200 });
   expect(disconnect).not.toHaveBeenCalled();
+});
+
+test("suppresses scroll anchoring until restored content has painted", async () => {
+  node.style.setProperty("overflow-anchor", "auto", "important");
+  height = 400;
+  memory.restore({ left: 0, top: 1200 });
+  expect(node.style.overflowAnchor).toBe("none");
+  expect(node.style.getPropertyPriority("overflow-anchor")).toBe("important");
+  height = 2000;
+  await updateContent();
+  expect(node.scrollTop).toBe(1200);
+  paint();
+  expect(node.style.overflowAnchor).toBe("none");
+  paint();
+  expect(node.style.overflowAnchor).toBe("auto");
+  expect(node.style.getPropertyPriority("overflow-anchor")).toBe("important");
+  expect(frames.size).toBe(0);
+});
+
+test("a new restore cancels the previous anchoring cleanup", () => {
+  memory.restore({ left: 0, top: 1200 });
+  paint();
+  memory.restore({ left: 0, top: 700 });
+  paint();
+  expect(node.style.overflowAnchor).toBe("none");
+  expect(node.scrollTop).toBe(700);
+  paint();
+  expect(node.style.overflowAnchor).toBe("");
+  expect(frames.size).toBe(0);
 });
 
 test("waits for cached rows before completing Back restoration", async () => {
@@ -104,6 +147,9 @@ test.each(["wheel", "pointerdown", "touchstart", "keydown"])(
     await updateContent();
     expect(node.scrollTop).toBe(300);
     expect(disconnect).toHaveBeenCalledOnce();
+    expect(node.style.overflowAnchor).toBe("");
+    resize([], {} as ResizeObserver);
+    expect(node.scrollTop).toBe(300);
   },
 );
 

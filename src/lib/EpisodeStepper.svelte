@@ -12,12 +12,14 @@
     total = null,
     onchange,
     onerror,
+    onpendingchange,
   }: {
     mediaId: number;
     progress: number;
     total?: number | null;
     onchange?: (e: ListEntry) => void;
     onerror?: (message: string) => void;
+    onpendingchange?: (pending: boolean) => void;
   } = $props();
 
   let pending = $state(untrack(() => progress));
@@ -35,6 +37,8 @@
   const dirty = $derived(pending !== saved);
   const atMin = $derived(pending <= 0);
   const atMax = $derived(pending >= (total ?? 9999));
+
+  $effect(() => { onpendingchange?.(dirty || saving); });
 
   function step(delta: number) {
     if (saving || installInFlight() || auth.changingSession) return;
