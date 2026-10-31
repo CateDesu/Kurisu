@@ -183,3 +183,37 @@ test("settings shows a failed logout save while the current account stays signed
   expect(document.querySelector('[role="dialog"]')).toBeNull();
   expect(mocks.api.logout).not.toHaveBeenCalled();
 });
+
+
+test("profileless offline session expiry dismisses the open logout confirmation", async () => {
+  await auth.logout();
+  mocks.api.logout.mockClear();
+  mocks.api.currentUser.mockRejectedValue(new Error("AniList unavailable"));
+  await auth.refresh();
+  expect(auth.ready).toBe(true);
+  expect(auth.user).toBeNull();
+  expect(auth.offline).toBe(true);
+  expect(auth.isLoggedIn).toBe(true);
+
+  components.push(mount(Settings, { target: document.body }));
+  await settle();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+  button("Log out").click();
+  await settle();
+  expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Log out?");
+  expect(auth.isLoggedIn).toBe(true);
+  expect(mocks.api.logout).not.toHaveBeenCalled();
+
+  const expired = mocks.listeners.get("kurisu://auth-expired");
+  expect(expired).toBeTypeOf("function");
+  mocks.api.isLoggedIn.mockClear().mockResolvedValue(false);
+  await expired!();
+  await settle();
+  expect(mocks.api.isLoggedIn).toHaveBeenCalledOnce();
+  expect(auth.user).toBeNull();
+  expect(auth.offline).toBe(false);
+  expect(auth.isLoggedIn).toBe(false);
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+  expect(button("Sign in with AniList")).toBeTruthy();
+  expect(mocks.api.logout).not.toHaveBeenCalled();
+});

@@ -1350,3 +1350,25 @@ test("torrent history reloads search seen state after an account change", async 
   expect(mocks.api.searchTorrents).toHaveBeenCalledTimes(2);
   expect(document.querySelector('[title="Download .torrent"]')!.closest(".cv-row")!.classList.contains("opacity-60")).toBe(false);
 });
+
+test("a stored offline session without a profile can log out from settings", async () => {
+  auth.user = null;
+  auth.offline = true;
+  auth.isLoggedIn = true;
+  const logout = vi.fn(async () => { auth.isLoggedIn = false; auth.offline = false; auth.epoch++; });
+  Object.assign(auth, { logout });
+  try {
+    await render(Settings);
+    expect(document.body.textContent).not.toContain("Not signed in.");
+    button("Log out").click();
+    await settle();
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    const confirm = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((element) => element.textContent?.trim() === "Log out")!;
+    confirm.click();
+    await settle();
+    expect(logout).toHaveBeenCalledOnce();
+    expect(document.body.textContent).toContain("Not signed in.");
+  } finally {
+    delete (auth as unknown as { logout?: unknown }).logout;
+  }
+});

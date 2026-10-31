@@ -241,14 +241,17 @@ pub(crate) fn stage(
     };
     let existing = state.db.pending_change(account, media_id)?;
     let already_pending = existing.is_some();
-    let mut pending = existing.unwrap_or(Pending {
-        media_id,
-        base: state.db.get_entry(media_id)?,
-        patch: Patch::default(),
-        error: None,
-        conflict: false,
-        missing_media: false,
-    });
+    let mut pending = match existing {
+        Some(pending) => pending,
+        None => Pending {
+            media_id,
+            base: state.db.get_entry(media_id)?,
+            patch: Patch::default(),
+            error: None,
+            conflict: false,
+            missing_media: false,
+        },
+    };
     if pending.missing_media {
         return Err(anyhow::anyhow!(
             "This anime was removed from AniList. Resolve its saved change before continuing."
@@ -321,12 +324,7 @@ pub(crate) fn overlay(state: &AppState) -> Result<()> {
 
 pub(crate) fn mark_media_missing(state: &AppState, media_id: i64) -> Result<()> {
     if let Some(account) = account_id(&state.db) {
-        if let Some(mut pending) = state
-            .db
-            .pending(account)?
-            .into_iter()
-            .find(|p| p.media_id == media_id)
-        {
+        if let Some(mut pending) = state.db.pending_change(account, media_id)? {
             pending.conflict = true;
             pending.missing_media = true;
             pending.error = Some("This anime was removed or merged on AniList. Your saved change is retained here until you discard it.".into());
@@ -704,10 +702,8 @@ async fn resolve_pending_inner(
     let account = account_id(&state.db).ok_or("Not signed in")?;
     let Some(pending) = state
         .db
-        .pending(account)
+        .pending_change(account, media_id)
         .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|p| p.media_id == media_id)
     else {
         return Ok(());
     };
@@ -1159,6 +1155,216 @@ mod tests {
             assert_eq!(PENDING_DESERIALIZATIONS.get() - before, 1);
             assert_eq!(crate::db::durable_commit_count(), commits);
         }
+    }
+
+    #[test]
+    fn staging_reads_baseline_only_for_new_pending_changes() {
+        let state = state(
+            anilist::AniList::new(),
+            Db::open(Path::new(":memory:")).unwrap(),
+        );
+        seed(&state);
+        for media_id in [1, 2] {
+            let base = serde_json::to_value(state.db.get_entry(media_id).unwrap()).unwrap();
+            let trace = SqlTrace::new(&state.db);
+            let baseline_reads = || {
+                trace
+                    .statements
+                    .borrow()
+                    .iter()
+                    .filter(|sql| sql.contains("FROM list_entry"))
+                    .count()
+            };
+            let (account, mut pending, already_pending) = stage(
+                &state,
+                media_id,
+                Patch {
+                    status: Some("PAUSED".into()),
+                    progress: Some(4),
+                    repeat: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(account, 7);
+            assert!(!already_pending);
+            assert_eq!(serde_json::to_value(&pending.base).unwrap(), base);
+            assert_eq!(baseline_reads(), 1);
+            pending.error = Some("Saved failure".into());
+            pending.conflict = true;
+            state.db.put_pending(account, &pending).unwrap();
+            state
+                .db
+                .0
+                .lock()
+                .execute(
+                    "UPDATE list_entry SET progress = 9 WHERE media_id = ?",
+                    [media_id],
+                )
+                .unwrap();
+            trace.statements.borrow_mut().clear();
+            let commits = crate::db::durable_commit_count();
+            let (account, updated, already_pending) = stage(
+                &state,
+                media_id,
+                Patch {
+                    progress: Some(5),
+                    score: Some(8.5),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(account, 7);
+            assert!(already_pending);
+            assert_eq!(baseline_reads(), 0);
+            assert_eq!(serde_json::to_value(&updated.base).unwrap(), base);
+            assert_eq!(updated.patch.status.as_deref(), Some("PAUSED"));
+            assert_eq!(updated.patch.progress, Some(5));
+            assert_eq!(updated.patch.score, Some(8.5));
+            assert_eq!(updated.patch.repeat, Some(1));
+            assert_eq!(updated.error, pending.error);
+            assert!(updated.conflict);
+            assert!(!updated.missing_media);
+            assert_eq!(crate::db::durable_commit_count(), commits + 1);
+            assert_eq!(
+                serde_json::to_value(state.db.pending_change(7, media_id).unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(&updated).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn staging_preserves_required_baseline_errors_without_blocking_existing_pending() {
+        let state = state(
+            anilist::AniList::new(),
+            Db::open(Path::new(":memory:")).unwrap(),
+        );
+        seed(&state);
+        let (_, pending, _) = stage(
+            &state,
+            1,
+            Patch {
+                progress: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        state
+            .db
+            .0
+            .lock()
+            .execute(
+                "UPDATE list_entry SET progress = 'broken' WHERE media_id = 1",
+                [],
+            )
+            .unwrap();
+        let baseline_error = state.db.get_entry(1).unwrap_err().to_string();
+        state.db.set_setting("anilist_user_id", "9").unwrap();
+        let trace = SqlTrace::new(&state.db);
+        let commits = crate::db::durable_commit_count();
+        let error = stage(&state, 1, Patch::default()).unwrap_err();
+        assert_eq!(error.to_string(), baseline_error);
+        assert_eq!(crate::db::durable_commit_count(), commits);
+        assert!(state.db.pending_change(9, 1).unwrap().is_none());
+        assert_eq!(
+            trace
+                .statements
+                .borrow()
+                .iter()
+                .filter(|sql| sql.contains("FROM list_entry"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.pending_change(7, 1).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&pending).unwrap()
+        );
+        state.db.set_setting("anilist_user_id", "7").unwrap();
+        trace.statements.borrow_mut().clear();
+        let commits = crate::db::durable_commit_count();
+        let (account, updated, already_pending) = stage(
+            &state,
+            1,
+            Patch {
+                score: Some(8.5),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(account, 7);
+        assert!(already_pending);
+        assert_eq!(
+            serde_json::to_value(&updated.base).unwrap(),
+            serde_json::to_value(&pending.base).unwrap()
+        );
+        assert_eq!(updated.patch.progress, Some(4));
+        assert_eq!(updated.patch.score, Some(8.5));
+        assert_eq!(crate::db::durable_commit_count(), commits + 1);
+        assert!(!trace
+            .statements
+            .borrow()
+            .iter()
+            .any(|sql| sql.contains("FROM list_entry")));
+    }
+
+    #[test]
+    fn staging_rejects_missing_media_without_reading_baseline() {
+        let state = state(
+            anilist::AniList::new(),
+            Db::open(Path::new(":memory:")).unwrap(),
+        );
+        seed(&state);
+        let pending = Pending {
+            media_id: 1,
+            base: state.db.get_entry(1).unwrap(),
+            patch: Patch {
+                progress: Some(4),
+                ..Default::default()
+            },
+            error: Some("Saved failure".into()),
+            conflict: true,
+            missing_media: true,
+        };
+        state.db.put_pending(7, &pending).unwrap();
+        state
+            .db
+            .0
+            .lock()
+            .execute(
+                "UPDATE list_entry SET progress = 'broken' WHERE media_id = 1",
+                [],
+            )
+            .unwrap();
+        let trace = SqlTrace::new(&state.db);
+        let commits = crate::db::durable_commit_count();
+        let error = stage(
+            &state,
+            1,
+            Patch {
+                progress: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "This anime was removed from AniList. Resolve its saved change before continuing."
+        );
+        assert!(!trace
+            .statements
+            .borrow()
+            .iter()
+            .any(|sql| sql.contains("FROM list_entry")));
+        assert_eq!(crate::db::durable_commit_count(), commits);
+        assert_eq!(
+            serde_json::to_value(state.db.pending_change(7, 1).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&pending).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2834,6 +3040,270 @@ mod tests {
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 3);
         assert!(state.db.pending(7).unwrap().is_empty());
         assert!(requests.try_recv().is_err());
+    }
+
+    fn single_title_lookup_fixture(count: i64, missing_media: bool) -> (AppState, Pending) {
+        let mut api = anilist::AniList::new();
+        api.set_token(Some("test-session".into()));
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        state.refresh_matchers();
+        let pending = Pending {
+            media_id: 1,
+            base: state.db.get_entry(1).unwrap(),
+            patch: Patch {
+                status: Some("PAUSED".into()),
+                progress: Some(4),
+                score: Some(0.0),
+                repeat: Some(2),
+            },
+            error: Some("Saved failure".into()),
+            conflict: missing_media,
+            missing_media,
+        };
+        state
+            .db
+            .durable_write(|conn| {
+                let mut insert = conn.prepare("INSERT INTO pending_change VALUES (7,?,?)")?;
+                for media_id in 1..=count {
+                    let mut row = pending.clone();
+                    row.media_id = media_id;
+                    if media_id != 1 {
+                        row.base = None;
+                    }
+                    insert.execute(rusqlite::params![media_id, serde_json::to_string(&row)?])?;
+                }
+                conn.execute("INSERT INTO pending_change VALUES (9,1,'invalid')", [])?;
+                conn.execute("INSERT INTO pending_change VALUES (9,6000,'invalid')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        (state, pending)
+    }
+
+    #[test]
+    fn indexed_single_title_missing_parses_one_payload_and_retains_intent() {
+        for count in [1, 5000] {
+            let (state, mut expected) = single_title_lookup_fixture(count, false);
+            if count == 5000 {
+                state.db.delete_media(1).unwrap();
+                assert!(state.db.get_media(1).unwrap().is_none());
+            }
+            let parses = PENDING_DESERIALIZATIONS.get();
+            let commits = crate::db::durable_commit_count();
+            let events = ENTRY_NOTIFICATIONS.get();
+            mark_media_missing(&state, 1).unwrap();
+            assert_eq!(
+                PENDING_DESERIALIZATIONS.get() - parses,
+                1,
+                "queue size {count}"
+            );
+            assert_eq!(crate::db::durable_commit_count() - commits, 1);
+            assert_eq!(ENTRY_NOTIFICATIONS.get() - events, 1);
+            assert!(state.db.get_entry(1).unwrap().is_none());
+            assert!(state.matchers.lock().is_empty());
+            let current = state.db.pending_change(7, 1).unwrap().unwrap();
+            assert!(current
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("removed or merged"));
+            expected.error.clone_from(&current.error);
+            expected.conflict = true;
+            expected.missing_media = true;
+            assert_eq!(
+                serde_json::to_value(current).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_single_title_missing_isolates_payload_errors_and_absent_targets() {
+        let (state, pending) = single_title_lookup_fixture(1, false);
+        state
+            .db
+            .0
+            .lock()
+            .execute("INSERT INTO pending_change VALUES (7,2,'invalid')", [])
+            .unwrap();
+        for account in [None, Some("7")] {
+            match account {
+                None => state.db.delete_setting("anilist_user_id").unwrap(),
+                Some(account) => state.db.set_setting("anilist_user_id", account).unwrap(),
+            }
+            let writes = state.db.0.lock().total_changes();
+            let parses = PENDING_DESERIALIZATIONS.get();
+            let events = ENTRY_NOTIFICATIONS.get();
+            mark_media_missing(&state, if account.is_none() { 1 } else { 6000 }).unwrap();
+            assert_eq!(PENDING_DESERIALIZATIONS.get() - parses, 0);
+            assert_eq!(state.db.0.lock().total_changes(), writes);
+            assert_eq!(ENTRY_NOTIFICATIONS.get(), events);
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 3);
+            assert_eq!(state.matchers.lock()[0].media_id, 1);
+        }
+        state
+            .db
+            .0
+            .lock()
+            .execute(
+                "UPDATE pending_change SET payload='invalid' WHERE account_id=7 AND media_id=1",
+                [],
+            )
+            .unwrap();
+        let expected_error = state.db.pending_change(7, 1).unwrap_err().to_string();
+        let parses = PENDING_DESERIALIZATIONS.get();
+        let writes = state.db.0.lock().total_changes();
+        let events = ENTRY_NOTIFICATIONS.get();
+        assert_eq!(
+            mark_media_missing(&state, 1).unwrap_err().to_string(),
+            expected_error
+        );
+        assert_eq!(PENDING_DESERIALIZATIONS.get() - parses, 1);
+        assert_eq!(state.db.0.lock().total_changes(), writes);
+        assert_eq!(ENTRY_NOTIFICATIONS.get(), events);
+        assert!(state.db.get_entry(1).unwrap().is_some());
+        state.db.put_pending(7, &pending).unwrap();
+        let parses = PENDING_DESERIALIZATIONS.get();
+        mark_media_missing(&state, 1).unwrap();
+        assert_eq!(PENDING_DESERIALIZATIONS.get() - parses, 1);
+        assert!(
+            state
+                .db
+                .pending_change(7, 1)
+                .unwrap()
+                .unwrap()
+                .missing_media
+        );
+        assert!(state.db.pending_change(7, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn indexed_single_title_resolution_parses_one_payload_for_both_missing_media_choices() {
+        for count in [1, 5000] {
+            for keep_local in [true, false] {
+                let (state, pending) = single_title_lookup_fixture(count, true);
+                let parses = PENDING_DESERIALIZATIONS.get();
+                let commits = crate::db::durable_commit_count();
+                let events = ENTRY_NOTIFICATIONS.get();
+                let result = resolve_pending_inner(1, keep_local, &state).await;
+                assert_eq!(
+                    PENDING_DESERIALIZATIONS.get() - parses,
+                    1,
+                    "queue size {count}"
+                );
+                if keep_local {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        "AniList no longer has this anime. Its saved change can be discarded."
+                    );
+                    assert_eq!(crate::db::durable_commit_count(), commits);
+                    assert_eq!(ENTRY_NOTIFICATIONS.get(), events);
+                    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 3);
+                    assert_eq!(state.matchers.lock()[0].media_id, 1);
+                    assert_eq!(
+                        serde_json::to_value(state.db.pending_change(7, 1).unwrap()).unwrap(),
+                        serde_json::to_value(pending).unwrap()
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(crate::db::durable_commit_count() - commits, 1);
+                    assert_eq!(ENTRY_NOTIFICATIONS.get() - events, 1);
+                    assert!(state.db.get_entry(1).unwrap().is_none());
+                    assert!(state.db.pending_change(7, 1).unwrap().is_none());
+                    assert!(state.matchers.lock().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_single_title_resolution_isolates_payload_errors_and_preserves_guards() {
+        for keep_local in [true, false] {
+            let (state, pending) = single_title_lookup_fixture(1, true);
+            state
+                .db
+                .0
+                .lock()
+                .execute("INSERT INTO pending_change VALUES (7,2,'invalid')", [])
+                .unwrap();
+            state.anilist.lock().set_token(None);
+            let parses = PENDING_DESERIALIZATIONS.get();
+            assert_eq!(
+                resolve_pending_inner(1, keep_local, &state)
+                    .await
+                    .unwrap_err(),
+                "Account changed"
+            );
+            assert_eq!(PENDING_DESERIALIZATIONS.get(), parses);
+            state.anilist.lock().set_token(Some("test-session".into()));
+            let remote_guard = state.remote_lock.lock().await;
+            let mut resolution = Box::pin(resolve_pending_inner(1, keep_local, &state));
+            enqueue_waiter(resolution.as_mut()).await;
+            state
+                .anilist
+                .lock()
+                .set_token(Some("replacement-session".into()));
+            drop(remote_guard);
+            assert_eq!(resolution.await.unwrap_err(), "Account changed");
+            assert_eq!(PENDING_DESERIALIZATIONS.get(), parses);
+            state.anilist.lock().set_token(Some("test-session".into()));
+            state.db.delete_setting("anilist_user_id").unwrap();
+            assert_eq!(
+                resolve_pending_inner(1, keep_local, &state)
+                    .await
+                    .unwrap_err(),
+                "Not signed in"
+            );
+            assert_eq!(PENDING_DESERIALIZATIONS.get(), parses);
+            state.db.set_setting("anilist_user_id", "7").unwrap();
+            let writes = state.db.0.lock().total_changes();
+            let events = ENTRY_NOTIFICATIONS.get();
+            resolve_pending_inner(6000, keep_local, &state)
+                .await
+                .unwrap();
+            assert_eq!(PENDING_DESERIALIZATIONS.get(), parses);
+            assert_eq!(state.db.0.lock().total_changes(), writes);
+            assert_eq!(ENTRY_NOTIFICATIONS.get(), events);
+            let entry_guard = state.entry_lock.lock().await;
+            let mut resolution = Box::pin(resolve_pending_inner(1, keep_local, &state));
+            enqueue_waiter(resolution.as_mut()).await;
+            assert_eq!(PENDING_DESERIALIZATIONS.get(), parses);
+            assert!(state.remote_lock.try_lock().is_err());
+            state
+                .db
+                .0
+                .lock()
+                .execute(
+                    "UPDATE pending_change SET payload='invalid' WHERE account_id=7 AND media_id=1",
+                    [],
+                )
+                .unwrap();
+            let expected_error = state.db.pending_change(7, 1).unwrap_err().to_string();
+            let parses = PENDING_DESERIALIZATIONS.get();
+            let writes = state.db.0.lock().total_changes();
+            drop(entry_guard);
+            assert_eq!(resolution.await.unwrap_err(), expected_error);
+            assert_eq!(PENDING_DESERIALIZATIONS.get() - parses, 1);
+            assert_eq!(state.db.0.lock().total_changes(), writes);
+            assert_eq!(ENTRY_NOTIFICATIONS.get(), events);
+            assert!(state.db.get_entry(1).unwrap().is_some());
+            state.db.put_pending(7, &pending).unwrap();
+            let parses = PENDING_DESERIALIZATIONS.get();
+            let result = resolve_pending_inner(1, keep_local, &state).await;
+            assert_eq!(PENDING_DESERIALIZATIONS.get() - parses, 1);
+            if keep_local {
+                assert!(result.unwrap_err().contains("no longer has this anime"));
+                assert_eq!(
+                    serde_json::to_value(state.db.pending_change(7, 1).unwrap()).unwrap(),
+                    serde_json::to_value(pending).unwrap()
+                );
+            } else {
+                result.unwrap();
+                assert!(state.db.pending_change(7, 1).unwrap().is_none());
+            }
+            assert!(state.db.pending_change(7, 2).is_err());
+        }
     }
 
     #[tokio::test]

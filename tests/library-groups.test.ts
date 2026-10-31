@@ -148,6 +148,87 @@ test("scoped library progress and removal retain unrelated file groups without a
   expect(document.body.textContent).toContain("series 2");
 });
 
+test.each(["scoped", "full"])("library recovers both groups after a failed %s list refresh", async (scope) => {
+  await render();
+  const firstGroup = await expand("First display");
+  const secondGroup = await expand("Second display");
+  expect(firstGroup.textContent).toContain("Ep 0/12 watched");
+  expect(secondGroup.textContent).toContain("Ep 0/12 watched");
+
+  const failedRead = scope === "scoped" ? mocks.api.localEntryUpdates : mocks.api.localEntries;
+  failedRead.mockRejectedValueOnce(new Error("list unavailable"));
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) {
+    callback(scope === "scoped" ? { payload: { media_ids: [1] } } : undefined);
+  }
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("list unavailable");
+  expect(section("First display")).toBe(firstGroup);
+  expect(firstGroup.textContent).toContain("Ep 0/12 watched");
+  expect(secondGroup.textContent).toContain("Ep 0/12 watched");
+  expect(button("Play Ep 1", firstGroup)).toBeDefined();
+  expect(firstGroup.querySelector('[title="Play one-1.mkv"] [title="Watched (per your list progress)"]')).toBeNull();
+
+  const recovered = [{ ...entry, progress: 1 }, { ...second, progress: 1 }];
+  mocks.api.localEntries.mockClear().mockResolvedValue(recovered);
+  mocks.api.localEntryUpdates.mockResolvedValue([recovered[1]]);
+  const scopedReads = mocks.api.localEntryUpdates.mock.calls.length;
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [2] } });
+  await settleListUpdates();
+  expect(secondGroup.textContent).toContain("Ep 1/12 watched");
+  expect(firstGroup.textContent).toContain("Ep 1/12 watched");
+  expect(document.body.textContent).not.toContain("list unavailable");
+  expect(firstGroup.querySelector('[title="Play one-1.mkv"] [title="Watched (per your list progress)"]')).not.toBeNull();
+  button("Play Ep 2", firstGroup).click();
+  await settle();
+  expect(mocks.openPath).toHaveBeenCalledExactlyOnceWith("/synthetic/one-2.mkv");
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(scopedReads);
+
+  await refreshScoped(1, { ...entry, progress: 2 });
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(scopedReads + 1);
+  expect(mocks.api.localEntryUpdates).toHaveBeenLastCalledWith([1], auth.user!.id);
+  expect(section("First display")).toBe(firstGroup);
+  expect(section("Second display")).toBe(secondGroup);
+  expect(firstGroup.textContent).toContain("Ep 2/12 watched");
+  expect(secondGroup.textContent).toContain("Ep 1/12 watched");
+  expect(firstGroup.querySelector('[title="Play one-2.mkv"] [title="Watched (per your list progress)"]')).not.toBeNull();
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+});
+
+test.each(["newer event", "new account"])("library ignores a list failure superseded by a %s", async (supersededBy) => {
+  await render();
+  const old = deferred<ListEntry[]>();
+  mocks.api.localEntryUpdates.mockReturnValueOnce(old.promise).mockResolvedValue([{ ...entry, progress: 7 }]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1], auth.user!.id);
+
+  mocks.api.localEntries.mockClear();
+  if (supersededBy === "new account") {
+    mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 5 }, second]);
+    auth.epoch++;
+    await settle();
+    expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+    expect(section("First display").textContent).toContain("Ep 5/12 watched");
+    mocks.api.localEntries.mockClear();
+  } else {
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  }
+  old.reject(new Error("obsolete list failure"));
+  await settleListUpdates();
+  if (supersededBy === "new account") {
+    expect(document.body.textContent).not.toContain("obsolete list failure");
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+    await settleListUpdates();
+  }
+  expect(document.body.textContent).not.toContain("obsolete list failure");
+  expect(section("First display").textContent).toContain("Ep 7/12 watched");
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(2);
+  expect(mocks.api.localEntryUpdates).toHaveBeenLastCalledWith([1], auth.user!.id);
+});
+
 test("scoped entry changes do not reevaluate unrelated expanded groups", async () => {
   await render();
   const changed = await expand("First display");
@@ -526,4 +607,171 @@ test("entry snapshots obey request and account guards", async () => {
   await settleListUpdates();
   expect(section("Series 10").textContent).toContain("Not on your list");
   expect(document.body.textContent).not.toContain("Ep 10/12 watched");
+});
+
+
+test("library clears an initial entry-read failure after an event recovers it", async () => {
+  mocks.api.localEntries.mockRejectedValueOnce("initial list unavailable");
+  await render();
+  expect(document.body.textContent).toContain("initial list unavailable");
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(document.body.textContent).not.toContain("initial list unavailable");
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
+  expect(library.folders).toEqual(["/synthetic"]);
+  expect(library.files).toEqual(files);
+  expect(document.body.textContent).not.toContain("No library folders yet");
+  expect(section("First display").textContent).toContain("Ep 0/12 watched");
+  expect(button("↻ Rescan").disabled).toBe(false);
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+  await refreshScoped(1, { ...entry, progress: 1 });
+  expect(section("First display").textContent).toContain("Ep 1/12 watched");
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+  button("↻ Rescan").click();
+  await settle();
+  expect(mocks.api.scanLibrary).toHaveBeenCalledTimes(2);
+});
+
+test("initial list recovery during an active scan does not queue another scan", async () => {
+  const scan = deferred<LibraryScan>();
+  mocks.api.localEntries.mockRejectedValueOnce("initial list unavailable");
+  mocks.api.scanLibrary.mockReturnValueOnce(scan.promise);
+  await render();
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+  expect(library.scanning).toBe(true);
+  emit();
+  await settleListUpdates();
+  expect(document.body.textContent).not.toContain("initial list unavailable");
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+  expect(button("Scanning…").disabled).toBe(true);
+  scan.resolve({ files: copy(files), unreadable: [] });
+  await settle();
+  await settle();
+  expect(section("First display").textContent).toContain("Ep 0/12 watched");
+  expect(button("↻ Rescan").disabled).toBe(false);
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+});
+
+test("initial list recovery preserves an independent startup scan failure", async () => {
+  mocks.api.localEntries.mockRejectedValueOnce("initial list unavailable");
+  mocks.api.scanLibrary.mockRejectedValueOnce("startup scan unavailable");
+  await render();
+  expect(document.body.textContent).toContain("startup scan unavailable");
+  emit();
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("startup scan unavailable");
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+});
+
+test("a failed initial read settled after logout cannot initialize the library", async () => {
+  const initial = deferred<ListEntry[]>();
+  mocks.api.localEntries.mockReturnValueOnce(initial.promise);
+  await render();
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  auth.epoch++;
+  auth.isLoggedIn = false;
+  library.reset();
+  await settle();
+  initial.reject("obsolete initial failure");
+  await settle();
+  expect(mocks.api.getLibraryFolders).not.toHaveBeenCalled();
+  expect(mocks.api.scanLibrary).not.toHaveBeenCalled();
+  expect(document.body.textContent).not.toContain("obsolete initial failure");
+});
+
+test('failed list registrations remain visible after startup and Rescan', async () => {
+  const { listen } = await import('@tauri-apps/api/event');
+  vi.mocked(listen).mockRejectedValueOnce('event listener unavailable').mockRejectedValueOnce('event listener unavailable');
+  await render();
+  expect(vi.mocked(listen).mock.calls.slice(0, 2).map(([event]) => event)).toEqual(['kurisu://episode-updated', 'kurisu://pending-changed']);
+  expect(mocks.listeners.get('kurisu://episode-updated')?.size ?? 0).toBe(0);
+  expect(mocks.listeners.get('kurisu://pending-changed')?.size ?? 0).toBe(0);
+  expect(section('First display').textContent).toContain('Ep 0/12 watched');
+  expect(mocks.api.scanLibrary).toHaveBeenCalledOnce();
+  mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 1 }, second]);
+  emit();
+  await settleListUpdates();
+  window.dispatchEvent(new Event('focus'));
+  await settle();
+  await vi.advanceTimersByTimeAsync(60_000);
+  await settle();
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(section('First display').textContent).toContain('Ep 0/12 watched');
+  expect(document.body.textContent).toContain('event listener unavailable');
+  button('↻ Rescan').click();
+  await settle();
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
+  expect(section('First display').textContent).toContain('Ep 1/12 watched');
+  expect(document.body.textContent).toContain('event listener unavailable');
+});
+
+
+test.each(["resolve", "reject"])("a superseded rescan %s cannot announce success over a current read failure", async (outcome) => {
+  await render();
+  const scan = deferred<LibraryScan>();
+  const rescanRead = deferred<ListEntry[]>();
+  mocks.api.scanLibrary.mockReturnValueOnce(scan.promise);
+  mocks.api.localEntries.mockReturnValueOnce(rescanRead.promise);
+  button("↻ Rescan").click();
+  await settle();
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(2);
+  expect(library.scanning).toBe(true);
+  mocks.api.localEntryUpdates.mockRejectedValueOnce("current event list unavailable");
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1], auth.user!.id);
+  expect(document.body.textContent).toContain("current event list unavailable");
+  if (outcome === "resolve") rescanRead.resolve([{ ...entry, progress: 11 }, second]);
+  else rescanRead.reject("obsolete rescan failure");
+  await settle();
+  expect(document.body.textContent).not.toContain("Ep 11/12 watched");
+  expect(document.body.textContent).not.toContain("obsolete rescan failure");
+  scan.resolve({ files: copy(files), unreadable: [] });
+  await settle();
+  await settle();
+  expect(library.scanning).toBe(false);
+  expect(document.body.textContent).toContain("current event list unavailable");
+  expect(document.body.textContent).not.toContain("Scan finished");
+});
+
+test("ordinary rescan success waits for both results", async () => {
+  await render();
+  const scan = deferred<LibraryScan>();
+  const read = deferred<ListEntry[]>();
+  mocks.api.scanLibrary.mockReturnValueOnce(scan.promise);
+  mocks.api.localEntries.mockReturnValueOnce(read.promise);
+  button("↻ Rescan").click();
+  await settle();
+  scan.resolve({ files: copy(files), unreadable: [] });
+  await settle();
+  expect(document.body.textContent).not.toContain("Scan finished");
+  read.resolve([{ ...entry, progress: 1 }, second]);
+  await settle();
+  expect(section("First display").textContent).toContain("Ep 1/12 watched");
+  expect(document.body.textContent).toContain("Scan finished");
+});
+test("obsolete listener rejection cannot contaminate a replacement registration", async () => {
+  const { listen } = await import("@tauri-apps/api/event");
+  const registration = deferred<() => void>();
+  vi.mocked(listen).mockReturnValueOnce(registration.promise);
+  await render();
+  auth.epoch++;
+  await settle();
+  await settle();
+  expect(section("First display").textContent).toContain("Ep 0/12 watched");
+  registration.reject("obsolete listener unavailable");
+  await settle();
+  expect(document.body.textContent).not.toContain("obsolete listener unavailable");
+});
+
+test("replacement registration clears the previous listener warning", async () => {
+  const { listen } = await import("@tauri-apps/api/event");
+  vi.mocked(listen).mockRejectedValueOnce("old listener unavailable");
+  await render();
+  expect(document.body.textContent).toContain("old listener unavailable");
+  auth.epoch++;
+  await settle();
+  await settle();
+  expect(section("First display").textContent).toContain("Ep 0/12 watched");
+  expect(document.body.textContent).not.toContain("old listener unavailable");
 });

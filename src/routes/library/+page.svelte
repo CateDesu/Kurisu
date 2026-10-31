@@ -25,6 +25,8 @@
   let entries = $state.raw<ListEntry[]>([]);
   let entriesLoaded = $state(false);
   let error = $state("");
+  let listError = $state("");
+  let listenerError = $state("");
   let linking = $state<string | null>(null);
   let expanded = $state<Set<number>>(new Set());
   let unlinking = $state<Group | null>(null);
@@ -129,16 +131,23 @@
   });
 
   let entryLoadId = 0;
-  async function refreshEntries(mediaIds?: readonly number[]) {
+  async function refreshEntries(mediaIds?: readonly number[]): Promise<boolean> {
     const id = ++entryLoadId;
     const epoch = auth.epoch;
     try {
       const update = await readListUpdate(entriesLoaded ? mediaIds : undefined);
-      if (id !== entryLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return;
+      if (id !== entryLoadId || epoch !== auth.epoch || !auth.isLoggedIn) return false;
       entries = update.mediaIds ? applyListUpdate(entries, update) : reconcileListEntries(entries, applyListUpdate(entries, update));
       entriesLoaded = true;
+      listError = "";
+      return true;
     } catch (e) {
-      if (id === entryLoadId && epoch === auth.epoch && auth.isLoggedIn) throw e;
+      if (id === entryLoadId && epoch === auth.epoch && auth.isLoggedIn) {
+        entriesLoaded = false;
+        listError = String(e);
+        throw e;
+      }
+      return false;
     }
   }
 
@@ -147,6 +156,10 @@
     error = "";
     try {
       await refreshEntries();
+    } catch {
+      // List failures must not skip folder and scan initialization.
+    }
+    try {
       if (epoch !== auth.epoch || !auth.isLoggedIn) return;
       await library.ensureScan();
     } catch (e) {
@@ -192,8 +205,8 @@
     const epoch = auth.epoch;
     error = "";
     try {
-      await Promise.all([library.scan(), refreshEntries()]);
-      if (epoch !== auth.epoch || !auth.isLoggedIn) return;
+      const [, entriesReady] = await Promise.all([library.scan(), refreshEntries().catch(() => false)]);
+      if (!entriesReady || epoch !== auth.epoch || !auth.isLoggedIn) return;
       scannedCount = library.files.length;
       const stamp = Date.now();
       scannedAt = stamp;
@@ -357,19 +370,19 @@
     removing = new Set();
     unlinkBusy = false;
     expanded = new Set();
+    listError = "";
+    listenerError = "";
     error = "";
     scannedAt = 0;
     if (!loggedIn) return;
     let alive = true;
     const updateEntries = (mediaIds?: readonly number[]) => {
       if (!alive || epoch !== auth.epoch) return;
-      return refreshEntries(mediaIds).catch((e) => {
-        if (alive && epoch === auth.epoch) error = String(e);
-      });
+      return refreshEntries(mediaIds).catch(() => {});
     };
     const stop = listenForListUpdates(
       updateEntries,
-      (e) => { if (epoch === auth.epoch) error = String(e); },
+      (e) => { if (alive && epoch === auth.epoch) listenerError = String(e); },
       () => { if (epoch === auth.epoch) return load(); },
       { invalidate: () => { entryLoadId++; }, revision: () => entryLoadId },
     );
@@ -421,9 +434,15 @@
       </button>
     </PageHeading>
 
-    {#if error}
+    {#if error || listError}
       <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
-        {error}
+        {error || listError}
+      </div>
+    {/if}
+
+    {#if listenerError}
+      <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
+        {listenerError}
       </div>
     {/if}
 

@@ -638,8 +638,34 @@ pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<
         if lv.is_empty() {
             continue;
         }
-        if lp.contains(&lv) {
-            let remainder = lp.replace(&lv, " ");
+        // Prefer whole titles over title text embedded in episode numbers or metadata.
+        let occurrence = lp.match_indices(&lv).min_by_key(|(start, _)| {
+            let end = *start + lv.len();
+            let embedded = lp[..*start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                || lp[end..].chars().next().is_some_and(char::is_alphanumeric);
+            let metadata = RE_BRACKETS
+                .find_iter(&lp)
+                .find(|bracket| bracket.start() <= *start && *start < bracket.end())
+                .map_or(0, |bracket| {
+                    if bracket
+                        .as_str()
+                        .trim_matches(['[', ']', '(', ')', '【', '】'])
+                        .trim()
+                        == lv
+                    {
+                        1
+                    } else {
+                        2
+                    }
+                });
+            (embedded, metadata)
+        });
+        if let Some((start, title)) = occurrence {
+            let mut remainder = lp.clone();
+            remainder.replace_range(start..start + title.len(), " ");
             return Some(parse_episode_number(&remainder, true));
         }
     }
@@ -1689,6 +1715,33 @@ mod tests {
             .map(|m| m.media_id),
             Some(2)
         );
+    }
+
+    #[test]
+    fn title_removal_prefers_titles_over_metadata_and_preserves_fallback() {
+        for (title, input, expected) in [
+            ("86", "[86ABCDEF] [86] - 03", Some(Some(3))),
+            ("86", "[86 Fansubs] 【86】 - 03", Some(Some(3))),
+            ("91 Days", "[91 Days Fansubs] 91 Days - 05", Some(Some(5))),
+            (
+                "Some Show",
+                "[Some Show Fansubs] Some Show - 03",
+                Some(Some(3)),
+            ),
+            ("Some Show", "[Some Show - 03]", Some(None)),
+            ("86", "[86ABCDEF] 86 [1080p]", Some(None)),
+            ("86", "[86] - 086", Some(Some(86))),
+            ("86", "[86] - 186", Some(Some(186))),
+            ("86", "[86] - 86", Some(Some(86))),
+            ("86", "[86] - 86 (1080p)", Some(Some(86))),
+            ("86", "Other Show - 03", None),
+        ] {
+            assert_eq!(
+                parse_episode_after(input, &[title.into()]),
+                expected,
+                "{input}"
+            );
+        }
     }
 
     #[test]

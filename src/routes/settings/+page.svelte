@@ -91,7 +91,7 @@
     }
   }
   $effect(() => {
-    if (!auth.user) confirmingLogout = false;
+    if (!auth.isLoggedIn) confirmingLogout = false;
   });
   async function saveTracking() {
     if (!trackingLoaded || trackingSaving) return;
@@ -190,8 +190,10 @@
 
   <section class="pt-4 border-t border-edge">
     <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Account</h2>
-    {#if auth.user}
-      <p class="text-sm mb-2">Signed in as <b>{auth.user.name}</b>.</p>
+    {#if auth.isLoggedIn}
+      <p class="text-sm mb-2">
+        {#if auth.user}Signed in as <b>{auth.user.name}</b>.{:else}Signed in offline. Your profile is unavailable.{/if}
+      </p>
       <button
         onclick={() => (confirmingLogout = true)}
         class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm"

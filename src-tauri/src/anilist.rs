@@ -484,7 +484,10 @@ impl AniList {
                     serde_json::json!({ "season": season, "year": year, "page": page }),
                 )
                 .await?;
-            let media = r.page.media.unwrap_or_default();
+            let media = r
+                .page
+                .media
+                .ok_or_else(|| anyhow!("AniList returned unavailable season media"))?;
             let got = media.len();
             for m in media.into_iter().flatten() {
                 out.push(Media::from(m));
@@ -542,7 +545,7 @@ impl AniList {
             .await?;
         Ok(r.page
             .recommendations
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow!("AniList returned unavailable recommendations"))?
             .into_iter()
             .filter_map(|rec| rec.media_recommendation)
             .map(Media::from)
@@ -999,7 +1002,10 @@ impl AniList {
                     serde_json::json!({ "startExclusive": start_exclusive, "end": end, "page": page }),
                 )
                 .await?;
-            let scheds = r.page.airing_schedules.unwrap_or_default();
+            let scheds = r
+                .page
+                .airing_schedules
+                .ok_or_else(|| anyhow!("AniList returned unavailable airing schedules"))?;
             let got = scheds.len();
             for s in scheds {
                 let Some(m) = s.media else { continue };
@@ -2372,6 +2378,53 @@ mod feature_tests {
                 assert!(!media_not_found(&error));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_discovery_results_are_not_empty_results() {
+        for field in ["media", "recommendations"] {
+            for available in [None, Some(json!(null))] {
+                let mut page = json!({"pageInfo":{"hasNextPage":false}});
+                if let Some(value) = available {
+                    page[field] = value;
+                }
+                let (api, _) = mock_api(vec![(200, json!({"data":{"Page":page}}))]).await;
+                if field == "media" {
+                    assert!(api.season_all("FALL", 2026).await.is_err());
+                } else {
+                    assert!(api.recommendations(1).await.is_err());
+                }
+            }
+        }
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"Page":{
+                "pageInfo":{"hasNextPage":false},"media":[]
+            }}}),
+        )])
+        .await;
+        assert!(api.season_all("FALL", 2026).await.unwrap().is_empty());
+        let (api, _) = mock_api(vec![(200, json!({"data":{"Page":{"recommendations":[]}}}))]).await;
+        assert!(api.recommendations(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_calendar_is_not_an_empty_calendar() {
+        for page in [
+            json!({"pageInfo":{"hasNextPage":false}}),
+            json!({"pageInfo":{"hasNextPage":false},"airingSchedules":null}),
+        ] {
+            let (api, _) = mock_api(vec![(200, json!({"data":{"Page":page}}))]).await;
+            assert!(api.airing_schedule(100, 200).await.is_err());
+        }
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"Page":{
+                "pageInfo":{"hasNextPage":false},"airingSchedules":[]
+            }}}),
+        )])
+        .await;
+        assert!(api.airing_schedule(100, 200).await.unwrap().is_empty());
     }
 
     #[tokio::test]

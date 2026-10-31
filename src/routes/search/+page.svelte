@@ -15,6 +15,7 @@
   let results = $state.raw<Media[]>([]);
   let searching = $state(false);
   let error = $state("");
+  let listError = $state("");
   const actions = createListActions();
   const loggedIn = $derived(auth.isLoggedIn);
 
@@ -39,9 +40,13 @@
       if (current()) {
         listByMedia = new Map(applyListUpdate([...listByMedia.values()], update).map((e) => [e.media_id, e]));
         listLoaded = true;
+        listError = "";
       }
     } catch (e) {
-      if (current()) error = String(e);
+      if (current()) {
+        listLoaded = false;
+        listError = String(e);
+      }
     }
   }
 
@@ -50,6 +55,7 @@
     loggedIn;
     listByMedia = new Map();
     listLoaded = false;
+    listError = "";
     error = "";
     actions.reset();
     searching = false;
@@ -158,9 +164,9 @@
     </form>
   </PageHeading>
 
-  {#if error || actions.error}
+  {#if error || listError || actions.error}
     <div class="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-md p-2 mb-4">
-      {error || actions.error}
+      {error || listError || actions.error}
     </div>
   {/if}
 

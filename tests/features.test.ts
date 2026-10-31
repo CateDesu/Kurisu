@@ -598,6 +598,89 @@ test("search reads changed badges and removals without replacing unrelated cards
   expect(cards[1].textContent).toContain("Watching · 7/12");
 });
 
+test.each(["scoped", "full"])("search recovers both badges after a failed %s list refresh", async (scope) => {
+  vi.useFakeTimers();
+  const secondMedia = { ...media, id: 2, title_english: "Second Show" };
+  const second = { ...entry, media_id: 2, media: secondMedia };
+  mocks.api.localEntries.mockResolvedValue([entry, second]);
+  mocks.api.searchAnimePage.mockResolvedValue({ items: [media, secondMedia], page: 1, has_next_page: false });
+  await render(Search);
+  input('[aria-label="Anime title"]', "show"); button("Search").click(); await settle();
+  const cards = [...document.querySelectorAll(".anime-card")];
+  expect(cards.every((card) => card.textContent?.includes("Watching · 3/12"))).toBe(true);
+
+  const failedRead = scope === "scoped" ? mocks.api.localEntryUpdates : mocks.api.localEntries;
+  failedRead.mockRejectedValueOnce(new Error("list unavailable"));
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) {
+    callback(scope === "scoped" ? { payload: { media_ids: [1] } } : undefined);
+  }
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("list unavailable");
+  expect(cards.every((card) => card.textContent?.includes("Watching · 3/12"))).toBe(true);
+
+  const recovered = [{ ...entry, progress: 8 }, { ...second, progress: 9 }];
+  mocks.api.localEntries.mockClear().mockResolvedValue(recovered);
+  mocks.api.localEntryUpdates.mockResolvedValue([recovered[1]]);
+  const scopedReads = mocks.api.localEntryUpdates.mock.calls.length;
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [2] } });
+  await settleListUpdates();
+  expect(cards[1].textContent).toContain("Watching · 9/12");
+  expect(cards[0].textContent).toContain("Watching · 8/12");
+  expect(document.body.textContent).not.toContain("list unavailable");
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(scopedReads);
+
+  mocks.api.localEntryUpdates.mockResolvedValue([{ ...entry, progress: 10 }]);
+  for (const callback of mocks.listeners.get("kurisu://episode-updated") ?? []) callback({ payload: { media_id: 1 } });
+  await settleListUpdates();
+  expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(scopedReads + 1);
+  expect(mocks.api.localEntryUpdates).toHaveBeenLastCalledWith([1], auth.user!.id);
+  const updatedCards = [...document.querySelectorAll(".anime-card")];
+  expect(updatedCards).toHaveLength(cards.length);
+  updatedCards.forEach((card, index) => expect(card).toBe(cards[index]));
+  expect(cards[0].textContent).toContain("Watching · 10/12");
+  expect(cards[1].textContent).toContain("Watching · 9/12");
+});
+
+test.each(["newer event", "new account"])("search ignores a list failure superseded by a %s", async (supersededBy) => {
+  vi.useFakeTimers();
+  mocks.api.localEntries.mockResolvedValue([entry]);
+  mocks.api.searchAnimePage.mockResolvedValue({ items: [media], page: 1, has_next_page: false });
+  await render(Search);
+  input('[aria-label="Anime title"]', "show"); button("Search").click(); await settle();
+  const old = deferred<unknown[]>();
+  mocks.api.localEntryUpdates.mockReturnValueOnce(old.promise).mockResolvedValue([{ ...entry, progress: 7 }]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledExactlyOnceWith([1], auth.user!.id);
+
+  mocks.api.localEntries.mockClear();
+  if (supersededBy === "new account") {
+    mocks.api.localEntries.mockResolvedValue([{ ...entry, progress: 5 }]);
+    auth.user = { ...auth.user!, id: 2 };
+    auth.epoch++;
+    await settle();
+    expect(mocks.api.localEntries).toHaveBeenCalledOnce();
+    expect(document.body.textContent).toContain("Watching · 5/12");
+    mocks.api.localEntries.mockClear();
+  } else {
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  }
+  old.reject(new Error("obsolete list failure"));
+  await settleListUpdates();
+  if (supersededBy === "new account") {
+    expect(document.body.textContent).not.toContain("obsolete list failure");
+    for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+    await settleListUpdates();
+  }
+  expect(document.body.textContent).not.toContain("obsolete list failure");
+  expect(document.body.textContent).toContain("Watching · 7/12");
+  expect(mocks.api.localEntries).not.toHaveBeenCalled();
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(2);
+  expect(mocks.api.localEntryUpdates).toHaveBeenLastCalledWith([1], auth.user!.id);
+});
+
 test("an accepted search write preserves a different ID from an invalidated targeted read", async () => {
   const secondMedia = { ...media, id: 2, title_english: "Second Show" };
   const second = { ...entry, media_id: 2, media: secondMedia };
@@ -727,4 +810,32 @@ test.each([false, true])("a playback update preserves the initial current list a
   expect(document.body.textContent).toContain("Second Show");
   expect(document.body.textContent).toContain("Ep 4/12 on your list");
   expect(document.body.textContent).not.toContain("temporary list failure");
+});
+
+
+test("a recovered search list read preserves an unrelated search failure", async () => {
+  vi.useFakeTimers();
+  await render(Search);
+  mocks.api.localEntryUpdates.mockRejectedValueOnce("list unavailable");
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  mocks.api.searchAnimePage.mockRejectedValueOnce("search unavailable");
+  input('[aria-label="Anime title"]', "show");
+  button("Search").click();
+  await settle();
+  mocks.api.localEntries.mockResolvedValue([entry]);
+  for (const callback of mocks.listeners.get("kurisu://pending-changed") ?? []) callback({ payload: { media_ids: [1] } });
+  await settleListUpdates();
+  expect(document.body.textContent).toContain("search unavailable");
+  expect(document.body.textContent).not.toContain("list unavailable");
+  const fullReads = mocks.api.localEntries.mock.calls.length;
+  const scopedReads = mocks.api.localEntryUpdates.mock.calls.length;
+  mocks.api.searchAnimePage.mockResolvedValueOnce({ items: [media], page: 1, has_next_page: false });
+  button("Search").click();
+  await settle();
+  expect(document.querySelector(".cv-card")?.textContent).toContain("Watching · 3/12");
+  expect(document.body.textContent).not.toContain("search unavailable");
+  expect(document.body.textContent).not.toContain("list unavailable");
+  expect(mocks.api.localEntries).toHaveBeenCalledTimes(fullReads);
+  expect(mocks.api.localEntryUpdates).toHaveBeenCalledTimes(scopedReads);
 });

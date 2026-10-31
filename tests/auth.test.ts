@@ -141,3 +141,14 @@ test("a failed replacement login cannot suppress a pending expiry check", async 
   await checking;
   expect(auth.isLoggedIn).toBe(false);
 });
+
+test("a stored token permits offline access without a cached profile", async () => {
+  mocks.api.currentUser.mockRejectedValue(new Error("offline"));
+  mocks.api.isLoggedIn.mockResolvedValue(true);
+  const { auth } = await import("#lib/auth.svelte.ts");
+  await settle();
+  expect(auth.ready).toBe(true);
+  expect(auth.user).toBeNull();
+  expect(auth.offline).toBe(true);
+  expect(auth.isLoggedIn).toBe(true);
+});

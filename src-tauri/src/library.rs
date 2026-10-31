@@ -1071,6 +1071,62 @@ mod tests {
     }
 
     #[test]
+    fn unbound_numeric_titles_ignore_title_text_in_metadata() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 1, "86", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        for filename in [
+            "[86ABCDEF] 86 - 03 (1080p).mkv",
+            "[86 Fansubs] 86 - 03 [86ABCDEF].mkv",
+            "[SubsPlease] 86 - 03 (1080p) [86ABCDEF].mkv",
+            "86 - 03.mkv",
+            "86 - Episode 03.mkv",
+        ] {
+            let path = format!("/synthetic/{filename}");
+            let matched = crate::recognize::match_title(&matchers, "", &path).unwrap();
+            assert_eq!(matched.media_id, 1, "{filename}");
+            let base = crate::recognize::basename(&path);
+            assert_eq!(
+                super::resolve_bound_episode(matched, &[&base], None),
+                Some(3),
+                "{filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_numeric_titles_preserve_identical_absolute_episode_numbers() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 1, "86", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let matched = &matchers[0];
+        let binding = super::LibraryBinding {
+            media_id: 1,
+            episode_offset: -85,
+        };
+        assert_eq!(
+            super::resolve_bound_episode(matched, &["86 - 86"], Some(binding)),
+            Some(1)
+        );
+        assert_eq!(
+            super::resolve_bound_episode(matched, &["86 - 87"], Some(binding)),
+            Some(2)
+        );
+        for filename in [
+            "[86] - 86",
+            "[86] - 86 (1080p)",
+            "[86] - 086",
+            "[86ABCDEF] [86] - 086",
+        ] {
+            assert_eq!(
+                super::resolve_bound_episode(matched, &[filename], Some(binding)),
+                Some(1),
+                "{filename}"
+            );
+        }
+    }
+
+    #[test]
     fn bound_episode_offsets_agree_for_library_files_and_playback_urls() {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
         db.upsert_media(&crate::models::Media {
