@@ -1,0 +1,77 @@
+name: Native release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable native source tag, newer than the bridge
+        required: true
+        default: v1.1.0
+      publish:
+        description: Publish native assets and frozen bridge aliases
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 3
+
+concurrency:
+  group: kurisu-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ver: ${{ steps.plan.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+      - id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node .github/release-transition.mjs plan native "$RELEASE_TAG"
+
+  build:
+    needs: plan
+    uses: ./.github/workflows/native-candidate.yml
+    with:
+      source-ref: ${{ inputs.tag }}
+      build-version: ${{ needs.plan.outputs.ver }}
+
+  publish:
+    if: inputs.publish
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kurisu-native-*
+          merge-multiple: true
+          path: downloaded-assets
+      - name: Stage both native platforms
+        run: |
+          mkdir release-assets
+          find downloaded-assets -type f \( -name 'kurisu-native*' -o -name 'Kurisu-Native_*' -o -name 'Kurisu_*_linux-x64.tar.gz*' \) -exec cp -t release-assets/ {} +
+      - name: Publish native release with unchanged bridge assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node .github/release-transition.mjs publish native "$RELEASE_TAG" release-assets
