@@ -1,0 +1,25 @@
+Native component APIs, batch 1
+
+components::input::TextInput implements Render, Focusable and EventEmitter<TextInputEvent>.
+TextInput::new(value: impl Into<String>, placeholder: impl Into<String>, window: &mut Window, cx: &mut Context<Self>) -> Self
+value(&self) -> &str
+set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>)
+set_masked(&mut self, masked: bool, cx: &mut Context<Self>)
+set_multiline(&mut self, multiline: bool, cx: &mut Context<Self>)
+set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>)
+TextInputEvent::{Changed(String), Submitted}. Programmatic set_value does not emit Changed.
+
+components::button(id: impl Into<ElementId>, label: impl Into<SharedString>, disabled: bool) -> Stateful<Div>. Caller adds .on_click. Enabled buttons show a visible focus border and GPUI activates focused clicks with Enter or Space. Disabled buttons suppress mouse down and are removed from Tab order. Pinned GPUI stores chained click callbacks on Stateful<Div>, so this exact return type cannot guarantee suppression for every activation path after a caller adds .on_click. Callers must also gate their callback while disabled; the lead should approve a typed callback API for guaranteed gating.
+
+components::heading(title: impl Into<SharedString>) -> Div.
+components::page_heading(title: impl Into<SharedString>) -> Stateful<Div>. 30px serif level 1 heading with accent period for route headers.
+components::eyebrow(label: impl Into<SharedString>) -> Div.
+components::dialog(id: impl Into<ElementId>, title: impl Into<SharedString>) -> Stateful<Div>. Caller supplies content, focus and close behavior.
+components::select(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div>. Caller supplies choices and selection behavior.
+components::score_value(format: &str, value: Option<f64>) -> String. This is formatting only; caller owns edits and validation.
+
+components::covers::CoverCache is the shared cover loader. CoverCache::new(max_bytes: usize, workers: usize) -> Self; request(&mut self, source: CoverSource, width_px: u32, height_px: u32, scale: f32, visible: bool) -> CoverTicket; poll(&mut self) -> Vec<CoverReady>; image(&mut self, ticket: &CoverTicket) -> Option<Arc<RenderImage>>; retain_visible(&mut self, tickets: &[CoverTicket]); clear(&mut self); take_disposed(&mut self) -> Vec<Arc<RenderImage>>. CoverSource::{Remote(String), Local(PathBuf)}. RenderImage is gpui::RenderImage. Call poll outside render via a timer or background completion, then notify views. Pass take_disposed images to gpui App::drop_image on the UI thread. Local paths are explicit permitted paths only.
+
+components::variable_list::StableList stores measured heights keyed by media ID. StableList::new(estimated_px: f32) -> Self; set_items(&mut self, ids: &[i64]); measure(&mut self, id: i64, height_px: f32); visible(&self, offset_px: f32, viewport_px: f32, overscan_px: f32) -> Vec<VisibleRow>; total_height(&self) -> f32; anchor(&self, offset_px: f32) -> Option<(i64, f32)>; offset_for_anchor(&self, id: i64, inset_px: f32) -> Option<f32>. VisibleRow contains id, index, top_px and height_px. Unsaved row state belongs to Workspace, not StableList.
+
+Multiline TextInput uses pinned GPUI shape_text wrapping and keeps cursor, selection and UTF-16 IME geometry aligned with visual rows. The scrollable input height stays 120px; the content grows with wrapped rows.

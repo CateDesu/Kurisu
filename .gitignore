@@ -26,3 +26,19 @@ audit-*.md
 AGENTS.md
 # Keep the AniList exchange service local.
 /Kurisu-AniList-Exchange/
+/native/target/
+/core/target/
+/native/__pycache__/
+
+# Local bridge checkout retained for the existing shortcut build.
+/src/
+/tests/
+/src-tauri/
+/vendor/
+/static/
+/package.json
+/package-lock.json
+/.npmrc
+/tsconfig.json
+/vite.config.js
+/vitest.config.ts
