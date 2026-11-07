@@ -132,7 +132,8 @@
       </div>
       <p class="text-xs text-ink-dim mt-3">
         {#if update.can_install}
-          Downloads the update. On Windows, follow the installer. On Linux, restart Kurisu after installation.
+          Moves to native Kurisu with a separate profile and a private rollback backup.
+          Your original profile stays available. On Windows, follow the installer.
         {:else}
           This release has no installer for your platform. Build the new version from source.
         {/if}

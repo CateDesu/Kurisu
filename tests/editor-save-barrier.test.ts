@@ -227,7 +227,7 @@ test("a tracking navigation preserves the rest of a submitted editor save", asyn
     if (path === "/now") navigation = unmount(instances.shift()!);
     return navigation;
   });
-  mocks.listeners.get("kurisu://tracking-ask")!({ payload: { media_id: 2, episode: 5, progress: 4, title: "Another Show" } });
+  mocks.listeners.get("kurisu://tracking-ask")!({ payload: { generation: "0", account_id: auth.user!.id, prompt_id: "1", ask: true, media_id: 2, episode: 5, progress: 4, title: "Another Show", raw_title: "Synthetic" } });
   await navigation;
   await settle();
   expect(mocks.goto).toHaveBeenCalledExactlyOnceWith("/now");

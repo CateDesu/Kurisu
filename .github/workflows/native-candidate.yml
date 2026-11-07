@@ -1,0 +1,151 @@
+name: Native checks and packaging
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-version:
+        description: Build stamp, empty discovers latest stable
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      source-ref:
+        type: string
+        default: ''
+      build-version:
+        type: string
+        default: ''
+  pull_request:
+    paths:
+      - 'core/**'
+      - 'native/**'
+      - '.github/workflows/native-candidate.yml'
+
+env:
+  CARGO_BUILD_JOBS: 3
+  KURISU_BUILD_VERSION: ${{ inputs.build-version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libdbus-1-dev libfontconfig-dev libfreetype-dev libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev libvulkan-dev mpv dbus-daemon
+
+      - name: Install Windows test and packaging dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install mpv nsis --no-progress -y
+
+      - name: Report Rust toolchain
+        run: rustc -Vv
+
+      - name: Check core formatting
+        run: cargo fmt --manifest-path core/Cargo.toml -- --check
+
+      - name: Check native formatting
+        run: cargo fmt --manifest-path native/Cargo.toml -- --check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+
+      - name: Release protocol regressions
+        run: node --test .github/release-version.test.mjs .github/release-transition.test.mjs
+
+      - name: Build version regression tests
+        run: python -m unittest discover -s native -p test_build.py
+
+      - name: Profile transfer regression tests
+        run: python -m unittest discover -s native -p test_migrate.py
+
+      - name: Core regressions
+        run: cargo test --locked --manifest-path core/Cargo.toml
+
+      - name: Compile native regressions
+        timeout-minutes: 30
+        run: cargo test --locked --manifest-path native/Cargo.toml --no-run
+
+      - name: Native regressions
+        timeout-minutes: 5
+        run: cargo test --locked --manifest-path native/Cargo.toml -- --test-threads=1 --nocapture
+
+      - name: Linux accessibility adapter regressions
+        if: runner.os == 'Linux'
+        run: cargo test --locked --manifest-path native/Cargo.toml -p accesskit_atspi_common --lib
+
+      - name: Core Clippy
+        run: cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
+
+      - name: Native Clippy
+        run: cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build Windows bridge candidate
+        if: runner.os == 'Windows' && hashFiles('src-tauri/Cargo.toml') != ''
+        shell: pwsh
+        run: |
+          $env:KURISU_BUILD_VERSION = (Get-Content .github/release-transition.json | ConvertFrom-Json).bridgeTag.TrimStart('v')
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx tauri build --bundles nsis
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Linux candidate
+        if: runner.os == 'Linux'
+        run: python native/build.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build Windows candidate and installer
+        if: runner.os == 'Windows'
+        run: python native/build.py --installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Verify Windows installer in disposable runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/test-native-installer.ps1
+
+      - name: Inspect Linux runtime dependencies
+        if: runner.os == 'Linux'
+        run: ldd native/target/release/kurisu-native
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kurisu-native-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            native/target/release/kurisu-native
+            native/target/release/kurisu-native.exe
+            native/target/release/kurisu-native.sha256
+            native/target/release/kurisu-native.exe.sha256
+            native/target/release/LICENSE
+            native/target/release/THIRD_PARTY_NOTICES.txt
+            native/target/release/PROFILE_TRANSFER.md
+            native/target/release/bundle/Kurisu-Native_*.exe
+            native/target/release/bundle/Kurisu-Native_*.exe.sha256
+            native/target/release/bundle/Kurisu_*_linux-x64.tar.gz
+            native/target/release/bundle/Kurisu_*_linux-x64.tar.gz.sha256

@@ -30,6 +30,10 @@ impl Fixture {
             remote_lock: tokio::sync::Mutex::new(()),
             matchers: Mutex::new(Arc::new(vec![])),
             library_cache: Default::default(),
+            events: tokio::sync::broadcast::channel(128).0,
+            last_auth_expired: Mutex::new(None),
+            last_now_playing: Mutex::new(None),
+            last_tracking_prompt: Mutex::new(None),
         };
         Self { state, root }
     }
@@ -414,6 +418,66 @@ async fn queued_library_account_checks_reject_replaced_sessions() {
     let current = get_watch_history_inner(None, None, state).await.unwrap();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].episode, 9);
+}
+
+#[tokio::test]
+async fn queued_folder_and_unlink_writes_do_not_cross_accounts() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    let state = &fixture.state;
+    let existing = fixture.path("existing");
+    let new_folder = fixture.path("new");
+    add_library_folder_inner(existing.clone(), state)
+        .await
+        .unwrap();
+    bind_library_path_inner(existing.clone(), 1, None, state)
+        .await
+        .unwrap();
+    let transition = state.entry_lock.lock().await;
+    let mut add = Box::pin(add_library_folder_inner(new_folder.clone(), state));
+    let mut remove = Box::pin(remove_library_folder_inner(existing.clone(), state));
+    let mut unlink = Box::pin(unbind_library_media_inner(1, state));
+    assert!(poll_once(add.as_mut()).is_pending());
+    assert!(poll_once(remove.as_mut()).is_pending());
+    assert!(poll_once(unlink.as_mut()).is_pending());
+    fixture.account(9);
+    drop(transition);
+    for error in [
+        add.await.unwrap_err(),
+        remove.await.unwrap_err(),
+        unlink.await.unwrap_err(),
+    ] {
+        assert_eq!(error, "Your AniList account changed. Try again.");
+    }
+    assert_eq!(
+        get_library_folders_inner(state).await.unwrap(),
+        std::slice::from_ref(&existing)
+    );
+    assert_eq!(
+        library_binding_for_inner(existing, state).await.unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn queued_library_writes_reject_a_new_intent_for_the_same_account() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    let state = &fixture.state;
+    let path = fixture.path("same-account");
+    let transition = state.entry_lock.lock().await;
+    let mut add = Box::pin(add_library_folder_inner(path.clone(), state));
+    let mut bind = Box::pin(bind_library_path_inner(path.clone(), 1, None, state));
+    assert!(poll_once(add.as_mut()).is_pending());
+    assert!(poll_once(bind.as_mut()).is_pending());
+    state.begin_auth_intent();
+    drop(transition);
+    assert_eq!(add.await.unwrap_err(), AUTH_REPLACED);
+    assert_eq!(bind.await.unwrap_err(), AUTH_REPLACED);
+    assert!(get_library_folders_inner(state).await.unwrap().is_empty());
+    assert!(library::get_bindings(&state.db).unwrap().is_empty());
 }
 
 #[test]

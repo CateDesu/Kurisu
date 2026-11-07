@@ -6,12 +6,13 @@
   import { auth } from "#lib/auth.svelte.ts";
   import { nowPlaying } from "#lib/nowplaying.svelte.ts";
   import Icon from "#lib/Icon.svelte";
-  import type { TrackingPrompt } from "#lib/types.ts";
+  import type { TrackingEvent as TrackingPrompt } from "#lib/types.ts";
 
   let prompt = $state<TrackingPrompt | null>(null);
   let queued = $state<TrackingPrompt[]>([]);
   let busy = $state(false);
   let err = $state("");
+  let dismissedThrough = 0n;
 
   const np = $derived(nowPlaying());
   const pct = $derived(
@@ -21,15 +22,16 @@
   );
 
   function presentPrompt(p: TrackingPrompt) {
+    if (p.account_id !== auth.user?.id || BigInt(p.prompt_id) <= dismissedThrough) return false;
     if (prompt) {
       const dup =
-        (prompt.media_id === p.media_id && prompt.episode === p.episode) ||
-        queued.some((q) => q.media_id === p.media_id && q.episode === p.episode);
+        prompt.prompt_id === p.prompt_id || queued.some((q) => q.prompt_id === p.prompt_id);
       if (!dup) queued = [...queued, p];
-      return;
+      return !dup;
     }
     prompt = p;
     err = "";
+    return true;
   }
 
   $effect(() => {
@@ -38,6 +40,7 @@
     queued = [];
     busy = false;
     err = "";
+    dismissedThrough = 0n;
     if (!auth.isLoggedIn) return;
     let alive = true;
     let un1: (() => void) | undefined;
@@ -52,8 +55,7 @@
       if (!alive || epoch !== auth.epoch || !auth.isLoggedIn) return;
       const p = e.payload;
       if (!p) return;
-      goto("/now");
-      presentPrompt(p);
+      if (presentPrompt(p)) goto("/now");
     }).then((u) => (alive ? (un2 = u) : u()));
     return () => {
       alive = false;
@@ -74,17 +76,20 @@
       const fresh = await api.getEntry(p.media_id);
       if (!current()) return;
       if (!fresh) {
-        if (prompt === p) dismiss();
+        await api.acknowledgeTrackingPrompt(p);
+        if (current()) dismiss();
         return;
       }
       if (fresh.progress >= p.episode) {
-        if (prompt === p) dismiss();
+        await api.acknowledgeTrackingPrompt(p);
+        if (current()) dismiss();
         return;
       }
       // Pass the fresh baseline so a concurrent edit cannot be overwritten.
       await api.setProgress(p.media_id, p.episode, fresh.progress);
       if (!current()) return;
-      if (prompt === p) dismiss();
+      await api.acknowledgeTrackingPrompt(p);
+      if (current()) dismiss();
     } catch (e) {
       if (current()) err = String(e);
     } finally {
@@ -93,6 +98,7 @@
   }
 
   function dismiss() {
+    if (prompt) dismissedThrough = BigInt(prompt.prompt_id);
     if (queued.length > 0) {
       prompt = queued[0];
       queued = queued.slice(1);
@@ -102,9 +108,20 @@
     }
   }
 
-  function skip() {
-    if (busy) return;
-    dismiss();
+  async function skip() {
+    if (busy || !prompt) return;
+    const p = prompt;
+    const epoch = auth.epoch;
+    busy = true;
+    err = "";
+    try {
+      await api.acknowledgeTrackingPrompt(p);
+      if (epoch === auth.epoch && prompt === p) dismiss();
+    } catch (e) {
+      if (epoch === auth.epoch && prompt === p) err = String(e);
+    } finally {
+      if (epoch === auth.epoch) busy = false;
+    }
   }
 </script>
 

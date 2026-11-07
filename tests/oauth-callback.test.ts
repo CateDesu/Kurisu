@@ -1,4 +1,4 @@
-import source from "../src-tauri/src/anilist.rs?raw";
+import source from "../core/src/anilist.rs?raw";
 import { expect, test } from "vitest";
 
 const literal = source.match(/const OK_HTML: &str = ("(?:\\.|[^"\\])*");/)?.[1];

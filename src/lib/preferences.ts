@@ -1,3 +1,5 @@
+import { mirrorPreferenceChange, notePreferenceWriteFailure } from "#lib/profileTransfer.ts";
+
 export const preferences = {
   get(key: string): string | null {
     try {
@@ -9,13 +11,17 @@ export const preferences = {
   set(key: string, value: string) {
     try {
       localStorage.setItem(key, value);
+      mirrorPreferenceChange(key);
     } catch {
+      notePreferenceWriteFailure(key, value);
     }
   },
   remove(key: string) {
     try {
       localStorage.removeItem(key);
+      mirrorPreferenceChange(key);
     } catch {
+      notePreferenceWriteFailure(key, null);
     }
   },
   getJson(key: string): unknown {

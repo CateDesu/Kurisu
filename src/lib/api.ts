@@ -17,12 +17,15 @@ import type {
   WatchHistoryItem,
   PendingChange,
   TrackingConfig,
+  TrackingEvent,
   UpdateInfo,
   User,
   UserStats,
 } from "./types";
 
 export const api = {
+  acknowledgeTrackingPrompt: (event: TrackingEvent) =>
+    invoke<boolean>("acknowledge_tracking_prompt", { event }),
   getTrackingConfig: () => invoke<TrackingConfig>("get_tracking_config"),
   setTrackingConfig: (
     mode: string,

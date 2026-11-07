@@ -12,6 +12,8 @@
   import Tracking from "#lib/Tracking.svelte";
   import PendingSync from "#lib/PendingSync.svelte";
   import Updater from "#lib/Updater.svelte";
+  import Dialog from "#lib/Dialog.svelte";
+  import { installInFlight } from "#lib/update.svelte.ts";
   import Confirm from "#lib/Confirm.svelte";
   import Icon from "#lib/Icon.svelte";
   import Img from "#lib/Img.svelte";
@@ -121,6 +123,11 @@
     <Tracking />
     <PendingSync />
     <Updater />
+    {#if installInFlight()}
+      <Dialog onclose={() => {}} busy layer={99}>
+        <p role="status">Saving your preferences and installing native Kurisu…</p>
+      </Dialog>
+    {/if}
     <div class="flex flex-1 min-h-0 overflow-hidden">
       <aside class="sidebar shrink-0 border-r border-edge flex flex-col">
         <div class="brand-block">

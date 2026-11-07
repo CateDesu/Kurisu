@@ -335,6 +335,13 @@ export interface TrackingPrompt {
   progress: number;
 }
 
+export interface TrackingEvent extends TrackingPrompt {
+  generation: string;
+  account_id: number | null;
+  prompt_id: string;
+  ask: boolean;
+}
+
 export interface UpdateInfo {
   available: boolean;
   can_install: boolean;

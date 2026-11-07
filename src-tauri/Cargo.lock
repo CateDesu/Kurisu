@@ -2123,6 +2123,7 @@ dependencies = [
  "directories",
  "env_logger",
  "glib",
+ "kurisu-core",
  "log",
  "mpris",
  "parking_lot",
@@ -2139,6 +2140,31 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tokio",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "kurisu-core"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "directories",
+ "env_logger",
+ "libc",
+ "log",
+ "mpris",
+ "parking_lot",
+ "quick-xml",
+ "regex",
+ "reqwest 0.12.28",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
  "tokio",
  "windows 0.62.2",
 ]

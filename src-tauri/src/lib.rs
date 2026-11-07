@@ -1,25 +1,101 @@
-mod anilist;
 mod commands;
 mod db;
-mod discord;
-mod library;
-mod models;
-mod mpvipc;
-mod playback;
-mod recognize;
+mod profile_transfer;
 #[cfg(target_os = "linux")]
 mod rendering;
-mod rss;
-mod show_torrents;
 mod shutdown;
-mod sync_queue;
+mod tracking;
 mod updater;
 
-use commands::AppState;
 use directories::ProjectDirs;
-use parking_lot::Mutex;
-use std::sync::Arc;
+use kurisu_core::{Core, Event, EventKind, Platform, Services, UpdateChannel};
 use tauri::Manager;
+
+struct TauriPlatform(tauri::AppHandle);
+
+impl Platform for TauriPlatform {
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        use tauri_plugin_opener::OpenerExt;
+        self.0
+            .opener()
+            .open_url(url, None::<&str>)
+            .map_err(|e| e.to_string())
+    }
+    fn open_path(&self, path: &std::path::Path) -> Result<(), String> {
+        use tauri_plugin_opener::OpenerExt;
+        self.0
+            .opener()
+            .open_path(path.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|e| e.to_string())
+    }
+    fn reveal_path(&self, path: &std::path::Path) -> Result<(), String> {
+        self.open_path(path.parent().unwrap_or(path))
+    }
+}
+
+struct LegacyServices {
+    services: tokio::sync::Mutex<Option<Services>>,
+    event_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LegacyServices {
+    fn drop(&mut self) {
+        self.services.get_mut().take();
+        self.event_task.abort();
+    }
+}
+
+fn emit_core_event(app: &tauri::AppHandle, event: Event) {
+    use tauri::Emitter;
+    let prompt = tracking::LegacyPrompt::from_event(&event);
+    match event.kind {
+        EventKind::AuthExpired => {
+            let _ = app.emit("kurisu://auth-expired", ());
+        }
+        EventKind::NowPlaying(value) => {
+            let _ = app.emit("kurisu://now-playing", value);
+        }
+        EventKind::TrackingPrompt(_) => {
+            if let Some(prompt) = prompt {
+                let _ = app.emit("kurisu://tracking-prompt", prompt);
+            }
+        }
+        EventKind::TrackingAsk(_) => {
+            if let Some(prompt) = prompt {
+                let _ = app.emit("kurisu://tracking-ask", prompt);
+            }
+        }
+        EventKind::EpisodeUpdated(value) => {
+            let _ = app.emit("kurisu://episode-updated", value);
+        }
+        EventKind::PendingChanged(ids) => {
+            if let Some(ids) = ids {
+                let _ = app.emit(
+                    "kurisu://pending-changed",
+                    serde_json::json!({"media_ids": ids}),
+                );
+            } else {
+                let _ = app.emit("kurisu://pending-changed", ());
+            }
+        }
+        EventKind::WatchHistoryUpdated(value) => {
+            let _ = app.emit("kurisu://watch-history-updated", value);
+        }
+        EventKind::UpdateAvailable(value) => {
+            let _ = app.emit("kurisu://update-available", value);
+        }
+        EventKind::UpdateFailed(message) => {
+            let _ = app.emit(
+                "kurisu://update-failed",
+                serde_json::json!({"message": message}),
+            );
+        }
+    }
+}
+
+fn current_event(core: &Core, event: Event) -> Option<Event> {
+    core.event_is_current(&event).then_some(event)
+}
 
 fn open_database(app: &tauri::App) -> Result<db::Db, String> {
     let data_dir = app
@@ -146,10 +222,10 @@ pub fn run() {
                 eprintln!("kurisu: already running; raising the existing window");
                 return;
             }
-            log::warn!(
-                "single instance port {SINGLE_INSTANCE_ADDR} held by a process that is not Kurisu; starting without the guard"
+            log::error!(
+                "cannot reserve {SINGLE_INSTANCE_ADDR}; quit any other Kurisu instance and retry"
             );
-            None
+            return;
         }
     };
 
@@ -177,6 +253,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(shutdown::Shutdown::default())
         .invoke_handler(tauri::generate_handler![
+            profile_transfer::legacy_profile_database_path,
+            profile_transfer::export_profile_preferences,
+            profile_transfer::mirror_profile_preferences,
+            commands::acknowledge_tracking_prompt,
             shutdown::shutdown_ready,
             shutdown::finish_shutdown,
             commands::is_logged_in,
@@ -213,9 +293,9 @@ pub fn run() {
             commands::library_binding_for,
             commands::library_binding_details,
             commands::get_watch_history,
-            sync_queue::get_pending_changes,
-            sync_queue::sync_pending_changes,
-            sync_queue::resolve_pending_change,
+            commands::get_pending_changes,
+            commands::sync_pending_changes,
+            commands::resolve_pending_change,
             commands::unbind_library_media,
             commands::get_rss_feeds,
             commands::add_rss_feed,
@@ -227,8 +307,8 @@ pub fn run() {
             commands::get_user_stats,
             commands::check_update,
             commands::install_update,
-            updater::take_update_failed,
-            updater::take_pending_update,
+            commands::take_update_failed,
+            commands::take_pending_update,
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -238,10 +318,10 @@ pub fn run() {
             if let Err(e) = updater::init_install_path() {
                 log::warn!("updater: {e}");
             }
+            app.manage(profile_transfer::Handoff::new()?);
             INSTANCE_HANDLE
                 .set(app.handle().clone())
                 .expect("instance handle set once");
-            commands::set_app_handle(app.handle().clone());
 
             let db = match open_database(app) {
                 Ok(db) => db,
@@ -256,22 +336,37 @@ pub fn run() {
                 }
             };
 
-            let mut anilist = anilist::AniList::new();
-            if let Ok(Some(token)) = db.get_setting("anilist_token") {
-                if !token.is_empty() {
-                    anilist.set_token(Some(token));
+            let data_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+            let platform = std::sync::Arc::new(TauriPlatform(app.handle().clone()));
+            let runtime = tauri::async_runtime::handle().inner().clone();
+            let core = Core::from_db(db, data_dir, runtime, platform, UpdateChannel::Legacy);
+            let mut events = core.subscribe();
+            let handle = app.handle().clone();
+            let bridge_core = core.clone();
+            let event_task = core.spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            if let Some(kind) = current_event(&bridge_core, event) {
+                                emit_core_event(&handle, kind);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            for event in bridge_core.recovery_events() {
+                                if let Some(kind) = current_event(&bridge_core, event) {
+                                    emit_core_event(&handle, kind);
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-            }
-            let matchers = recognize::build_matchers(&db);
-            app.manage(AppState {
-                anilist: Mutex::new(anilist),
-                db: std::sync::Arc::new(db),
-                user: Mutex::new(None),
-                auth_intent: tokio::sync::watch::channel(0).0,
-                entry_lock: tokio::sync::Mutex::new(()),
-                remote_lock: tokio::sync::Mutex::new(()),
-                matchers: Mutex::new(Arc::new(matchers)),
-                library_cache: Default::default(),
+            });
+            let services = core.start_services();
+            app.manage(core);
+            app.manage(LegacyServices {
+                services: tokio::sync::Mutex::new(Some(services)),
+                event_task,
             });
 
             let tray_result: Result<(), String> = (|| {
@@ -335,11 +430,8 @@ pub fn run() {
                 main_window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         let close_to_tray = w
-                            .state::<AppState>()
-                            .db
-                            .get_setting("close_to_tray")
-                            .ok()
-                            .flatten()
+                            .state::<Core>()
+                            .legacy_setting("close_to_tray")
                             .map(|v| v == "1")
                             .unwrap_or(false);
                         if (tray_available && close_to_tray && w.hide().is_ok())
@@ -351,56 +443,14 @@ pub fn run() {
                 });
             }
 
-            playback::spawn(app.handle().clone());
-            sync_queue::spawn(app.handle().clone());
-
-            {
-                use tauri::Emitter;
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let sweep_handle = handle.clone();
-                    let update_failed = tokio::task::spawn_blocking(move || {
-                        if let Ok(dir) = sweep_handle.path().app_local_data_dir() {
-                            updater::sweep_update_leftovers(&dir);
-                        }
-                        updater::sweep_install_dir()
-                    })
-                    .await
-                    .unwrap_or(false);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    if update_failed {
-                        let _ = handle.emit(
-                            "kurisu://update-failed",
-                            serde_json::json!({
-                                "message": updater::FAILED_MESSAGE
-                            }),
-                        );
-                    }
-                    if !updater::auto_check_eligible() {
-                        return;
-                    }
-                    let enabled = || {
-                        handle
-                            .state::<AppState>()
-                            .db
-                            .get_setting("auto_update")
-                            .ok()
-                            .flatten()
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
-                    };
-                    updater::watch_updates(enabled, |payload| {
-                        updater::set_pending_update(payload.clone());
-                        let _ = handle.emit("kurisu://update-available", payload);
-                    })
-                    .await;
-                });
-            }
             Ok(())
         })
         .build(context)
         .expect("error while building kurisu")
         .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                profile_transfer::launch_after_exit(app);
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if shutdown::request(app, code.unwrap_or(0)) {
                     api.prevent_exit();
@@ -411,7 +461,101 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::migrate_legacy_db;
+    use super::{current_event, migrate_legacy_db};
+    use kurisu_core::models::{TrackingPrompt, UpdateInfo};
+    use kurisu_core::{Core, Event, EventKind, Platform, UpdateChannel};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    pub(crate) struct TestPlatform;
+    impl Platform for TestPlatform {
+        fn open_url(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn open_path(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn reveal_path(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_old_account_events_and_keeps_global_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "kurisu-bridge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let core = Core::open(
+            dir.clone(),
+            tokio::runtime::Handle::current(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Legacy,
+        )
+        .unwrap();
+        let db = kurisu_core::Db::open(&dir.join("kurisu.db")).unwrap();
+        db.set_setting("anilist_user_id", "8").unwrap();
+        let prompt = TrackingPrompt {
+            media_id: 1,
+            episode: 2,
+            title: "Old".into(),
+            raw_title: "Old".into(),
+            progress: 1,
+        };
+        let stale = Event {
+            generation: core.generation(),
+            account_id: Some(7),
+            prompt_id: Some(0),
+            kind: EventKind::TrackingPrompt(prompt.clone()),
+        };
+        assert!(current_event(&core, stale).is_none());
+        let mut events = core.subscribe();
+        core.emit(EventKind::TrackingPrompt(prompt));
+        let active = events.recv().await.unwrap();
+        assert!(matches!(
+            current_event(&core, active.clone()),
+            Some(Event {
+                kind: EventKind::TrackingPrompt(_),
+                ..
+            })
+        ));
+        assert!(core
+            .recovery_events()
+            .iter()
+            .any(|event| matches!(&event.kind, EventKind::TrackingPrompt(_))));
+        assert!(core.acknowledge_tracking_prompt(active.clone()).await);
+        assert!(current_event(&core, active).is_none());
+        let update = UpdateInfo {
+            available: true,
+            can_install: false,
+            restart_pending: false,
+            version: "2.0.0".into(),
+            tag: "v2.0.0".into(),
+            html_url: String::new(),
+            body: String::new(),
+            current: "1.0.0".into(),
+        };
+        let global = Event {
+            generation: 0,
+            account_id: None,
+            prompt_id: None,
+            kind: EventKind::UpdateAvailable(update),
+        };
+        assert!(matches!(
+            current_event(&core, global),
+            Some(Event {
+                kind: EventKind::UpdateAvailable(_),
+                ..
+            })
+        ));
+        drop(db);
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn test_dirs(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let base =

@@ -4,6 +4,7 @@
   import { auth } from "#lib/auth.svelte.ts";
   import { installInFlight, notePendingRestart, runInstallUpdate, updateNeedsRestart } from "#lib/update.svelte.ts";
   import Confirm from "#lib/Confirm.svelte";
+  import { exportUiPreferences, legacyProfileDatabasePath } from "#lib/profileTransfer.ts";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { TrackingConfig, UpdateInfo } from "#lib/types.ts";
 
@@ -33,6 +34,11 @@
   let signInErr = $state("");
   let confirmingLogout = $state(false);
   let loggingOut = $state(false);
+  let legacyDatabasePath = $state("");
+  let profilePathError = $state("");
+  let exportingPreferences = $state(false);
+  let preferenceExportPath = $state("");
+  let preferenceExportError = $state("");
 
   const modes: Array<[TrackingConfig["mode"], string]> = [
     ["off", "Off — don't track playback"],
@@ -46,6 +52,28 @@
       trackingLoaded = true;
     } catch (e) {
       loadError = String(e);
+    }
+  }
+
+  async function loadLegacyDatabasePath() {
+    try {
+      legacyDatabasePath = await legacyProfileDatabasePath();
+    } catch (error) {
+      profilePathError = String(error);
+    }
+  }
+
+  async function savePreferenceExport() {
+    if (exportingPreferences) return;
+    exportingPreferences = true;
+    preferenceExportPath = "";
+    preferenceExportError = "";
+    try {
+      preferenceExportPath = await exportUiPreferences() ?? "";
+    } catch (error) {
+      preferenceExportError = String(error);
+    } finally {
+      exportingPreferences = false;
     }
   }
 
@@ -174,6 +202,7 @@
     }
   }
   load();
+  void loadLegacyDatabasePath();
   void loadToggle("close_to_tray");
   void loadToggle("auto_update");
 </script>
@@ -215,6 +244,34 @@
         {signInErr}
       </div>
     {/if}
+  </section>
+
+  <section class="pt-4 border-t border-edge">
+    <h2 class="text-sm font-semibold uppercase tracking-wide text-ink-dim mb-2">Move to the native candidate</h2>
+    <p class="text-sm text-ink-dim mb-2">
+      Export this program's nine UI preferences, then quit both Kurisu programs before copying your saved profile.
+      The database and export file stay separate so you can return to this program.
+    </p>
+    <button
+      onclick={savePreferenceExport}
+      disabled={exportingPreferences}
+      class="px-3 py-1.5 rounded-md bg-panel-2 hover:bg-edge text-sm disabled:opacity-50"
+    >
+      {exportingPreferences ? "Exporting…" : "Export UI preferences"}
+    </button>
+    {#if preferenceExportPath}
+      <p class="text-xs text-accent mt-2">Saved to <code class="select-text break-all">{preferenceExportPath}</code></p>
+    {/if}
+    {#if preferenceExportError}
+      <p class="text-xs text-red-400 mt-2" role="alert">Export failed: {preferenceExportError}</p>
+    {/if}
+    <p class="text-xs text-ink-dim mt-3">Legacy database for the transfer command:</p>
+    {#if legacyDatabasePath}
+      <code class="block text-xs select-text break-all mt-1">{legacyDatabasePath}</code>
+    {:else if profilePathError}
+      <p class="text-xs text-red-400 mt-1" role="alert">Couldn't find the profile path: {profilePathError}</p>
+    {/if}
+    <p class="text-xs text-ink-dim mt-2">Follow <code>native/PROFILE_TRANSFER.md</code> to create the new profile and a backup.</p>
   </section>
 
   <section class="pt-4 border-t border-edge">

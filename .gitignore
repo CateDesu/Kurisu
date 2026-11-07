@@ -26,3 +26,6 @@ audit-*.md
 AGENTS.md
 # Keep the AniList exchange service local.
 /Kurisu-AniList-Exchange/
+/native/target/
+/core/target/
+/native/__pycache__/

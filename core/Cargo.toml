@@ -1,0 +1,43 @@
+[package]
+name = "kurisu-core"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# system-proxy keeps AniList and update requests working on managed networks.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "io-util"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+directories = "5"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+regex = "1"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+ring = "0.17"
+sha2 = "0.10"
+quick-xml = "0.41"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris = "2.0"
+libc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Media_Control"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+dbus = "0.9"

@@ -63,7 +63,7 @@ test("Close saves buffered progress and waits for acknowledgement", async () => 
   expect(mocks.close).not.toHaveBeenCalled();
   write.resolve({ media_id: 1, progress: 4 });
   await settle();
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("a failed close retains the intended progress for retry", async () => {
@@ -76,7 +76,7 @@ test("a failed close retains the intended progress for retry", async () => {
   expect(target.textContent).toContain("Disk is full");
   await close();
   expect(mocks.setProgress).toHaveBeenNthCalledWith(2, 1, 4, 3);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("close joins an in-flight save after the component is removed", async () => {
@@ -91,7 +91,7 @@ test("close joins an in-flight save after the component is removed", async () =>
   expect(mocks.close).not.toHaveBeenCalled();
   write.resolve({ media_id: 1, progress: 4 });
   await settle();
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("shutdown does not apply buffered edits to a replacement account", async () => {
@@ -217,4 +217,20 @@ test("a failed immediate final episode save stays pending and can complete on re
   expect(onchange).toHaveBeenCalledExactlyOnceWith(completed);
   await vi.advanceTimersByTimeAsync(3000);
   expect(mocks.setProgress).toHaveBeenCalledTimes(2);
+});
+
+test("Close keeps the program open after durable preference failure and retries the latest value", async () => {
+  mocks.invoke.mockRejectedValueOnce(new Error("Preference disk is full"));
+  components.push(mount(TitleBar, { target }));
+  localStorage.setItem("kurisu.list.q", "before retry");
+  await close();
+  await vi.waitFor(() => expect(target.textContent).toContain("Preference disk is full"));
+  expect(mocks.close).not.toHaveBeenCalled();
+  localStorage.setItem("kurisu.list.q", "latest retry");
+  await close();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
+  expect(mocks.invoke).toHaveBeenLastCalledWith("mirror_profile_preferences", {
+    preferences: expect.objectContaining({ "kurisu.list.q": "latest retry" }),
+  });
+  localStorage.removeItem("kurisu.list.q");
 });

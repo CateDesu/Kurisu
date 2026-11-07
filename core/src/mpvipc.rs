@@ -1,0 +1,917 @@
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::time::Duration;
+
+/// Bound the whole exchange, including peers that trickle incomplete replies.
+const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+const MAX_REPLY_BYTES: usize = 1024 * 1024;
+
+#[cfg(unix)]
+const IO_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Property indices also identify their IPC replies.
+const IDX_PAUSE: usize = 1;
+const IDX_PATH: usize = 2;
+const IDX_TITLE: usize = 3;
+const IDX_FILENAME: usize = 4;
+const IDX_DURATION: usize = 5;
+const IDX_POSITION: usize = 6;
+const PROPS: [(&str, usize); 6] = [
+    ("pause", IDX_PAUSE),
+    ("path", IDX_PATH),
+    ("media-title", IDX_TITLE),
+    ("filename", IDX_FILENAME),
+    ("duration", IDX_DURATION),
+    ("time-pos", IDX_POSITION),
+];
+
+pub(crate) struct MpvSnapshot {
+    pub playing: bool,
+    pub path: String,
+    pub media_title: String,
+    pub filename: String,
+    pub duration_us: i64,
+    pub position_us: i64,
+}
+
+pub(crate) fn probe(paths: &[String]) -> Vec<MpvSnapshot> {
+    let mut snapshots = Vec::new();
+    for p in paths {
+        #[cfg(unix)]
+        if std::fs::metadata(p).is_err() {
+            continue;
+        }
+        if let Some(s) = probe_one(p) {
+            snapshots.push(s);
+        }
+    }
+    snapshots
+}
+
+#[cfg(unix)]
+fn probe_one(path: &str) -> Option<MpvSnapshot> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::unix::net::UnixStream;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None).ok()?;
+    socket
+        .connect_timeout(&SockAddr::unix(path).ok()?, IO_TIMEOUT)
+        .ok()?;
+    let stream: UnixStream = socket.into();
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let writer = stream.try_clone().ok()?;
+    query(
+        BufReader::new(stream),
+        writer,
+        std::time::Instant::now() + QUERY_DEADLINE,
+    )
+}
+
+#[cfg(windows)]
+fn probe_one(path: &str) -> Option<MpvSnapshot> {
+    use std::io;
+    use tokio::io::Interest;
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+
+    struct Pipe<'a> {
+        socket: NamedPipeClient,
+        runtime: &'a ProbeRuntime,
+        deadline: tokio::time::Instant,
+    }
+
+    impl Pipe<'_> {
+        fn io(
+            &self,
+            interest: Interest,
+            mut operation: impl FnMut() -> io::Result<usize>,
+        ) -> io::Result<usize> {
+            self.runtime.block_on(async {
+                tokio::time::timeout_at(self.deadline, async {
+                    loop {
+                        self.socket.ready(interest).await?;
+                        match operation() {
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                            result => return result,
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+            })
+        }
+    }
+
+    impl io::Read for &Pipe<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.io(Interest::READABLE, || self.socket.try_read(buf))
+        }
+    }
+
+    impl Write for &Pipe<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.io(Interest::WRITABLE, || self.socket.try_write(buf))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let runtime = probe_runtime()?;
+    let deadline = std::time::Instant::now() + QUERY_DEADLINE;
+    let socket = {
+        let _guard = runtime.handle().enter();
+        ClientOptions::new().open(path).ok()?
+    };
+    // Dropping overlapped I/O closes a stalled pipe so the next probe can retry.
+    let pipe = Pipe {
+        socket,
+        runtime: &runtime,
+        deadline: deadline.into(),
+    };
+    query(BufReader::new(&pipe), &pipe, deadline)
+}
+
+#[cfg(any(windows, test))]
+enum ProbeRuntime {
+    Shared(tokio::runtime::Handle),
+    Local(tokio::runtime::Runtime),
+}
+
+#[cfg(any(windows, test))]
+impl ProbeRuntime {
+    fn handle(&self) -> &tokio::runtime::Handle {
+        match self {
+            Self::Shared(handle) => handle,
+            Self::Local(runtime) => runtime.handle(),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        match self {
+            Self::Shared(handle) => handle.block_on(future),
+            Self::Local(runtime) => runtime.block_on(future),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn probe_runtime() -> Option<ProbeRuntime> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return Some(ProbeRuntime::Shared(handle));
+        }
+    }
+    // A current-thread handle alone cannot drive pipe I/O or deadlines.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    Some(ProbeRuntime::Local(runtime))
+}
+
+fn query<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    deadline: std::time::Instant,
+) -> Option<MpvSnapshot> {
+    let mut out = String::new();
+    for (prop, id) in PROPS {
+        out.push_str(&format!(
+            "{{\"command\":[\"get_property\",\"{prop}\"],\"request_id\":{id}}}\n"
+        ));
+    }
+    writer.write_all(out.as_bytes()).ok()?;
+    writer.flush().ok()?;
+
+    let mut vals: Vec<Option<serde_json::Value>> = vec![None; PROPS.len() + 1];
+    let mut received = [false; PROPS.len() + 1];
+    let mut answered = 0;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let line = read_reply(&mut reader, deadline)?;
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("event").is_some() {
+            continue;
+        }
+        let Some(rid) = v.get("request_id").and_then(|x| x.as_u64()) else {
+            continue;
+        };
+        if rid == 0 || rid >= vals.len() as u64 || received[rid as usize] {
+            continue;
+        }
+        received[rid as usize] = true;
+        let ok = v.get("error").and_then(|e| e.as_str()) == Some("success");
+        vals[rid as usize] = ok.then(|| v.get("data").cloned()).flatten();
+        answered += 1;
+        if answered == PROPS.len() {
+            return build_snapshot(&vals);
+        }
+    }
+}
+
+fn read_reply(reader: &mut impl BufRead, deadline: std::time::Instant) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let bytes = reader.fill_buf().ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let newline = bytes.iter().position(|b| *b == b'\n');
+        let count = newline.map_or(bytes.len(), |n| n + 1);
+        if line.len() + count > MAX_REPLY_BYTES {
+            return None;
+        }
+        line.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return Some(line);
+        }
+    }
+}
+
+fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
+    let paused = vals[IDX_PAUSE].as_ref().and_then(|v| v.as_bool())?;
+    let path = vals[IDX_PATH].as_ref().and_then(|v| v.as_str())?;
+    if path.is_empty() {
+        return None;
+    }
+    let str_at = |i: usize| {
+        vals[i]
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let secs_to_us = |i: usize| {
+        vals[i]
+            .as_ref()
+            .and_then(|v| v.as_f64())
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|s| (s * 1_000_000.0).round() as i64)
+    };
+    let position = secs_to_us(IDX_POSITION);
+    Some(MpvSnapshot {
+        playing: !paused,
+        path: path.to_string(),
+        media_title: str_at(IDX_TITLE),
+        filename: str_at(IDX_FILENAME),
+        duration_us: position.and_then(|_| secs_to_us(IDX_DURATION)).unwrap_or(0),
+        position_us: position.unwrap_or(0),
+    })
+}
+
+pub(crate) fn default_socket_paths() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    #[cfg(unix)]
+    {
+        v.push("/tmp/mpvsocket".into());
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+            v.push(format!("{}/mpv.sock", xdg.to_string_lossy()));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy();
+            v.push(format!("{home}/.cache/mpv/socket"));
+            v.push(format!("{home}/.config/mpv/socket"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        v.push(r"\\.\pipe\mpvsocket".into());
+        v.push(r"\\.\pipe\mpv-socket".into());
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    #[test]
+    fn synchronous_probes_keep_a_local_runtime_alive() {
+        let runtime = probe_runtime().unwrap();
+        assert!(matches!(runtime, ProbeRuntime::Local(_)));
+        let _entered = runtime.handle().enter();
+        runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_probes_reuse_the_running_runtime_and_its_timer_driver() {
+        let local_runtimes = tokio::task::spawn_blocking(|| {
+            let mut local_runtimes = 0;
+            for _ in 0..20 {
+                let runtime = probe_runtime().unwrap();
+                local_runtimes += usize::from(matches!(runtime, ProbeRuntime::Local(_)));
+                let _entered = runtime.handle().enter();
+                runtime.block_on(async {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                });
+            }
+            local_runtimes
+        })
+        .await
+        .unwrap();
+        assert_eq!(local_runtimes, 0);
+    }
+
+    #[tokio::test]
+    async fn current_thread_callers_keep_the_local_driver_fallback() {
+        tokio::task::spawn_blocking(|| {
+            let runtime = probe_runtime().unwrap();
+            assert!(matches!(runtime, ProbeRuntime::Local(_)));
+            let _entered = runtime.handle().enter();
+            runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stalled_windows_pipe_closes_and_recovers_without_restarting() {
+        windows_pipe_recovery(false);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_stalled_windows_pipe_recovers_on_the_shared_runtime() {
+        tokio::task::spawn_blocking(|| windows_pipe_recovery(true))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn windows_pipe_recovery(shared: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let path = format!(
+            r"\\.\pipe\kurisu-mpv-recovery-{}-{shared}",
+            std::process::id()
+        );
+        let server_path = path.clone();
+        let (ready, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let pipe = ServerOptions::new().create(&server_path).unwrap();
+                    ready.send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), pipe.connect())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut reader = tokio::io::BufReader::new(pipe);
+                    for (property, id) in PROPS {
+                        let mut line = String::new();
+                        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(
+                            request["command"],
+                            serde_json::json!(["get_property", property])
+                        );
+                        assert_eq!(request["request_id"], id);
+                    }
+                    let closed = matches!(
+                        tokio::time::timeout(
+                            QUERY_DEADLINE + Duration::from_secs(2),
+                            reader.read_u8()
+                        )
+                        .await,
+                        Ok(Err(_))
+                    );
+                    let mut pipe = reader.into_inner();
+                    pipe.disconnect().unwrap();
+                    ready.send(()).unwrap();
+                    if matches!(
+                        tokio::time::timeout(Duration::from_secs(2), pipe.connect()).await,
+                        Ok(Ok(()))
+                    ) {
+                        let mut reader = tokio::io::BufReader::new(&mut pipe);
+                        for _ in PROPS {
+                            tokio::time::timeout(
+                                Duration::from_secs(2),
+                                reader.read_line(&mut String::new()),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        }
+                        let reply = [
+                            ok(IDX_PAUSE, "false"),
+                            ok(IDX_PATH, r#""C:\\Anime\\Some Show - 03.mkv""#),
+                            ok(IDX_TITLE, r#""Some Show - 03""#),
+                            ok(IDX_FILENAME, r#""Some Show - 03.mkv""#),
+                            ok(IDX_DURATION, "1200"),
+                            ok(IDX_POSITION, "1100"),
+                        ]
+                        .concat();
+                        for fragment in reply.as_bytes().chunks(17) {
+                            pipe.write_all(fragment).await.unwrap();
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(2), pipe.read_u8()).await;
+                    }
+                    closed
+                })
+        });
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(probe(std::slice::from_ref(&path)).is_empty());
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        let recovered = probe(&[format!("{path}-missing"), path]);
+        let closed = server.join().unwrap();
+        assert!(closed, "the timed out probe left its pipe open");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a recovered MPV must be detected on the next tick"
+        );
+        assert_eq!(recovered[0].position_us, 1_100_000_000);
+        assert_eq!(recovered[0].duration_us, 1_200_000_000);
+        assert!(recovered[0].playing);
+    }
+
+    fn query_lines(lines: &str) -> (Option<MpvSnapshot>, String) {
+        let mut sink = Vec::new();
+        let snap = query(
+            BufReader::new(Cursor::new(lines.to_string())),
+            &mut sink,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        (snap, String::from_utf8(sink).unwrap())
+    }
+
+    struct Trickle;
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(6);
+            buf[..n].copy_from_slice(&b"junk\n\n"[..n]);
+            Ok(n)
+        }
+    }
+    impl BufRead for Trickle {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Ok(&b"junk\n"[..])
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn an_ever_trickling_peer_hits_the_deadline() {
+        let mut sink = Vec::new();
+        let started = std::time::Instant::now();
+        let snap = query(
+            Trickle,
+            &mut sink,
+            std::time::Instant::now() + Duration::from_millis(200),
+        );
+        assert!(snap.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline must bound the exchange"
+        );
+    }
+
+    #[test]
+    fn incomplete_lines_still_hit_the_deadline() {
+        struct PartialLine {
+            chunks: usize,
+        }
+        impl std::io::Read for PartialLine {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let chunk = self.fill_buf()?;
+                if chunk.is_empty() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = chunk[0];
+                self.consume(1);
+                Ok(1)
+            }
+        }
+        impl BufRead for PartialLine {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(if self.chunks > 0 { b" " } else { b"" })
+            }
+            fn consume(&mut self, count: usize) {
+                self.chunks -= count;
+            }
+        }
+        let started = std::time::Instant::now();
+        let snap = query(
+            PartialLine { chunks: 100 },
+            Vec::new(),
+            started + Duration::from_millis(100),
+        );
+        assert!(snap.is_none());
+        assert!(started.elapsed() < Duration::from_millis(800));
+    }
+
+    #[test]
+    fn oversized_reply_lines_are_rejected() {
+        let replies = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, r#""/anime/Some Show - 03.mkv""#),
+            ok(IDX_TITLE, r#""Some Show - 03""#),
+            ok(IDX_FILENAME, r#""Some Show - 03.mkv""#),
+            ok(IDX_DURATION, "1200"),
+            ok(IDX_POSITION, "1100"),
+        ]
+        .concat();
+        assert!(query_lines(&replies).0.is_some());
+        let oversized = " ".repeat(MAX_REPLY_BYTES) + &replies;
+        assert!(query_lines(&oversized).0.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_full_socket_backlog_cannot_block_the_probe() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let path = std::env::temp_dir().join(format!("kurisu-mpv-backlog-{}", std::process::id()));
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let clients = [
+            std::os::unix::net::UnixStream::connect(&path).unwrap(),
+            std::os::unix::net::UnixStream::connect(&path).unwrap(),
+        ];
+        let (release, wait) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+            drop(listener);
+        });
+        let started = std::time::Instant::now();
+        assert!(probe_one(path.to_str().unwrap()).is_none());
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        closer.join().unwrap();
+        drop(clients);
+        std::fs::remove_file(path).unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    fn ok(id: usize, data: &str) -> String {
+        format!("{{\"data\":{data},\"request_id\":{id},\"error\":\"success\"}}\n")
+    }
+
+    #[test]
+    fn parses_a_playing_file() {
+        let lines = [
+            "{\"event\":\"playback-restart\"}\n".to_string(),
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, "\"/anime/[Group] Frieren - 05 [1080p].mkv\""),
+            ok(IDX_TITLE, "\"[Group] Frieren - 05\""),
+            ok(IDX_FILENAME, "\"[Group] Frieren - 05 [1080p].mkv\""),
+            ok(IDX_DURATION, "1440.5"),
+            ok(IDX_POSITION, "0.25"),
+        ]
+        .concat();
+        let (snap, sent) = query_lines(&lines);
+        let s = snap.expect("all six answers arrived");
+        assert!(s.playing);
+        assert_eq!(s.path, "/anime/[Group] Frieren - 05 [1080p].mkv");
+        assert_eq!(s.media_title, "[Group] Frieren - 05");
+        assert_eq!(s.duration_us, 1_440_500_000);
+        assert_eq!(s.position_us, 250_000);
+        for (prop, id) in PROPS {
+            assert!(
+                sent.contains(&format!(
+                    "[\"get_property\",\"{prop}\"],\"request_id\":{id}"
+                )),
+                "command burst must ask for {prop} with id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_properties_degrade_instead_of_sinking_the_snapshot() {
+        let lines = [
+            ok(IDX_PAUSE, "true"),
+            ok(IDX_PATH, "\"https://example.com/stream\""),
+            "{\"request_id\":3,\"error\":\"property unavailable\"}\n".to_string(),
+            ok(IDX_FILENAME, "\"stream\""),
+            "{\"request_id\":5,\"error\":\"property unavailable\"}\n".to_string(),
+            "{\"request_id\":6,\"error\":\"property unavailable\"}\n".to_string(),
+        ]
+        .concat();
+        let (snap, _) = query_lines(&lines);
+        let s = snap.expect("a paused stream with no timeline is still a track");
+        assert!(!s.playing);
+        assert_eq!(s.path, "https://example.com/stream");
+        assert_eq!(s.media_title, "");
+        assert_eq!(s.duration_us, 0);
+        assert_eq!(s.position_us, 0);
+    }
+
+    #[test]
+    fn an_unavailable_position_does_not_look_like_a_usable_timeline() {
+        let lines = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, "\"/anime/episode03.mkv\""),
+            ok(IDX_TITLE, "\"Some Show - 03\""),
+            ok(IDX_FILENAME, "\"episode03.mkv\""),
+            ok(IDX_DURATION, "1200"),
+            "{\"request_id\":6,\"error\":\"property unavailable\"}\n".to_string(),
+        ]
+        .concat();
+        let (snapshot, _) = query_lines(&lines);
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.playing);
+        assert_eq!(snapshot.duration_us, 0);
+        assert_eq!(snapshot.position_us, 0);
+        let at_start = lines.replace(
+            "{\"request_id\":6,\"error\":\"property unavailable\"}\n",
+            &ok(IDX_POSITION, "0"),
+        );
+        let (snapshot, _) = query_lines(&at_start);
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.duration_us, 1_200_000_000);
+        assert_eq!(snapshot.position_us, 0);
+    }
+
+    #[test]
+    fn an_idle_mpv_with_no_file_is_not_a_track() {
+        let lines = [
+            ok(IDX_PAUSE, "false"),
+            "{\"request_id\":2,\"error\":\"property unavailable\"}\n".to_string(),
+            ok(IDX_TITLE, "null"),
+            ok(IDX_FILENAME, "null"),
+            "{\"request_id\":5,\"error\":\"property unavailable\"}\n".to_string(),
+            "{\"request_id\":6,\"error\":\"property unavailable\"}\n".to_string(),
+        ]
+        .concat();
+        let (snap, _) = query_lines(&lines);
+        assert!(snap.is_none());
+    }
+
+    #[test]
+    fn a_truncated_or_garbage_round_trip_is_none() {
+        let lines = [ok(IDX_PAUSE, "false"), ok(IDX_PATH, "\"/a.mkv\"")].concat();
+        let (snap, _) = query_lines(&lines);
+        assert!(snap.is_none());
+    }
+
+    #[test]
+    fn out_of_order_and_foreign_answers_are_ignored() {
+        let mut lines = String::new();
+        lines.push_str(&ok(IDX_FILENAME, "\"f.mkv\""));
+        lines.push_str(&ok(99, "\"junk\""));
+        lines.push_str(&ok(0, "\"junk\""));
+        lines.push_str(&ok(IDX_PAUSE, "false"));
+        lines.push_str(&ok(IDX_PATH, "\"/f.mkv\""));
+        lines.push_str(&ok(IDX_PATH, "\"/f.mkv\""));
+        lines.push_str(&ok(IDX_TITLE, "\"f\""));
+        lines.push_str(&ok(IDX_DURATION, "60"));
+        lines.push_str(&ok(IDX_POSITION, "10"));
+        let (snap, _) = query_lines(&lines);
+        assert!(snap.is_some());
+    }
+
+    #[test]
+    fn duplicate_failed_properties_do_not_finish_the_query_early() {
+        let failed = "{\"request_id\":3,\"error\":\"property unavailable\"}\n";
+        let lines = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, "\"/f.mkv\""),
+            failed.into(),
+            failed.into(),
+            ok(IDX_FILENAME, "\"f.mkv\""),
+            ok(IDX_DURATION, "60"),
+            ok(IDX_POSITION, "10"),
+        ]
+        .concat();
+        let snap = query_lines(&lines).0.unwrap();
+        assert_eq!(snap.position_us, 10_000_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_playing_socket_is_available_for_recognition() {
+        use std::os::unix::net::UnixListener;
+        let mut paths = Vec::new();
+        let mut servers = Vec::new();
+        for (index, filename) in ["unrelated.mp3", "Some Show - 03.mkv"].iter().enumerate() {
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-mpv-recognition-{}-{index}",
+                std::process::id()
+            ));
+            let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            paths.push(path.to_str().unwrap().to_string());
+            let filename = filename.to_string();
+            servers.push(std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                for _ in PROPS {
+                    reader.read_line(&mut String::new()).unwrap();
+                }
+                let path = serde_json::to_string(&format!("/anime/{filename}")).unwrap();
+                let filename = serde_json::to_string(&filename).unwrap();
+                let lines = [
+                    ok(IDX_PAUSE, "false"),
+                    ok(IDX_PATH, &path),
+                    ok(IDX_TITLE, &filename),
+                    ok(IDX_FILENAME, &filename),
+                    ok(IDX_DURATION, "1200"),
+                    ok(IDX_POSITION, "1100"),
+                ]
+                .concat();
+                (&stream).write_all(lines.as_bytes()).unwrap();
+            }));
+        }
+        let snapshots = probe(&paths).into_iter().collect::<Vec<_>>();
+        for server in servers {
+            server.join().unwrap();
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.path.ends_with("Some Show - 03.mkv")),
+            "the earlier audio socket hid the anime from playback recognition"
+        );
+        assert_eq!(snapshots.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paused_and_playing_sockets_are_available_for_selection() {
+        use std::os::unix::net::UnixListener;
+        struct SocketPath(std::path::PathBuf);
+        impl Drop for SocketPath {
+            fn drop(&mut self) {
+                std::fs::remove_file(&self.0).ok();
+            }
+        }
+        let mut paths = Vec::new();
+        let mut sockets = Vec::new();
+        let mut servers = Vec::new();
+        for paused in [true, false] {
+            let path = std::env::temp_dir()
+                .join(format!("kurisu-mpv-choice-{}-{paused}", std::process::id()));
+            let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            paths.push(path.to_str().unwrap().to_string());
+            sockets.push(SocketPath(path));
+            servers.push(std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "MPV probe did not connect"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                for _ in PROPS {
+                    assert!(reader.read_line(&mut String::new()).unwrap() > 0);
+                }
+                let lines = [
+                    ok(IDX_PAUSE, if paused { "true" } else { "false" }),
+                    ok(IDX_PATH, "\"/f.mkv\""),
+                    ok(IDX_TITLE, "\"f\""),
+                    ok(IDX_FILENAME, "\"f.mkv\""),
+                    ok(IDX_DURATION, "60"),
+                    ok(IDX_POSITION, "10"),
+                ]
+                .concat();
+                (&stream).write_all(lines.as_bytes()).unwrap();
+            }));
+        }
+        let snapshots = probe(&paths);
+        let joined: Vec<_> = servers.into_iter().map(|server| server.join()).collect();
+        drop(sockets);
+        for result in joined {
+            result.unwrap();
+        }
+        assert_eq!(snapshots.len(), 2);
+        assert!(!snapshots[0].playing);
+        assert!(snapshots[1].playing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probes_a_live_mpv() {
+        struct Player {
+            child: std::process::Child,
+            dir: std::path::PathBuf,
+        }
+
+        impl Drop for Player {
+            fn drop(&mut self) {
+                self.child.kill().ok();
+                self.child.wait().ok();
+                std::fs::remove_dir_all(&self.dir).ok();
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("kurisu-mpv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("t.wav");
+        // Five seconds of silence as 8 kHz, 8 bit mono PCM.
+        let data_len = 40_000_u32;
+        let mut wav_bytes = Vec::new();
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&16_u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        wav_bytes.extend_from_slice(&1_u16.to_le_bytes()); // mono
+        wav_bytes.extend_from_slice(&8000_u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&8000_u32.to_le_bytes()); // byte rate
+        wav_bytes.extend_from_slice(&1_u16.to_le_bytes()); // block align
+        wav_bytes.extend_from_slice(&8_u16.to_le_bytes()); // bits
+        wav_bytes.extend_from_slice(b"data");
+        wav_bytes.extend_from_slice(&data_len.to_le_bytes());
+        wav_bytes.extend(std::iter::repeat_n(128_u8, data_len as usize));
+        std::fs::write(&wav, wav_bytes).unwrap();
+
+        let sock = dir.join("sock");
+        let mut cmd = std::process::Command::new("mpv");
+        // MPV requires the socket argument in the =value form.
+        let mut ipc_arg = std::ffi::OsString::from("--input-ipc-server=");
+        ipc_arg.push(&sock);
+        cmd.arg("--no-config")
+            .arg("--load-scripts=no")
+            .arg("--vo=null")
+            .arg("--ao=null")
+            .arg("--loop-file=inf")
+            .arg(&ipc_arg)
+            .arg(&wav);
+        // Do not let Cargo's library path override MPV's system libraries.
+        cmd.env_remove("LD_LIBRARY_PATH");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        let mut player = Player {
+            child: cmd
+                .spawn()
+                .expect("install MPV to run the IPC integration test"),
+            dir,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            assert!(
+                player.child.try_wait().unwrap().is_none(),
+                "MPV exited before playback started"
+            );
+            if let Some(snap) = probe_one(sock.to_str().unwrap()) {
+                if snap.position_us > 0 {
+                    break snap;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MPV did not start playback"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        assert!(snap.playing);
+        assert!(snap.path.ends_with("t.wav"));
+        assert_eq!(snap.duration_us, 5_000_000);
+    }
+}

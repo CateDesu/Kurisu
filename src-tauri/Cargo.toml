@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 tokio = { version = "1.53.3", features = ["test-util"] }
 
 [dependencies]
+kurisu-core = { path = "../core" }
 tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

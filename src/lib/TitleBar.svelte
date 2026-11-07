@@ -2,6 +2,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   import { flushPendingEdits } from "#lib/pendingEdits.ts";
+  import { flushUiPreferences } from "#lib/profileTransfer.ts";
 
   let closeError = $state("");
   let closing = $state(false);
@@ -11,6 +12,7 @@
     closeError = "";
     try {
       await flushPendingEdits();
+      await flushUiPreferences();
       await appWindow.close();
     } catch (error) {
       closeError = `Could not save progress: ${String(error)}`;

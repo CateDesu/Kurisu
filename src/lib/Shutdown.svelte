@@ -3,11 +3,14 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { flushPendingEdits } from "#lib/pendingEdits.ts";
+  import { flushUiPreferences } from "#lib/profileTransfer.ts";
+  import { releaseInstallForRetry } from "#lib/update.svelte.ts";
 
   let saving = $state(false);
   let error = $state("");
 
   $effect(() => {
+    void flushUiPreferences().catch((e) => { error = `Could not prepare your preferences: ${String(e)}. Retry by closing Kurisu again.`; });
     let alive = true;
     let unlisten: (() => void) | undefined;
     void listen("kurisu://shutdown-requested", async () => {
@@ -17,6 +20,7 @@
       let success = false;
       try {
         await flushPendingEdits();
+        await flushUiPreferences();
         success = true;
       } catch (e) {
         error = `Could not save progress: ${String(e)}. Kurisu is still open.`;
@@ -27,6 +31,7 @@
       } catch (e) {
         error = String(e);
       }
+      releaseInstallForRetry();
       saving = false;
     }).then(async (un) => {
       if (!alive) { un(); return; }

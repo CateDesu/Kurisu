@@ -39,16 +39,26 @@ pub fn request(app: &tauri::AppHandle, exit_code: i32) -> bool {
 }
 
 #[tauri::command]
-pub fn finish_shutdown(success: bool, app: tauri::AppHandle, state: tauri::State<'_, Shutdown>) {
-    let mut status = state.0.lock();
-    if !status.requested {
-        return;
+pub async fn finish_shutdown(
+    success: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Shutdown>,
+) -> Result<(), String> {
+    let code = {
+        let status = state.0.lock();
+        if !status.requested {
+            return Ok(());
+        }
+        status.exit_code
+    };
+    crate::profile_transfer::settle_close(&app, success).await;
+    {
+        let mut status = state.0.lock();
+        status.requested = false;
+        status.approved = success;
     }
-    status.requested = false;
-    status.approved = success;
-    let code = status.exit_code;
-    drop(status);
     if success {
         app.exit(code);
     }
+    Ok(())
 }

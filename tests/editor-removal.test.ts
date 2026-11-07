@@ -39,6 +39,7 @@ beforeEach(() => {
   finishOperations = [];
   entries = new Map([[1, { ...original }]]);
   mocks.invoke.mockImplementation(async (command: string, args: any) => {
+    if (command === "mirror_profile_preferences") return;
     if (command === "get_recommendations") return [];
     if (command === "delete_entry_cmd") { entries.delete(args.mediaId); return; }
     if (command === "set_progress") {
@@ -130,7 +131,7 @@ test("removing an entry cancels its buffered progress and still saves other show
 
   expect(entries.has(1)).toBe(false);
   expect(entries.get(2)?.progress).toBe(7);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 2, progress: 7, expected: 6 }]]);
 });
@@ -166,7 +167,7 @@ test("closing during a removal waits without submitting the buffered progress", 
   expect(closedEarly).toBe(false);
   expect(entries.has(1)).toBe(false);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress")).toEqual([]);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("a failed pending removal keeps Close open and restores progress for retry", async () => {
@@ -192,7 +193,7 @@ test("a failed pending removal keeps Close open and restores progress for retry"
   expect(entries.get(1)?.progress).toBe(4);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 1, progress: 4, expected: 3 }]]);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("a save completed during a failed removal can still leave the save barrier", async () => {
@@ -219,7 +220,7 @@ test("a save completed during a failed removal can still leave the save barrier"
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 1, progress: 4, expected: 3 }]]);
   expect(entries.get(1)?.progress).toBe(4);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("a failed removal does not replace a newer buffered edit for the same show", async () => {
@@ -284,7 +285,7 @@ test("overlapping failed removals after a route remount retain progress for retr
   await close();
   await closeFinished();
   expect(entries.get(1)?.progress).toBe(4);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
   await close();
   await closeFinished();
   expect(mocks.close).toHaveBeenCalledTimes(2);
@@ -332,7 +333,7 @@ test.each(removalOutcomes.flatMap((outcomes) => [
     await close();
   }
   await closeFinished();
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
   const deleted = outcomes.some(Boolean);
   expect(entries.get(1)?.progress).toBe(deleted ? undefined : 4);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
@@ -370,7 +371,7 @@ test.each(["before", "after"])("a newer same-show edit %s the second removal sur
   expect(entries.get(1)?.progress).toBe(5);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 1, progress: 5, expected: 3 }]]);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("a failed removal cannot resume the progress timer while another removal is pending", async () => {
@@ -398,7 +399,7 @@ test("a failed removal cannot resume the progress timer while another removal is
   expect(entries.get(1)?.progress).toBe(4);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 1, progress: 4, expected: 3 }]]);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test("successful overlapping removals still wait for a previously submitted save acknowledgement", async () => {
@@ -438,7 +439,7 @@ test("successful overlapping removals still wait for a previously submitted save
   expect(entries.has(1)).toBe(false);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 1, progress: 4, expected: 3 }]]);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });
 
 test.each([false, true])("overlapping removals cannot replace another account's progress when the last succeeds: %s", async (succeeds) => {
@@ -470,5 +471,5 @@ test.each([false, true])("overlapping removals cannot replace another account's 
   expect(entries.get(1)?.progress).toBe(7);
   expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_progress"))
     .toEqual([["set_progress", { mediaId: 1, progress: 7, expected: 6 }]]);
-  expect(mocks.close).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.close).toHaveBeenCalledOnce());
 });

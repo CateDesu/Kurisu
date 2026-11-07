@@ -6,11 +6,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries(["takePendingUpdate", "takeUpdateFailed", "checkUpdate", "installUpdate", "getTrackingConfig", "getAppSetting", "setProgress"].map((name) => [name, vi.fn()])),
   listener: null as ((event: { payload: unknown }) => void) | null,
+  shutdown: null as (() => Promise<void>) | null,
 }));
 vi.mock("#lib/api.ts", () => ({ api: mocks.api }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => {}) }));
 vi.mock("#lib/auth.svelte.ts", () => ({ auth: { user: { id: 1, name: "Example" }, isLoggedIn: true, epoch: 0 } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, callback: typeof mocks.listener) => {
   if (name === "kurisu://update-available") mocks.listener = callback;
+  if (name === "kurisu://shutdown-requested") mocks.shutdown = callback as unknown as () => Promise<void>;
   return () => {};
 }) }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
@@ -24,6 +27,7 @@ beforeEach(async () => {
   runtime = await import("svelte");
   vi.resetAllMocks();
   mocks.listener = null;
+  mocks.shutdown = null;
   mocks.api.takePendingUpdate.mockResolvedValue(null);
   mocks.api.takeUpdateFailed.mockResolvedValue(null);
   mocks.api.checkUpdate.mockResolvedValue(update);
@@ -180,10 +184,57 @@ test("installing flushes progress and prevents new buffered clicks", async () =>
   await vi.advanceTimersByTimeAsync(3000);
   expect(mocks.api.setProgress).toHaveBeenCalledOnce();
   progress.resolve({ media_id: 1, progress: 4 });
-  await settle();
-  expect(mocks.api.installUpdate).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(mocks.api.installUpdate).toHaveBeenCalledOnce());
   installer.resolve("restarting");
   await installing;
   await settle();
   expect(plus.disabled).toBe(true);
+});
+
+test("failed durable preference preparation prevents installation and permits retry", async () => {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { runInstallUpdate, installInFlight } = await import("#lib/update.svelte.ts");
+  vi.mocked(invoke).mockRejectedValueOnce(new Error("Preference disk is full")).mockResolvedValue(undefined);
+  await expect(runInstallUpdate()).rejects.toThrow("Preference disk is full");
+  expect(mocks.api.installUpdate).not.toHaveBeenCalled();
+  expect(installInFlight()).toBe(false);
+  await expect(runInstallUpdate()).resolves.toBe("installed");
+  expect(mocks.api.installUpdate).toHaveBeenCalledOnce();
+});
+
+test.each(["before", "after"])("failed exit %s the install reply releases controls and retains restart guidance", async (ordering) => {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { default: Shutdown } = await import("#lib/Shutdown.svelte");
+  const { flushUiPreferences } = await import("#lib/profileTransfer.ts");
+  const { runInstallUpdate, installInFlight, updateNeedsRestart } = await import("#lib/update.svelte.ts");
+  let rejectMirror = false;
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "mirror_profile_preferences" && rejectMirror) {
+      rejectMirror = false;
+      throw new Error("Preference disk is full");
+    }
+  });
+  instances.push(runtime.mount(Shutdown, { target: document.body }));
+  await settle();
+  await flushUiPreferences();
+  mocks.api.installUpdate.mockImplementation(async () => {
+    if (ordering === "before") {
+      rejectMirror = true;
+      await mocks.shutdown!();
+    }
+    return "restarting";
+  });
+  await runInstallUpdate();
+  if (ordering === "after") {
+    expect(installInFlight()).toBe(true);
+    rejectMirror = true;
+    await mocks.shutdown!();
+  }
+  await settle();
+  expect(invoke).toHaveBeenCalledWith("finish_shutdown", { success: false });
+  expect(document.body.textContent).toContain("Preference disk is full");
+  expect(installInFlight()).toBe(false);
+  expect(updateNeedsRestart()).toBe(true);
+  await mocks.shutdown!();
+  expect(invoke).toHaveBeenLastCalledWith("finish_shutdown", { success: true });
 });

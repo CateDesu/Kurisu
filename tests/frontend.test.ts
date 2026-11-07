@@ -6,7 +6,7 @@ import { button, deferred, selectOption, settle, settleListUpdates } from "./hel
 
 const mocks = vi.hoisted(() => ({
   api: Object.fromEntries([
-    "getEntry", "setProgress", "updateEntry", "deleteEntry", "getMedia", "getMediaDetail", "getRecommendations",
+    "getEntry", "setProgress", "acknowledgeTrackingPrompt", "updateEntry", "deleteEntry", "getMedia", "getMediaDetail", "getRecommendations",
     "localEntries", "localEntryUpdates", "getSeason", "getAiringSchedule", "getTrackingConfig", "getAppSetting", "setTrackingConfig",
     "getLibraryBinding", "bindLibraryPath", "getRssFeeds", "fetchTorrents", "searchTorrents", "findShowTorrents", "markTorrentsSeen", "setAppSetting",
   ].map((name) => [name, vi.fn()])),
@@ -105,7 +105,15 @@ async function render<C extends Component<any>>(component: C, props?: any) {
   return instance as ReturnType<C>;
 }
 
+let trackingId = 0;
 function event(name: string, payload: unknown) {
+  if (name === "kurisu://tracking-prompt" || name === "kurisu://tracking-ask") {
+    payload = {
+      generation: String(auth.epoch), account_id: auth.user?.id ?? null,
+      prompt_id: String(++trackingId), ask: name.endsWith("tracking-ask"), raw_title: "Synthetic",
+      ...(payload as object),
+    };
+  }
   for (const callback of mocks.listeners.get(name) ?? []) callback({ payload });
 }
 
@@ -126,6 +134,7 @@ beforeEach(() => {
   mocks.library.loadFolders.mockResolvedValue(undefined);
   mocks.library.ensureScan.mockResolvedValue(undefined);
   mocks.api.getEntry.mockResolvedValue({ ...entry });
+  mocks.api.acknowledgeTrackingPrompt.mockResolvedValue(true);
   mocks.api.localEntries.mockResolvedValue([{ ...entry }]);
   mocks.api.localEntryUpdates.mockResolvedValue([{ ...entry }]);
   mocks.api.getMedia.mockResolvedValue(media);
@@ -225,6 +234,95 @@ test("tracking closes an accepted progress prompt without receiving a list-updat
   button("Set progress to Ep 8").click();
   await settle();
   expect(mocks.api.setProgress).toHaveBeenCalledOnce();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+});
+
+test("tracking Skip acknowledges its identity and ignores an already delivered replay", async () => {
+  const ack = deferred<boolean>();
+  mocks.api.acknowledgeTrackingPrompt.mockReturnValueOnce(ack.promise);
+  const payload = { generation: "0", account_id: 1, prompt_id: "999999", ask: false,
+    media_id: 1, episode: 8, progress: 0, title: "Example Show", raw_title: "Synthetic" };
+  await render(Tracking);
+  event("kurisu://tracking-prompt", payload);
+  await settle();
+  button("Skip").click();
+  await settle();
+  expect(mocks.api.acknowledgeTrackingPrompt).toHaveBeenCalledExactlyOnceWith(payload);
+  event("kurisu://tracking-prompt", payload);
+  ack.resolve(true);
+  await settle();
+  event("kurisu://tracking-prompt", payload);
+  await settle();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+  event("kurisu://tracking-prompt", { ...payload, prompt_id: "1000000" });
+  await settle();
+  expect(button("Set progress to Ep 8")).toBeDefined();
+});
+
+test("failed tracking confirmation remains retryable and never acknowledges rejection", async () => {
+  mocks.api.setProgress.mockRejectedValueOnce("rejected").mockResolvedValue({ ...entry, progress: 8 });
+  await render(Tracking);
+  event("kurisu://tracking-prompt", { media_id: 1, episode: 8, progress: 0, title: "Example Show" });
+  await settle();
+  button("Set progress to Ep 8").click();
+  await settle();
+  expect(document.body.textContent).toContain("rejected");
+  expect(mocks.api.acknowledgeTrackingPrompt).not.toHaveBeenCalled();
+  button("Set progress to Ep 8").click();
+  await settle();
+  expect(mocks.api.acknowledgeTrackingPrompt).toHaveBeenCalledOnce();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+});
+
+test("a later identical prompt survives a pending Skip acknowledgement", async () => {
+  const ack = deferred<boolean>();
+  mocks.api.acknowledgeTrackingPrompt.mockReturnValueOnce(ack.promise);
+  const payload = { generation: "0", account_id: 1, prompt_id: "40", ask: false,
+    media_id: 1, episode: 8, progress: 0, title: "Example Show", raw_title: "Synthetic" };
+  await render(Tracking);
+  event("kurisu://tracking-prompt", payload);
+  await settle();
+  button("Skip").click();
+  event("kurisu://tracking-prompt", { ...payload, prompt_id: "41" });
+  ack.resolve(false);
+  await settle();
+  expect(button("Set progress to Ep 8")).toBeDefined();
+  button("Skip").click();
+  await settle();
+  expect(mocks.api.acknowledgeTrackingPrompt).toHaveBeenLastCalledWith({ ...payload, prompt_id: "41" });
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+});
+
+test("an old Skip acknowledgement cannot dismiss another account's prompt", async () => {
+  const ack = deferred<boolean>();
+  mocks.api.acknowledgeTrackingPrompt.mockReturnValueOnce(ack.promise);
+  await render(Tracking);
+  event("kurisu://tracking-prompt", { media_id: 1, episode: 8, progress: 0, title: "First account" });
+  await settle();
+  button("Skip").click();
+  auth.epoch++;
+  auth.user = { id: 2, name: "Other", score_format: "POINT_100" };
+  await settle();
+  event("kurisu://tracking-prompt", { media_id: 2, episode: 3, progress: 0, title: "Second account" });
+  await settle();
+  ack.resolve(false);
+  await settle();
+  expect(document.body.textContent).toContain("Second account");
+  expect(button("Set progress to Ep 3").disabled).toBe(false);
+  expect(mocks.api.setProgress).not.toHaveBeenCalled();
+});
+
+test("failed prompt acknowledgement retains Skip for retry", async () => {
+  mocks.api.acknowledgeTrackingPrompt.mockRejectedValueOnce("temporary failure").mockResolvedValue(true);
+  await render(Tracking);
+  event("kurisu://tracking-ask", { media_id: 1, episode: 8, progress: 0, title: "Example Show" });
+  await settle();
+  button("Skip").click();
+  await settle();
+  expect(document.body.textContent).toContain("temporary failure");
+  expect(button("Skip").disabled).toBe(false);
+  button("Skip").click();
+  await settle();
   expect(document.querySelector('[role="dialog"]')).toBeNull();
 });
 
@@ -1037,7 +1135,7 @@ test.each([
   try {
     await render(Settings);
     expect(document.querySelector<HTMLInputElement>("#mpv-sock")!.placeholder).toBe(socket);
-    expect(document.querySelector("code")!.textContent).toBe(`input-ipc-server=${socket}`);
+    expect(document.querySelector("#mpv-sock")!.parentElement!.querySelector("code")!.textContent).toBe(`input-ipc-server=${socket}`);
     expect(document.body.textContent).toContain(detection);
   } finally {
     userAgent.mockRestore();
