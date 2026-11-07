@@ -67,6 +67,8 @@ Release publication is manual. Pin the final bridge tag in `.github/release-tran
 
 Every native release must republish the exact frozen bridge assets under their legacy names beside the native downloads. Old updaters select the highest stable release, so retaining the bridge only on its original release would strand users who skip it. Never rebuild those aliases from later source or prune the bridge release. The Windows native installer uses a different suffix from legacy setup installers so older selectors find only the bridge.
 
+After publication, the release workflow downloads and verifies the new assets and frozen bridge aliases before removing older stable native releases. Tauri releases, drafts, prereleases and Git tags are retained. Users can skip intermediate native versions and update directly to the newest release.
+
 The native updater selects native assets. The transition release can hand off to the same published native release without requiring a second newer tag. The native executable carries that release's version, preventing a repeated update prompt.
 
 The primary branch contains the GPUI program and shared Core. The old frontend and Tauri adapter remain in the frozen bridge tag. Keep the frozen release and rollback downloads permanently. See [Profile transfer and rollback](PROFILE_TRANSFER.md) before returning to it: native-only changes, including pending edits, are not copied back automatically.

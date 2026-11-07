@@ -75,3 +75,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: node .github/release-transition.mjs publish native "$RELEASE_TAG" release-assets
+      - name: Keep the latest native release and all Tauri releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node .github/prune-native-releases.mjs "$RELEASE_TAG" release-assets

@@ -73,7 +73,7 @@ jobs:
           node-version-file: '.node-version'
 
       - name: Release protocol regressions
-        run: node --test .github/release-transition.test.mjs
+        run: node --test .github/release-transition.test.mjs .github/prune-native-releases.test.mjs
 
       - name: Build version regression tests
         run: python -m unittest discover -s native -p test_build.py
