@@ -1,0 +1,402 @@
+{
+  "profiling@1.0.18": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision 8271551172eb6fa4cba47369aedd93790c623df9 in https://github.com/aclysma/profiling",
+    "files": [
+      {
+        "path": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+      },
+      {
+        "path": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+      }
+    ]
+  },
+  "profiling-procmacros@1.0.18": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision 8271551172eb6fa4cba47369aedd93790c623df9 in https://github.com/aclysma/profiling",
+    "files": [
+      {
+        "path": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+      },
+      {
+        "path": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+      }
+    ]
+  },
+  "zune-inflate@0.2.54": {
+    "license": "MIT OR Apache-2.0 OR Zlib",
+    "provenance": "Published crate revision 69502ce83fdfecdd0beefd677e2abb3781b29d98 in https://github.com/etemesi254/zune-image",
+    "files": [
+      {
+        "path": "7fa429541e55b1509909e058f2d21a37467e4958ec713b357f6e0cf9dc4ee352.txt",
+        "name": "LICENSE-ZLIB",
+        "source": "https://raw.githubusercontent.com/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE-ZLIB"
+      },
+      {
+        "path": "e870d7fd7819a9f0453c62798cb52ae95d148a8c91dc2de1d983f997143c72de.txt",
+        "name": "LICENSE.md",
+        "source": "https://raw.githubusercontent.com/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE.md"
+      }
+    ]
+  },
+  "pulp-wasm-simd-flag@0.1.1": {
+    "license": "MIT",
+    "provenance": "Published crate revision 5eb07fd7b68edf0a5e19f71737d315f72a510295 in https://github.com/sarah-quinones/pulp/",
+    "files": [
+      {
+        "path": "d64f878c89bd5f1e5ada7e4aad57690b122727cf5229b7b87ea1980c188da1d9.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/sarah-quinones/pulp/5eb07fd7b68edf0a5e19f71737d315f72a510295/LICENSE"
+      }
+    ]
+  },
+  "taffy@0.15.0": {
+    "license": "MIT",
+    "provenance": "Published crate revision eb6450694f33e2b7413e40677f230ff63f0fc194 in https://github.com/DioxusLabs/taffy",
+    "files": [
+      {
+        "path": "f97daf1a0124413dccf399a4e6626b4b74acd05282f80b6d64ac82225650b77a.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/DioxusLabs/taffy/eb6450694f33e2b7413e40677f230ff63f0fc194/LICENSE"
+      }
+    ]
+  },
+  "lyon@1.0.19": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision 56219c95c658d4f39de7b190d98e57d5773ba241 in https://github.com/nical/lyon",
+    "files": [
+      {
+        "path": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE"
+      },
+      {
+        "path": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+      }
+    ]
+  },
+  "lyon_path@1.0.19": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision 56219c95c658d4f39de7b190d98e57d5773ba241 in https://github.com/nical/lyon",
+    "files": [
+      {
+        "path": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE"
+      },
+      {
+        "path": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+      }
+    ]
+  },
+  "lyon_tessellation@1.0.23": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision db98d26a1a90076a7a894262dcb51117eef643c8 in https://github.com/nical/lyon",
+    "files": [
+      {
+        "path": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
+      },
+      {
+        "path": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
+      }
+    ]
+  },
+  "lyon_geom@1.0.20": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision db98d26a1a90076a7a894262dcb51117eef643c8 in https://github.com/nical/lyon",
+    "files": [
+      {
+        "path": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
+      },
+      {
+        "path": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
+      }
+    ]
+  },
+  "lyon_algorithms@1.0.22": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision db98d26a1a90076a7a894262dcb51117eef643c8 in https://github.com/nical/lyon",
+    "files": [
+      {
+        "path": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
+      },
+      {
+        "path": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
+      }
+    ]
+  },
+  "svg_fmt@0.4.5": {
+    "license": "MIT/Apache-2.0",
+    "provenance": "Published crate revision 93f414cd572b5c2781df93dbdc068ed13443d05a in https://github.com/nical/rust_debug",
+    "files": [
+      {
+        "path": "7e98bed7f100747aaae7d82ab94fbe6b76fd6b84b09a3aaa413bff8196d0fbb1.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/nical/rust_debug/93f414cd572b5c2781df93dbdc068ed13443d05a/LICENSE"
+      }
+    ]
+  },
+  "accesskit@0.24.1": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969 in https://github.com/AccessKit/accesskit",
+    "files": [
+      {
+        "path": "3bab8c36f6a85657504aaefb37c7ff34e29b8c917290f3d28a1f0920c992e502.txt",
+        "name": "AUTHORS",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/AUTHORS"
+      },
+      {
+        "path": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-APACHE"
+      },
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT"
+      },
+      {
+        "path": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308.txt",
+        "name": "LICENSE.chromium",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE.chromium"
+      }
+    ]
+  },
+  "xim-parser@0.2.2": {
+    "license": "MIT",
+    "provenance": "Published crate revision 7300de35a111de2df1a694bf70454532a8419685 in https://github.com/Riey/xim-rs",
+    "files": [
+      {
+        "path": "efa1224931b98468f5005f77285457f8d2eab0a77a15941aa10abbab1ae9a74e.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/Riey/xim-rs/7300de35a111de2df1a694bf70454532a8419685/LICENSE"
+      }
+    ]
+  },
+  "xim-ctext@0.3.0": {
+    "license": "MIT",
+    "provenance": "Published crate revision 65f77e44524ba487285a63aac4080faf2c05b4ed in https://github.com/Riey/xim-rs",
+    "files": [
+      {
+        "path": "efa1224931b98468f5005f77285457f8d2eab0a77a15941aa10abbab1ae9a74e.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/Riey/xim-rs/65f77e44524ba487285a63aac4080faf2c05b4ed/LICENSE"
+      }
+    ]
+  },
+  "pathfinder_simd@0.5.6": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision 6c3c0466f451c5bd2007087728cd168798cd64e8 in https://github.com/servo/pathfinder",
+    "files": [
+      {
+        "path": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-APACHE"
+      },
+      {
+        "path": "0621878e61f0d0fda054bcbe02df75192c28bde1ecc8289cbd86aeba2dd72720.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-MIT"
+      }
+    ]
+  },
+  "spirv@0.4.0+sdk-1.4.341.0": {
+    "license": "Apache-2.0",
+    "provenance": "Published crate revision 8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4 in https://github.com/gfx-rs/rspirv",
+    "files": [
+      {
+        "path": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/gfx-rs/rspirv/8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4/LICENSE"
+      }
+    ]
+  },
+  "harfrust@0.5.2": {
+    "license": "MIT",
+    "provenance": "Published crate revision efdae3142ab76a2f1524d72cff9e3dfdc5afd7ca in https://github.com/harfbuzz/harfrust",
+    "files": [
+      {
+        "path": "3a7c3f0b887abb7c638faf022d29257418458614c6724b120ceeffb279f9c7d2.txt",
+        "name": "LICENSE",
+        "source": "https://raw.githubusercontent.com/harfbuzz/harfrust/efdae3142ab76a2f1524d72cff9e3dfdc5afd7ca/LICENSE"
+      }
+    ]
+  },
+  "accesskit_unix@0.22.1": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision c88605b96d04431f9c3c792464a0f2f253480e94 in https://github.com/AccessKit/accesskit",
+    "files": [
+      {
+        "path": "3bab8c36f6a85657504aaefb37c7ff34e29b8c917290f3d28a1f0920c992e502.txt",
+        "name": "AUTHORS",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/AUTHORS"
+      },
+      {
+        "path": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
+      },
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT"
+      },
+      {
+        "path": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308.txt",
+        "name": "LICENSE.chromium",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
+      }
+    ]
+  },
+  "accesskit_atspi_common@0.19.1": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision c88605b96d04431f9c3c792464a0f2f253480e94 in https://github.com/AccessKit/accesskit",
+    "files": [
+      {
+        "path": "3bab8c36f6a85657504aaefb37c7ff34e29b8c917290f3d28a1f0920c992e502.txt",
+        "name": "AUTHORS",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/AUTHORS"
+      },
+      {
+        "path": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
+      },
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT"
+      },
+      {
+        "path": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308.txt",
+        "name": "LICENSE.chromium",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
+      }
+    ]
+  },
+  "accesskit_consumer@0.38.0": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision c88605b96d04431f9c3c792464a0f2f253480e94 in https://github.com/AccessKit/accesskit",
+    "files": [
+      {
+        "path": "3bab8c36f6a85657504aaefb37c7ff34e29b8c917290f3d28a1f0920c992e502.txt",
+        "name": "AUTHORS",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/AUTHORS"
+      },
+      {
+        "path": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
+      },
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT"
+      },
+      {
+        "path": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308.txt",
+        "name": "LICENSE.chromium",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
+      }
+    ]
+  },
+  "accesskit_windows@0.34.0": {
+    "license": "MIT OR Apache-2.0",
+    "provenance": "Published crate revision c88605b96d04431f9c3c792464a0f2f253480e94 in https://github.com/AccessKit/accesskit",
+    "files": [
+      {
+        "path": "3bab8c36f6a85657504aaefb37c7ff34e29b8c917290f3d28a1f0920c992e502.txt",
+        "name": "AUTHORS",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/AUTHORS"
+      },
+      {
+        "path": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
+      },
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT"
+      },
+      {
+        "path": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308.txt",
+        "name": "LICENSE.chromium",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
+      }
+    ]
+  },
+  "enum-kinds@0.5.1": {
+    "license": "MIT",
+    "provenance": "The published Cargo.toml declares MIT. No separate license text was shipped. Standard MIT permission text follows; authors are listed from the package metadata. No copyright year is inferred.",
+    "files": [
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT"
+      }
+    ]
+  },
+  "simd_helpers@0.1.0": {
+    "license": "MIT",
+    "provenance": "The published Cargo.toml declares MIT. No separate license text was shipped. Standard MIT permission text follows; authors are listed from the package metadata. No copyright year is inferred.",
+    "files": [
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT"
+      }
+    ]
+  },
+  "seahash@4.1.0": {
+    "license": "MIT",
+    "provenance": "The published Cargo.toml declares MIT. No separate license text was shipped. Standard MIT permission text follows; authors are listed from the package metadata. No copyright year is inferred.",
+    "files": [
+      {
+        "path": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+        "name": "LICENSE-MIT",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT"
+      }
+    ]
+  },
+  "pathfinder_geometry@0.5.1": {
+    "license": "MIT/Apache-2.0",
+    "provenance": "The published src/lib.rs copyright header permits Apache-2.0 or MIT. The Apache-2.0 option is reproduced from pathfinder_simd in the same upstream program.",
+    "files": [
+      {
+        "path": "a830c3e1ca7ae32b804500428e0dd1fbaf34e997174af1ff2296227bd537c0d3.txt",
+        "name": "src/lib.rs copyright and license header",
+        "source": "https://docs.rs/crate/pathfinder_geometry/0.5.1/source/src/lib.rs"
+      },
+      {
+        "path": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+        "name": "LICENSE-APACHE",
+        "source": "https://raw.githubusercontent.com/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-APACHE"
+      }
+    ]
+  }
+}
