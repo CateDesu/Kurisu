@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kurisu
+Comment=Anime tracking with AniList
+Exec=kurisu
+Icon=kurisu
+Categories=AudioVideo;
+Terminal=false
+StartupWMClass=com.catedesu.kurisu
