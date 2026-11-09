@@ -13,6 +13,7 @@ fn press(cx: &mut VisualTestContext, key: &str) {
 }
 
 fn keyboard_login(cx: &mut TestAppContext, route: Route, key: &str) {
+    let _port = browser_sign_in_guard();
     let browser = Arc::new(BrowserSignInProbe(std::sync::Mutex::new(vec![])));
     let (core, runtime, _dir) = fixture_with_platform(browser.clone());
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -55,6 +56,7 @@ fn keyboard_settings_login_renders_recovery(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn token_submission_keeps_one_job_and_can_replace_browser_login(cx: &mut TestAppContext) {
+    let _port = browser_sign_in_guard();
     let (core, runtime, _dir) = fixture();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
     settle(cx, &runtime);
@@ -75,6 +77,7 @@ fn token_submission_keeps_one_job_and_can_replace_browser_login(cx: &mut TestApp
 
 #[gpui::test]
 fn closing_auth_window_stops_listener_with_workspace_retained(cx: &mut TestAppContext) {
+    let _port = browser_sign_in_guard();
     let browser = Arc::new(BrowserSignInProbe(std::sync::Mutex::new(vec![])));
     let (core, runtime, _dir) = fixture_with_platform(browser.clone());
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -106,6 +109,7 @@ fn closing_auth_window_stops_listener_with_workspace_retained(cx: &mut TestAppCo
 
 #[gpui::test]
 fn destroying_workspace_aborts_unstarted_auth(cx: &mut TestAppContext) {
+    let _port = browser_sign_in_guard();
     let browser = Arc::new(BrowserSignInProbe(std::sync::Mutex::new(vec![])));
     let (core, runtime, _dir) = fixture_with_platform(browser.clone());
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));

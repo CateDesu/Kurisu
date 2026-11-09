@@ -132,7 +132,15 @@ $process = Start-Process -FilePath $installer[0].FullName -ArgumentList '/S' -Wa
 if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
 Assert-RetainedProfiles
 $binary = Join-Path $installDirectory 'kurisu.exe'
-if ((& $binary --version) -notmatch '^kurisu-native [0-9.]+$') { throw 'Installed executable is not native' }
+@'
+import re, subprocess, sys
+result = subprocess.run([sys.argv[1], "--version"], check=True,
+                        capture_output=True, encoding="utf-8", timeout=15)
+if not re.fullmatch(r"kurisu-native [0-9.]+", result.stdout.strip()):
+    raise SystemExit("Installed executable did not report a native version")
+print(result.stdout.strip())
+'@ | python - $binary
+if ($LASTEXITCODE -ne 0) { throw 'Installed native version check failed' }
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;

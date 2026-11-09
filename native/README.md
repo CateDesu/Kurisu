@@ -52,9 +52,9 @@ python3 -m unittest discover -s native -p test_migrate.py
 cargo fmt --manifest-path core/Cargo.toml -- --check
 cargo fmt --manifest-path native/Cargo.toml -- --check
 cargo test --locked --manifest-path core/Cargo.toml
-cargo test --locked --manifest-path native/Cargo.toml -- --test-threads=1
+cargo test --locked --manifest-path native/Cargo.toml --features fixture-runtime -- --test-threads=1
 cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
-cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+cargo clippy --locked --manifest-path native/Cargo.toml --features fixture-runtime --all-targets -- -D warnings
 ```
 
 Core tests use controlled MPV and D-Bus instances. Install MPV for playback regression tests and `dbus-daemon` for Linux MPRIS tests. Startup tests use disposable profiles and never discover the host's default profile. The frozen bridge source and its frontend checks remain at [v1.0.0.78](https://github.com/CateDesu/Kurisu/tree/v1.0.0.78).

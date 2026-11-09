@@ -2304,6 +2304,22 @@ fn delayed_end_cover_callback_drops_after_generation_or_route_change(cx: &mut Te
     });
 }
 
+// These fixtures share the registered OAuth callback port.
+static BROWSER_SIGN_IN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn browser_sign_in_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = BROWSER_SIGN_IN_LOCK.lock().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while std::net::TcpListener::bind("127.0.0.1:39417").is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "Previous OAuth listener must stop"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guard
+}
+
 struct BrowserSignInProbe(std::sync::Mutex<Vec<String>>);
 
 impl Platform for BrowserSignInProbe {
@@ -2372,6 +2388,7 @@ fn deny_browser_login(url: &str) {
 
 #[gpui::test]
 fn browser_sign_in_retry_rejects_the_old_callback_and_recovers(cx: &mut TestAppContext) {
+    let _port = browser_sign_in_guard();
     let browser = Arc::new(BrowserSignInProbe(std::sync::Mutex::new(vec![])));
     let (core, runtime, _dir) = fixture_with_platform(browser.clone());
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -2407,6 +2424,7 @@ fn browser_sign_in_retry_rejects_the_old_callback_and_recovers(cx: &mut TestAppC
 
 #[gpui::test]
 fn settings_browser_sign_in_can_be_cancelled_and_retried(cx: &mut TestAppContext) {
+    let _port = browser_sign_in_guard();
     let browser = Arc::new(BrowserSignInProbe(std::sync::Mutex::new(vec![])));
     let (core, runtime, _dir) = fixture_with_platform(browser.clone());
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -2438,6 +2456,7 @@ fn settings_browser_sign_in_can_be_cancelled_and_retried(cx: &mut TestAppContext
 
 #[gpui::test]
 fn cancelling_unstarted_login_never_opens_a_browser(cx: &mut TestAppContext) {
+    let _port = browser_sign_in_guard();
     let browser = Arc::new(BrowserSignInProbe(std::sync::Mutex::new(vec![])));
     let (core, runtime, _dir) = fixture_with_platform(browser.clone());
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));

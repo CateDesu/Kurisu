@@ -65,9 +65,9 @@ python3 -m unittest discover -s native -p test_build.py
 python3 -m unittest discover -s native -p test_migrate.py
 cargo fmt --manifest-path native/Cargo.toml -- --check
 cargo test --locked --manifest-path core/Cargo.toml
-cargo test --locked --manifest-path native/Cargo.toml -- --test-threads=1
+cargo test --locked --manifest-path native/Cargo.toml --features fixture-runtime -- --test-threads=1
 cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
-cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+cargo clippy --locked --manifest-path native/Cargo.toml --features fixture-runtime --all-targets -- -D warnings
 ```
 
 See the [native guide](native/README.md) for release sequencing and compatibility requirements.

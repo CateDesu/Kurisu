@@ -139,6 +139,40 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('$CandidateDir == "$LOCALAPPDATA\\Programs\\Kurisu Native"', script)
 
 
+class InstallerVersionTests(unittest.TestCase):
+    def run_installed_check(self, output, exit_code=0):
+        script = (BUILD.ROOT.parent / ".github/test-native-installer.ps1").read_text()
+        code = script.split("\n'@ | python - $binary", 1)[0].rsplit("@'\n", 1)[1]
+        original_run = BUILD.subprocess.run
+
+        def version_process(command, **options):
+            self.assertEqual(command, ["/fixture/kurisu.exe", "--version"])
+            return original_run(
+                [sys.executable, "-c",
+                 f"import sys; sys.stdout.write({output!r}); sys.exit({exit_code})"],
+                **options,
+            )
+
+        with patch.object(sys, "argv", ["-", "/fixture/kurisu.exe"]), \
+                patch.object(BUILD.subprocess, "run", side_effect=version_process):
+            exec(compile(code, "installer-version-check", "exec"), {"__name__": "__main__"})
+
+    def test_installed_version_accepts_completed_native_output(self):
+        self.run_installed_check("kurisu-native 7.8.9\n")
+
+    def test_installed_version_rejects_failed_process_even_with_valid_output(self):
+        with self.assertRaises(BUILD.subprocess.CalledProcessError) as error:
+            self.run_installed_check("kurisu-native 7.8.9\n", 7)
+        self.assertEqual(error.exception.returncode, 7)
+        self.assertEqual(error.exception.stdout, "kurisu-native 7.8.9\n")
+
+    def test_installed_version_rejects_empty_or_wrong_output(self):
+        for output in ("", "kurisu 7.8.9\n", "kurisu-native 7.8.9\nunexpected\n"):
+            with self.subTest(output=output), self.assertRaisesRegex(
+                    SystemExit, "Installed executable did not report a native version"):
+                self.run_installed_check(output)
+
+
 class DependencyNoticeTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

@@ -216,6 +216,10 @@ impl Workspace {
             ));
         }
         self.editor_inputs = Some(inputs);
+        let editor_input = self
+            .editor_inputs
+            .as_ref()
+            .map(|inputs| inputs.progress.entity_id());
         let generation = self.generation;
         let core = self.core.clone();
         let worker = core.clone();
@@ -225,6 +229,11 @@ impl Workspace {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.generation != generation
+                    || this
+                        .editor_inputs
+                        .as_ref()
+                        .map(|inputs| inputs.progress.entity_id())
+                        != editor_input
                     || this
                         .editor
                         .as_ref()
@@ -301,6 +310,10 @@ impl Workspace {
             return;
         }
         let id = editor.media_id;
+        let editor_input = self
+            .editor_inputs
+            .as_ref()
+            .map(|inputs| inputs.progress.entity_id());
         let generation = self.generation;
         self.editor_details_loading = true;
         let core = self.core.clone();
@@ -311,6 +324,11 @@ impl Workspace {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
                 if generation != this.generation
+                    || this
+                        .editor_inputs
+                        .as_ref()
+                        .map(|inputs| inputs.progress.entity_id())
+                        != editor_input
                     || this
                         .editor
                         .as_ref()
@@ -548,12 +566,15 @@ impl Workspace {
         }
         if !editor.confirming_delete {
             editor.confirming_delete = true;
+            self.editor_delete_confirmation = self.editor_delete_confirmation.wrapping_add(1);
+            let confirmation = self.editor_delete_confirmation;
             let id = editor.media_id;
             let generation = self.generation;
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
                 let _ = this.update_in(cx, |this, _window, cx| {
                     if this.generation == generation
+                        && this.editor_delete_confirmation == confirmation
                         && this
                             .editor
                             .as_ref()
@@ -1267,5 +1288,444 @@ mod tests {
         assert_eq!(patch.progress, Some(12));
         assert_eq!(patch.repeat, None);
         assert_eq!(editor.saved_progress(), 11);
+    }
+    use super::Workspace;
+    use std::{path::Path, sync::Arc};
+
+    struct Platform;
+    impl kurisu_core::Platform for Platform {
+        fn open_url(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn open_path(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn reveal_path(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    struct FixtureDir(std::path::PathBuf);
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn editor_fixture() -> (kurisu_core::Core, tokio::runtime::Runtime, FixtureDir) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "kurisu-editor-reopen-{}-{nonce}",
+            std::process::id()
+        ));
+        let _dir = FixtureDir(path.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let core = kurisu_core::Core::open(
+            path.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        (core, runtime, _dir)
+    }
+
+    #[gpui::test]
+    fn reopened_editor_rejects_old_details_completion(cx: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        for _ in 0..16 {
+            cx.run_until_parked();
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(
+                vec![ListEntry {
+                    media_id: 71,
+                    progress: 3,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                }],
+                0,
+            );
+            w.open_editor(71, window, cx);
+            w.load_editor_details(window, cx);
+            assert!(w.editor_details_loading);
+        });
+        // Finish the old service read without dispatching its UI callback.
+        runtime.block_on(async { tokio::task::yield_now().await });
+        workspace.update_in(cx, |w, window, cx| {
+            w.close_editor(cx);
+            w.open_editor(71, window, cx);
+            w.load_editor_details(window, cx);
+            assert!(w.editor_details_loading);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert!(
+                w.editor_details_loading,
+                "Old completion cleared the new editor's loading state"
+            );
+            assert!(w.editor.as_ref().unwrap().error.is_empty());
+        });
+        for _ in 0..16 {
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+        }
+        workspace.read_with(cx, |w, _| {
+            assert!(!w.editor_details_loading);
+            assert!(
+                w.editor
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .starts_with("Entry details are unavailable.")
+            );
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+    #[gpui::test]
+    fn reopened_editor_keeps_its_removal_confirmation(cx: &mut gpui::TestAppContext) {
+        check_removal_confirmation_timeout(cx, false);
+    }
+
+    #[gpui::test]
+    fn failed_removal_retry_keeps_its_confirmation(cx: &mut gpui::TestAppContext) {
+        check_removal_confirmation_timeout(cx, true);
+    }
+
+    fn check_removal_confirmation_timeout(cx: &mut gpui::TestAppContext, retry: bool) {
+        use std::time::{Duration, Instant};
+        let (core, runtime, _dir) = editor_fixture();
+        if retry {
+            let db = kurisu_core::Db::open(&_dir.0.join("kurisu.db")).unwrap();
+            db.upsert_entry(&ListEntry {
+                media_id: 71,
+                progress: 3,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        for _ in 0..16 {
+            cx.run_until_parked();
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(
+                vec![ListEntry {
+                    media_id: 71,
+                    progress: 3,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                }],
+                0,
+            );
+            w.open_editor(71, window, cx);
+            w.delete_editor(window, cx);
+            assert!(w.editor.as_ref().unwrap().confirming_delete);
+        });
+        cx.run_until_parked();
+        if retry {
+            workspace.update_in(cx, |w, window, cx| {
+                w.delete_editor(window, cx);
+                assert!(w.editor.as_ref().unwrap().busy);
+            });
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+                if workspace.read_with(cx, |w, _| !w.editor.as_ref().unwrap().busy) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Removal must finish before retrying"
+                );
+            }
+            workspace.read_with(cx, |w, _| {
+                assert_eq!(w.editor.as_ref().unwrap().error, "not authenticated");
+                assert!(!w.editor.as_ref().unwrap().confirming_delete);
+                assert_eq!(w.active_writes, 0);
+                assert_eq!(w.list.entry(71).unwrap().progress, 3);
+            });
+        }
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, window, cx| {
+            if !retry {
+                w.close_editor(cx);
+                w.open_editor(71, window, cx);
+            }
+            w.delete_editor(window, cx);
+            assert!(w.editor.as_ref().unwrap().confirming_delete);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(1100));
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert!(
+                w.editor.as_ref().unwrap().confirming_delete,
+                "An old timeout must not expire the current confirmation after 1.1 seconds"
+            );
+        });
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert!(
+                !w.editor.as_ref().unwrap().confirming_delete,
+                "The current confirmation must expire after its own four-second window"
+            );
+            assert!(!w.editor.as_ref().unwrap().busy);
+            assert_eq!(w.list.entry(71).unwrap().progress, 3);
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn reopened_editor_rejects_old_recommendations(cx: &mut gpui::TestAppContext) {
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "KURISU_EDITOR_RECOMMENDATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            run_recommendation_fixture(CHILD);
+            return;
+        }
+        assert!(
+            std::env::var_os("KURISU_FIXTURE_GRAPHQL").is_some(),
+            "The child requires the loopback fixture endpoint"
+        );
+        let (core, runtime, dir) = editor_fixture();
+        drop(core);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        db.replace_account(
+            "synthetic-editor-token",
+            &kurisu_core::User {
+                id: 47,
+                name: "Fixture".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+        let core = kurisu_core::Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            cx.run_until_parked();
+            if workspace.read_with(cx, |w, _| w.profile.is_some() && w.list.loaded) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Account initialization must finish"
+            );
+        }
+        let old_input = workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(
+                vec![ListEntry {
+                    media_id: 71,
+                    progress: 3,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                }],
+                0,
+            );
+            w.open_editor(71, window, cx);
+            w.editor_inputs.as_ref().unwrap().progress.entity_id()
+        });
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            // Finish the Core read while its UI callback remains queued.
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            if workspace.read_with(cx, |w, _| {
+                w.read_aborts["editor-recs"]
+                    .iter()
+                    .all(|job| job.is_finished())
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Old recommendation read must finish"
+            );
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.close_editor(cx);
+            w.open_editor(71, window, cx);
+            assert_ne!(
+                w.editor_inputs.as_ref().unwrap().progress.entity_id(),
+                old_input
+            );
+            w.editor_recs = vec![Media {
+                id: 799,
+                ..Default::default()
+            }];
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(
+                w.editor_recs
+                    .iter()
+                    .map(|media| media.id)
+                    .collect::<Vec<_>>(),
+                [799],
+                "Old successful recommendations must not replace the reopened editor"
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            cx.run_until_parked();
+            if workspace.read_with(cx, |w, _| {
+                w.editor_recs.first().is_some_and(|media| media.id == 702)
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Current recommendations must arrive"
+            );
+        }
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.editor_recs.len(), 1);
+            assert_eq!(
+                w.editor_recs[0].title_english.as_deref(),
+                Some("Recommendation 702")
+            );
+            assert!(w.editor_recs_error.is_empty());
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    fn run_recommendation_fixture(child_flag: &str) {
+        use serde_json::json;
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            net::TcpListener,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Configure the existing loopback seam in a child, without changing test-process globals.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "screens::editor::tests::reopened_editor_rejects_old_recommendations",
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(child_flag, "1")
+            .env(
+                "KURISU_FIXTURE_GRAPHQL",
+                format!("http://{}", listener.local_addr().unwrap()),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut recommendations = 0;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "Recommendation child timed out");
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("Fixture accept failed: {error}"),
+                };
+                // Windows inherits the listener's nonblocking mode.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let query = request["query"].as_str().unwrap();
+                let data = if query.contains("recommendations(mediaId:") {
+                    assert_eq!(request["variables"]["mediaId"], 71);
+                    recommendations += 1;
+                    let id = 700 + recommendations;
+                    json!({"Page":{"recommendations":[{"mediaRecommendation":{
+                        "id":id, "idMal":null,
+                        "title":{"romaji":null,"english":format!("Recommendation {id}"),"native":null},
+                        "coverImage":null, "episodes":24, "format":"TV", "status":"FINISHED",
+                        "averageScore":null,"season":null,"seasonYear":null,
+                        "description":null,"nextAiringEpisode":null
+                    }}]}})
+                } else if query.contains("MediaListCollection") {
+                    json!({"MediaListCollection":{"lists":[],"hasNextChunk":false}})
+                } else if query.contains("Viewer") {
+                    json!({"Viewer":{"id":47,"name":"Fixture"}})
+                } else {
+                    panic!("Unexpected fixture query: {query}");
+                };
+                let response = json!({"data":data}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            }
+        }));
+        if served.is_err() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        if let Err(error) = served {
+            std::panic::resume_unwind(error);
+        }
+        assert!(
+            output.status.success(),
+            "Recommendation child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            recommendations, 2,
+            "Both old and current HTTP reads must succeed"
+        );
     }
 }

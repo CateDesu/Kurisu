@@ -137,6 +137,7 @@ pub(super) struct LibraryState {
     pending_draft: Option<LibraryDraft>,
     bind_request: u64,
     link_query: Option<Entity<TextInput>>,
+    link_cover_query: String,
     offset: Option<Entity<TextInput>>,
     subscriptions: Vec<Subscription>,
     remove_folder: Option<String>,
@@ -181,6 +182,7 @@ impl Default for LibraryState {
             pending_draft: None,
             bind_request: 0,
             link_query: None,
+            link_cover_query: String::new(),
             offset: None,
             subscriptions: Vec::new(),
             remove_folder: None,
@@ -304,6 +306,7 @@ impl Workspace {
             draft.bind.error.clear();
             draft.bind.restored = true;
             if let Some(input) = &self.library_screen.link_query {
+                self.library_screen.link_cover_query = draft.query.trim().to_lowercase();
                 input.update(cx, |input, cx| input.set_value(draft.query, cx));
             }
             if let Some(input) = &self.library_screen.offset {
@@ -349,7 +352,7 @@ impl Workspace {
     pub(super) fn refresh_library_covers(&mut self) {
         let offset = self.library_screen.list_widget.logical_scroll_top().item_ix;
         self.prefetch_library_covers(offset..offset.saturating_add(36), self.cover_scale);
-        self.prefetch_library_link_covers_without_query();
+        self.refresh_library_link_covers();
     }
 
     fn prefetch_library_link_covers(&mut self, cx: &gpui::App) {
@@ -359,11 +362,13 @@ impl Workspace {
             .as_ref()
             .map(|input| input.read(cx).value().trim().to_lowercase())
             .unwrap_or_default();
+        self.library_screen.link_cover_query = query.clone();
         self.prefetch_library_link_covers_for(&query);
     }
 
-    fn prefetch_library_link_covers_without_query(&mut self) {
-        self.prefetch_library_link_covers_for("");
+    fn refresh_library_link_covers(&mut self) {
+        let query = self.library_screen.link_cover_query.clone();
+        self.prefetch_library_link_covers_for(&query);
     }
 
     fn prefetch_library_link_covers_for(&mut self, query: &str) {
@@ -375,23 +380,8 @@ impl Workspace {
         {
             return;
         }
-        let urls: Vec<_> = self
-            .library_screen
-            .entries
-            .iter()
-            .filter(|entry| {
-                query.is_empty()
-                    || entry.media.as_ref().is_some_and(|media| {
-                        [
-                            media.title_english.as_deref(),
-                            media.title_romaji.as_deref(),
-                            media.title_native.as_deref(),
-                        ]
-                        .iter()
-                        .flatten()
-                        .any(|title| title.to_lowercase().contains(query))
-                    })
-            })
+        let urls: Vec<_> = link_candidates(&self.library_screen.entries, query)
+            .into_iter()
             .take(100)
             .filter_map(|entry| {
                 entry.media.as_ref().and_then(|media| {
@@ -574,13 +564,13 @@ impl Workspace {
                                     })
                                     .detach();
                                 }
-                                this.rebuild_library_rows();
                             }
                             Err(error) => {
                                 this.library_screen.scan_error = error;
                                 this.library_screen.rescan_feedback = false;
                             }
                         }
+                        this.rebuild_library_rows();
                     }
                     Err(error) => {
                         this.library_screen.scan_error = error;
@@ -1822,37 +1812,7 @@ impl Workspace {
                 .as_ref()
                 .map(|input| input.read(cx).value().trim().to_lowercase())
                 .unwrap_or_default();
-            let mut candidates: Vec<_> = self
-                .library_screen
-                .entries
-                .iter()
-                .filter(|entry| {
-                    if search.is_empty() {
-                        return true;
-                    }
-                    entry.media.as_ref().is_some_and(|media| {
-                        [
-                            media.title_english.as_deref(),
-                            media.title_romaji.as_deref(),
-                            media.title_native.as_deref(),
-                        ]
-                        .iter()
-                        .flatten()
-                        .any(|title| title.to_lowercase().contains(&search))
-                    })
-                })
-                .cloned()
-                .collect();
-            candidates.sort_by_key(|entry| {
-                (
-                    status_order(&entry.status),
-                    entry
-                        .media
-                        .as_ref()
-                        .map(|media| media.display_title().to_lowercase())
-                        .unwrap_or_default(),
-                )
-            });
+            let candidates = link_candidates(&self.library_screen.entries, &search);
             if candidates.is_empty() {
                 body = body.child(div().text_color(rgb(DIM)).child("No matches on your list."));
             }
@@ -1939,6 +1899,36 @@ impl Workspace {
         )
         .into_any()
     }
+}
+
+fn link_candidates<'a>(entries: &'a [ListEntry], query: &str) -> Vec<&'a ListEntry> {
+    let mut candidates: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            query.is_empty()
+                || entry.media.as_ref().is_some_and(|media| {
+                    [
+                        media.title_english.as_deref(),
+                        media.title_romaji.as_deref(),
+                        media.title_native.as_deref(),
+                    ]
+                    .iter()
+                    .flatten()
+                    .any(|title| title.to_lowercase().contains(query))
+                })
+        })
+        .collect();
+    candidates.sort_by_key(|entry| {
+        (
+            status_order(&entry.status),
+            entry
+                .media
+                .as_ref()
+                .map(|media| media.display_title().to_lowercase())
+                .unwrap_or_default(),
+        )
+    });
+    candidates
 }
 
 fn group_library_rows(
@@ -2387,6 +2377,277 @@ fn render_library_row(
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn link_dialog_refreshes_candidates_when_library_scan_fails(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+        struct NoExternal;
+        impl Platform for NoExternal {
+            fn open_url(&self, _: &str) -> Result<(), String> {
+                panic!("Unexpected URL")
+            }
+            fn open_path(&self, _: &Path) -> Result<(), String> {
+                panic!("Unexpected path")
+            }
+            fn reveal_path(&self, _: &Path) -> Result<(), String> {
+                panic!("Unexpected reveal")
+            }
+        }
+        struct FixtureDir(std::path::PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = FixtureDir(std::env::temp_dir().join(format!(
+            "kurisu-library-refresh-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let db_path = directory.0.join("kurisu.db");
+        let db = kurisu_core::Db::open(&db_path).unwrap();
+        let episode = directory.0.join("Unrelated 01.mkv");
+        std::fs::write(&episode, []).unwrap();
+        db.set_setting(
+            "library_folders",
+            &serde_json::to_string(&[directory.0.to_string_lossy().as_ref()]).unwrap(),
+        )
+        .unwrap();
+        let media = |id, title: &str| kurisu_core::models::Media {
+            id,
+            title_english: Some(title.into()),
+            cover_medium: Some(format!("invalid-cover-{id}")),
+            ..Default::default()
+        };
+        for (id, title) in [(71, "Match"), (72, "Other")] {
+            db.upsert_media(&media(id, title)).unwrap();
+            db.upsert_entry(&ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let core = kurisu_core::Core::from_db(
+            kurisu_core::Db::open(&db_path).unwrap(),
+            directory.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(NoExternal),
+            kurisu_core::UpdateChannel::Native,
+        );
+        let observer = core.clone();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |this, window, cx| {
+            this.auth_intent += 1;
+            this.restoring_session = false;
+            this.profile = Some(kurisu_core::User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            });
+            this.route = Route::Library;
+            this.enter_library(window, cx);
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                cx.run_until_parked();
+                if workspace.read_with(cx, |this, _| {
+                    !this.library_screen.scanning && this.library_screen.entries_loaded
+                }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "Library data read must finish");
+            }
+        };
+        settle(cx);
+        workspace.update_in(cx, |this, window, cx| {
+            assert!(this.library_screen.scan_loaded);
+            assert!(this.library_screen.scan_error.is_empty());
+            assert_eq!(this.library_screen.files.len(), 1);
+            let path = this.library_screen.files[0].path.clone();
+            assert_eq!(path, episode.to_string_lossy());
+            this.open_library_bind(path, None, BindMode::Link, window, cx);
+            let input = this.library_screen.link_query.clone().unwrap();
+            input.update(cx, |input, cx| {
+                input.replace_text_in_range(None, "  MATCH  ", window, cx)
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |this, _| {
+            assert_eq!(this.library_screen.link_cover_query, "match");
+            assert_eq!(
+                this.cover_regions[&CoverOwner::LibraryDialog].audit_visible(),
+                &HashSet::from([(71, 32, 44)])
+            );
+        });
+        db.upsert_media(&media(71, "Former")).unwrap();
+        db.upsert_media(&media(72, "Match")).unwrap();
+        db.set_setting("library_bindings", "{").unwrap();
+        let expected_error = runtime.block_on(observer.scan_library()).unwrap_err();
+        assert_eq!(
+            expected_error,
+            "EOF while parsing an object at line 1 column 1"
+        );
+        workspace.update_in(cx, |this, window, cx| {
+            this.refresh_library_entries(window, cx)
+        });
+        settle(cx);
+        workspace.read_with(cx, |this, _| {
+            assert_eq!(this.library_screen.scan_error, expected_error);
+            assert!(this.library_screen.list_error.is_empty());
+            assert_eq!(
+                link_candidates(&this.library_screen.entries, "match")
+                    .iter()
+                    .map(|entry| entry.media_id)
+                    .collect::<Vec<_>>(),
+                [72]
+            );
+            assert_eq!(
+                this.cover_regions[&CoverOwner::LibraryDialog].audit_visible(),
+                &HashSet::from([(72, 32, 44)]),
+                "Fresh candidates must own covers when the scan fails"
+            );
+        });
+        db.set_setting("library_bindings", "{}").unwrap();
+        db.upsert_media(&media(71, "Match")).unwrap();
+        db.upsert_media(&media(72, "Other")).unwrap();
+        workspace.update_in(cx, |this, window, cx| {
+            this.refresh_library_entries(window, cx)
+        });
+        settle(cx);
+        workspace.read_with(cx, |this, _| {
+            assert!(this.library_screen.scan_error.is_empty());
+            assert!(this.library_screen.scan_loaded);
+            assert_eq!(
+                this.cover_regions[&CoverOwner::LibraryDialog].audit_visible(),
+                &HashSet::from([(71, 32, 44)]),
+                "Successful retry must update candidates again"
+            );
+        });
+        workspace.update_in(cx, |this, _, _| this.cancel_all_reads());
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(observer);
+        drop(runtime);
+        drop(db);
+    }
+
+    #[gpui::test]
+    fn link_dialog_cover_owners_follow_sorted_and_filtered_candidates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct NoExternal;
+        impl Platform for NoExternal {
+            fn open_url(&self, _: &str) -> Result<(), String> {
+                panic!("Unexpected URL")
+            }
+            fn open_path(&self, _: &Path) -> Result<(), String> {
+                panic!("Unexpected path")
+            }
+            fn reveal_path(&self, _: &Path) -> Result<(), String> {
+                panic!("Unexpected reveal")
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let core = kurisu_core::Core::from_db(
+            kurisu_core::Db::open(Path::new(":memory:")).unwrap(),
+            std::env::temp_dir(),
+            runtime.handle().clone(),
+            Arc::new(NoExternal),
+            kurisu_core::UpdateChannel::Native,
+        );
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |this, window, cx| {
+            this.route = Route::Library;
+            this.library_screen.bind = Some(BindDialog {
+                path: "/controlled/episode.mkv".into(),
+                media_id: Some(1),
+                title: "Synthetic".into(),
+                mode: BindMode::Link,
+                scope: BindScope::File,
+                request: 1,
+                current: Some(LibraryBinding {
+                    media_id: 1,
+                    episode_offset: 0,
+                }),
+                current_title: None,
+                checked: true,
+                loading: false,
+                busy: false,
+                error: String::new(),
+                relink: None,
+                restored: false,
+            });
+            this.library_screen.entries = (1..=101)
+                .map(|id| ListEntry {
+                    media_id: id,
+                    status: if id == 101 { "CURRENT" } else { "PLANNING" }.into(),
+                    media: Some(kurisu_core::models::Media {
+                        id,
+                        title_english: Some(format!("Show {id:03}")),
+                        cover_medium: Some(format!("invalid-cover-{id}")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect();
+            let input = cx.new(|cx| TextInput::new("", "Search", window, cx));
+            this.library_screen.link_query = Some(input.clone());
+            this.prefetch_library_link_covers(cx);
+            let owner = CoverOwner::LibraryDialog;
+            let keys = this.cover_regions.get(&owner).unwrap().audit_visible();
+            assert_eq!(keys.len(), 100);
+            assert!(
+                keys.contains(&(101, 32, 44)),
+                "First displayed candidate needs a cover owner"
+            );
+            assert!(
+                !keys.contains(&(100, 32, 44)),
+                "Candidate beyond display limit must retire"
+            );
+            input.update(cx, |input, cx| input.set_value("Show 100", cx));
+            this.prefetch_library_link_covers(cx);
+            assert_eq!(
+                this.cover_regions
+                    .get(&owner)
+                    .unwrap()
+                    .audit_visible()
+                    .len(),
+                1
+            );
+            assert!(
+                this.cover_regions
+                    .get(&owner)
+                    .unwrap()
+                    .audit_visible()
+                    .contains(&(100, 32, 44))
+            );
+            this.refresh_library_covers();
+            let keys = this.cover_regions.get(&owner).unwrap().audit_visible();
+            assert_eq!(
+                keys.len(),
+                1,
+                "Route refresh must preserve the active candidate query"
+            );
+            assert!(keys.contains(&(100, 32, 44)));
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
     #[gpui::test]
     fn empty_library_keeps_compact_folder_and_history_spacing(cx: &mut gpui::TestAppContext) {
         struct NoExternal;
