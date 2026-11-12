@@ -3147,6 +3147,7 @@ dependencies = [
  "log",
  "open",
  "reqwest",
+ "same-file",
  "serde",
  "serde_json",
  "sys-locale",

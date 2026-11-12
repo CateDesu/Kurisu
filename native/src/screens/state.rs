@@ -9,7 +9,40 @@ use icu_collator::{
     preferences::CollationNumericOrdering,
 };
 use icu_locale_core::Locale;
-use kurisu_core::models::{EntryDetails, FuzzyDate, ListEntry, Media, MediaDetail};
+use kurisu_core::models::{EntryDetails, FuzzyDate, LibraryFile, ListEntry, Media, MediaDetail};
+
+#[derive(Default)]
+pub(super) struct LibraryFiles {
+    files: Vec<LibraryFile>,
+    episodes: HashMap<(i64, i64), usize>,
+}
+
+impl LibraryFiles {
+    pub(super) fn replace(&mut self, files: Vec<LibraryFile>) {
+        self.episodes.clear();
+        for (index, file) in files.iter().enumerate() {
+            if let Some(key) = file.media_id.zip(file.episode) {
+                self.episodes.entry(key).or_insert(index);
+            }
+        }
+        self.files = files;
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.files.clear();
+        self.episodes.clear();
+    }
+
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, LibraryFile> {
+        self.files.iter()
+    }
+
+    pub(super) fn episode(&self, media_id: i64, episode: i64) -> Option<&LibraryFile> {
+        self.episodes
+            .get(&(media_id, episode))
+            .map(|&index| &self.files[index])
+    }
+}
 
 pub const STATUSES: [&str; 6] = [
     "CURRENT",
@@ -157,6 +190,13 @@ impl ListState {
         self.error.clear();
         self.step_error.clear();
         self.next_airing_boundary = None;
+        self.revision += 1;
+    }
+
+    pub fn clear_scores(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.score = None;
+        }
         self.revision += 1;
     }
 
@@ -826,6 +866,8 @@ pub struct EditorState {
     pub status: String,
     pub progress: i64,
     pub score: Option<f64>,
+    pub displayed_format: Option<String>,
+    pub score_cleared: bool,
     pub repeat: i64,
     status_before_completion: Option<String>,
     status_chosen: bool,
@@ -847,6 +889,8 @@ impl EditorState {
             status: entry.status.clone(),
             progress: entry.progress,
             score: entry.score,
+            displayed_format: None,
+            score_cleared: false,
             repeat: entry.repeat,
             snapshot: entry,
             status_before_completion: None,
@@ -881,6 +925,9 @@ impl EditorState {
     }
 
     pub fn set_progress(&mut self, progress: i64) {
+        if self.progress == progress {
+            return;
+        }
         self.progress = progress;
         if self.status_chosen {
             return;
@@ -917,11 +964,9 @@ impl EditorState {
             status: (self.status_before_completion.is_none()
                 && (self.status != self.snapshot.status || self.status_chosen && progress_touched))
                 .then(|| self.status.clone()),
-            progress: progress_touched.then(|| {
-                self.progress
-                    .clamp(0, self.total().unwrap_or(i64::MAX).max(0))
-            }),
-            score: (score_available && self.score != self.snapshot.score)
+            // Core distinguishes exact completion from overshoot before clamping.
+            progress: progress_touched.then_some(self.progress),
+            score: (score_available && (self.score_cleared || self.score != self.snapshot.score))
                 .then_some(self.score.unwrap_or(0.0)),
             repeat: (self.repeat != self.snapshot.repeat).then_some(self.repeat.max(0)),
         }
@@ -957,7 +1002,20 @@ impl EditorState {
         }
     }
 
+    pub fn refresh_score_format(&mut self, format: Option<String>) -> bool {
+        if self.displayed_format == format {
+            return false;
+        }
+        self.displayed_format = format;
+        self.score = None;
+        self.snapshot.score = None;
+        self.score_cleared = false;
+        self.error = "Score format changed. Re-enter the score before saving.".into();
+        true
+    }
+
     pub fn accept_basic(&mut self, entry: ListEntry) {
+        self.score_cleared = false;
         self.snapshot = entry;
         self.status_before_completion = None;
         self.status_chosen = false;
@@ -1080,6 +1138,75 @@ impl DetailState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn library_episode_index_matches_first_file_in_scan_order() {
+        let files: Vec<_> = (0..25_000)
+            .map(|index| LibraryFile {
+                path: format!("/synthetic/{index}.mkv"),
+                media_id: (index % 7 != 0).then_some(index % 101 - 1),
+                episode: (index % 11 != 0).then_some(index % 23 - 1),
+                ..Default::default()
+            })
+            .collect();
+        let mut library = LibraryFiles::default();
+        library.replace(files.clone());
+        for media_id in -1..=101 {
+            for episode in -1..=23 {
+                let expected = files
+                    .iter()
+                    .find(|file| file.media_id == Some(media_id) && file.episode == Some(episode));
+                assert_eq!(
+                    library.episode(media_id, episode).map(|file| &file.path),
+                    expected.map(|file| &file.path),
+                    "media {media_id}, episode {episode}"
+                );
+            }
+        }
+        assert_eq!(
+            library.iter().map(|file| &file.path).collect::<Vec<_>>(),
+            files.iter().map(|file| &file.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn library_episode_index_tracks_replacements_and_clear() {
+        let file = |path: &str, media_id, episode| LibraryFile {
+            path: path.into(),
+            media_id,
+            episode,
+            ..Default::default()
+        };
+        let mut library = LibraryFiles::default();
+        assert!(library.episode(7, 2).is_none());
+        let first = file("first.mkv", Some(7), Some(2));
+        let second = file("second.mkv", Some(7), Some(2));
+        library.replace(vec![first.clone(), second.clone()]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "first.mkv");
+        library.replace(vec![second.clone(), first]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "second.mkv");
+        library.replace(vec![second]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "second.mkv");
+        library.replace(vec![file("renamed.mkv", Some(7), Some(2))]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "renamed.mkv");
+        library.replace(vec![file("renamed.mkv", Some(8), Some(2))]);
+        assert!(library.episode(7, 2).is_none());
+        assert!(library.episode(8, 2).is_some());
+        library.replace(vec![file("renamed.mkv", Some(8), Some(1))]);
+        assert!(library.episode(8, 2).is_none());
+        assert!(library.episode(8, 1).is_some());
+        library.replace(vec![file("renamed.mkv", None, Some(1))]);
+        assert!(library.episode(8, 1).is_none());
+        library.replace(vec![file("renamed.mkv", Some(8), None)]);
+        assert!(library.episode(8, 1).is_none());
+        library.replace(Vec::new());
+        assert_eq!(library.iter().len(), 0);
+        assert!(library.episode(8, 1).is_none());
+        library.replace(vec![file("fresh.mkv", Some(8), Some(1))]);
+        library.clear();
+        assert_eq!(library.iter().len(), 0);
+        assert!(library.episode(8, 1).is_none());
+    }
+
     fn assert_full_rebuild_equivalent(list: &ListState, now: i64) {
         let mut reference = ListState::new();
         reference.entries = list.entries.clone();
@@ -1115,6 +1242,23 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn list_titles_and_sorting_fall_back_past_blank_translations() {
+        let mut translated = entry(1, " \t\u{3000}", "CURRENT", 0, None);
+        translated.media.as_mut().unwrap().title_romaji = Some("Zebra".into());
+        let restored: ListEntry =
+            serde_json::from_str(&serde_json::to_string(&translated).unwrap()).unwrap();
+        assert_eq!(title_key(&restored), "Zebra");
+        let mut list = ListState::new();
+        list.replace(vec![restored, entry(2, "Alpha", "CURRENT", 0, None)], 0);
+        assert_eq!(list.visible(), &[2, 1]);
+        translated.media.as_mut().unwrap().title_romaji = Some("\n".into());
+        translated.media.as_mut().unwrap().title_native = Some("原題".into());
+        assert_eq!(title_key(&translated), "原題");
+        translated.media.as_mut().unwrap().title_native = None;
+        assert_eq!(title_key(&translated), "#1");
     }
 
     #[test]
@@ -1703,5 +1847,20 @@ mod tests {
         assert!(!registry.resolve_review(9, 4, None, true));
         assert!(registry.resolve_review(9, 4, None, false));
         assert!(registry.edit(9, 4).is_none());
+    }
+    #[test]
+    fn format_refresh_and_explicit_clear_preserve_other_editor_intent() {
+        let mut editor = EditorState::new(ListEntry {
+            score: Some(80.0),
+            ..Default::default()
+        });
+        editor.displayed_format = Some("POINT_100".into());
+        editor.progress = 5;
+        assert!(editor.refresh_score_format(Some("POINT_5".into())));
+        assert_eq!(editor.score, None);
+        assert_eq!(editor.basic_patch(true).score, None);
+        editor.score_cleared = true;
+        assert_eq!(editor.basic_patch(true).score, Some(0.0));
+        assert_eq!(editor.basic_patch(true).progress, Some(5));
     }
 }

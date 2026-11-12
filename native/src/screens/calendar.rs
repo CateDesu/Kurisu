@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use chrono::{Duration, Local, NaiveDate, TimeZone};
 use gpui::{
-    AnyElement, Context, ListAlignment, ListState as GpuiListState, Window, div, img, list,
-    prelude::*, px, rgb,
+    AnyElement, Context, ListAlignment, ListOffset, ListState as GpuiListState, Window, div, img,
+    list, prelude::*, px, rgb,
 };
 use kurisu_core::models::AiringItem;
 
@@ -14,6 +14,8 @@ use super::{Workspace, joined, now_seconds};
 use crate::components::button;
 use crate::contracts::Route;
 use crate::theme::{ACCENT, BASE, DIM, EDGE, ERROR, OCHRE, PANEL, PANEL_2};
+
+const CALENDAR_ROW_HEIGHT: f32 = 64.;
 
 fn today() -> NaiveDate {
     Local::now().date_naive()
@@ -108,6 +110,53 @@ impl Default for CalendarState {
 }
 
 impl CalendarState {
+    fn replace_visible(&mut self, visible: Vec<usize>) {
+        if let Some(rows) = &self.rows {
+            if self.visible.as_ref() == &visible {
+                rows.remeasure_items(0..rows.item_count());
+            } else {
+                let mut offset = rows.logical_scroll_top();
+                let at_end = rows.item_count() > 0 && offset.item_ix >= rows.item_count();
+                let anchor = self.visible.get(offset.item_ix);
+                if let Some(position) =
+                    anchor.and_then(|anchor| visible.iter().position(|id| id == anchor))
+                {
+                    offset.item_ix = position;
+                } else {
+                    offset.item_ix = offset.item_ix.min(visible.len().saturating_sub(1));
+                    offset.offset_in_item = px(0.);
+                }
+                rows.reset_with_uniform_height(visible.len(), px(CALENDAR_ROW_HEIGHT));
+                if at_end {
+                    rows.scroll_to_end();
+                } else {
+                    rows.scroll_to(offset);
+                }
+            }
+        }
+        self.visible = Arc::new(visible);
+    }
+
+    fn scroll_anchor(&self) -> Option<(AiringItem, ListOffset)> {
+        let offset = self.rows.as_ref()?.logical_scroll_top();
+        let item = self.items.get(*self.visible.get(offset.item_ix)?)?;
+        Some((item.clone(), offset))
+    }
+
+    fn restore_anchor(&self, anchor: Option<(AiringItem, ListOffset)>) {
+        if let Some((item, mut offset)) = anchor
+            && let Some(rows) = &self.rows
+            && let Some(position) = self.visible.iter().position(|index| {
+                let candidate = &self.items[*index];
+                (candidate.media.id, candidate.episode, candidate.airing_at)
+                    == (item.media.id, item.episode, item.airing_at)
+            })
+        {
+            offset.item_ix = position;
+            rows.scroll_to(offset);
+        }
+    }
+
     pub(super) fn reset_account(&mut self) {
         *self = Self {
             watching_only: self.watching_only,
@@ -120,7 +169,8 @@ impl CalendarState {
 impl Workspace {
     pub(super) fn enter_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.calendar.rows.is_none() {
-            let rows = GpuiListState::new(0, ListAlignment::Top, px(84.));
+            let rows = GpuiListState::new(0, ListAlignment::Top, px(84.))
+                .with_uniform_item_height(px(CALENDAR_ROW_HEIGHT));
             let weak = cx.weak_entity();
             rows.set_scroll_handler(move |event, _window, app| {
                 let _ = weak.update(app, |this, _| {
@@ -189,6 +239,7 @@ impl Workspace {
         let request = self.calendar.request;
         self.calendar.loading = true;
         self.calendar.error.clear();
+        let anchor = self.calendar.scroll_anchor();
         self.calendar.items.clear();
         self.refresh_calendar_visible();
         let (start, end) = week_dates(self.calendar.anchor, self.calendar.offset);
@@ -214,6 +265,8 @@ impl Workspace {
                     Ok(items) => {
                         this.calendar.items = items;
                         this.refresh_calendar_visible();
+                        this.calendar.restore_anchor(anchor);
+                        this.refresh_calendar_covers();
                     }
                     Err(error) => this.calendar.error = error,
                 }
@@ -283,16 +336,7 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
         visible.sort_by_key(|index| self.calendar.items[*index].airing_at);
-        self.calendar.visible = Arc::new(visible);
-        if let Some(rows) = self.calendar.rows.as_ref() {
-            let first = rows.logical_scroll_top().item_ix;
-            let count = self.calendar.visible.len();
-            rows.reset(count);
-            rows.scroll_to(gpui::ListOffset {
-                item_ix: first.min(count.saturating_sub(1)),
-                offset_in_item: px(0.),
-            });
-        }
+        self.calendar.replace_visible(visible);
         self.refresh_calendar_covers();
     }
 
@@ -693,6 +737,100 @@ impl Workspace {
 mod tests {
     use super::*;
     use kurisu_core::models::Media;
+    #[test]
+    fn refresh_restores_the_airing_identity_after_reordering() {
+        let item = |id, episode, airing_at| AiringItem {
+            media: Media {
+                id,
+                ..Default::default()
+            },
+            episode,
+            airing_at,
+        };
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(84.));
+        let mut state = CalendarState {
+            rows: Some(rows.clone()),
+            items: vec![item(1, 1, 100), item(1, 2, 200)],
+            ..Default::default()
+        };
+        state.replace_visible(vec![0, 1]);
+        rows.scroll_to(ListOffset {
+            item_ix: 1,
+            offset_in_item: px(13.),
+        });
+        let anchor = state.scroll_anchor();
+        state.items.clear();
+        state.replace_visible(vec![]);
+        state.items = vec![item(2, 1, 50), item(1, 1, 100), item(1, 2, 200)];
+        state.replace_visible(vec![0, 1, 2]);
+        state.restore_anchor(anchor);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            ListOffset {
+                item_ix: 2,
+                offset_in_item: px(13.)
+            }
+        );
+        let anchor = state.scroll_anchor();
+        state.items = vec![item(1, 2, 300)];
+        state.replace_visible(vec![0]);
+        state.restore_anchor(anchor);
+        assert_eq!(rows.logical_scroll_top(), ListOffset::default());
+    }
+
+    #[test]
+    fn end_request_survives_filtering_before_layout() {
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        let mut state = CalendarState {
+            rows: Some(rows.clone()),
+            ..Default::default()
+        };
+        state.replace_visible((0..100).collect());
+        assert_eq!(rows.logical_scroll_top(), ListOffset::default());
+        rows.scroll_to_end();
+        state.replace_visible((0..100).step_by(2).collect());
+        assert_eq!(rows.logical_scroll_top().item_ix, 50);
+        state.replace_visible(vec![]);
+        assert_eq!(rows.logical_scroll_top(), ListOffset::default());
+    }
+
+    #[test]
+    fn filters_keep_the_airing_anchor_and_inset() {
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(84.));
+        let mut state = CalendarState {
+            rows: Some(rows.clone()),
+            ..Default::default()
+        };
+        state.replace_visible((0..100).collect());
+        assert_eq!(rows.max_offset_for_scrollbar().y, px(6400.));
+        rows.scroll_to(gpui::ListOffset {
+            item_ix: 50,
+            offset_in_item: px(17.),
+        });
+        let filtered = (0..100).step_by(2).collect::<Vec<_>>();
+        state.replace_visible(filtered.clone());
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 25,
+                offset_in_item: px(17.)
+            }
+        );
+        state.replace_visible(filtered);
+        assert_eq!(rows.logical_scroll_top().offset_in_item, px(17.));
+        state.replace_visible(vec![1, 3, 5]);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 2,
+                offset_in_item: px(0.)
+            }
+        );
+        state.replace_visible(vec![]);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+        assert_eq!(rows.max_offset_for_scrollbar().y, px(0.));
+    }
+
     #[test]
     fn week_navigation_uses_calendar_days_and_filter_uses_current_status() {
         let anchor = NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();

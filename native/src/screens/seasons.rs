@@ -7,7 +7,10 @@ use gpui::{
 };
 use kurisu_core::models::Media;
 
-use super::search::{ERROR_BG, ERROR_EDGE, card_columns, discovery_heading, media_card};
+use super::search::{
+    CARD_ROW_HEIGHT, ERROR_BG, ERROR_EDGE, card_columns, discovery_heading, media_card,
+    reset_card_rows,
+};
 use super::state::{STATUSES, status_label};
 use super::{Workspace, covers::CoverOwner, joined};
 use crate::components::input::{TextInput, TextInputEvent};
@@ -136,6 +139,41 @@ impl Default for SeasonsState {
     }
 }
 
+impl SeasonsState {
+    fn replace_visible(&mut self, visible: Vec<usize>) {
+        if let Some(rows) = &self.rows {
+            if self.visible.as_ref() == &visible {
+                rows.remeasure_items(0..rows.item_count());
+            } else {
+                let mut offset = rows.logical_scroll_top();
+                let at_end = rows.item_count() > 0 && offset.item_ix >= rows.item_count();
+                let columns = self.columns.max(1);
+                let anchor = self.visible.get(offset.item_ix * columns);
+                if let Some(position) =
+                    anchor.and_then(|anchor| visible.iter().position(|id| id == anchor))
+                {
+                    offset.item_ix = position / columns;
+                } else {
+                    offset.item_ix = offset
+                        .item_ix
+                        .min(visible.len().saturating_sub(1) / columns);
+                    offset.offset_in_item = px(0.);
+                }
+                rows.reset_with_uniform_height(
+                    visible.len().div_ceil(columns),
+                    px(CARD_ROW_HEIGHT),
+                );
+                if at_end {
+                    rows.scroll_to_end();
+                } else {
+                    rows.scroll_to(offset);
+                }
+            }
+        }
+        self.visible = Arc::new(visible);
+    }
+}
+
 impl Workspace {
     pub(super) fn enter_seasons(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.seasons.year_input.is_none() {
@@ -166,7 +204,8 @@ impl Workspace {
             self.seasons.title_input = Some(input);
         }
         if self.seasons.rows.is_none() {
-            let rows = GpuiListState::new(0, ListAlignment::Top, px(290.));
+            let rows = GpuiListState::new(0, ListAlignment::Top, px(290.))
+                .with_uniform_item_height(px(CARD_ROW_HEIGHT));
             let weak = cx.weak_entity();
             rows.set_scroll_handler(move |event, _window, app| {
                 let _ = weak.update(app, |this, _| {
@@ -291,20 +330,7 @@ impl Workspace {
                 .then_some(index)
             })
             .collect::<Vec<_>>();
-        self.seasons.visible = Arc::new(visible);
-        if let Some(rows) = self.seasons.rows.as_ref() {
-            let first = rows.logical_scroll_top().item_ix;
-            let count = self
-                .seasons
-                .visible
-                .len()
-                .div_ceil(self.seasons.columns.max(1));
-            rows.reset(count);
-            rows.scroll_to(gpui::ListOffset {
-                item_ix: first.min(count.saturating_sub(1)),
-                offset_in_item: px(0.),
-            });
-        }
+        self.seasons.replace_visible(visible);
         self.refresh_seasons_covers();
     }
 
@@ -377,17 +403,15 @@ impl Workspace {
         }
         let columns = card_columns(window.bounds().size.width.into());
         if columns != self.seasons.columns {
-            let first = self.seasons.rows.as_ref().map_or(0, |rows| {
-                rows.logical_scroll_top().item_ix * self.seasons.columns.max(1)
-            });
-            self.seasons.columns = columns;
             if let Some(rows) = self.seasons.rows.as_ref() {
-                rows.reset(self.seasons.visible.len().div_ceil(columns));
-                rows.scroll_to(gpui::ListOffset {
-                    item_ix: first / columns,
-                    offset_in_item: px(0.),
-                });
+                reset_card_rows(
+                    rows,
+                    self.seasons.visible.len(),
+                    self.seasons.columns,
+                    columns,
+                );
             }
+            self.seasons.columns = columns;
             cx.spawn_in(window, async move |this, cx| {
                 let _ = this.update_in(cx, |this, _, _| this.refresh_seasons_covers());
             })
@@ -924,6 +948,69 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn end_request_survives_filtering_before_layout() {
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        let mut state = SeasonsState {
+            rows: Some(rows.clone()),
+            columns: 3,
+            ..Default::default()
+        };
+        state.replace_visible((0..90).collect());
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+        rows.scroll_to_end();
+        state.replace_visible((0..90).step_by(2).collect());
+        assert_eq!(rows.logical_scroll_top().item_ix, 15);
+        state.replace_visible(vec![]);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+    }
+
+    #[test]
+    fn filters_and_reflow_keep_the_top_media_and_inset() {
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(290.));
+        let mut state = SeasonsState {
+            rows: Some(rows.clone()),
+            columns: 3,
+            ..Default::default()
+        };
+        state.replace_visible((0..300).collect());
+        assert_eq!(rows.max_offset_for_scrollbar().y, px(30_200.));
+        rows.scroll_to(gpui::ListOffset {
+            item_ix: 50,
+            offset_in_item: px(22.),
+        });
+        let filtered = (0..300).step_by(2).collect::<Vec<_>>();
+        state.replace_visible(filtered.clone());
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 25,
+                offset_in_item: px(22.)
+            }
+        );
+        state.replace_visible(filtered);
+        assert_eq!(rows.logical_scroll_top().offset_in_item, px(22.));
+        reset_card_rows(&rows, state.visible.len(), 3, 1);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 75,
+                offset_in_item: px(22.)
+            }
+        );
+        state.columns = 1;
+        state.replace_visible(vec![1, 3]);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 1,
+                offset_in_item: px(0.)
+            }
+        );
+        state.replace_visible(vec![]);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+    }
+
     #[test]
     fn season_shift_and_filters_follow_account_status() {
         assert_eq!(shifted("FALL", 2026, 1), ("WINTER".into(), 2027));

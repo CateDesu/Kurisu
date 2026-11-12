@@ -13,7 +13,7 @@ pub(super) enum CoverOwner {
     Avatar,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub(super) struct CoverRegion {
     visible: HashSet<CoverKey>,
     nearby: HashSet<CoverKey>,
@@ -120,14 +120,15 @@ impl Workspace {
             CoverOwner::Route(route) => *route == self.route,
             CoverOwner::Playback => self.route == Route::Now,
             CoverOwner::LibraryDialog => {
-                matches!(self.library_modal_layer(), Some(ModalLayer::LibraryBind))
+                self.route == Route::Library
+                    && matches!(self.library_modal_layer(), Some(ModalLayer::LibraryBind))
             }
             CoverOwner::Editor => self.editor.is_some(),
             CoverOwner::Avatar => self.profile.is_some(),
         }
     }
 
-    fn queue_cover(&mut self, key: CoverKey, url: &str, visible: bool) {
+    fn queue_cover(&mut self, key: CoverKey, url: &str, visible: bool) -> bool {
         let ticket = self.covers.request(
             CoverSource::Remote(url.into()),
             key.1,
@@ -135,10 +136,12 @@ impl Workspace {
             self.cover_scale,
             visible,
         );
-        if self.cover_tickets.get(&key) != Some(&ticket) {
+        let changed = self.cover_tickets.get(&key) != Some(&ticket);
+        if changed {
             self.cover_images.remove(&key);
+            self.cover_tickets.insert(key, ticket);
         }
-        self.cover_tickets.insert(key, ticket);
+        changed
     }
 
     pub(super) fn request_cover(&mut self, id: i64, url: &str, width: u32, height: u32) {
@@ -153,13 +156,16 @@ impl Workspace {
         if !self.cover_owner_active(&owner) {
             return;
         }
-        self.queue_cover(key, url, true);
-        self.cover_regions
+        let changed = self.queue_cover(key, url, true);
+        let added = self
+            .cover_regions
             .entry(owner)
             .or_default()
             .visible
             .insert(key);
-        self.sync_cover_ownership();
+        if changed || added {
+            self.sync_cover_ownership();
+        }
     }
 
     pub(super) fn replace_cover_region(
@@ -172,19 +178,32 @@ impl Workspace {
             return;
         }
         let mut region = CoverRegion::default();
+        let mut changed = false;
         for (key, url) in visible {
-            self.queue_cover(key, &url, true);
+            changed |= self.queue_cover(key, &url, true);
             region.visible.insert(key);
         }
         for (key, url) in nearby {
             if region.visible.contains(&key) {
                 continue;
             }
-            self.queue_cover(key, &url, false);
+            changed |= self.queue_cover(key, &url, false);
             region.nearby.insert(key);
         }
-        self.cover_regions.insert(owner, region);
-        self.sync_cover_ownership();
+        if changed || self.cover_regions.get(&owner) != Some(&region) {
+            self.cover_regions.insert(owner, region);
+            self.sync_cover_ownership();
+        }
+    }
+
+    pub(super) fn reset_detail_cover_region(&mut self) {
+        if self
+            .cover_regions
+            .remove(&CoverOwner::Route(self.route.clone()))
+            .is_some()
+        {
+            self.sync_cover_ownership();
+        }
     }
 
     pub(super) fn retain_cover_route(&mut self) {
@@ -265,6 +284,9 @@ impl Workspace {
         self.cover_images.clear();
         if self.editor.is_some() {
             self.requeue_editor_covers();
+        }
+        if self.route == Route::Now {
+            self.refresh_playback_cover();
         }
     }
 
@@ -375,11 +397,18 @@ impl Workspace {
     }
 
     pub(super) fn poll_covers(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let completed = self.covers.completion_signal();
         cx.spawn_in(window, async move |this, cx| {
+            // The deterministic scheduler cannot accept wakes from worker threads.
+            let deterministic = cx.background_executor().is_test();
+            let mut maintenance = cx.background_executor().timer(Duration::from_millis(120));
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(120))
-                    .await;
+                tokio::select! {
+                    _ = completed.notified(), if !deterministic => {},
+                    _ = &mut maintenance => {
+                        maintenance = cx.background_executor().timer(Duration::from_millis(120));
+                    },
+                }
                 if this
                     .update_in(cx, |this, window, cx| {
                         if (this.cover_scale - window.scale_factor()).abs() >= 0.01 {
@@ -399,7 +428,13 @@ impl Workspace {
                                 this.refresh_route_covers();
                             }
                         }
-                        this.retain_cover_route();
+                        if this
+                            .cover_regions
+                            .keys()
+                            .any(|owner| !this.cover_owner_active(owner))
+                        {
+                            this.retain_cover_route();
+                        }
                         this.refresh_avatar_cover();
                         let ready = this.covers.poll();
                         let mut changed = false;
@@ -471,5 +506,213 @@ impl Workspace {
                 self.request_cover(media.id, url, 112, 160);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use kurisu_core::{Platform, UpdateChannel};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestPlatform;
+
+    impl Platform for TestPlatform {
+        fn open_url(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn open_path(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn reveal_path(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct FixtureDir(PathBuf);
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (Core, tokio::runtime::Runtime, FixtureDir) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("kurisu-covers-{}-{nonce}", std::process::id()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let core = Core::open(
+            path.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        )
+        .unwrap();
+        (core, runtime, FixtureDir(path))
+    }
+
+    #[gpui::test]
+    fn real_cover_workers_finish_without_waking_the_test_scheduler(cx: &mut TestAppContext) {
+        let (core, runtime, dir) = fixture();
+        let path = dir.0.join("cover.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, _, _| {
+            w.auth_intent += 1;
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+        });
+        cx.run_until_parked();
+        for (index, route) in [Route::Now, Route::Library].into_iter().enumerate() {
+            let key = (index as i64, index as u32 + 1, 2);
+            let completed = workspace.update_in(cx, |w, _, _| {
+                w.route = route.clone();
+                w.retain_cover_route();
+                let ticket =
+                    w.covers
+                        .request(CoverSource::Local(path.clone()), key.1, key.2, 1., true);
+                w.cover_tickets.insert(key, ticket);
+                w.cover_regions.insert(
+                    CoverOwner::Route(route),
+                    CoverRegion {
+                        visible: HashSet::from([key]),
+                        nearby: HashSet::new(),
+                    },
+                );
+                w.sync_cover_ownership();
+                w.covers.completion_signal()
+            });
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), completed.notified())
+                    .await
+                    .unwrap();
+            });
+            cx.executor().advance_clock(Duration::from_millis(120));
+            cx.run_until_parked();
+            workspace.read_with(cx, |w, _| {
+                assert!(w.cover_images.contains_key(&key));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn unchanged_ownership_skips_reconciliation_but_source_and_visibility_changes_do_not(
+        cx: &mut TestAppContext,
+    ) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        let baseline = workspace.update_in(cx, |w, _, _| {
+            w.auth_intent += 1;
+            w.profile = Some(User {
+                id: 47,
+                avatar: Some("invalid-avatar".into()),
+                ..Default::default()
+            });
+            w.route = Route::Search;
+            w.refresh_avatar_cover();
+            let owner = CoverOwner::Route(Route::Search);
+            let visible = vec![((1, 46, 63), "invalid-first".into())];
+            let nearby = vec![((2, 46, 63), "invalid-second".into())];
+            w.replace_cover_region(owner.clone(), visible.clone(), nearby.clone());
+            let baseline = w.covers.audit_ownership_updates();
+            for _ in 0..32 {
+                w.replace_cover_region(owner.clone(), visible.clone(), nearby.clone());
+                w.request_cover_for(owner.clone(), (1, 46, 63), "invalid-first");
+                w.refresh_avatar_cover();
+            }
+            assert_eq!(w.covers.audit_ownership_updates(), baseline);
+            baseline
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(240));
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, _, _| {
+            assert_eq!(w.covers.audit_ownership_updates(), baseline);
+            let owner = CoverOwner::Route(Route::Search);
+            let old = w.cover_tickets[&(1, 46, 63)].clone();
+            w.replace_cover_region(
+                owner.clone(),
+                vec![((1, 46, 63), "changed-source".into())],
+                vec![((2, 46, 63), "invalid-second".into())],
+            );
+            assert_ne!(w.cover_tickets[&(1, 46, 63)], old);
+            assert_eq!(w.covers.audit_ownership_updates(), baseline + 1);
+            w.replace_cover_region(
+                owner.clone(),
+                vec![((2, 46, 63), "invalid-second".into())],
+                vec![((1, 46, 63), "changed-source".into())],
+            );
+            assert_eq!(w.covers.audit_ownership_updates(), baseline + 2);
+            assert_eq!(
+                w.cover_regions[&owner].visible,
+                HashSet::from([(2, 46, 63)])
+            );
+            w.replace_cover_region(owner, vec![], vec![]);
+            assert_eq!(w.covers.audit_ownership_updates(), baseline + 3);
+            assert!(!w.cover_tickets.contains_key(&(1, 46, 63)));
+            assert!(!w.cover_tickets.contains_key(&(2, 46, 63)));
+            assert!(w.cover_tickets.contains_key(&AVATAR_KEY));
+        });
+    }
+
+    #[gpui::test]
+    fn detail_navigation_retains_cache_identity_and_retires_synthetic_portrait_owners(
+        cx: &mut TestAppContext,
+    ) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, window, cx| {
+            w.auth_intent += 1;
+            w.profile = Some(User {
+                id: 47,
+                avatar: Some("invalid-avatar".into()),
+                ..Default::default()
+            });
+            w.refresh_avatar_cover();
+            w.request_cover(7, "invalid-list", 46, 63);
+            let list = w.cover_tickets[&(7, 46, 63)].clone();
+            let avatar = w.cover_tickets[&AVATAR_KEY].clone();
+            w.switch_route(Route::Anime(7), window, cx);
+            assert_eq!(w.cover_tickets[&AVATAR_KEY], avatar);
+            assert!(!w.cover_tickets.contains_key(&(7, 46, 63)));
+            w.request_cover(-1, "first-character", 112, 160);
+            let portrait = w.cover_tickets[&(-1, 112, 160)].clone();
+            w.load_detail(7, window, cx);
+            assert!(!w.cover_tickets.contains_key(&(-1, 112, 160)));
+            assert_eq!(w.cover_tickets[&AVATAR_KEY], avatar);
+            w.request_cover(-1, "second-character", 112, 160);
+            assert_ne!(w.cover_tickets[&(-1, 112, 160)], portrait);
+            w.switch_route(Route::MyList, window, cx);
+            assert!(!w.cover_tickets.contains_key(&(-1, 112, 160)));
+            w.request_cover(7, "invalid-list", 46, 63);
+            assert_eq!(w.cover_tickets[&(7, 46, 63)], list);
+            w.ensure_cover_scale(w.cover_scale * 2.);
+            w.request_cover(7, "invalid-list", 46, 63);
+            assert_ne!(w.cover_tickets[&(7, 46, 63)], list);
+            let scaled = w.cover_tickets[&(7, 46, 63)].clone();
+            w.set_profile(
+                Some(User {
+                    id: 48,
+                    ..Default::default()
+                }),
+                window,
+                cx,
+            );
+            w.request_cover(7, "invalid-list", 46, 63);
+            assert_ne!(w.cover_tickets[&(7, 46, 63)], scaled);
+        });
     }
 }

@@ -422,8 +422,21 @@ impl Db {
             .optional()?;
         let id = user.id.to_string();
         let changed = previous.as_deref() != Some(id.as_str());
+        let previous_profile: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'anilist_profile'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let previous_format = previous_profile
+            .as_deref()
+            .and_then(|profile| serde_json::from_str::<crate::models::User>(profile).ok())
+            .and_then(|user| user.score_format);
         if changed {
             tx.execute("DELETE FROM list_entry", [])?;
+        } else if previous_format != user.score_format {
+            tx.execute("UPDATE list_entry SET score = NULL WHERE score != 0", [])?;
         }
         for (key, value) in [
             ("anilist_token", token),
@@ -664,6 +677,70 @@ fn row_to_media_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Media> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_format_changes_invalidate_cached_scores_without_changing_progress() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut user = crate::models::User {
+            id: 7,
+            name: "Tester".into(),
+            score_format: Some("POINT_5".into()),
+            ..Default::default()
+        };
+        db.replace_account("session", &user).unwrap();
+        db.upsert_media(&crate::models::Media {
+            id: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&crate::models::ListEntry {
+            id: Some(22),
+            media_id: 1,
+            status: "CURRENT".into(),
+            progress: 3,
+            score: Some(4.0),
+            ..Default::default()
+        })
+        .unwrap();
+        db.replace_account("session", &user).unwrap();
+        assert_eq!(db.get_entry(1).unwrap().unwrap().score, Some(4.0));
+        user.score_format = Some("POINT_100".into());
+        assert!(!db.replace_account("session", &user).unwrap());
+        let entry = db.get_entry(1).unwrap().unwrap();
+        assert_eq!(entry.score, None);
+        assert_eq!(
+            (entry.id, entry.progress, entry.status.as_str()),
+            (Some(22), 3, "CURRENT")
+        );
+    }
+
+    #[test]
+    fn profile_format_changes_preserve_known_unrated_and_unknown_scores() {
+        for score in [None, Some(0.0)] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            let mut user = crate::models::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            };
+            db.replace_account("session", &user).unwrap();
+            db.upsert_media(&crate::models::Media {
+                id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&crate::models::ListEntry {
+                media_id: 1,
+                status: "CURRENT".into(),
+                score,
+                ..Default::default()
+            })
+            .unwrap();
+            user.score_format = Some("POINT_5".into());
+            db.replace_account("session", &user).unwrap();
+            assert_eq!(db.get_entry(1).unwrap().unwrap().score, score);
+        }
+    }
 
     #[test]
     fn account_change_rolls_back_identity_and_rows_on_any_write_failure() {
@@ -1090,6 +1167,8 @@ mod tests {
                     error: None,
                     conflict: false,
                     missing_media: false,
+                    score_format: None,
+                    base_score_format: None,
                 },
             )
             .unwrap();
@@ -1137,6 +1216,8 @@ mod tests {
             error: Some("synthetic outage".into()),
             conflict: false,
             missing_media: false,
+            score_format: None,
+            base_score_format: None,
         })
         .unwrap();
         {

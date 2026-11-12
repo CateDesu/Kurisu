@@ -27,9 +27,7 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListOffset,
     ListState as GpuiListState, Render, ScrollHandle, Subscription, Window, prelude::*, px,
 };
-use kurisu_core::models::{
-    LibraryFile, Media, NowPlaying, PendingChange, TrackingPrompt, UpdateInfo, User,
-};
+use kurisu_core::models::{Media, NowPlaying, PendingChange, TrackingPrompt, UpdateInfo, User};
 use kurisu_core::{Core, Event, EventKind};
 
 use crate::components::covers::{CoverCache, CoverTicket};
@@ -37,7 +35,8 @@ use crate::components::input::{TextInput, TextInputEvent};
 use crate::contracts::{CloseIntent, Route, WorkspaceEvent};
 use my_list::{MyListAnchor, MyListSlot};
 use state::{
-    DetailState, EditorState, ListChange, ListState, ProgressEdit, ProgressRegistry, SortKey,
+    DetailState, EditorState, LibraryFiles, ListChange, ListState, ProgressEdit, ProgressRegistry,
+    SortKey,
 };
 
 fn now_seconds() -> i64 {
@@ -310,7 +309,7 @@ pub struct Workspace {
     delete_waiting: bool,
     detail: DetailState,
     detail_scroll: HashMap<i64, ScrollHandle>,
-    library_files: Vec<LibraryFile>,
+    library_files: LibraryFiles,
     library_request: u64,
     pending: Vec<PendingChange>,
     pending_error: String,
@@ -501,7 +500,7 @@ impl Workspace {
             delete_waiting: false,
             detail: DetailState::default(),
             detail_scroll: HashMap::new(),
-            library_files: Vec::new(),
+            library_files: LibraryFiles::default(),
             library_request: 0,
             pending: Vec::new(),
             pending_error: String::new(),
@@ -1451,7 +1450,17 @@ impl Workspace {
             self.last_sync_attempt = None;
             self.auth_error.clear();
         }
+        let format_changed = old_id == new_id
+            && self.profile.as_ref().and_then(|u| u.score_format.as_ref())
+                != user.as_ref().and_then(|u| u.score_format.as_ref());
         self.profile = user;
+        if format_changed {
+            self.list.clear_scores();
+            if let Some(entry) = self.detail.entry.as_mut() {
+                entry.score = None;
+            }
+            self.queue_list_refresh(None, window, cx);
+        }
         if changed
             && let Some(account) = new_id
             && let Some(draft) = self.editor_drafts.remove(&account)
@@ -1463,6 +1472,17 @@ impl Workspace {
             self.editor_recs = draft.recommendations;
             let busy = self.editor.as_ref().is_some_and(|editor| editor.busy);
             self.set_editor_inputs_disabled(busy, cx);
+        }
+        if let Some(editor) = self.editor.as_mut() {
+            let format = self
+                .profile
+                .as_ref()
+                .and_then(|user| user.score_format.clone());
+            if editor.refresh_score_format(format)
+                && let Some(inputs) = self.editor_inputs.as_ref()
+            {
+                inputs.score.update(cx, |input, cx| input.set_value("", cx));
+            }
         }
         if switched_account {
             self.preference_reset += 1;
@@ -1876,6 +1896,7 @@ impl Workspace {
                     return;
                 }
                 this.list.syncing = false;
+                this.refresh_pending(window, cx);
                 if epoch != this.list_epoch {
                     if result.is_ok() {
                         this.mark_list_synced(window, cx);
@@ -1903,7 +1924,6 @@ impl Workspace {
                     }
                     Err(error) => this.list.error = error,
                 }
-                this.refresh_pending(window, cx);
                 cx.notify();
             });
         })
@@ -2224,10 +2244,7 @@ impl Workspace {
     fn load_detail(&mut self, id: i64, window: &Window, cx: &mut Context<Self>) {
         self.cancel_reads("detail-entry");
         self.cancel_reads("detail-recommendations");
-        self.covers.clear();
-        self.cover_tickets.clear();
-        self.cover_images.clear();
-        self.cover_regions.clear();
+        self.reset_detail_cover_region();
         let request = self.detail.start(id);
         let entry_revision = self.list.revision();
         let generation = self.generation;
@@ -2400,13 +2417,32 @@ impl Workspace {
         let generation = self.generation;
         let core = self.core.clone();
         let worker = core.clone();
-        let job = core.spawn(async move { worker.get_pending_changes().await });
+        let job = core.spawn(async move {
+            let pending = worker.get_pending_changes().await;
+            let user = worker.current_user().await;
+            (pending, user)
+        });
         self.replace_reads("pending", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
-            let result = joined(job.await);
-            let _ = this.update_in(cx, |this, _window, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |this, window, cx| {
                 if generation != this.generation || request != this.pending_request {
                     return;
+                }
+                let (result, user) = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        this.pending_error = error.to_string();
+                        return;
+                    }
+                };
+                if let Ok(Some(user)) = user
+                    && this
+                        .profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.id == user.id)
+                {
+                    this.set_profile(Some(user), window, cx);
                 }
                 match result {
                     Ok(items) => {

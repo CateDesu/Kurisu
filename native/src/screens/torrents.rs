@@ -17,7 +17,7 @@ use kurisu_core::{
 use super::{Workspace, covers::CoverOwner, joined, state::status_label};
 use crate::{
     components::input::{TextInput, TextInputEvent},
-    components::scrollbar::list_scrollbar,
+    components::scrollbar::{list_scrollbar, replace_list_rows},
     components::{button, page_heading},
     contracts::Route,
     platform::NativePlatform,
@@ -45,7 +45,6 @@ const RELEASE_OPTIONS: [(&str, &str); 3] = [
     ("2", "Trusted only"),
 ];
 
-#[derive(Clone)]
 struct ShowGroup {
     entry: ListEntry,
     title: String,
@@ -55,10 +54,9 @@ struct ShowGroup {
     newest: i64,
 }
 
-#[derive(Clone)]
 enum TorrentDisplayRow {
     SearchHeading,
-    SearchRelease(TorrentItem),
+    SearchRelease(Arc<TorrentItem>),
     Category {
         status: &'static str,
         total: usize,
@@ -70,7 +68,7 @@ enum TorrentDisplayRow {
         shown: usize,
         total: usize,
     },
-    Show(Box<ShowGroup>),
+    Show(Arc<ShowGroup>),
     ChoiceStatus {
         media_id: i64,
         text: String,
@@ -83,7 +81,7 @@ enum TorrentDisplayRow {
     },
     ChoiceRelease {
         media_id: i64,
-        item: TorrentItem,
+        item: Arc<TorrentItem>,
     },
     ChoiceMore {
         media_id: i64,
@@ -683,29 +681,23 @@ fn choice_key(entry: &ListEntry, category: &str, release: &str) -> String {
 
 impl Workspace {
     fn rebuild_torrent_rows(&mut self) {
-        let old_top = self
-            .torrents
-            .widget
-            .as_ref()
-            .map(ListState::logical_scroll_top);
-        let old_key = old_top
-            .as_ref()
-            .and_then(|offset| self.torrents.rows.get(offset.item_ix))
-            .map(TorrentDisplayRow::key);
         let groups = display_groups(
             &self.torrents.entries,
             &self.torrents.items,
             &self.torrents.category,
             &self.torrents.release,
             self.torrents.new_only,
-        );
+        )
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>();
         let mut rows = Vec::new();
         if self.torrents.searching || self.torrents.searched {
             rows.push(TorrentDisplayRow::SearchHeading);
             if self.torrents.searched {
                 for item in &self.torrents.results {
                     if matches_filters(item, &self.torrents.category, &self.torrents.release) {
-                        rows.push(TorrentDisplayRow::SearchRelease(item.clone()));
+                        rows.push(TorrentDisplayRow::SearchRelease(Arc::new(item.clone())));
                     }
                 }
             }
@@ -763,7 +755,7 @@ impl Workspace {
                     total,
                 });
                 for group in shown {
-                    rows.push(TorrentDisplayRow::Show(Box::new(group.clone())));
+                    rows.push(TorrentDisplayRow::Show(Arc::clone(group)));
                     if self.torrents.expanded_shows.contains(&group.entry.media_id) {
                         append_choice_rows(
                             &mut rows,
@@ -791,18 +783,16 @@ impl Workspace {
                 rows.push(TorrentDisplayRow::Unmatched(unmatched));
             }
         }
-        self.torrents.rows = Arc::new(rows);
         if let Some(widget) = &self.torrents.widget {
-            widget.reset_with_uniform_height(self.torrents.rows.len(), px(78.));
-            if let (Some(key), Some(offset)) = (old_key, old_top)
-                && let Some(index) = self.torrents.rows.iter().position(|row| row.key() == key)
-            {
-                widget.scroll_to(ListOffset {
-                    item_ix: index,
-                    offset_in_item: offset.offset_in_item,
-                });
-            }
+            replace_list_rows(
+                widget,
+                &self.torrents.rows,
+                &rows,
+                px(78.),
+                TorrentDisplayRow::key,
+            );
         }
+        self.torrents.rows = Arc::new(rows);
         self.refresh_torrents_covers();
     }
 
@@ -1098,7 +1088,10 @@ fn append_choice_rows(
                 let mut item = item.clone();
                 item.seen |= opened_links.contains(&item.link)
                     || identities(&item).iter().any(|key| opened_ids.contains(key));
-                rows.push(TorrentDisplayRow::ChoiceRelease { media_id: id, item });
+                rows.push(TorrentDisplayRow::ChoiceRelease {
+                    media_id: id,
+                    item: Arc::new(item),
+                });
             }
             for item in items {
                 found_links.insert(item.link.clone());
@@ -1141,7 +1134,7 @@ fn append_choice_rows(
         for item in remaining {
             rows.push(TorrentDisplayRow::ChoiceRelease {
                 media_id: id,
-                item: item.clone(),
+                item: Arc::new(item.clone()),
             });
         }
     }
@@ -1445,86 +1438,6 @@ impl Workspace {
             .flex()
             .flex_col()
             .gap(px(16.));
-        let mut actions = div().flex().items_center().gap(px(8.));
-        if visible_new > 0 {
-            actions = actions.child(
-                div()
-                    .text_color(rgb(ACCENT))
-                    .child(format!("{visible_new} new")),
-            );
-        }
-        actions = actions
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("torrent-new-only")
-                    .role(Role::CheckBox)
-                    .aria_label("New feed releases only")
-                    .aria_toggled(Toggled::from(state.new_only))
-                    .tab_stop(state.prefs_loaded)
-                    .focusable()
-                    .focus_visible(|style| style.border_1().border_color(rgb(ACCENT)))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_color(rgb(DIM))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .w(px(13.))
-                            .h(px(13.))
-                            .flex_shrink_0()
-                            .rounded(px(3.))
-                            .border_1()
-                            .border_color(rgb(if state.new_only { ACCENT } else { EDGE }))
-                            .bg(rgb(if state.new_only { ACCENT } else { PANEL_2 }))
-                            .when(state.new_only, |box_| {
-                                box_.child(
-                                    div().text_size(px(11.)).text_color(rgb(BASE)).child("✓"),
-                                )
-                            }),
-                    )
-                    .child("New feed releases only")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if !this.torrents.prefs_loaded {
-                            return;
-                        }
-                        this.torrents.new_only = !this.torrents.new_only;
-                        this.persist_preference(
-                            "kurisu.torrents.new",
-                            Some(if this.torrents.new_only { "1" } else { "0" }.into()),
-                            window,
-                            cx,
-                        );
-                        this.rebuild_torrent_rows();
-                        cx.notify();
-                    })),
-            )
-            .child(
-                button(
-                    "torrent-refresh",
-                    if state.loading {
-                        "Refreshing…"
-                    } else {
-                        "↻ Refresh"
-                    },
-                    state.loading,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if !this.torrents.loading {
-                        this.load_torrent_feeds(window, cx);
-                        this.load_torrent_entries(window, cx);
-                        this.refresh_torrent_feed(true, window, cx);
-                    }
-                })),
-            );
-        if state
-            .refreshed
-            .is_some_and(|time| time.elapsed() < Duration::from_secs(3))
-        {
-            actions = actions.child(div().text_color(rgb(ACCENT)).child("Refreshed ✓"));
-        }
-        toolbar = toolbar.child(actions);
         let search = state.search_input.clone();
         let feed = state.feed_input.clone();
         let mut forms = div().flex().flex_wrap().gap(px(14.));
@@ -1836,13 +1749,93 @@ impl Workspace {
                 .priority(1),
             );
         }
+        let mut actions = div().flex().flex_wrap().items_center().gap(px(8.));
+        if visible_new > 0 {
+            actions = actions.child(
+                div()
+                    .text_color(rgb(ACCENT))
+                    .child(format!("{visible_new} new")),
+            );
+        }
+        actions = actions
+            .child(
+                div()
+                    .id("torrent-new-only")
+                    .role(Role::CheckBox)
+                    .aria_label("New feed releases only")
+                    .aria_toggled(Toggled::from(state.new_only))
+                    .tab_stop(state.prefs_loaded)
+                    .focusable()
+                    .focus_visible(|style| style.border_1().border_color(rgb(ACCENT)))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(rgb(DIM))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(13.))
+                            .h(px(13.))
+                            .flex_shrink_0()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(rgb(if state.new_only { ACCENT } else { EDGE }))
+                            .bg(rgb(if state.new_only { ACCENT } else { PANEL_2 }))
+                            .when(state.new_only, |box_| {
+                                box_.child(
+                                    div().text_size(px(11.)).text_color(rgb(BASE)).child("✓"),
+                                )
+                            }),
+                    )
+                    .child("New feed releases only")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !this.torrents.prefs_loaded {
+                            return;
+                        }
+                        this.torrents.new_only = !this.torrents.new_only;
+                        this.persist_preference(
+                            "kurisu.torrents.new",
+                            Some(if this.torrents.new_only { "1" } else { "0" }.into()),
+                            window,
+                            cx,
+                        );
+                        this.rebuild_torrent_rows();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button(
+                    "torrent-refresh",
+                    if state.loading {
+                        "Refreshing…"
+                    } else {
+                        "↻ Refresh"
+                    },
+                    state.loading,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if !this.torrents.loading {
+                        this.load_torrent_feeds(window, cx);
+                        this.load_torrent_entries(window, cx);
+                        this.refresh_torrent_feed(true, window, cx);
+                    }
+                })),
+            );
+        if state
+            .refreshed
+            .is_some_and(|time| time.elapsed() < Duration::from_secs(3))
+        {
+            actions = actions.child(div().text_color(rgb(ACCENT)).child("Refreshed ✓"));
+        }
         toolbar = toolbar.child(
             div()
                 .flex()
                 .flex_wrap()
+                .items_end()
                 .gap(px(10.))
                 .child(category)
-                .child(release),
+                .child(release)
+                .child(actions),
         );
         page = page.child(toolbar);
         let mut tips = div()
@@ -1871,13 +1864,10 @@ impl Workspace {
                     })),
             );
         if state.show_tips {
-            tips = tips.child(div().mt(px(8.))
-                .child("Open a show to find batches and your next unwatched episode. Filters apply to feed releases and Nyaa searches. New feed releases only keeps the full list and download options available.")
-                .child(" Trusted marks trusted uploaders. Remake marks re-encodes or altered reuploads. Use quoted phrases, -word exclusions, and word|other alternatives.")
-                .child(button("torrent-search-guide", "Open Nyaa’s search guide", false)
-                    .on_click(cx.listener(|this, _, window, cx| this.open_torrent_url(None, "https://nyaa.si/help".into(), window, cx)))));
+            tips = tips.child(div().mt(px(8.)).child(
+                "Filters apply to feed releases and Nyaa searches. Trusted marks trusted uploaders.",
+            ));
         }
-        tips = tips.child(div().mt(px(16.)).child("Open a show for batches and your next unwatched episode from different release groups."));
         page = page.child(tips);
         for error in [&state.error, &state.entries_error, &state.feeds_error] {
             if !error.is_empty() {
@@ -1956,10 +1946,10 @@ impl Workspace {
                     .flex_col()
                     .child(
                         list(widget.clone(), move |index, _, app| {
-                            let Some(row) = rows.get(index).cloned() else {
+                            let Some(row) = rows.get(index) else {
                                 return div().into_any();
                             };
-                            let cover = if let TorrentDisplayRow::Show(group) = &row {
+                            let cover = if let TorrentDisplayRow::Show(group) = row {
                                 weak.read_with(app, |this, _| {
                                     this.cover_images
                                         .get(&(group.entry.media_id, 40, 56))
@@ -2037,7 +2027,7 @@ impl Workspace {
 }
 
 fn render_torrent_row(
-    row: TorrentDisplayRow,
+    row: &TorrentDisplayRow,
     cover: Option<Arc<gpui::RenderImage>>,
     weak: WeakEntity<Workspace>,
     app: &mut gpui::App,
@@ -2084,6 +2074,7 @@ fn render_torrent_row(
             releases,
             new_count,
         } => {
+            let status = *status;
             let expanded = weak
                 .read_with(app, |this, _| {
                     this.torrents.expanded_statuses.contains(status)
@@ -2131,10 +2122,10 @@ fn render_torrent_row(
                         .child(div().flex_1())
                         .child(div().text_size(px(12.)).text_color(rgb(DIM)).child(format!(
                             "{total} show{} · {releases} feed release{}",
-                            if total == 1 { "" } else { "s" },
-                            if releases == 1 { "" } else { "s" },
+                            if *total == 1 { "" } else { "s" },
+                            if *releases == 1 { "" } else { "s" },
                         )))
-                        .when(new_count > 0, |row| {
+                        .when(*new_count > 0, |row| {
                             row.child(
                                 div()
                                     .text_size(px(12.))
@@ -2183,7 +2174,7 @@ fn render_torrent_row(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(DIM))
-                    .child(if shown == 0 {
+                    .child(if *shown == 0 {
                         "No shows or releases match your filter.".to_owned()
                     } else {
                         format!("{shown} of {total} shows")
@@ -2291,8 +2282,9 @@ fn render_torrent_row(
                 .gap(px(8.))
                 .text_size(px(12.))
                 .text_color(rgb(DIM))
-                .child(div().flex_1().child(text));
-            if retry {
+                .child(div().flex_1().child(text.clone()));
+            if *retry {
+                let media_id = *media_id;
                 row = row.child(
                     button(
                         format!("torrent-choice-retry-{media_id}"),
@@ -2333,7 +2325,9 @@ fn render_torrent_row(
             count,
             expanded,
         } => {
-            let label = if expanded {
+            let media_id = *media_id;
+            let title = title.clone();
+            let label = if *expanded {
                 "Show fewer".to_owned()
             } else {
                 format!("Show all {count}")
@@ -2348,7 +2342,7 @@ fn render_torrent_row(
                         format!("{label} {}", title.to_lowercase()),
                         false,
                     )
-                    .aria_expanded(expanded)
+                    .aria_expanded(*expanded)
                     .on_click(move |_, _, app| {
                         let _ = weak.update(app, |this, cx| {
                             this.toggle_torrent_section(media_id, title.clone(), cx)
@@ -2364,14 +2358,18 @@ fn render_torrent_row(
             .text_color(rgb(DIM))
             .child(format!(
                 "{count} feed item{} didn't match your list and {} hidden.",
-                if count == 1 { "" } else { "s" },
-                if count == 1 { "is" } else { "are" }
+                if *count == 1 { "" } else { "s" },
+                if *count == 1 { "is" } else { "are" }
             ))
             .into_any(),
     }
 }
 
-fn render_release_row(item: TorrentItem, scope: String, weak: WeakEntity<Workspace>) -> AnyElement {
+fn render_release_row(
+    item: &Arc<TorrentItem>,
+    scope: String,
+    weak: WeakEntity<Workspace>,
+) -> AnyElement {
     let guid = item.guid.clone();
     let title = item.title.clone();
     let mut meta = Vec::new();
@@ -2456,18 +2454,19 @@ fn render_release_row(item: TorrentItem, scope: String, weak: WeakEntity<Workspa
     }
     if let Some(url) = item.magnet.clone() {
         let weak_magnet = weak.clone();
-        let selected = item.clone();
+        let selected = Arc::clone(item);
         row = row.child(
             button(format!("torrent-magnet-{scope}-{guid}"), "Magnet", false)
                 .aria_label("Open magnet in torrent client")
                 .on_click(move |_, window, app| {
                     let _ = weak_magnet.update(app, |this, cx| {
-                        this.open_torrent_url(Some(selected.clone()), url.clone(), window, cx)
+                        this.open_torrent_url(Some((*selected).clone()), url.clone(), window, cx)
                     });
                 }),
         );
     }
     let link = item.link.clone();
+    let item = Arc::clone(item);
     row.child(
         button(
             format!("torrent-download-{scope}-{guid}"),
@@ -2477,7 +2476,7 @@ fn render_release_row(item: TorrentItem, scope: String, weak: WeakEntity<Workspa
         .aria_label("Download torrent file")
         .on_click(move |_, window, app| {
             let _ = weak.update(app, |this, cx| {
-                this.open_torrent_url(Some(item.clone()), link.clone(), window, cx)
+                this.open_torrent_url(Some((*item).clone()), link.clone(), window, cx)
             });
         }),
     )
@@ -2705,6 +2704,53 @@ mod tests {
                 Some(value)
             );
         }
+    }
+
+    #[gpui::test]
+    fn retained_row_snapshot_is_unchanged_by_progress_and_seen_updates(cx: &mut TestAppContext) {
+        let (core, _runtime) = fixture(&[], Some("[]"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |workspace, _, _| {
+            workspace.torrents.entries_loaded = true;
+            workspace.torrents.entries = vec![ListEntry {
+                media_id: 1,
+                status: "CURRENT".into(),
+                progress: 0,
+                ..Default::default()
+            }];
+            workspace.torrents.items = vec![TorrentItem {
+                guid: "snapshot-release".into(),
+                media_id: Some(1),
+                episode: Some(1),
+                seen: false,
+                ..Default::default()
+            }];
+            workspace.rebuild_torrent_rows();
+            let snapshot = workspace.torrents.rows.clone();
+            workspace.torrents.entries[0].progress = 1;
+            workspace.torrents.items[0].seen = true;
+            workspace.rebuild_torrent_rows();
+            let group = |rows: &Vec<TorrentDisplayRow>| {
+                rows.iter()
+                    .find_map(|row| {
+                        if let TorrentDisplayRow::Show(group) = row {
+                            Some(group.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap()
+            };
+            let old = group(&snapshot);
+            let current = group(&workspace.torrents.rows);
+            assert_eq!(old.entry.progress, 0);
+            assert!(!old.items[0].seen);
+            assert!(old.has_new);
+            assert_eq!(current.entry.progress, 1);
+            assert!(current.items[0].seen);
+            assert!(!current.has_new);
+            assert!(!Arc::ptr_eq(&old, &current));
+        });
     }
 
     #[gpui::test]

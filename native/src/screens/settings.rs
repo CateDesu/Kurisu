@@ -590,14 +590,12 @@ impl Workspace {
         content = content.child(account);
 
         let disabled = !state.cfg_loaded || state.cfg_saving;
-        let mut tracking =
-            section("Playback tracking").child(div().mb(px(12.)).text_color(rgb(DIM)).child(
-                if cfg!(target_os = "windows") {
-                    "Detect playback through Windows media sessions and update your list. Bare MPV is detected through its IPC socket."
-                } else {
-                    "Detect playback through MPRIS2 players such as VLC and Celluloid and update your list. Bare MPV is detected through its IPC socket."
-                },
-            ));
+        let mut tracking = section("Playback tracking").child(
+            div()
+                .mb(px(12.))
+                .text_color(rgb(DIM))
+                .child("Detect playback in supported players and update your list."),
+        );
         if !state.cfg_error.is_empty() {
             tracking = tracking.child(
                 div()
@@ -663,16 +661,11 @@ impl Workspace {
                 .child(
                     toggle_button(
                         "tracking-discord",
-                        "Show what I'm watching as my Discord status",
+                        "Discord Rich Presence",
                         state.cfg.discord_enabled,
                         disabled,
                     )
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_tracking_option(true, cx))),
-                )
-                .child(
-                    div().ml(px(21.)).text_size(px(12.)).text_color(rgb(DIM)).child(
-                        "Rich Presence announces the matched show and episode with the time left while it plays, then clears when playback stops. It works in every tracking mode while Discord is running.",
-                    ),
                 );
         if let Some(input) = &state.socket {
             tracking = tracking.child(
@@ -781,7 +774,7 @@ impl Workspace {
             content = content.child(row);
         }
 
-        let mut updates = div().flex().flex_wrap().gap(px(8.)).child(
+        let mut updates = div().mt(px(12.)).flex().flex_wrap().gap(px(8.)).child(
             button(
                 "settings-check-update",
                 if state.update_checking {

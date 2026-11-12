@@ -59,6 +59,14 @@ fn same_tracking_prompt(a: &crate::Event, b: &crate::Event) -> bool {
 }
 
 impl AppState {
+    pub(crate) fn cached_score_format(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .db
+            .cached_user()
+            .map_err(|e| e.to_string())?
+            .and_then(|user| user.score_format))
+    }
+
     pub(crate) fn origin(&self) -> crate::EventOrigin {
         crate::EventOrigin {
             generation: *self.auth_intent.borrow(),
@@ -907,17 +915,51 @@ async fn sync_my_list_inner(state: &AppState) -> Result<Vec<ListEntry>, String> 
     if !al.has_token() {
         return Err("not logged in".to_string());
     }
-    let user_name = state
+    let mut user_name = state
         .db
         .get_setting(USERNAME_KEY)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "not logged in".to_string())?;
-    let result = al.user_list(&user_name).await;
+        .ok_or("not logged in")?;
+    let mut score_format = state
+        .db
+        .cached_user()
+        .map_err(|e| e.to_string())?
+        .and_then(|user| user.score_format);
+    let mut snapshot = None;
+    for _ in 0..3 {
+        // Pin every chunk so a format change cannot mix score scales.
+        let result = al.user_list(&user_name, score_format.as_deref()).await;
+        let entries = match result {
+            Ok(entries) => entries,
+            Err(e) => {
+                let _write = state.entry_lock.lock().await;
+                return Err(write_err(state, &e));
+            }
+        };
+        let result = al.viewer().await;
+        let _write = state.entry_lock.lock().await;
+        let user = result.map_err(|e| write_err(state, &e))?;
+        if crate::sync_queue::account_id(&state.db) != Some(user.id)
+            || state.anilist.lock().token() != al.token()
+        {
+            return Err("Account changed".into());
+        }
+        if score_format == user.score_format && user_name == user.name {
+            snapshot = Some((entries, user));
+            break;
+        }
+        user_name = user.name;
+        score_format = user.score_format;
+    }
+    let (entries, user) = snapshot.ok_or(
+        "Account name or score format kept changing during sync. Try again after changing your AniList settings.",
+    )?;
     let _write = state.entry_lock.lock().await;
-    let entries = match result {
-        Ok(v) => v,
-        Err(e) => return Err(write_err(state, &e)),
-    };
+    state
+        .db
+        .replace_account(al.token().as_deref().ok_or("Not signed in")?, &user)
+        .map_err(|e| e.to_string())?;
+    *state.user.lock() = Some(user);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.replace_list_snapshot(&entries))
         .await
@@ -995,7 +1037,8 @@ async fn local_entry_updates_inner(
                     status: "CURRENT".into(),
                     ..Default::default()
                 });
-            pending.patch.apply(&mut entry);
+            crate::sync_queue::apply_display_patch(state, &pending, &mut entry)
+                .map_err(|e| e.to_string())?;
             if stored.is_none() {
                 entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
             }
@@ -1054,6 +1097,35 @@ pub async fn save_entry_inner(
     save_entry_inner_checked(state, media_id, status, progress, score, repeat, None).await
 }
 
+impl crate::Core {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_entry_in_format(
+        &self,
+        media_id: i64,
+        status: Option<String>,
+        progress: Option<i64>,
+        score: Option<f64>,
+        repeat: Option<i64>,
+        expected_progress: Option<i64>,
+        displayed_format: Option<String>,
+    ) -> Result<ListEntry, String> {
+        let origin = self.state.origin();
+        let entry = save_entry_inner_checked_impl(
+            &self.state,
+            media_id,
+            status,
+            progress,
+            score,
+            repeat,
+            expected_progress,
+            Some(displayed_format),
+        )
+        .await?;
+        self.state.clear_tracking_prompt_if_advanced(origin, &entry);
+        Ok(entry)
+    }
+}
+
 pub async fn save_entry_inner_checked(
     state: &AppState,
     media_id: i64,
@@ -1072,12 +1144,14 @@ pub async fn save_entry_inner_checked(
         score,
         repeat,
         expected_progress,
+        None,
     )
     .await?;
     state.clear_tracking_prompt_if_advanced(origin, &entry);
     Ok(entry)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn save_entry_inner_checked_impl(
     state: &AppState,
     media_id: i64,
@@ -1086,12 +1160,25 @@ async fn save_entry_inner_checked_impl(
     score: Option<f64>,
     repeat: Option<i64>,
     expected_progress: Option<i64>,
+    displayed_format: Option<Option<String>>,
 ) -> Result<ListEntry, String> {
     let origin = state.origin();
     let expected_token = state.anilist.lock().token();
     let _remote = state.remote_lock.lock().await;
     let _write = state.entry_lock.lock().await;
     check_write_session(state, &expected_token)?;
+    if score.is_some_and(|score| score != 0.0) {
+        if let Some(displayed) = displayed_format {
+            let current = state
+                .db
+                .cached_user()
+                .map_err(|e| e.to_string())?
+                .and_then(|user| user.score_format);
+            if displayed.is_none() || displayed != current {
+                return Err("Score format changed. Re-enter the score before saving.".into());
+            }
+        }
+    }
     if let Some(expected) = expected_progress {
         match state.db.get_entry(media_id).map_err(|e| e.to_string())? {
             None => return Err("the entry is no longer on your list".into()),
@@ -1134,7 +1221,9 @@ async fn save_entry_inner_checked_impl(
     // A cache miss may already exist remotely.
     if before.is_none() {
         drop(_write);
-        let result = al.entry_by_media_id(media_id).await;
+        let result = al
+            .entry_by_media_id(media_id, state.cached_score_format()?.as_deref())
+            .await;
         let _write = state.entry_lock.lock().await;
         match result {
             Ok(Some(remote)) => {
@@ -1312,7 +1401,10 @@ async fn save_entry_unlocked_with_guard<'a>(
         },
     )
     .map_err(|e| e.to_string())?;
-    if let Some((_, pending, true)) = &staged {
+    if let Some((_, pending, _)) = staged
+        .as_ref()
+        .filter(|(_, pending, already_pending)| *already_pending || pending.conflict)
+    {
         return crate::sync_queue::local_entry_from(state, origin, pending)
             .map_err(|e| e.to_string());
     }
@@ -1321,9 +1413,32 @@ async fn save_entry_unlocked_with_guard<'a>(
     }
     let entry_id = before.as_ref().and_then(|entry| entry.id);
     drop(_write);
+    if let Some((account, pending, _)) = staged.as_ref() {
+        if let Err(error) =
+            crate::sync_queue::check_score_format(state, &al, *account, pending).await
+        {
+            let _write = state.entry_lock.lock().await;
+            if !state.origin_is_current(origin) || state.anilist.lock().token() != al.token() {
+                return Err(error);
+            }
+            let mut pending = pending.clone();
+            pending.conflict = error == crate::sync_queue::SCORE_FORMAT_ERROR;
+            pending.error = Some(error);
+            state
+                .db
+                .put_pending(*account, &pending)
+                .map_err(|e| e.to_string())?;
+            return crate::sync_queue::local_entry_from(state, origin, &pending)
+                .map_err(|e| e.to_string());
+        }
+    }
     // Automatic playback must respect the same baseline as queued retries.
+    let score_format = state.cached_score_format()?;
     let preflight = if let Some((account, pending, _)) = staged.as_ref().filter(|_| check_remote) {
-        match al.entry_by_media_id(media_id).await {
+        match al
+            .entry_by_media_id(media_id, score_format.as_deref())
+            .await
+        {
             Ok(remote) => {
                 let snapshot = remote
                     .as_ref()
@@ -1363,10 +1478,45 @@ async fn save_entry_unlocked_with_guard<'a>(
         Err(error) => Err(error),
         Ok(Some(saved)) => Ok(saved),
         Ok(None) => match entry_id {
-            Some(id) => al.save_entry_by_id(id, st, progress, score, repeat).await,
-            None => al.save_entry(media_id, st, progress, score, repeat).await,
+            Some(id) => {
+                al.save_entry_by_id(id, st, progress, score, repeat, score_format.as_deref())
+                    .await
+            }
+            None => {
+                al.save_entry(
+                    media_id,
+                    st,
+                    progress,
+                    score,
+                    repeat,
+                    score_format.as_deref(),
+                )
+                .await
+            }
         },
     };
+    // A successful mutation can still have interpreted the score on a changed scale.
+    if saved.is_ok() {
+        if let Some((account, pending, _)) = staged.as_ref() {
+            if let Err(error) =
+                crate::sync_queue::check_score_format(state, &al, *account, pending).await
+            {
+                let _write = state.entry_lock.lock().await;
+                if !state.origin_is_current(origin) || state.anilist.lock().token() != al.token() {
+                    return Err(error);
+                }
+                let mut pending = pending.clone();
+                pending.conflict = error == crate::sync_queue::SCORE_FORMAT_ERROR;
+                pending.error = Some(error);
+                state
+                    .db
+                    .put_pending(*account, &pending)
+                    .map_err(|e| e.to_string())?;
+                return crate::sync_queue::local_entry_from(state, origin, &pending)
+                    .map_err(|e| e.to_string());
+            }
+        }
+    }
     let _write = state.entry_lock.lock().await;
     let saved = match saved {
         Ok(s) => s,
@@ -1656,7 +1806,7 @@ async fn delete_entry_inner(media_id: i64, state: &AppState) -> Result<(), Strin
     let id = if let Some(id) = entry.as_ref().and_then(|e| e.id) {
         Some(id)
     } else if entry.is_some() || queued {
-        let result = al.entry_by_media_id(media_id).await;
+        let result = al.entry_by_media_id(media_id, None).await;
         let _write = state.entry_lock.lock().await;
         match result {
             Ok(remote) => remote.map(|entry| entry.id),
@@ -1673,7 +1823,7 @@ async fn delete_entry_inner(media_id: i64, state: &AppState) -> Result<(), Strin
             result.map_err(|e| write_err(state, &e))?
         };
         if !deleted {
-            let result = al.entry_by_media_id(media_id).await;
+            let result = al.entry_by_media_id(media_id, None).await;
             let _write = state.entry_lock.lock().await;
             match result {
                 Ok(Some(live)) => {
@@ -2425,6 +2575,7 @@ mod tests {
                 "synthetic-session",
                 &User {
                     id: 7,
+                    score_format: Some("POINT_100".into()),
                     ..Default::default()
                 },
             )
@@ -2442,6 +2593,8 @@ mod tests {
             error: Some("Synthetic conflict".into()),
             conflict: true,
             missing_media: false,
+            score_format: Some("POINT_100".into()),
+            base_score_format: Some("POINT_100".into()),
         };
         state.db.put_pending(7, &pending).unwrap();
         state
@@ -2460,6 +2613,7 @@ mod tests {
                 &crate::sync_queue::Pending {
                     media_id: 2,
                     missing_media: true,
+                    score_format: Some("POINT_100".into()),
                     ..pending.clone()
                 },
             )
@@ -2555,6 +2709,8 @@ mod tests {
                         error: None,
                         conflict: false,
                         missing_media: false,
+                        score_format: None,
+                        base_score_format: None,
                     },
                 )
                 .unwrap();
@@ -2627,6 +2783,8 @@ mod tests {
                     error: None,
                     conflict: false,
                     missing_media: false,
+                    score_format: None,
+                    base_score_format: None,
                 },
             )
             .unwrap();
@@ -2972,7 +3130,7 @@ mod regression_tests {
             .unwrap();
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"id":22,"progress":4})
+            json!({"id":22,"progress":4,"scoreFormat":null})
         );
     }
 
@@ -3027,7 +3185,7 @@ mod regression_tests {
         assert_eq!(state.db.pending(7).unwrap().len(), 1);
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"id":22,"progress":4})
+            json!({"id":22,"progress":4,"scoreFormat":null})
         );
         assert!(requests.try_recv().is_err());
     }
@@ -3686,12 +3844,26 @@ mod regression_tests {
             (200, json!({"data": {"SaveMediaListEntry": {"id": 22, "status": "PAUSED", "progress": 4, "score": 8.5, "repeat": 2}}})),
         ]).await;
         let state = state_with_api(api);
+        state
+            .db
+            .replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    score_format: Some("POINT_10_DECIMAL".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let saved = save_entry_inner(&state, 1, Some("PAUSED".into()), None, None, None)
             .await
             .unwrap();
         requests.recv().await.unwrap();
         let write = requests.recv().await.unwrap();
-        assert_eq!(write["variables"], json!({"id": 22, "status": "PAUSED"}));
+        assert_eq!(
+            write["variables"],
+            json!({"id": 22, "status": "PAUSED", "scoreFormat": "POINT_10_DECIMAL"})
+        );
         assert_eq!(
             (saved.progress, saved.score, saved.repeat),
             (4, Some(8.5), 2)
@@ -3780,7 +3952,7 @@ mod regression_tests {
         requests.recv().await.unwrap();
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"id": 22, "status": "REPEATING", "progress": 0})
+            json!({"id": 22, "status": "REPEATING", "progress": 0, "scoreFormat": null})
         );
     }
 
@@ -4848,6 +5020,7 @@ mod persistence_tests {
         let user = User {
             id: 7,
             name: "Tester".into(),
+            score_format: Some("POINT_100".into()),
             ..Default::default()
         };
         let state = AppState {
@@ -4990,7 +5163,7 @@ mod persistence_tests {
                     .unwrap();
                     assert_eq!((saved.status.as_str(), saved.progress), ("COMPLETED", 12));
                     assert_eq!(saved.repeat, if finishing_rewatch { 3 } else { 2 });
-                    let mut expected = json!({"id":22,"status":"COMPLETED","progress":12});
+                    let mut expected = json!({"id":22,"status":"COMPLETED","progress":12,"scoreFormat":"POINT_100"});
                     if finishing_rewatch {
                         expected["repeat"] = json!(3);
                     }
@@ -5023,7 +5196,7 @@ mod persistence_tests {
                 None,
                 None,
                 10,
-                json!({"id":22,"progress":11}),
+                json!({"id":22,"progress":11,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5031,7 +5204,7 @@ mod persistence_tests {
                 None,
                 None,
                 11,
-                json!({"id":22,"progress":12}),
+                json!({"id":22,"progress":12,"scoreFormat":"POINT_100"}),
             ),
             (
                 None,
@@ -5039,7 +5212,7 @@ mod persistence_tests {
                 None,
                 None,
                 11,
-                json!({"id":22,"progress":12}),
+                json!({"id":22,"progress":12,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(0),
@@ -5047,7 +5220,7 @@ mod persistence_tests {
                 None,
                 None,
                 0,
-                json!({"id":22,"progress":0}),
+                json!({"id":22,"progress":0,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5055,7 +5228,7 @@ mod persistence_tests {
                 Some("PAUSED"),
                 None,
                 11,
-                json!({"id":22,"status":"PAUSED","progress":12}),
+                json!({"id":22,"status":"PAUSED","progress":12,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5063,7 +5236,7 @@ mod persistence_tests {
                 Some("CURRENT"),
                 None,
                 11,
-                json!({"id":22,"status":"CURRENT","progress":12}),
+                json!({"id":22,"status":"CURRENT","progress":12,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5071,7 +5244,7 @@ mod persistence_tests {
                 Some("REPEATING"),
                 None,
                 11,
-                json!({"id":22,"status":"REPEATING","progress":12}),
+                json!({"id":22,"status":"REPEATING","progress":12,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5079,7 +5252,7 @@ mod persistence_tests {
                 Some("completed"),
                 None,
                 11,
-                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":3}),
+                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":3,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5087,7 +5260,7 @@ mod persistence_tests {
                 Some("COMPLETED"),
                 Some(9),
                 11,
-                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":9}),
+                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":9,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5095,7 +5268,7 @@ mod persistence_tests {
                 Some("COMPLETED"),
                 None,
                 11,
-                json!({"id":22,"status":"COMPLETED","progress":12}),
+                json!({"id":22,"status":"COMPLETED","progress":12,"scoreFormat":"POINT_100"}),
             ),
             (
                 Some(12),
@@ -5103,7 +5276,7 @@ mod persistence_tests {
                 None,
                 None,
                 12,
-                json!({"id":22,"status":"COMPLETED","progress":12}),
+                json!({"id":22,"status":"COMPLETED","progress":12,"scoreFormat":"POINT_100"}),
             ),
         ] {
             let mut reply = remote();
@@ -5143,8 +5316,12 @@ mod persistence_tests {
         reply["status"] = json!("REPEATING");
         reply["progress"] = json!(12);
         reply["score"] = json!(80);
-        let (api, mut requests) =
-            anilist::mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":reply}}))]).await;
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, score_profile("POINT_100")),
+            (200, json!({"data":{"SaveMediaListEntry":reply}})),
+            (200, score_profile("POINT_100")),
+        ])
+        .await;
         let state = state(api);
         let mut before = state.db.get_entry(1).unwrap().unwrap();
         before.status = "REPEATING".into();
@@ -5163,9 +5340,13 @@ mod persistence_tests {
         .await
         .unwrap();
 
+        assert!(requests.recv().await.unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .contains("Viewer"));
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"id":22,"status":"REPEATING","progress":12,"score":80.0})
+            json!({"id":22,"status":"REPEATING","progress":12,"score":80.0,"scoreFormat":"POINT_100"})
         );
         assert_eq!(
             (saved.status.as_str(), saved.progress, saved.repeat),
@@ -5173,6 +5354,11 @@ mod persistence_tests {
         );
         assert_eq!(saved.score, Some(80.0));
         assert!(state.db.pending(7).unwrap().is_empty());
+        assert!(requests.recv().await.unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .contains("Viewer"));
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -5257,7 +5443,7 @@ mod persistence_tests {
             requests.recv().await.unwrap();
             assert_eq!(
                 requests.recv().await.unwrap()["variables"],
-                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":6})
+                json!({"id":22,"status":"COMPLETED","progress":12,"repeat":6,"scoreFormat":"POINT_100"})
             );
 
             save_entry_inner(&state, 1, None, Some(12), None, None)
@@ -5265,7 +5451,7 @@ mod persistence_tests {
                 .unwrap();
             assert_eq!(
                 requests.recv().await.unwrap()["variables"],
-                json!({"id":22,"progress":12})
+                json!({"id":22,"progress":12,"scoreFormat":"POINT_100"})
             );
             assert_eq!(state.db.get_entry(1).unwrap().unwrap().repeat, 6);
         }
@@ -5289,7 +5475,7 @@ mod persistence_tests {
         requests.recv().await.unwrap();
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"mediaId":1,"status":"COMPLETED","progress":12})
+            json!({"mediaId":1,"status":"COMPLETED","progress":12,"scoreFormat":"POINT_100"})
         );
         assert!(state.db.pending(7).unwrap().is_empty());
     }
@@ -5315,7 +5501,7 @@ mod persistence_tests {
 
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"id":22,"progress":12})
+            json!({"id":22,"progress":12,"scoreFormat":"POINT_100"})
         );
         assert_eq!((saved.status.as_str(), saved.progress), ("CURRENT", 12));
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().status, "CURRENT");
@@ -5362,7 +5548,7 @@ mod persistence_tests {
         requests.recv().await.unwrap();
         assert_eq!(
             requests.recv().await.unwrap()["variables"],
-            json!({"id":22,"status":"COMPLETED","progress":12,"repeat":3})
+            json!({"id":22,"status":"COMPLETED","progress":12,"repeat":3,"scoreFormat":"POINT_100"})
         );
         assert!(state.db.pending(7).unwrap().is_empty());
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().repeat, 3);
@@ -5490,6 +5676,7 @@ mod persistence_tests {
             if adding {
                 replies.push((200, json!({"data":{"Media":{"mediaListEntry":null}}})));
             }
+            replies.push((200, json!({"data":{"Viewer":{"id":7,"name":"Tester","mediaListOptions":{"scoreFormat":"POINT_100"}}}})));
             replies.extend([
                 (429, json!({})),
                 (
@@ -5509,6 +5696,7 @@ mod persistence_tests {
             if adding {
                 requests.recv().await.unwrap();
             }
+            requests.recv().await.unwrap();
             requests.recv().await.unwrap();
             assert_eq!(
                 local_entries_inner(&state).await.unwrap()[0].score,
@@ -5550,9 +5738,11 @@ mod persistence_tests {
                 } else {
                     reply[field] = json!(null);
                 }
-                let (api, mut requests) =
-                    anilist::mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":reply}}))])
-                        .await;
+                let (api, mut requests) = anilist::mock_api(vec![
+                    (200, score_profile("POINT_100")),
+                    (200, json!({"data":{"SaveMediaListEntry":reply}})),
+                ])
+                .await;
                 let state = state(api);
                 let saved = save_entry_inner(&state, 1, None, None, Some(80.0), None)
                     .await
@@ -5560,7 +5750,14 @@ mod persistence_tests {
                 assert_eq!(saved.score, Some(80.0));
                 assert_progress_preserved(&state);
                 assert_eq!(state.db.pending(7).unwrap()[0].patch.score, Some(80.0));
-                requests.recv().await.unwrap();
+                assert!(requests.recv().await.unwrap()["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Viewer"));
+                assert!(requests.recv().await.unwrap()["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("mutation"));
                 set_progress_inner(&state, 1, 13, Some(12)).await.unwrap();
                 assert_progress_preserved(&state);
                 assert_eq!(state.db.pending(7).unwrap()[0].patch.progress, Some(12));
@@ -5602,9 +5799,12 @@ mod persistence_tests {
             } else {
                 vec![
                     (200, json!({"data":{"Media":{"mediaListEntry":remote()}}})),
+                    (200, score_profile("POINT_100")),
                     (200, json!({"data":{"SaveMediaListEntry":partial}})),
                 ]
             };
+            let mut replies = replies;
+            replies.insert(0, (200, json!({"data":{"Viewer":{"id":7,"name":"Tester","mediaListOptions":{"scoreFormat":"POINT_100"}}}})));
             let (api, _) = anilist::mock_api(replies).await;
             let state = state(api);
             let (_, pending, _) = crate::sync_queue::stage(
@@ -5671,7 +5871,10 @@ mod persistence_tests {
                     "hasNextChunk":false,"lists":[{"entries":[remote()]}]
                 }}}),
             ),
+            (200, json!({"data":{"Viewer":{"id":7,"name":"Tester","mediaListOptions":{"scoreFormat":"POINT_100"}}}})),
+            (200, json!({"data":{"Viewer":{"id":7,"name":"Tester","mediaListOptions":{"scoreFormat":"POINT_100"}}}})),
             (200, json!({"data":{"SaveMediaListEntry":saved}})),
+            (200, score_profile("POINT_100")),
         ])
         .await;
         let state = Arc::new(state(api));
@@ -5723,5 +5926,388 @@ mod persistence_tests {
             kind: crate::EventKind::PendingChanged(Some(vec![1])),
         };
         assert!(!state.event_is_current(&stale));
+    }
+    #[tokio::test]
+    async fn displayed_score_format_is_checked_before_staging() {
+        let (api, mut requests) = anilist::mock_api(vec![]).await;
+        let state = state(api);
+        crate::sync_queue::stage(
+            &state,
+            1,
+            crate::sync_queue::Patch {
+                progress: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = save_entry_inner_checked_impl(
+            &state,
+            1,
+            None,
+            None,
+            Some(4.0),
+            None,
+            None,
+            Some(Some("POINT_5".into())),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("Score format changed"));
+        let pending = state.db.pending(7).unwrap().remove(0);
+        assert_eq!(pending.patch.progress, Some(5));
+        assert_eq!(pending.patch.score, None);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn foreground_format_change_preserves_intent_without_mutation() {
+        let (api, mut requests) = anilist::mock_api(vec![(200,
+            json!({"data":{"Viewer":{"id":7,"name":"Tester","mediaListOptions":{"scoreFormat":"POINT_5"}}}})
+        )]).await;
+        let state = state(api);
+        let saved = save_entry_inner_checked_impl(
+            &state,
+            1,
+            None,
+            Some(5),
+            Some(80.0),
+            None,
+            None,
+            Some(Some("POINT_100".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.score, None);
+        let pending = state.db.pending(7).unwrap().remove(0);
+        assert_eq!(pending.patch.progress, Some(5));
+        assert_eq!(pending.patch.score, Some(80.0));
+        assert_eq!(
+            state.user.lock().as_ref().unwrap().score_format.as_deref(),
+            Some("POINT_5")
+        );
+        assert!(requests.recv().await.unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .contains("Viewer"));
+        assert!(requests.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn foreground_score_preflight_expiration_is_not_a_successful_save() {
+        let (api, _) = anilist::mock_api(vec![(
+            401,
+            json!({"errors":[{"message":"Invalid token","status":401}]}),
+        )])
+        .await;
+        let state = state(api);
+        assert!(save_entry_inner(&state, 1, None, None, Some(80.0), None)
+            .await
+            .is_err());
+        assert!(state.anilist.lock().token().is_none());
+        assert_eq!(state.db.pending(7).unwrap()[0].patch.score, Some(80.0));
+    }
+
+    #[tokio::test]
+    async fn score_rejection_waits_for_local_entry_writes() {
+        let (api, mut requests) = anilist::mock_api(vec![(
+            401,
+            json!({"errors":[{"message":"Invalid token","status":401}]}),
+        )])
+        .await;
+        let state = Arc::new(state(api));
+        let pending = crate::sync_queue::Pending {
+            media_id: 1,
+            base: None,
+            patch: crate::sync_queue::Patch {
+                score: Some(80.0),
+                ..Default::default()
+            },
+            error: None,
+            conflict: false,
+            missing_media: false,
+            score_format: Some("POINT_100".into()),
+            base_score_format: Some("POINT_100".into()),
+        };
+        let guard = state.entry_lock.lock().await;
+        let worker = state.clone();
+        let job = tokio::spawn(async move {
+            let _remote = worker.remote_lock.lock().await;
+            let al = worker.anilist.lock().clone();
+            crate::sync_queue::check_score_format(&worker, &al, 7, &pending).await
+        });
+        requests.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            state.anilist.lock().token().is_some(),
+            "rejection bypassed entry_lock"
+        );
+        drop(guard);
+        assert!(job.await.unwrap().is_err());
+        assert!(state.db.entries_with_media().unwrap().is_empty());
+    }
+
+    fn score_profile(format: &str) -> serde_json::Value {
+        json!({"data":{"Viewer":{"id":7,"name":"Renamed","mediaListOptions":{"scoreFormat":format}}}})
+    }
+
+    fn score_snapshot(score: f64, more: bool, media_id: i64) -> serde_json::Value {
+        let mut entry = remote();
+        entry["mediaId"] = json!(media_id);
+        entry["score"] = json!(score);
+        json!({"data":{"MediaListCollection":{"hasNextChunk":more,"lists":[{"entries":[entry]}]}}})
+    }
+
+    #[tokio::test]
+    async fn failed_rename_refetch_preserves_the_cached_list() {
+        let (api, _) = anilist::mock_api(vec![
+            (200, score_snapshot(90.0, false, 2)),
+            (200, score_profile("POINT_100")),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        let state = state(api);
+        assert!(sync_my_list_inner(&state).await.is_err());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
+        assert!(state.db.get_entry(2).unwrap().is_none());
+        assert_eq!(state.db.cached_user().unwrap().unwrap().name, "Tester");
+    }
+
+    #[tokio::test]
+    async fn sync_refetches_a_renamed_account_before_replacing_its_list() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, score_snapshot(90.0, false, 2)),
+            (200, score_profile("POINT_100")),
+            (200, score_snapshot(70.0, false, 1)),
+            (200, score_profile("POINT_100")),
+        ])
+        .await;
+        let state = state(api);
+        let entries = sync_my_list_inner(&state).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].media_id, 1);
+        assert!(state.db.get_entry(2).unwrap().is_none());
+        assert_eq!(state.db.cached_user().unwrap().unwrap().name, "Renamed");
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"]["userName"],
+            "Tester"
+        );
+        requests.recv().await.unwrap();
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"]["userName"],
+            "Renamed"
+        );
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ordinary_sync_refreshes_the_score_profile_and_scores_together() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, score_snapshot(80.0, false, 1)),
+            (200, score_profile("POINT_5")),
+            (200, score_snapshot(4.0, false, 1)),
+            (200, score_profile("POINT_5")),
+        ])
+        .await;
+        let state = state(api);
+        let entries = sync_my_list_inner(&state).await.unwrap();
+        assert_eq!(entries[0].score, Some(4.0));
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(4.0));
+        for source in [state.user.lock().clone(), state.db.cached_user().unwrap()] {
+            assert_eq!(source.unwrap().score_format.as_deref(), Some("POINT_5"));
+        }
+        let first = requests.recv().await.unwrap();
+        assert_eq!(first["variables"]["scoreFormat"], "POINT_100");
+        assert!(first["query"]
+            .as_str()
+            .unwrap()
+            .contains("score(format: $scoreFormat)"));
+        requests.recv().await.unwrap();
+        let fresh = requests.recv().await.unwrap();
+        assert_eq!(fresh["variables"]["scoreFormat"], "POINT_5");
+        assert_eq!(fresh["variables"]["userName"], "Renamed");
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_recovers_a_legacy_profile_before_publishing_scores() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, score_snapshot(80.0, false, 1)),
+            (200, score_profile("POINT_100")),
+            (200, score_snapshot(80.0, false, 1)),
+            (200, score_profile("POINT_100")),
+        ])
+        .await;
+        let state = state(api);
+        state.db.delete_setting(PROFILE_KEY).unwrap();
+        assert_eq!(
+            sync_my_list_inner(&state).await.unwrap()[0].score,
+            Some(80.0)
+        );
+        assert_eq!(
+            state
+                .db
+                .cached_user()
+                .unwrap()
+                .unwrap()
+                .score_format
+                .as_deref(),
+            Some("POINT_100")
+        );
+        assert!(requests.recv().await.unwrap()["variables"]["scoreFormat"].is_null());
+        requests.recv().await.unwrap();
+        assert_eq!(
+            requests.recv().await.unwrap()["variables"]["scoreFormat"],
+            "POINT_100"
+        );
+        requests.recv().await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_retries_another_format_change_and_pins_every_chunk() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, score_snapshot(80.0, false, 1)),
+            (200, score_profile("POINT_5")),
+            (200, score_snapshot(4.0, false, 1)),
+            (200, score_profile("POINT_10_DECIMAL")),
+            (200, score_snapshot(8.0, true, 1)),
+            (200, score_snapshot(9.0, false, 2)),
+            (200, score_profile("POINT_10_DECIMAL")),
+        ])
+        .await;
+        let state = state(api);
+        let entries = sync_my_list_inner(&state).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(8.0));
+        assert_eq!(state.db.get_entry(2).unwrap().unwrap().score, Some(9.0));
+        let mut chunks = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            if request["query"]
+                .as_str()
+                .unwrap()
+                .contains("MediaListCollection")
+            {
+                chunks.push(request["variables"].clone());
+            }
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|v| v["scoreFormat"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "POINT_100",
+                "POINT_5",
+                "POINT_10_DECIMAL",
+                "POINT_10_DECIMAL"
+            ]
+        );
+        assert_eq!(chunks[3]["chunk"], 2);
+    }
+
+    #[tokio::test]
+    async fn unstable_sync_or_failed_refetch_preserves_the_previous_snapshot() {
+        for refetch_fails in [false, true] {
+            let mut replies = vec![
+                (200, score_snapshot(80.0, false, 2)),
+                (200, score_profile("POINT_5")),
+            ];
+            if refetch_fails {
+                replies.push((503, json!({"errors":[{"message":"Unavailable"}]})));
+            } else {
+                replies.extend([
+                    (200, score_snapshot(4.0, false, 2)),
+                    (200, score_profile("POINT_10_DECIMAL")),
+                    (200, score_snapshot(8.0, false, 2)),
+                    (200, score_profile("POINT_3")),
+                ]);
+            }
+            let count = replies.len();
+            let (api, mut requests) = anilist::mock_api(replies).await;
+            let state = state(api);
+            assert!(sync_my_list_inner(&state).await.is_err());
+            assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
+            assert!(state.db.get_entry(2).unwrap().is_none());
+            assert_eq!(
+                state
+                    .db
+                    .cached_user()
+                    .unwrap()
+                    .unwrap()
+                    .score_format
+                    .as_deref(),
+                Some("POINT_100")
+            );
+            for _ in 0..count {
+                requests.recv().await.unwrap();
+            }
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_score_postflight_retains_original_intent() {
+        for failure in [false, true] {
+            let mut saved = remote();
+            saved["score"] = json!(4);
+            let postflight = if failure {
+                (503, json!({"errors":[{"message":"Unavailable"}]}))
+            } else {
+                (200, score_profile("POINT_10_DECIMAL"))
+            };
+            let (api, mut requests) = anilist::mock_api(vec![
+                (200, score_profile("POINT_100")),
+                (200, json!({"data":{"SaveMediaListEntry":saved}})),
+                postflight,
+            ])
+            .await;
+            let state = state(api);
+            let entry = save_entry_inner(&state, 1, None, None, Some(4.0), None)
+                .await
+                .unwrap();
+            assert_eq!(entry.score, if failure { Some(4.0) } else { None });
+            let pending = state.db.pending(7).unwrap().remove(0);
+            assert_eq!(pending.patch.score, Some(4.0));
+            assert_eq!(pending.score_format.as_deref(), Some("POINT_100"));
+            assert_eq!(pending.conflict, !failure);
+            assert!(pending.error.is_some());
+            requests.recv().await.unwrap();
+            assert_eq!(requests.recv().await.unwrap()["variables"]["score"], 4.0);
+            assert!(requests.recv().await.unwrap()["query"]
+                .as_str()
+                .unwrap()
+                .contains("Viewer"));
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_profile_failures_do_not_publish_a_snapshot() {
+        for (status, profile) in [
+            (
+                401,
+                json!({"errors":[{"message":"Invalid token","status":401}]}),
+            ),
+            (500, json!({"errors":[{"message":"Unavailable"}]})),
+            (200, json!({"data":{"Viewer":{"id":8,"name":"Other"}}})),
+        ] {
+            let (api, _) = anilist::mock_api(vec![
+                (
+                    200,
+                    json!({"data":{"MediaListCollection":{"hasNextChunk":false,"lists":[]}}}),
+                ),
+                (status, profile),
+            ])
+            .await;
+            let state = state(api);
+            assert!(sync_my_list_inner(&state).await.is_err());
+            if status == 401 {
+                assert!(state.db.entries_with_media().unwrap().is_empty());
+                assert!(state.user.lock().is_none());
+            } else {
+                assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
+                assert_eq!(state.user.lock().as_ref().unwrap().id, 7);
+            }
+        }
     }
 }

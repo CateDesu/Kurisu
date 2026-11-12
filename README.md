@@ -4,17 +4,19 @@ Linux · Windows · [Downloads](https://github.com/CateDesu/Kurisu/releases) · 
 
 Kurisu is an anime tracking program for [AniList](https://anilist.co), inspired by [Taiga](https://taiga.moe). It detects playback, syncs your progress, and helps you find and play local episodes.
 
-The [GPUI desktop](native/README.md) is the primary implementation. A final Tauri transition release carries existing installations forward and remains available for rollback.
+Browse seasonal anime and airing schedules, search torrent feeds, view watch statistics, and share playback through Discord Rich Presence.
 
 ![Kurisu showing the anime list and episode progress](docs/screenshot.png)
 
 ## Getting started
 
-1. Download the native Windows installer or Linux archive from [Releases](https://github.com/CateDesu/Kurisu/releases). On Linux, extract the archive and run `chmod +x kurisu` first. Keep its license files beside the executable. Windows keeps the usual **Kurisu** shortcut.
+1. Download the native Windows installer or Linux archive from [Releases](https://github.com/CateDesu/Kurisu/releases). On Windows, install and open **Kurisu**. On Linux, extract the archive, run `chmod +x kurisu`, then launch `./kurisu`. Keep its license files beside the executable.
 2. Choose **Connect via AniList** and authorize Kurisu in your browser to sync your list.
 3. Optionally add media folders in **Library**. Configure **Settings → Playback tracking** and click **Save tracking**. Automatic progress updates are off by default.
 
 Add shows to your list before watching them so playback can be matched. Your cached list is available offline. Progress, status, score, and rewatch changes are saved on this device during connection failures and retried for the same AniList account. Conflicting remote edits appear in the pending sync bar for you to resolve. Deleting entries and editing notes, dates, or custom lists require a connection.
+
+For older installations, see [Profile transfer and rollback](native/PROFILE_TRANSFER.md) for upgrade and recovery instructions.
 
 ## Player setup
 
@@ -36,18 +38,10 @@ Restart MPV afterward. Set custom socket paths in **Settings → Playback tracki
 
 In Library, use **Episode numbering** to adjust files that continue numbering from an earlier season. An offset of `-12` maps file 13 to episode 1. Known single-episode movies can be recognized without a numbered filename. **Watch history** shows local playback that reached the watch threshold and was accepted for tracking, or was already marked watched on your list.
 
-## Upgrading an existing installation
-
-Use Kurisu's normal update action. Older installations first receive the final Tauri transition release, which saves your interface preferences. Its next update opens the GPUI program with a separate native profile and a standalone backup. No Python or manual file copying is needed. Quit the old program fully if Kurisu asks, then select **Retry**.
-
-This route also works when you skip releases: legacy downloads on later native release pages still contain the same transition program. Fresh installations should choose the native downloads. If you downloaded a native build directly and it cannot find prepared preferences, run the final transition release once with your original profile, quit it, then retry the native build.
-
-Your original profile stays available. Existing native candidate profiles keep their data. Missing, damaged or busy profiles stop the transfer and show recovery instructions. See [Profile transfer and rollback](native/PROFILE_TRANSFER.md) before returning to the Tauri release, especially if you have unsynced native changes.
-
 <details>
 <summary>Build from source</summary>
 
-Requires Rust, a C/C++ toolchain, Python 3.10 or newer for packaging, and GitHub CLI for release version discovery. Linux and Windows dependencies are listed in the [native build guide](native/README.md).
+Kurisu uses GPUI and a shared Rust core. Building requires Rust, a C/C++ toolchain, Python 3.10 or newer, and GitHub CLI for release version discovery. Linux and Windows dependencies are listed in the [build guide](native/README.md#platform-dependencies).
 
 ```sh
 python3 native/build.py
@@ -63,6 +57,7 @@ Run the checks from the program root. Core playback tests need MPV on `PATH`; Li
 ```sh
 python3 -m unittest discover -s native -p test_build.py
 python3 -m unittest discover -s native -p test_migrate.py
+cargo fmt --manifest-path core/Cargo.toml -- --check
 cargo fmt --manifest-path native/Cargo.toml -- --check
 cargo test --locked --manifest-path core/Cargo.toml
 cargo test --locked --manifest-path native/Cargo.toml --features fixture-runtime -- --test-threads=1
@@ -70,11 +65,9 @@ cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnin
 cargo clippy --locked --manifest-path native/Cargo.toml --features fixture-runtime --all-targets -- -D warnings
 ```
 
-See the [native guide](native/README.md) for release sequencing and compatibility requirements.
+See the [build guide](native/README.md) for packaging and release maintenance.
 
 </details>
-
-The final Tauri transition source and its build instructions are preserved at [v1.0.0.78](https://github.com/CateDesu/Kurisu/tree/v1.0.0.78). Keep that release for rollback and compatibility with older updaters.
 
 AniList tokens are stored locally in plaintext. See [Privacy](PRIVACY.md) and [Terms](TERMS.md).
 

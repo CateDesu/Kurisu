@@ -785,7 +785,7 @@ impl Shell {
             .px(px(12.))
             .pt(px(7.));
         for (index, (route, icon)) in nav.into_iter().enumerate() {
-            if index == 0 || index == 4 || index == 8 {
+            if index == 0 || index == 4 || index == 9 {
                 links = links.child(
                     div()
                         .px(px(12.))
@@ -1018,20 +1018,10 @@ impl Shell {
                             .mx(px(18.))
                             .mb(px(14.))
                             .overflow_hidden()
-                            .opacity(0.27)
+                            .opacity(0.85)
                             .child(
                                 svg()
-                                    .path("icons/gearwork-heading.svg")
-                                    .absolute()
-                                    .top(px(-8.))
-                                    .left(px(-5.))
-                                    .w(px(210.))
-                                    .h(px(124.))
-                                    .text_color(rgb(DIM)),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/gearwork-heading-accent.svg")
+                                    .path("icons/gearwork.svg")
                                     .absolute()
                                     .top(px(-8.))
                                     .left(px(-5.))

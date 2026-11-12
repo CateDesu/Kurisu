@@ -19,6 +19,8 @@ use gpui::{AssetSource, SharedString};
 use kurisu_core::Platform;
 use reqwest::Url;
 
+mod profile_init;
+
 pub struct NativePlatform;
 
 impl Platform for NativePlatform {
@@ -190,27 +192,14 @@ pub fn data_dir(argument: Option<PathBuf>) -> Result<PathBuf, String> {
             .to_path_buf(),
     };
     validate_profile_path(&path)?;
-    if has_native_profile(&path)? {
-        return path.canonicalize().map_err(|error| error.to_string());
-    }
     create_private_dir(&path)?;
     let path = path.canonicalize().map_err(|error| error.to_string())?;
     reject_forbidden(&path)?;
-    drop(kurisu_core::Db::open(&path.join("kurisu.db")).map_err(|error| error.to_string())?);
-    let mut options = File::options();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let _initialization = profile_init::lock(&path)?;
+    profile_init::recover(&path)?;
+    if !has_native_profile_unlocked(&path)? {
+        profile_init::create(&path)?;
     }
-    let mut marker = options
-        .open(path.join(".kurisu-native-profile"))
-        .map_err(|error| error.to_string())?;
-    marker
-        .write_all(b"kurisu-native-v1\n")
-        .and_then(|()| marker.sync_all())
-        .map_err(|error| error.to_string())?;
     Ok(path)
 }
 
@@ -228,6 +217,15 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), String> {
 
 pub(crate) fn has_native_profile(path: &Path) -> Result<bool, String> {
     validate_profile_path(path)?;
+    if !path_present(path)? {
+        return Ok(false);
+    }
+    let _initialization = profile_init::lock(path)?;
+    profile_init::recover(path)?;
+    has_native_profile_unlocked(path)
+}
+
+fn has_native_profile_unlocked(path: &Path) -> Result<bool, String> {
     let marker = path.join(".kurisu-native-profile");
     if path_present(&marker)? {
         let metadata = std::fs::metadata(&marker).map_err(|error| error.to_string())?;

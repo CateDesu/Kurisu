@@ -15,6 +15,7 @@ use crate::components::{button, tracked_mono};
 use crate::contracts::Route;
 use crate::theme::{ACCENT, BASE, DIM, EDGE, ERROR, INK, PANEL, PANEL_2, RUST, serif_font};
 
+pub(super) const CARD_ROW_HEIGHT: f32 = 302.;
 pub(super) const ERROR_BG: u32 = 0x160b0b;
 pub(super) const ERROR_EDGE: u32 = 0x502826;
 
@@ -140,6 +141,38 @@ pub(super) fn card_columns(width: f32) -> usize {
     }
 }
 
+pub(super) fn reset_card_rows(
+    rows: &GpuiListState,
+    item_count: usize,
+    old_columns: usize,
+    columns: usize,
+) {
+    let mut offset = rows.logical_scroll_top();
+    let at_end = rows.item_count() > 0 && offset.item_ix >= rows.item_count();
+    let first = offset.item_ix.saturating_mul(old_columns.max(1));
+    offset.item_ix = first.min(item_count.saturating_sub(1)) / columns.max(1);
+    if first >= item_count {
+        offset.offset_in_item = px(0.);
+    }
+    let count = item_count.div_ceil(columns.max(1));
+    let old_count = rows.item_count();
+    if old_columns == columns && count >= old_count {
+        if count > old_count {
+            rows.splice(old_count..old_count, count - old_count);
+            rows.clone().with_uniform_item_height(px(CARD_ROW_HEIGHT));
+        } else {
+            rows.remeasure_items(0..count);
+        }
+    } else {
+        rows.reset_with_uniform_height(count, px(CARD_ROW_HEIGHT));
+    }
+    if at_end {
+        rows.scroll_to_end();
+    } else {
+        rows.scroll_to(offset);
+    }
+}
+
 pub(super) fn merge_search_page(
     previous: &[Media],
     found: SearchPage,
@@ -173,7 +206,8 @@ impl Workspace {
             self.search.input = Some(input);
         }
         if self.search.rows.is_none() {
-            let rows = GpuiListState::new(0, ListAlignment::Top, px(290.));
+            let rows = GpuiListState::new(0, ListAlignment::Top, px(290.))
+                .with_uniform_item_height(px(CARD_ROW_HEIGHT));
             let weak = cx.weak_entity();
             rows.set_scroll_handler(move |event, _window, app| {
                 let _ = weak.update(app, |this, _| {
@@ -202,13 +236,12 @@ impl Workspace {
 
     fn reset_search_rows(&mut self) {
         if let Some(rows) = self.search.rows.as_ref() {
-            let columns = self.search.columns.max(1);
-            let first = rows.logical_scroll_top().item_ix * columns;
-            rows.reset(self.search.results.len().div_ceil(columns));
-            rows.scroll_to(gpui::ListOffset {
-                item_ix: first / columns,
-                offset_in_item: px(0.),
-            });
+            reset_card_rows(
+                rows,
+                self.search.results.len(),
+                self.search.columns,
+                self.search.columns,
+            );
         }
     }
 
@@ -315,17 +348,15 @@ impl Workspace {
     ) -> AnyElement {
         let columns = card_columns(window.bounds().size.width.into());
         if columns != self.search.columns {
-            let first = self.search.rows.as_ref().map_or(0, |rows| {
-                rows.logical_scroll_top().item_ix * self.search.columns.max(1)
-            });
-            self.search.columns = columns;
             if let Some(rows) = self.search.rows.as_ref() {
-                rows.reset(self.search.results.len().div_ceil(columns));
-                rows.scroll_to(gpui::ListOffset {
-                    item_ix: first / columns,
-                    offset_in_item: px(0.),
-                });
+                reset_card_rows(
+                    rows,
+                    self.search.results.len(),
+                    self.search.columns,
+                    columns,
+                );
             }
+            self.search.columns = columns;
             cx.spawn_in(window, async move |this, cx| {
                 let _ = this.update_in(cx, |this, _, _| this.refresh_search_covers());
             })
@@ -762,6 +793,80 @@ pub(super) fn media_card(
 mod tests {
     use super::*;
     use gpui::{Render, TestAppContext};
+
+    #[test]
+    fn end_request_survives_paging_and_reflow_before_layout() {
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        reset_card_rows(&rows, 30, 3, 3);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+        rows.scroll_to_end();
+        reset_card_rows(&rows, 33, 3, 3);
+        assert_eq!(rows.logical_scroll_top().item_ix, 11);
+        reset_card_rows(&rows, 33, 3, 1);
+        assert_eq!(rows.logical_scroll_top().item_ix, 33);
+        reset_card_rows(&rows, 0, 1, 1);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+    }
+
+    #[gpui::test]
+    fn paging_preserves_measured_height_estimates(cx: &mut TestAppContext) {
+        struct Rows(GpuiListState);
+        impl Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(500.)).into_any()).size_full()
+            }
+        }
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        reset_card_rows(&rows, 30, 3, 3);
+        let (_, cx) = cx.add_window_view(|_, _| Rows(rows.clone()));
+        cx.run_until_parked();
+        let before = rows.max_offset_for_scrollbar().y;
+        reset_card_rows(&rows, 33, 3, 3);
+        assert_eq!(
+            rows.max_offset_for_scrollbar().y,
+            before + px(CARD_ROW_HEIGHT)
+        );
+        let after = rows.max_offset_for_scrollbar().y;
+        reset_card_rows(&rows, 33, 3, 3);
+        assert_eq!(rows.max_offset_for_scrollbar().y, after);
+    }
+
+    #[test]
+    fn paging_and_column_changes_keep_the_card_anchor_and_inset() {
+        let rows = GpuiListState::new(0, ListAlignment::Top, px(290.));
+        reset_card_rows(&rows, 300, 3, 3);
+        assert_eq!(rows.max_offset_for_scrollbar().y, px(30_200.));
+        rows.scroll_to(gpui::ListOffset {
+            item_ix: 50,
+            offset_in_item: px(35.),
+        });
+        reset_card_rows(&rows, 350, 3, 3);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 50,
+                offset_in_item: px(35.)
+            }
+        );
+        reset_card_rows(&rows, 350, 3, 2);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 75,
+                offset_in_item: px(35.)
+            }
+        );
+        reset_card_rows(&rows, 10, 2, 2);
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 4,
+                offset_in_item: px(0.)
+            }
+        );
+        reset_card_rows(&rows, 0, 2, 2);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+    }
 
     struct CompactHeading;
 

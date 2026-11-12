@@ -15,6 +15,7 @@ use super::{
     Workspace,
     covers::{CoverKey, CoverOwner},
     joined, now_seconds,
+    state::LibraryFiles,
 };
 use crate::components::{button, heading, scrollbar::list_scrollbar};
 use crate::contracts::Route;
@@ -220,6 +221,26 @@ impl WatchingState {
         self.playback_loading = id.is_some();
         self.playback_checked = id.is_none();
         Some(self.playback_request)
+    }
+
+    fn playback(&self, id: Option<i64>) -> Option<&ListEntry> {
+        let id = id?;
+        self.playback_entry
+            .as_ref()
+            .filter(|entry| entry.media_id == id)
+            .or_else(|| self.current.iter().find(|entry| entry.media_id == id))
+    }
+
+    fn accept_playback_update(&mut self, id: i64, entry: Option<ListEntry>) -> bool {
+        if self.playback_id != Some(id) {
+            return false;
+        }
+        // A read started before the write must not restore old progress.
+        self.playback_request += 1;
+        self.playback_loading = false;
+        self.playback_checked = true;
+        self.playback_entry = entry;
+        true
     }
 
     fn accept_list(
@@ -452,24 +473,13 @@ impl Workspace {
         Some(visible)
     }
 
-    fn refresh_playback_cover(&mut self) {
+    pub(super) fn refresh_playback_cover(&mut self) {
         let playback = self
             .now_playing
             .as_ref()
             .filter(|playing| playing.active)
             .and_then(|playing| playing.media_id)
-            .and_then(|id| {
-                self.watching
-                    .playback_entry
-                    .as_ref()
-                    .filter(|entry| entry.media_id == id)
-                    .or_else(|| {
-                        self.watching
-                            .current
-                            .iter()
-                            .find(|entry| entry.media_id == id)
-                    })
-            });
+            .and_then(|id| self.watching.playback(Some(id)));
         if let Some(entry) = playback
             && let Some(url) = entry
                 .media
@@ -546,12 +556,7 @@ impl Workspace {
             playing.matched.hash(&mut key);
             playing.player.hash(&mut key);
             (playing.length_us > 0).hash(&mut key);
-            if let Some(entry) = self.watching.playback_entry.as_ref().or_else(|| {
-                self.watching
-                    .current
-                    .iter()
-                    .find(|entry| Some(entry.media_id) == playing.media_id)
-            }) {
+            if let Some(entry) = self.watching.playback(playing.media_id) {
                 let progress = self.watching_progress(entry);
                 progress.hash(&mut key);
                 next_episode_file(&self.library_files, entry.media_id, progress)
@@ -759,7 +764,12 @@ impl Workspace {
                 this.watching.updating = false;
                 match result {
                     Ok(Some(entry)) => {
-                        this.watching.playback_entry = Some(entry.clone());
+                        if this
+                            .watching
+                            .accept_playback_update(id, Some(entry.clone()))
+                        {
+                            this.cancel_reads("watching-entry");
+                        }
                         let change = this.list.apply_one(entry.clone(), now_seconds());
                         this.apply_list_change(change);
                         if let Some(current) = this
@@ -773,13 +783,16 @@ impl Workspace {
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
                     Ok(None) => {
-                        this.watching.playback_entry = None;
+                        if this.watching.accept_playback_update(id, None) {
+                            this.cancel_reads("watching-entry");
+                        }
                         this.watching.remove_row(id);
                         this.watching.update_error = "This show is no longer on your list.".into();
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
                     Err(error) => this.watching.update_error = error,
                 }
+                this.refresh_watching_covers();
                 this.check_barrier(window, cx);
                 cx.notify();
             });
@@ -815,12 +828,7 @@ impl Workspace {
         if let Some(playing) = playing.filter(|playing| playing.active) {
             let generation = self.generation;
             let account = self.profile.as_ref().map(|user| user.id);
-            let entry = self.watching.playback_entry.as_ref().or_else(|| {
-                self.watching
-                    .current
-                    .iter()
-                    .find(|entry| Some(entry.media_id) == playing.media_id)
-            });
+            let entry = self.watching.playback(playing.media_id);
             let progress = entry.map(|entry| self.watching_progress(entry));
             let can_update = playing
                 .episode
@@ -1194,10 +1202,8 @@ fn title(entry: &ListEntry) -> String {
         .map(|media| media.display_title())
         .unwrap_or_else(|| format!("#{}", entry.media_id))
 }
-fn next_episode_file(files: &[LibraryFile], media_id: i64, progress: i64) -> Option<&LibraryFile> {
-    files
-        .iter()
-        .find(|file| file.media_id == Some(media_id) && file.episode == Some(progress + 1))
+fn next_episode_file(files: &LibraryFiles, media_id: i64, progress: i64) -> Option<&LibraryFile> {
+    files.episode(media_id, progress.checked_add(1)?)
 }
 fn time(us: i64) -> String {
     let seconds = (us / 1_000_000).max(0);
@@ -2094,7 +2100,8 @@ mod tests {
 
     #[test]
     fn next_playback_uses_list_progress_and_exact_media() {
-        let files = vec![
+        let mut files = LibraryFiles::default();
+        files.replace(vec![
             LibraryFile {
                 path: "/controlled/other2.mkv".into(),
                 media_id: Some(7),
@@ -2113,13 +2120,175 @@ mod tests {
                 episode: Some(2),
                 ..Default::default()
             },
-        ];
+        ]);
         assert_eq!(
             next_episode_file(&files, 8, 1).map(|file| file.path.as_str()),
             Some("/controlled/own2.mkv")
         );
         assert!(next_episode_file(&files, 8, 2).is_none());
         assert_eq!(time(125_000_000), "2:05");
+    }
+
+    #[test]
+    fn next_playback_rejects_progress_overflow() {
+        let mut files = LibraryFiles::default();
+        files.replace(vec![LibraryFile {
+            media_id: Some(8),
+            episode: Some(i64::MIN),
+            ..Default::default()
+        }]);
+        assert!(next_episode_file(&files, 8, i64::MAX).is_none());
+    }
+
+    #[gpui::test]
+    fn watching_scale_change_keeps_the_playback_cover(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, _, _| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.route = Route::Now;
+            w.now_playing = Some(playing(7));
+            w.watching.playback_entry = Some(playback_entry(7, Some("invalid-playback")));
+            w.watching.replace_rows(cover_rows(20));
+            w.refresh_watching_covers();
+            let old = w.cover_tickets[&(7, 96, 140)].clone();
+            w.prefetch_watching_covers(0..3, w.cover_scale * 2.);
+            assert!(w.cover_regions.contains_key(&CoverOwner::Playback));
+            assert_ne!(w.cover_tickets[&(7, 96, 140)], old);
+        });
+    }
+
+    #[gpui::test]
+    fn watching_episode_index_follows_library_scans_and_account_changes(cx: &mut TestAppContext) {
+        let (core, runtime, dir) = fixture();
+        drop(core);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        for id in [7, 8] {
+            db.upsert_media(&Media {
+                id,
+                title_english: Some(format!("Synthetic Show {id}")),
+                episodes: Some(24),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let core = Core::from_db(
+            db,
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        );
+        let folder = dir.0.join("episodes");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("ep13.mkv");
+        std::fs::write(&path, []).unwrap();
+        let folder = folder.to_str().unwrap().to_owned();
+        let path = path.to_str().unwrap().to_owned();
+        runtime
+            .block_on(core.add_library_folder(folder.clone()))
+            .unwrap();
+        runtime
+            .block_on(core.bind_library_path(path.clone(), 7, Some(-12)))
+            .unwrap();
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+        workspace.update_in(cx, |workspace, _, _| {
+            workspace.auth_intent += 1;
+            workspace.restoring_session = false;
+            workspace.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            workspace.route = Route::Now;
+        });
+        let refresh = |cx: &mut VisualTestContext, expected: &[(Option<i64>, Option<i64>)]| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.refresh_library_entries(window, cx);
+                workspace.ensure_library_fresh(window, cx);
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            loop {
+                runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await
+                });
+                cx.run_until_parked();
+                if workspace.read_with(cx, |workspace, _| {
+                    workspace
+                        .library_files
+                        .iter()
+                        .map(|file| (file.media_id, file.episode))
+                        .collect::<Vec<_>>()
+                        == expected
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Library scan must update Watching"
+                );
+            }
+            workspace.read_with(cx, |workspace, _| {
+                for id in [7, 8] {
+                    for progress in 0..=13 {
+                        let expected = workspace.library_files.iter().find(|file| {
+                            file.media_id == Some(id) && file.episode == Some(progress + 1)
+                        });
+                        assert_eq!(
+                            next_episode_file(&workspace.library_files, id, progress)
+                                .map(|file| &file.path),
+                            expected.map(|file| &file.path)
+                        );
+                    }
+                }
+            });
+        };
+        refresh(cx, &[(Some(7), Some(1))]);
+        runtime
+            .block_on(core.bind_library_path(path.clone(), 8, Some(-12)))
+            .unwrap();
+        refresh(cx, &[(Some(8), Some(1))]);
+        runtime
+            .block_on(core.bind_library_path(path.clone(), 8, Some(-11)))
+            .unwrap();
+        refresh(cx, &[(Some(8), Some(2))]);
+        runtime.block_on(core.unbind_library_media(8)).unwrap();
+        refresh(cx, &[(None, None)]);
+        runtime
+            .block_on(core.bind_library_path(path.clone(), 8, Some(-11)))
+            .unwrap();
+        refresh(cx, &[(Some(8), Some(2))]);
+        std::fs::remove_file(&path).unwrap();
+        refresh(cx, &[]);
+        std::fs::write(&path, []).unwrap();
+        refresh(cx, &[(Some(8), Some(2))]);
+        runtime
+            .block_on(core.remove_library_folder(folder.clone()))
+            .unwrap();
+        refresh(cx, &[]);
+        runtime.block_on(core.add_library_folder(folder)).unwrap();
+        refresh(cx, &[(Some(8), Some(2))]);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_profile(
+                Some(User {
+                    id: 48,
+                    ..Default::default()
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(workspace.library_files.iter().len(), 0);
+            assert!(next_episode_file(&workspace.library_files, 8, 1).is_none());
+        });
     }
 
     #[test]
@@ -2134,6 +2303,38 @@ mod tests {
         assert_eq!(state.begin_playback(Some(8)), Some(2));
         assert_eq!(state.begin_playback(None), Some(3));
         assert_eq!(state.begin_playback(None), None);
+    }
+
+    #[test]
+    fn playback_update_preserves_new_show_and_supersedes_older_reads() {
+        let mut state = WatchingState::default();
+        state.begin_playback(Some(7));
+        state.playback_entry = Some(playback_entry(7, None));
+        state.begin_playback(Some(8));
+        let mut current = playback_entry(8, None);
+        current.progress = 4;
+        state.playback_entry = Some(current.clone());
+        let read = state.playback_request;
+        assert!(!state.accept_playback_update(7, Some(playback_entry(7, None))));
+        assert!(!state.accept_playback_update(7, None));
+        assert_eq!(state.playback_request, read);
+        assert_eq!(state.playback(Some(8)).unwrap().progress, 4);
+        current.progress = 5;
+        assert!(state.accept_playback_update(8, Some(current)));
+        assert_ne!(state.playback_request, read);
+        assert_eq!(state.playback(Some(8)).unwrap().progress, 5);
+        assert!(!state.playback_loading);
+        assert!(state.playback_checked);
+    }
+
+    #[test]
+    fn playback_lookup_ignores_another_shows_entry() {
+        let mut state = WatchingState::default();
+        state.replace_rows(vec![playback_entry(8, None)]);
+        state.playback_entry = Some(playback_entry(7, None));
+        assert_eq!(state.playback(Some(8)).unwrap().media_id, 8);
+        assert!(state.playback(Some(9)).is_none());
+        assert!(state.playback(None).is_none());
     }
 
     fn cover_rows(count: i64) -> Vec<ListEntry> {
@@ -2235,7 +2436,7 @@ mod tests {
             }
             workspace.watching.replace_rows(rows);
             workspace.watching.loaded = true;
-            workspace.library_files = files.clone();
+            workspace.library_files.replace(files.clone());
             cx.notify();
         });
         cx.run_until_parked();
@@ -2257,7 +2458,7 @@ mod tests {
             (files, true),
         ] {
             workspace.update_in(cx, |workspace, _, cx| {
-                workspace.library_files = files;
+                workspace.library_files.replace(files);
                 cx.notify();
             });
             cx.run_until_parked();
@@ -2306,14 +2507,16 @@ mod tests {
             }
             workspace.watching.replace_rows(rows);
             workspace.watching.loaded = true;
-            workspace.library_files = (1..=80)
-                .map(|id| LibraryFile {
-                    media_id: Some(id),
-                    episode: Some(2),
-                    path: format!("/synthetic/{id}.mkv"),
-                    ..Default::default()
-                })
-                .collect();
+            workspace.library_files.replace(
+                (1..=80)
+                    .map(|id| LibraryFile {
+                        media_id: Some(id),
+                        episode: Some(2),
+                        path: format!("/synthetic/{id}.mkv"),
+                        ..Default::default()
+                    })
+                    .collect(),
+            );
             cx.notify();
         });
         cx.run_until_parked();
@@ -2329,9 +2532,13 @@ mod tests {
             );
         });
         workspace.update_in(cx, |workspace, _, cx| {
-            workspace
+            let files = workspace
                 .library_files
-                .retain(|file| file.media_id.unwrap() <= 36);
+                .iter()
+                .filter(|file| file.media_id.unwrap() <= 36)
+                .cloned()
+                .collect();
+            workspace.library_files.replace(files);
             cx.notify();
         });
         cx.run_until_parked();
@@ -2363,12 +2570,12 @@ mod tests {
         cover_frames(cx, 5);
         let old_key = workspace.read_with(cx, |workspace, _| workspace.watching_cover_layout_key());
         workspace.update_in(cx, |workspace, _, cx| {
-            workspace.library_files = vec![LibraryFile {
+            workspace.library_files.replace(vec![LibraryFile {
                 media_id: Some(900),
                 episode: Some(2),
                 path: "/synthetic/900.mkv".into(),
                 ..Default::default()
-            }];
+            }]);
             cx.notify();
         });
         cx.run_until_parked();

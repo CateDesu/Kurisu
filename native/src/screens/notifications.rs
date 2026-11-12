@@ -16,6 +16,8 @@ use crate::{
     theme::{ACCENT, DIM, EDGE, ERROR, INK, PANEL, PANEL_2},
 };
 
+const NOTIFICATION_ROW_HEIGHT: f32 = 84.;
+
 pub(super) struct NotificationsState {
     items: Arc<Vec<Notification>>,
     widget: Option<ListState>,
@@ -46,10 +48,53 @@ impl Default for NotificationsState {
     }
 }
 
+impl NotificationsState {
+    fn replace_items(&mut self, items: Vec<Notification>) {
+        if let Some(widget) = &self.widget {
+            let mut offset = widget.logical_scroll_top();
+            let at_end = widget.item_count() > 0 && offset.item_ix >= widget.item_count();
+            let anchor = self.items.get(offset.item_ix).map(|item| item.id);
+            if let Some(position) =
+                anchor.and_then(|id| items.iter().position(|item| item.id == id))
+            {
+                offset.item_ix = position;
+            } else {
+                offset = gpui::ListOffset::default();
+            }
+            let old_count = self.items.len();
+            if items.len() >= old_count
+                && self
+                    .items
+                    .iter()
+                    .zip(&items)
+                    .all(|(old, new)| old.id == new.id)
+            {
+                if items.len() > old_count {
+                    widget.splice(old_count..old_count, items.len() - old_count);
+                    widget
+                        .clone()
+                        .with_uniform_item_height(px(NOTIFICATION_ROW_HEIGHT));
+                } else {
+                    widget.remeasure_items(0..items.len());
+                }
+            } else {
+                widget.reset_with_uniform_height(items.len(), px(NOTIFICATION_ROW_HEIGHT));
+            }
+            if at_end {
+                widget.scroll_to_end();
+            } else {
+                widget.scroll_to(offset);
+            }
+        }
+        self.items = Arc::new(items);
+    }
+}
+
 impl Workspace {
     pub(super) fn enter_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.notifications.widget.is_none() {
-            let widget = ListState::new(0, ListAlignment::Top, px(800.));
+            let widget = ListState::new(0, ListAlignment::Top, px(800.))
+                .with_uniform_item_height(px(NOTIFICATION_ROW_HEIGHT));
             let weak = cx.weak_entity();
             widget.set_scroll_handler(move |range, _, app| {
                 let _ = weak.update(app, |this, cx| {
@@ -128,19 +173,12 @@ impl Workspace {
                 this.notifications.loading = false;
                 match result {
                     Ok(page) => {
-                        this.notifications.items =
-                            Arc::new(merge_page(&this.notifications.items, page.items, more));
+                        let items = merge_page(&this.notifications.items, page.items, more);
+                        this.notifications.replace_items(items);
                         this.notifications.page = page.page;
                         this.notifications.has_more = page.has_next_page;
                         this.notifications.unread = page.unread_count;
                         this.notifications.loaded = true;
-                        if let Some(widget) = &this.notifications.widget {
-                            let offset = widget.logical_scroll_top();
-                            widget.reset(this.notifications.items.len());
-                            if more {
-                                widget.scroll_to(offset);
-                            }
-                        }
                         this.refresh_notifications_covers();
                     }
                     Err(error) => this.notifications.error = error,
@@ -349,7 +387,8 @@ impl Workspace {
                         .flatten();
                     render_notification_row(item, cover, weak.clone())
                 })
-                .flex_1(),
+                .flex_1()
+                .min_h_0(),
             );
         }
         if state.has_more {
@@ -578,6 +617,109 @@ fn time_ago(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_request_survives_paging_before_layout() {
+        let rows = ListState::new(0, ListAlignment::Top, px(0.));
+        let mut state = NotificationsState {
+            widget: Some(rows.clone()),
+            ..Default::default()
+        };
+        let items = |count| {
+            (0..count)
+                .map(|id| Notification {
+                    id,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        state.replace_items(items(20));
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+        rows.scroll_to_end();
+        state.replace_items(items(30));
+        assert_eq!(rows.logical_scroll_top().item_ix, 30);
+        state.replace_items(vec![]);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+    }
+
+    #[gpui::test]
+    fn paging_preserves_measured_notification_heights(cx: &mut gpui::TestAppContext) {
+        struct Rows(ListState);
+        impl gpui::Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(150.)).into_any()).size_full()
+            }
+        }
+        let rows = ListState::new(0, ListAlignment::Top, px(0.));
+        let mut state = NotificationsState {
+            widget: Some(rows.clone()),
+            ..Default::default()
+        };
+        let items = |count| {
+            (0..count)
+                .map(|id| Notification {
+                    id,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        state.replace_items(items(20));
+        let (_, cx) = cx.add_window_view(|_, _| Rows(rows.clone()));
+        cx.run_until_parked();
+        let before = rows.max_offset_for_scrollbar().y;
+        state.replace_items(items(21));
+        assert_eq!(
+            rows.max_offset_for_scrollbar().y,
+            before + px(NOTIFICATION_ROW_HEIGHT)
+        );
+        let after = rows.max_offset_for_scrollbar().y;
+        state.replace_items(items(21));
+        assert_eq!(rows.max_offset_for_scrollbar().y, after);
+    }
+
+    #[test]
+    fn refresh_and_paging_keep_the_notification_anchor_and_inset() {
+        let rows = ListState::new(0, ListAlignment::Top, px(800.));
+        let mut state = NotificationsState {
+            widget: Some(rows.clone()),
+            ..Default::default()
+        };
+        let items = |range: std::ops::Range<i64>| {
+            range
+                .map(|id| Notification {
+                    id,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        state.replace_items(items(0..100));
+        assert_eq!(rows.max_offset_for_scrollbar().y, px(8400.));
+        rows.scroll_to(gpui::ListOffset {
+            item_ix: 30,
+            offset_in_item: px(11.),
+        });
+        state.replace_items(items(-3..100));
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 33,
+                offset_in_item: px(11.)
+            }
+        );
+        state.replace_items(items(-3..150));
+        assert_eq!(
+            rows.logical_scroll_top(),
+            gpui::ListOffset {
+                item_ix: 33,
+                offset_in_item: px(11.)
+            }
+        );
+        state.replace_items(items(100..150));
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+        state.replace_items(vec![]);
+        assert_eq!(rows.item_count(), 0);
+        assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
+    }
 
     #[test]
     fn paging_deduplicates_without_reordering_older_rows() {

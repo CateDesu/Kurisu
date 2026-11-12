@@ -145,6 +145,8 @@ impl Workspace {
             .and_then(|media| media.cover_medium.as_deref())
             .map(str::to_owned);
         self.editor = Some(EditorState::new(entry.clone()));
+        self.editor.as_mut().unwrap().displayed_format =
+            self.profile.as_ref().and_then(|u| u.score_format.clone());
         if let Some(url) = cover_url {
             self.request_cover_for(CoverOwner::Editor, (id, 48, 64), &url);
         }
@@ -186,7 +188,8 @@ impl Workspace {
             window,
             |this, _, event, window, cx| match event {
                 TextInputEvent::Changed(value) => {
-                    if let (Some(editor), Ok(number)) = (this.editor.as_mut(), value.parse::<i64>())
+                    if let (Some(editor), Ok(number)) =
+                        (this.editor.as_mut(), value.trim().parse::<i64>())
                     {
                         editor.set_progress(number);
                         cx.notify();
@@ -355,6 +358,16 @@ impl Workspace {
         .detach();
     }
 
+    pub(super) fn clear_editor_score(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.editor.as_mut().filter(|editor| !editor.busy) {
+            editor.score = None;
+            editor.score_cleared = true;
+            if let Some(inputs) = self.editor_inputs.as_ref() {
+                inputs.score.update(cx, |input, cx| input.set_value("", cx));
+            }
+        }
+    }
+
     pub(super) fn read_editor_inputs(&mut self, cx: &gpui::App) -> Result<(), String> {
         let Some(inputs) = self.editor_inputs.as_ref() else {
             return Err("Editor is closed.".into());
@@ -362,13 +375,14 @@ impl Workspace {
         let Some(editor) = self.editor.as_mut() else {
             return Err("Editor is closed.".into());
         };
-        editor.progress = inputs
+        let progress = inputs
             .progress
             .read(cx)
             .value()
             .trim()
             .parse()
             .map_err(|_| "Enter a valid episode progress.".to_string())?;
+        editor.set_progress(progress);
         editor.repeat = inputs
             .repeat
             .read(cx)
@@ -393,12 +407,8 @@ impl Workspace {
                         .map_err(|_| "Enter a valid score.".to_string())?,
                 )
             };
-            editor.set_score(
-                score,
-                self.profile
-                    .as_ref()
-                    .and_then(|user| user.score_format.as_deref()),
-            );
+            let format = editor.displayed_format.clone();
+            editor.set_score(score, format.as_deref());
         }
         if editor.details.is_some() {
             editor.notes = inputs.notes.read(cx).value().to_string();
@@ -453,6 +463,7 @@ impl Workspace {
         editor.error.clear();
         let id = editor.media_id;
         let expected_progress = editor.saved_progress();
+        let displayed_format = editor.displayed_format.clone();
         let generation = self.generation;
         let entry_revision = self.list.revision();
         self.set_editor_inputs_disabled(true, cx);
@@ -483,13 +494,14 @@ impl Workspace {
                         Ok(None)
                     } else {
                         worker
-                            .update_entry_checked(
+                            .update_entry_in_format(
                                 id,
                                 basic_patch.status,
                                 basic_patch.progress,
                                 basic_patch.score,
                                 basic_patch.repeat,
                                 Some(expected_progress),
+                                displayed_format,
                             )
                             .await
                             .map(Some)
@@ -892,11 +904,7 @@ impl Workspace {
                 .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                 .child(status),
         );
-        let score_format = self
-            .profile
-            .as_ref()
-            .and_then(|user| user.score_format.as_deref())
-            .unwrap_or("POINT_100");
+        let score_format = editor.displayed_format.as_deref().unwrap_or("POINT_100");
         let mut fields = div().flex().gap(px(10.));
         fields = fields.child(input_field(
             "Progress",
@@ -923,6 +931,12 @@ impl Workspace {
         form = form.child(fields);
         if matches!(score_format, "POINT_3" | "POINT_5") {
             let mut ratings = div().flex().gap(px(4.));
+            ratings = ratings.child(button("score-clear", "Clear score", editor.busy).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.clear_editor_score(cx);
+                    cx.notify();
+                }),
+            ));
             let limit = if score_format == "POINT_3" { 3 } else { 5 };
             for rating in 1..=limit {
                 let label = if score_format == "POINT_3" {
@@ -1335,6 +1349,184 @@ mod tests {
         (core, runtime, _dir)
     }
 
+    fn total_entry(status: &str, progress: i64) -> ListEntry {
+        ListEntry {
+            id: Some(22),
+            media_id: 71,
+            progress,
+            status: status.into(),
+            repeat: 2,
+            score: Some(70.0),
+            media: Some(Media {
+                id: 71,
+                episodes: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    fn untouched_total_progress_preserves_status_and_score_only_patch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        for status in ["PAUSED", "REPEATING", "CURRENT"] {
+            workspace.update_in(cx, |w, window, cx| {
+                w.list.replace(vec![total_entry(status, 12)], 0);
+                w.open_editor(71, window, cx);
+                assert!(w.editor.as_ref().unwrap().basic_patch(true).is_empty());
+                w.read_editor_inputs(cx).unwrap();
+                let editor = w.editor.as_ref().unwrap();
+                assert_eq!(editor.status, status);
+                assert!(editor.basic_patch(true).is_empty());
+                w.editor_inputs
+                    .as_ref()
+                    .unwrap()
+                    .score
+                    .update(cx, |input, cx| {
+                        input.set_value("80", cx);
+                    });
+                w.read_editor_inputs(cx).unwrap();
+                let editor = w.editor.as_ref().unwrap();
+                let patch = editor.basic_patch(true);
+                assert_eq!(editor.status, status);
+                assert_eq!(patch.score, Some(80.0));
+                assert_eq!(patch.progress, None);
+                assert_eq!(patch.status, None);
+                assert_eq!(patch.repeat, None);
+                w.close_editor(cx);
+            });
+        }
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+
+    #[gpui::test]
+    fn untouched_total_save_and_close_do_not_start_writes(cx: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        for _ in 0..16 {
+            cx.run_until_parked();
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(vec![total_entry("PAUSED", 12)], 0);
+            w.open_editor(71, window, cx);
+            w.save_editor(window, cx);
+            assert!(w.editor.is_none());
+            assert_eq!(w.active_writes, 0);
+            w.open_editor(71, window, cx);
+            w.request_close(super::super::CloseIntent::Quit, window, cx);
+            assert!(w.barrier.is_none());
+            assert!(w.barrier_error.is_empty());
+            assert_eq!(w.active_writes, 0);
+            assert_eq!(w.editor.as_ref().unwrap().status, "PAUSED");
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+
+    #[gpui::test]
+    fn rewatch_overshoot_keeps_raw_progress_after_live_and_save_reads(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(vec![total_entry("REPEATING", 11)], 0);
+            w.open_editor(71, window, cx);
+        });
+        for (value, status) in [
+            (" 13 ", "REPEATING"),
+            (" 12 ", "COMPLETED"),
+            ("13", "REPEATING"),
+        ] {
+            workspace.update_in(cx, |w, _, cx| {
+                w.editor_inputs
+                    .as_ref()
+                    .unwrap()
+                    .progress
+                    .update(cx, |input, cx| {
+                        input.set_value(value, cx);
+                        cx.emit(super::TextInputEvent::Changed(value.into()));
+                    });
+            });
+            cx.run_until_parked();
+            workspace.update_in(cx, |w, _, cx| {
+                assert_eq!(w.editor.as_ref().unwrap().status, status);
+                w.read_editor_inputs(cx).unwrap();
+                let editor = w.editor.as_ref().unwrap();
+                assert_eq!(editor.status, status);
+                assert_eq!(editor.repeat, 2);
+                assert_eq!(
+                    editor.basic_patch(true).progress,
+                    Some(value.trim().parse().unwrap())
+                );
+            });
+        }
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+
+    #[gpui::test]
+    fn whitespace_progress_updates_completion_before_save(cx: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(
+                vec![ListEntry {
+                    media_id: 71,
+                    progress: 3,
+                    status: "CURRENT".into(),
+                    media: Some(Media {
+                        id: 71,
+                        episodes: Some(12),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                0,
+            );
+            w.open_editor(71, window, cx);
+            let input = w.editor_inputs.as_ref().unwrap().progress.clone();
+            input.update(cx, |input, cx| {
+                input.set_value(" 12 ", cx);
+                cx.emit(super::TextInputEvent::Changed(" 12 ".into()));
+            });
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, _, cx| {
+            let editor = w.editor.as_ref().unwrap();
+            assert_eq!(editor.progress, 12);
+            assert_eq!(editor.status, "COMPLETED");
+            w.read_editor_inputs(cx).unwrap();
+            assert_eq!(
+                w.editor.as_ref().unwrap().basic_patch(true).progress,
+                Some(12)
+            );
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .update(cx, |input, cx| {
+                    input.set_value(" 4 ", cx);
+                });
+            w.read_editor_inputs(cx).unwrap();
+            let editor = w.editor.as_ref().unwrap();
+            assert_eq!(editor.progress, 4);
+            assert_eq!(editor.status, "CURRENT");
+            assert_eq!(editor.basic_patch(true).progress, Some(4));
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+
     #[gpui::test]
     fn reopened_editor_rejects_old_details_completion(cx: &mut gpui::TestAppContext) {
         let (core, runtime, _dir) = editor_fixture();
@@ -1620,6 +1812,170 @@ mod tests {
     #[cfg(feature = "fixture-runtime")]
     fn run_recommendation_fixture(child_flag: &str) {
         use serde_json::json;
+        let mut recommendations = 0;
+        run_graphql_fixture(
+            child_flag,
+            "screens::editor::tests::reopened_editor_rejects_old_recommendations",
+            |request| {
+                let query = request["query"].as_str().unwrap();
+                if query.contains("recommendations(mediaId:") {
+                    assert_eq!(request["variables"]["mediaId"], 71);
+                    recommendations += 1;
+                    let id = 700 + recommendations;
+                    json!({"Page":{"recommendations":[{"mediaRecommendation":{
+                        "id":id, "idMal":null,
+                        "title":{"romaji":null,"english":format!("Recommendation {id}"),"native":null},
+                        "coverImage":null, "episodes":24, "format":"TV", "status":"FINISHED",
+                        "averageScore":null,"season":null,"seasonYear":null,
+                        "description":null,"nextAiringEpisode":null
+                    }}]}})
+                } else if query.contains("MediaListCollection") {
+                    json!({"MediaListCollection":{"lists":[],"hasNextChunk":false}})
+                } else if query.contains("Viewer") {
+                    json!({"Viewer":{"id":47,"name":"Fixture"}})
+                } else {
+                    panic!("Unexpected fixture query: {query}");
+                }
+            },
+        );
+        assert_eq!(recommendations, 2, "Both HTTP reads must succeed");
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[test]
+    fn editor_patch_preserves_core_completion_contract() {
+        use serde_json::json;
+        const CHILD: &str = "KURISU_EDITOR_COMPLETION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut mutations = Vec::new();
+            let mut statuses = ["REPEATING"; 7].into_iter().chain(["PAUSED"]);
+            run_graphql_fixture(
+                CHILD,
+                "screens::editor::tests::editor_patch_preserves_core_completion_contract",
+                |request| {
+                    let query = request["query"].as_str().unwrap();
+                    if query.contains("Viewer") {
+                        return json!({"Viewer":{"id":47,"name":"Fixture","mediaListOptions":{"scoreFormat":"POINT_100"}}});
+                    }
+                    assert!(query.contains("SaveMediaListEntry"));
+                    let before_status = statuses.next().unwrap();
+                    let variables = &request["variables"];
+                    mutations.push(variables.clone());
+                    json!({"SaveMediaListEntry":{
+                        "id":22, "status":variables.get("status").cloned().unwrap_or(json!(before_status)),
+                        "progress":variables.get("progress").cloned().unwrap_or(json!(12)),
+                        "repeat":variables.get("repeat").cloned().unwrap_or(json!(2)),
+                        "score":variables.get("score").cloned().unwrap_or(json!(70.0)),
+                        "updatedAt":100
+                    }})
+                },
+            );
+            assert_eq!(
+                mutations,
+                vec![
+                    json!({"id":22,"progress":12,"scoreFormat":"POINT_100"}),
+                    json!({"id":22,"progress":12,"status":"COMPLETED","repeat":3,"scoreFormat":"POINT_100"}),
+                    json!({"id":22,"progress":12,"status":"REPEATING","scoreFormat":"POINT_100"}),
+                    json!({"id":22,"progress":12,"status":"PAUSED","scoreFormat":"POINT_100"}),
+                    json!({"id":22,"progress":12,"status":"COMPLETED","repeat":5,"scoreFormat":"POINT_100"}),
+                    json!({"id":22,"progress":12,"scoreFormat":"POINT_100"}),
+                    json!({"id":22,"progress":12,"status":"COMPLETED","repeat":3,"scoreFormat":"POINT_100"}),
+                    json!({"id":22,"score":80.0,"scoreFormat":"POINT_100"}),
+                ]
+            );
+            return;
+        }
+        let (core, runtime, dir) = editor_fixture();
+        drop(core);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        db.replace_account(
+            "synthetic-token",
+            &kurisu_core::models::User {
+                id: 47,
+                name: "Fixture".into(),
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let core = kurisu_core::Core::from_db(
+            db,
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        );
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        for (index, (requested, chosen, repeat, expected_status, expected_repeat)) in [
+            (13, None, None, "REPEATING", 2),
+            (12, None, None, "COMPLETED", 3),
+            (12, Some("REPEATING"), None, "REPEATING", 2),
+            (12, Some("PAUSED"), None, "PAUSED", 2),
+            (12, None, Some(5), "COMPLETED", 5),
+            (13, None, None, "REPEATING", 2),
+            (13, Some("COMPLETED"), None, "COMPLETED", 3),
+            (12, None, None, "PAUSED", 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let score_only = index == 7;
+            let entry = total_entry(
+                if score_only { "PAUSED" } else { "REPEATING" },
+                if score_only { 12 } else { 11 },
+            );
+            db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
+            db.upsert_entry(&entry).unwrap();
+            let mut editor = EditorState::new(entry);
+            if index == 5 {
+                editor.set_progress(12);
+            }
+            editor.set_progress(requested);
+            if let Some(status) = chosen {
+                editor.choose_status(status);
+            }
+            if let Some(repeat) = repeat {
+                editor.repeat = repeat;
+            }
+            if score_only {
+                editor.set_score(Some(80.0), Some("POINT_100"));
+            }
+            let patch = editor.basic_patch(true);
+            let saved = runtime
+                .block_on(core.update_entry_in_format(
+                    71,
+                    patch.status,
+                    patch.progress,
+                    patch.score,
+                    patch.repeat,
+                    Some(editor.saved_progress()),
+                    Some("POINT_100".into()),
+                ))
+                .unwrap();
+            assert_eq!(
+                (saved.status.as_str(), saved.progress, saved.repeat),
+                (expected_status, 12, expected_repeat)
+            );
+            let persisted = db.get_entry(71).unwrap().unwrap();
+            assert_eq!(
+                (
+                    persisted.status.as_str(),
+                    persisted.progress,
+                    persisted.repeat
+                ),
+                (expected_status, 12, expected_repeat)
+            );
+            assert_eq!(persisted.score, Some(if score_only { 80.0 } else { 70.0 }));
+        }
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    fn run_graphql_fixture(
+        child_flag: &str,
+        test_name: &str,
+        mut data: impl FnMut(serde_json::Value) -> serde_json::Value,
+    ) {
+        use serde_json::json;
         use std::{
             io::{BufRead, BufReader, Read, Write},
             net::TcpListener,
@@ -1631,12 +1987,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         // Configure the existing loopback seam in a child, without changing test-process globals.
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "screens::editor::tests::reopened_editor_rejects_old_recommendations",
-                "--exact",
-                "--test-threads=1",
-                "--nocapture",
-            ])
+            .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
             .env(child_flag, "1")
             .env(
                 "KURISU_FIXTURE_GRAPHQL",
@@ -1646,14 +1997,13 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut recommendations = 0;
         let deadline = Instant::now() + Duration::from_secs(15);
         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 if child.try_wait().unwrap().is_some() {
                     break;
                 }
-                assert!(Instant::now() < deadline, "Recommendation child timed out");
+                assert!(Instant::now() < deadline, "Editor child timed out");
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1687,26 +2037,7 @@ mod tests {
                 let mut body = vec![0; length.unwrap()];
                 reader.read_exact(&mut body).unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let query = request["query"].as_str().unwrap();
-                let data = if query.contains("recommendations(mediaId:") {
-                    assert_eq!(request["variables"]["mediaId"], 71);
-                    recommendations += 1;
-                    let id = 700 + recommendations;
-                    json!({"Page":{"recommendations":[{"mediaRecommendation":{
-                        "id":id, "idMal":null,
-                        "title":{"romaji":null,"english":format!("Recommendation {id}"),"native":null},
-                        "coverImage":null, "episodes":24, "format":"TV", "status":"FINISHED",
-                        "averageScore":null,"season":null,"seasonYear":null,
-                        "description":null,"nextAiringEpisode":null
-                    }}]}})
-                } else if query.contains("MediaListCollection") {
-                    json!({"MediaListCollection":{"lists":[],"hasNextChunk":false}})
-                } else if query.contains("Viewer") {
-                    json!({"Viewer":{"id":47,"name":"Fixture"}})
-                } else {
-                    panic!("Unexpected fixture query: {query}");
-                };
-                let response = json!({"data":data}).to_string();
+                let response = json!({"data":data(request)}).to_string();
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
             }
         }));
@@ -1719,13 +2050,9 @@ mod tests {
         }
         assert!(
             output.status.success(),
-            "Recommendation child failed:\n{}\n{}",
+            "Editor child failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            recommendations, 2,
-            "Both old and current HTTP reads must succeed"
         );
     }
 }
