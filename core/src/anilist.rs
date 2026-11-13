@@ -19,6 +19,10 @@ const OAUTH_EXCHANGE: &str = "https://kurisu-anilist-exchange.vercel.app/api/exc
 /// Must match the registered OAuth redirect port.
 pub const OAUTH_PORT: u16 = 39417;
 
+pub(crate) fn valid_account_id(id: i64) -> bool {
+    (1..=i64::from(i32::MAX)).contains(&id)
+}
+
 #[cfg(feature = "test-support")]
 fn fixture_graphql_endpoint(value: &str) -> Result<String> {
     Ok(fixture_loopback_http_url(value)?.to_string())
@@ -485,6 +489,7 @@ impl AniList {
                 serde_json::json!({}),
             )
             .await?;
+        anyhow::ensure!(valid_account_id(r.viewer.id), "Invalid AniList account ID");
         Ok(User {
             id: r.viewer.id,
             name: r.viewer.name,
@@ -884,7 +889,8 @@ impl AniList {
         })
     }
 
-    pub async fn user_statistics(&self, user_name: &str) -> Result<UserStats> {
+    pub async fn user_statistics(&self, account_id: i64) -> Result<UserStats> {
+        anyhow::ensure!(valid_account_id(account_id), "Invalid AniList account ID");
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "User")]
@@ -892,6 +898,7 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct UserNode {
+            id: i64,
             statistics: Option<Statistics>,
         }
         #[derive(Deserialize)]
@@ -950,8 +957,9 @@ impl AniList {
             release_year: Option<i64>,
             count: i64,
         }
-        let q = "query ($name: String!) {
-            User(name: $name) {
+        let q = "query ($accountId: Int!) {
+            User(id: $accountId) {
+                id
                 statistics {
                     anime {
                         count episodesWatched minutesWatched meanScore standardDeviation
@@ -965,8 +973,12 @@ impl AniList {
             }
         }";
         let r: R = self
-            .gql(q, serde_json::json!({ "name": user_name }))
+            .gql(q, serde_json::json!({ "accountId": account_id }))
             .await?;
+        anyhow::ensure!(
+            r.user.id == account_id,
+            "AniList returned statistics for a different account"
+        );
         let a = r
             .user
             .statistics
@@ -1138,9 +1150,10 @@ impl AniList {
     /// Return only a complete list. Sync deletes local entries absent from this result.
     pub async fn user_list(
         &self,
-        user_name: &str,
+        account_id: i64,
         score_format: Option<&str>,
     ) -> Result<Vec<ListEntry>> {
+        anyhow::ensure!(valid_account_id(account_id), "Invalid AniList account ID");
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "MediaListCollection")]
@@ -1149,8 +1162,13 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Collection {
+            user: Owner,
             lists: Option<Vec<AniList>>,
             has_next_chunk: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        struct Owner {
+            id: i64,
         }
         #[derive(Deserialize)]
         struct AniList {
@@ -1169,8 +1187,9 @@ impl AniList {
             media_id: i64,
             media: Option<AniMedia>,
         }
-        let q = "query ($userName: String!, $chunk: Int!, $scoreFormat: ScoreFormat) {
-            MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk, perChunk: 500) {
+        let q = "query ($accountId: Int!, $chunk: Int!, $scoreFormat: ScoreFormat) {
+            MediaListCollection(userId: $accountId, type: ANIME, chunk: $chunk, perChunk: 500) {
+                user { id }
                 hasNextChunk
                 lists {
                     entries {
@@ -1190,9 +1209,13 @@ impl AniList {
             let r: R = self
                 .gql(
                     q,
-                    serde_json::json!({ "userName": user_name, "chunk": chunk, "scoreFormat": score_format }),
+                    serde_json::json!({ "accountId": account_id, "chunk": chunk, "scoreFormat": score_format }),
                 )
                 .await?;
+            anyhow::ensure!(
+                r.collection.user.id == account_id,
+                "AniList returned a list for a different account"
+            );
             let before = out.len();
             let lists = r.collection.lists.ok_or_else(|| {
                 anyhow!("AniList returned null lists, refusing to sync a partial list")
@@ -2301,10 +2324,16 @@ pub(crate) async fn mock_api_mapped(
             map_response(&request, &mut body);
             let _ = requests.send(request);
             if let Some(gate) = &gate {
-                gate.acquire().await.unwrap().forget();
+                tokio::select! {
+                    permit = gate.acquire() => permit.unwrap().forget(),
+                    _ = requests.closed() => return,
+                }
             }
-            let body = body.to_string();
-            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let (content_type, body) = match body {
+                serde_json::Value::String(raw) => ("text/html", raw),
+                body => ("application/json", body.to_string()),
+            };
+            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.shutdown().await.unwrap();
         }
@@ -2324,6 +2353,16 @@ pub(crate) async fn mock_api_mapped(
 mod regression_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_account_ids_do_not_send_identity_queries() {
+        let (api, mut requests) = mock_api(vec![]).await;
+        for id in [-1, 0, i64::from(i32::MAX) + 1, i64::MAX] {
+            assert!(api.user_list(id, None).await.is_err());
+            assert!(api.user_statistics(id).await.is_err());
+        }
+        assert!(requests.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn oauth_exchange_sends_only_the_code_to_the_service() {
@@ -2447,7 +2486,7 @@ mod regression_tests {
                 let (api, mut requests) = mock_api(vec![
                 (200, json!({"data":{"Media":{"mediaListEntry":entry}}})),
                 (200, json!({"data":{"SaveMediaListEntry":entry}})),
-                (200, json!({"data":{"MediaListCollection":{"lists":[{"entries":[listed]}],"hasNextChunk":false}}})),
+                (200, json!({"data":{"MediaListCollection":{"user":{"id":7},"lists":[{"entries":[listed]}],"hasNextChunk":false}}})),
             ])
             .await;
                 let expected = Some(score.as_f64().unwrap_or(0.0))
@@ -2467,10 +2506,7 @@ mod regression_tests {
                         .score,
                     expected
                 );
-                assert_eq!(
-                    api.user_list("Tester", format).await.unwrap()[0].score,
-                    expected
-                );
+                assert_eq!(api.user_list(7, format).await.unwrap()[0].score, expected);
                 for _ in 0..3 {
                     let request = requests.recv().await.unwrap();
                     assert_eq!(request["variables"]["scoreFormat"], json!(format));
@@ -2500,20 +2536,20 @@ mod regression_tests {
         ] {
             let (api, _) = mock_api(vec![(
                 200,
-                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+                json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": lists, "hasNextChunk": false}}}),
             )])
             .await;
-            assert!(api.user_list("Tester", None).await.is_err());
+            assert!(api.user_list(7, None).await.is_err());
         }
     }
 
     #[tokio::test]
     async fn a_missing_later_chunk_is_not_a_complete_list() {
         let (api, _) = mock_api(vec![
-            (200, json!({"data": {"MediaListCollection": {"lists": [{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "score": 0}]}], "hasNextChunk": true}}})),
-            (200, json!({"data": {"MediaListCollection": {"lists": [], "hasNextChunk": false}}})),
+            (200, json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": [{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "score": 0}]}], "hasNextChunk": true}}})),
+            (200, json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": [], "hasNextChunk": false}}})),
         ]).await;
-        assert!(api.user_list("Tester", None).await.is_err());
+        assert!(api.user_list(7, None).await.is_err());
     }
 
     #[tokio::test]
@@ -2528,10 +2564,10 @@ mod regression_tests {
         ] {
             let (api, _) = mock_api(vec![(
                 200,
-                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+                json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": lists, "hasNextChunk": false}}}),
             )])
             .await;
-            assert_eq!(api.user_list("Tester", None).await.unwrap().len(), count);
+            assert_eq!(api.user_list(7, None).await.unwrap().len(), count);
         }
     }
 }
@@ -2780,9 +2816,13 @@ mod feature_tests {
 
     #[tokio::test]
     async fn statistics_null_is_unavailable_instead_of_an_empty_account() {
-        let (api, _) = mock_api(vec![(200, json!({"data":{"User":{"statistics":null}}}))]).await;
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"User":{"id":7,"statistics":null}}}),
+        )])
+        .await;
         assert!(api
-            .user_statistics("Tester")
+            .user_statistics(7)
             .await
             .unwrap_err()
             .to_string()
@@ -2836,10 +2876,10 @@ mod feature_tests {
             }
             let (api, _) = mock_api(vec![(
                 200,
-                json!({"data":{"User":{"statistics":{"anime":anime}}}}),
+                json!({"data":{"User":{"id":7,"statistics":{"anime":anime}}}}),
             )])
             .await;
-            let found = api.user_statistics("Tester").await.unwrap();
+            let found = api.user_statistics(7).await.unwrap();
             assert_eq!(found.count, 0);
             assert_eq!(found.episodes_watched, 0);
             assert!(found.scores.is_empty());
@@ -2876,10 +2916,12 @@ mod feature_tests {
                         "airingAt":1000,"episode":1,"media":airing
                     }]}})
                 }
-                "list" => json!({"MediaListCollection":{"hasNextChunk":false,"lists":[{"entries":[{
-                    "id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,
-                    "repeat":0,"updatedAt":null,"media":media
-                }]}]}}),
+                "list" => {
+                    json!({"MediaListCollection":{"user":{"id":7},"hasNextChunk":false,"lists":[{"entries":[{
+                        "id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,
+                        "repeat":0,"updatedAt":null,"media":media
+                    }]}]}})
+                }
                 "relations" => {
                     let mut parent = mock_media(2);
                     let mut relation = media.clone();
@@ -2896,7 +2938,7 @@ mod feature_tests {
                 "season" => api.season_all("WINTER", 2026).await.map(|_| ()),
                 "recommendations" => api.recommendations(1).await.map(|_| ()),
                 "calendar" => api.airing_schedule(1, 2000).await.map(|_| ()),
-                "list" => api.user_list("Tester", None).await.map(|_| ()),
+                "list" => api.user_list(7, None).await.map(|_| ()),
                 "relations" => api.media_detail(2).await.map(|_| ()),
                 _ => unreachable!(),
             };

@@ -1830,7 +1830,7 @@ mod tests {
                         "description":null,"nextAiringEpisode":null
                     }}]}})
                 } else if query.contains("MediaListCollection") {
-                    json!({"MediaListCollection":{"lists":[],"hasNextChunk":false}})
+                    json!({"MediaListCollection":{"user":{"id":47},"lists":[],"hasNextChunk":false}})
                 } else if query.contains("Viewer") {
                     json!({"Viewer":{"id":47,"name":"Fixture"}})
                 } else {

@@ -1217,7 +1217,7 @@ mod tests {
         unrated["score"] = json!(null);
         let mut saved = remote(3);
         saved["score"] = json!(3);
-        let snapshot = json!({"data":{"MediaListCollection":{
+        let snapshot = json!({"data":{"MediaListCollection":{"user":{"id":7},
             "hasNextChunk":false,"lists":[{"entries":[unrated]}]
         }}});
         let (api, mut requests) = anilist::mock_api(vec![
