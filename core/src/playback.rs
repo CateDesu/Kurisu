@@ -112,7 +112,12 @@ pub struct TrackingPrompt {
     pub progress: i64,
 }
 
-type ProgressTask = tokio::task::JoinHandle<Result<bool, String>>;
+enum ProgressOutcome {
+    Rejected,
+    Accepted { history_recorded: bool },
+}
+
+type ProgressTask = tokio::task::JoinHandle<Result<ProgressOutcome, String>>;
 
 struct ActiveTrack {
     key: TrackKey,
@@ -468,6 +473,10 @@ async fn tick(
     let mut cache = std::mem::take(recognition);
     let (cache, info) = work
         .spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(info) = cache.probe_result.take() {
+                return (cache, Ok(Some(info)));
+            }
             let info = read_now(&app_for_blocking, &mut cache);
             (cache, info)
         })
@@ -596,7 +605,8 @@ async fn tick(
             .await
             .unwrap_or_else(|error| Err(error.to_string()));
         match result {
-            Ok(history_recorded) => {
+            Ok(ProgressOutcome::Rejected) => {}
+            Ok(ProgressOutcome::Accepted { history_recorded }) => {
                 track.incremented = true;
                 track.history_recorded |= history_recorded;
                 if state
@@ -667,8 +677,9 @@ async fn tick(
             let history_recorded = track.history_recorded;
             track.push = Some(work.spawn(async move {
                 let state = handle.state();
-                let result = commands::watcher_set_progress(
+                let result = commands::watcher_set_progress_from(
                     state,
+                    origin,
                     media_id,
                     episode,
                     expected_token.as_deref(),
@@ -678,20 +689,22 @@ async fn tick(
                 if state.anilist.lock().token() != expected_token
                     || !state.origin_is_current(origin)
                 {
-                    return Ok(false);
+                    return Ok(ProgressOutcome::Rejected);
                 }
                 if let Some(entry) = result {
                     state.emit_from(origin, EventKind::EpisodeUpdated(entry.clone()));
                 }
-                let accepted = state
+                let progress_reached = state
                     .db
                     .get_entry(media_id)
                     .ok()
                     .flatten()
                     .is_some_and(|entry| entry.progress >= episode);
-                Ok(history_recorded
-                    || (accepted
-                        && save_history(state, origin, &watched, expected_token.as_deref())))
+                Ok(ProgressOutcome::Accepted {
+                    history_recorded: history_recorded
+                        || (progress_reached
+                            && save_history(state, origin, &watched, expected_token.as_deref())),
+                })
             }));
         }
         _ => {}
@@ -864,6 +877,8 @@ struct RecognitionCache {
     entries: std::collections::VecDeque<RecognizedTitle>,
     #[cfg(test)]
     recognitions: usize,
+    #[cfg(test)]
+    probe_result: Option<TickInfo>,
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -1343,6 +1358,248 @@ fn read_now(_app: &Core, _cache: &mut RecognitionCache) -> anyhow::Result<Option
 mod tests {
     use super::*;
 
+    async fn assert_tick_progress_origin(
+        cancel_before_tick: bool,
+        cancel_after_spawn: bool,
+        already_pending: bool,
+        local_history: bool,
+    ) {
+        use crate::{anilist, Db, ListEntry, Platform, UpdateChannel, User};
+        use serde_json::json;
+        use std::path::Path;
+
+        struct NoPlatform;
+        impl Platform for NoPlatform {
+            fn open_url(&self, _: &str) -> Result<(), String> {
+                panic!("unexpected platform call")
+            }
+            fn open_path(&self, _: &Path) -> Result<(), String> {
+                panic!("unexpected platform call")
+            }
+            fn reveal_path(&self, _: &Path) -> Result<(), String> {
+                panic!("unexpected platform call")
+            }
+        }
+
+        let remote =
+            |progress| json!({"id":22,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":{"mediaListEntry":remote(3)}}})),
+            (200, json!({"data":{"SaveMediaListEntry":remote(5)}})),
+        ])
+        .await;
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.replace_account(
+            "test-session",
+            &User {
+                id: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            id: Some(22),
+            media_id: 1,
+            status: "CURRENT".into(),
+            progress: 3,
+            score: Some(0.0),
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_setting("tracking_mode", "auto").unwrap();
+        let core = Core::from_db(
+            db,
+            std::env::temp_dir().join("kurisu-playback-origin-fixture"),
+            tokio::runtime::Handle::current(),
+            Arc::new(NoPlatform),
+            UpdateChannel::Native,
+        );
+        let state = core.state();
+        *state.anilist.lock() = api;
+        if already_pending {
+            let (_, pending, _) = crate::sync_queue::stage(
+                state,
+                1,
+                crate::sync_queue::Patch {
+                    progress: Some(4),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            crate::sync_queue::local_entry(state, &pending).unwrap();
+        }
+        let saved_entry = serde_json::to_value(state.db.get_entry(1).unwrap()).unwrap();
+        let saved_pending = serde_json::to_value(state.db.pending(7).unwrap()).unwrap();
+        if cancel_before_tick {
+            state.cancel_login();
+        }
+        let origin = state.origin();
+        assert_eq!(origin.generation, u64::from(cancel_before_tick));
+        let info = TickInfo {
+            trackid: if local_history {
+                core.data_dir.join("episode05.mkv").to_str().unwrap().into()
+            } else {
+                "https://example.org/episode05.m3u8".into()
+            },
+            length_us: 100_000_000,
+            position_us: 90_000_000,
+            ..source("fixture", true, Some(1), Some(5))
+        };
+        let work = PlaybackWork::default();
+        let mut track = ActiveTrack::new(info.key(Some("test-session".into())), work.clone());
+        track.was_playing = true;
+        track.accumulated = Duration::from_secs(60);
+        let mut active = Some(track);
+        let mut recognition = RecognitionCache {
+            probe_result: Some(info.clone()),
+            ..Default::default()
+        };
+        tick(&core, &work, &mut active, &mut recognition)
+            .await
+            .unwrap();
+        let task = active
+            .as_ref()
+            .unwrap()
+            .push
+            .as_ref()
+            .expect("tick must spawn an automatic write");
+        // The current thread has not yielded since tick spawned the writer.
+        assert!(!task.is_finished());
+        assert!(matches!(
+            requests.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        if cancel_after_spawn {
+            state.cancel_login();
+        }
+        assert_eq!(state.origin_is_current(origin), !cancel_after_spawn);
+        assert_eq!(
+            state.anilist.lock().token().as_deref(),
+            Some("test-session")
+        );
+        assert_eq!(state.origin().account_id, Some(7));
+        tokio::time::timeout(Duration::from_secs(5), work.wait_idle())
+            .await
+            .unwrap();
+        assert!(active
+            .as_ref()
+            .unwrap()
+            .push
+            .as_ref()
+            .unwrap()
+            .is_finished());
+        assert!(!requests.is_closed());
+        if cancel_after_spawn {
+            assert!(
+                requests.try_recv().is_err(),
+                "obsolete tick changed cached {:?}",
+                state.db.get_entry(1).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry(1).unwrap()).unwrap(),
+                saved_entry
+            );
+            assert_eq!(
+                serde_json::to_value(state.db.pending(7).unwrap()).unwrap(),
+                saved_pending
+            );
+            assert!(state.db.watch_history(7, 10, None).unwrap().is_empty());
+        }
+        // Joining the task here would bypass tick's recovery state.
+        for _ in 0..3 {
+            recognition.probe_result = Some(info.clone());
+            tick(&core, &work, &mut active, &mut recognition)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), work.wait_idle())
+                .await
+                .unwrap();
+        }
+        let track = active.as_ref().unwrap();
+        assert!(track.key == info.key(Some("test-session".into())));
+        assert!(track.accumulated >= Duration::from_secs(60));
+        assert_eq!(
+            state.db.get_entry(1).unwrap().unwrap().progress,
+            5,
+            "same track must recover after rejection, pending={already_pending}"
+        );
+        assert!(track.incremented);
+        assert!(track.push.is_none());
+        assert_eq!(track.fail_count, 0);
+        assert!(track.retry_at.is_none());
+        assert_eq!(track.history_recorded, local_history);
+        assert_eq!(
+            state.db.watch_history(7, 10, None).unwrap().len(),
+            usize::from(local_history)
+        );
+        assert!(!requests.is_closed());
+        let sent = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+        if already_pending {
+            assert!(sent.is_empty());
+            assert_eq!(
+                state
+                    .db
+                    .pending_change(7, 1)
+                    .unwrap()
+                    .unwrap()
+                    .patch
+                    .progress,
+                Some(5)
+            );
+        } else {
+            assert!(state.db.pending(7).unwrap().is_empty());
+            assert_eq!(sent.len(), 2);
+            assert!(sent[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("mediaListEntry"));
+            assert_eq!(
+                sent[0]["variables"],
+                json!({"mediaId":1,"scoreFormat":null})
+            );
+            assert!(sent[1]["query"]
+                .as_str()
+                .unwrap()
+                .contains("SaveMediaListEntry"));
+            assert_eq!(
+                sent[1]["variables"],
+                json!({"id":22,"progress":5,"scoreFormat":null})
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_progress_rejects_cancellation_before_the_spawned_writer_is_polled() {
+        assert_tick_progress_origin(false, true, false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_progress_recovers_a_pending_update_after_rejecting_a_stale_task() {
+        assert_tick_progress_origin(false, true, true, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_progress_accepts_an_unchanged_generation() {
+        for already_pending in [false, true] {
+            assert_tick_progress_origin(false, false, already_pending, true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_progress_accepts_a_fresh_tick_after_cancellation() {
+        for already_pending in [false, true] {
+            assert_tick_progress_origin(true, false, already_pending, true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_progress_accepts_updates_without_local_history() {
+        for already_pending in [false, true] {
+            assert_tick_progress_origin(false, false, already_pending, false).await;
+        }
+    }
+
     #[tokio::test]
     async fn service_shutdown_joins_a_cancelled_tick() {
         struct Dropped(Arc<AtomicUsize>);
@@ -1440,7 +1697,9 @@ mod tests {
             let _ = entered.send(());
             let _ = released.await;
             recorded.fetch_add(1, Ordering::SeqCst);
-            Ok(true)
+            Ok(ProgressOutcome::Accepted {
+                history_recorded: true,
+            })
         }));
         started.await.unwrap();
         drop(track);

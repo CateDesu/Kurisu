@@ -253,7 +253,7 @@ fn normalize_matcher_inputs(inputs: Vec<MatcherInput>) -> Vec<Matcher> {
                 .titles
                 .iter()
                 .flatten()
-                .next()
+                .find(|title| !title.trim().is_empty())
                 .cloned()
                 .unwrap_or_else(|| format!("#{}", input.media_id)),
             variants,
@@ -349,6 +349,9 @@ fn norm_season_ordinal(norm: &str) -> Option<u32> {
             return Some(n);
         }
     }
+    if words.len() == 2 && words[0] == "no" {
+        return None;
+    }
     words.last().and_then(|w| {
         if w.len() <= 2 {
             w.parse::<u32>()
@@ -396,6 +399,48 @@ type TiebreakKey = (
     std::cmp::Reverse<i64>,
 );
 
+fn strip_corner_release_groups<'a>(mut title: &'a str, matchers: &[Matcher]) -> &'a str {
+    loop {
+        let trimmed = title.trim_start();
+        if trimmed.starts_with(['[', '(']) {
+            let Some(group) = RE_BRACKETS.find(trimmed).filter(|group| group.start() == 0) else {
+                break;
+            };
+            let remainder = trimmed[group.end()..].trim_start();
+            if !remainder.starts_with(['【', '[', '(']) {
+                break;
+            }
+            title = remainder;
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix('【') else {
+            break;
+        };
+        let Some(end) = rest.find('】') else {
+            break;
+        };
+        // A shared bracket label alone does not identify a catalog title.
+        let lower = title.trim_start().to_lowercase();
+        if matchers.iter().any(|matched| {
+            matched.variants.iter().any(|variant| {
+                let variant = variant.trim_start().to_lowercase();
+                variant.starts_with('【')
+                    && lower.strip_prefix(&variant).is_some_and(|tail| {
+                        tail.chars().next().is_none_or(|c| !c.is_alphanumeric())
+                    })
+            })
+        }) {
+            break;
+        }
+        let remainder = rest[end + '】'.len_utf8()..].trim_start();
+        if strip_ext(remainder).trim().is_empty() {
+            break;
+        }
+        title = remainder;
+    }
+    title
+}
+
 /// Seasons must agree. Unnumbered releases cannot imply a numbered sequel.
 pub(crate) fn match_title<'a>(
     matchers: &'a [Matcher],
@@ -403,13 +448,33 @@ pub(crate) fn match_title<'a>(
     url: &str,
 ) -> Option<&'a Matcher> {
     let base = basename(url);
+    let title = strip_corner_release_groups(title, matchers);
+    let base = strip_corner_release_groups(&base, matchers);
     let candidates = [
-        (clean_title(title), None, false),
-        (clean_title(&base), None, false),
-        (norm_title(title), Some(title), true),
-        (norm_title(&base), Some(base.as_str()), true),
-        (clean_title_inner(title, false), None, true),
-        (clean_title_inner(&base, false), None, true),
+        (clean_title(title), None, 0),
+        (clean_title(base), None, 0),
+        (norm_title(title), Some(title), 5),
+        (norm_title(base), Some(base), 5),
+        (clean_title_inner(title, false), None, 4),
+        (clean_title_inner(base, false), None, 4),
+        (
+            clean_title_inner(&title.replace(['【', '】'], " "), false),
+            None,
+            if title.trim_start().starts_with('【') {
+                5
+            } else {
+                3
+            },
+        ),
+        (
+            clean_title_inner(&base.replace(['【', '】'], " "), false),
+            None,
+            if base.trim_start().starts_with('【') {
+                5
+            } else {
+                3
+            },
+        ),
     ];
     let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
     let mut best: Option<(TiebreakKey, &Matcher)> = None;
@@ -418,7 +483,8 @@ pub(crate) fn match_title<'a>(
         .or_else(|| parse_season_word(&basename(url)))
         .or_else(|| parse_season_token(title))
         .or_else(|| parse_season_token(&basename(url)));
-    for (cand, raw_title, exact_only) in candidates {
+    for (cand, raw_title, exact_tier) in candidates {
+        let exact_only = exact_tier > 0;
         if cand.is_empty() {
             continue;
         }
@@ -434,6 +500,7 @@ pub(crate) fn match_title<'a>(
                         || RE_EXPLICIT_EP.is_match(tail.as_str())
                 });
                 if marked_episode
+                    && parse_season_marker(raw).is_none()
                     && !m
                         .variants
                         .iter()
@@ -455,7 +522,8 @@ pub(crate) fn match_title<'a>(
                 .iter()
                 .filter_map(|n| {
                     if exact_only {
-                        (n == &cand).then_some((4, n.len()))
+                        // Preserve title numbers before status breaks ties.
+                        (n == &cand).then_some((exact_tier, n.len()))
                     } else {
                         norm_match_tier(n, &cand).map(|t| (t, n.len()))
                     }
@@ -522,7 +590,7 @@ fn preceded_by_season(s: &str, start: usize) -> bool {
 }
 
 pub(crate) fn norm_title(s: &str) -> String {
-    let s = strip_ext(s);
+    let s = strip_ext(s).replace(['【', '】'], " ");
     let s = RE_BRACKETS.replace_all(&s, " ");
     let res_stripped = RE_RES.replace_all(&s, " ");
     // A real title such as Opus can also be a codec name.
@@ -807,9 +875,17 @@ pub(crate) fn resolve_playback_episode(
         return Some(episode);
     }
     (bound
-        || candidates
-            .iter()
-            .any(|candidate| matched.norms.contains(&norm_title(candidate))))
+        || candidates.iter().any(|candidate| {
+            matched
+                .norms
+                .contains(&norm_title(strip_corner_release_groups(
+                    candidate,
+                    std::slice::from_ref(matched),
+                )))
+                || matched
+                    .norms
+                    .contains(&norm_title(&RE_BRACKETS.replace_all(candidate, " ")))
+        }))
     .then_some(1)
 }
 
@@ -910,6 +986,26 @@ fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matcher_display_skips_blank_preferred_titles() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        for title in ["", "   "] {
+            db.upsert_media(&crate::models::Media {
+                id: 1,
+                title_english: Some(title.into()),
+                title_romaji: Some("Some Show".into()),
+                episodes: Some(12),
+                ..Default::default()
+            })
+            .unwrap();
+            let matchers = build_matchers(&db);
+            let matched = match_title(&matchers, "Some Show - 01", "").unwrap();
+            assert_eq!(matched.display, "Some Show");
+            assert_eq!(resolve_episode(matched, &["Some Show - 01"]), Some(1));
+        }
+    }
 
     fn seed_refresh_inputs(db: &Db) {
         for (id, title) in [(1, "Some Show"), (2, "[Group]")] {
@@ -2498,5 +2594,334 @@ mod tests {
         ] {
             assert_eq!(resolve_episode(&matchers[0], &[title]), None, "{title}");
         }
+    }
+    #[test]
+    fn catalog_corner_brackets_preserve_titles_and_release_groups() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_refresh_inputs(&db);
+        db.upsert_media(&crate::models::Media {
+            id: 1,
+            title_native: Some("【推しの子】".into()),
+            episodes: Some(11),
+            ..Default::default()
+        })
+        .unwrap();
+        let matchers = build_matchers(&db);
+        for title in [
+            "[Group] 推しの子 - 03 [1080p].mkv",
+            "[Group] 【推しの子】 - 03 [1080p].mkv",
+            "【Group】 推しの子 - 03 [1080p].mkv",
+            "推しの子 S01E03.mkv",
+        ] {
+            let matched = match_title(&matchers, title, "").expect(title);
+            assert_eq!(matched.media_id, 1);
+            assert_eq!(resolve_episode(matched, &[title]), Some(3), "{title}");
+        }
+        assert!(match_title(&matchers, "[推しの子] Other Show - 03", "").is_none());
+        let siblings = vec![mk(1, "【推しの子】"), mk(3, "【推しの子】 2")];
+        for title in ["【推しの子】 S02E03", "推しの子 S02E03"] {
+            let matched = match_title(&siblings, title, "").expect(title);
+            assert_eq!(matched.media_id, 3);
+            assert_eq!(resolve_episode(matched, &[title]), Some(3));
+        }
+    }
+
+    #[test]
+    fn exact_movie_titles_beat_current_cleaned_titles_on_real_paths() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        for (id, title, status) in [
+            (1, "Ghost in the Shell", "CURRENT"),
+            (2, "Ghost in the Shell 2.0", "COMPLETED"),
+            (3, "Some Movie", "COMPLETED"),
+            (4, "Patlabor", "CURRENT"),
+            (5, "Patlabor 2", "COMPLETED"),
+        ] {
+            db.upsert_media(&crate::models::Media {
+                id,
+                title_english: Some(title.into()),
+                episodes: Some(1),
+                format: Some("MOVIE".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&crate::models::ListEntry {
+                media_id: id,
+                status: status.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let matchers = build_matchers(&db);
+        for (path, expected) in [
+            ("file:///movies/Ghost%20in%20the%20Shell%202.0.mkv", 2),
+            ("/movies/[Group] Ghost in the Shell 2.0 - 01.mkv", 2),
+            ("/movies/Ghost in the Shell.mkv", 1),
+            ("/movies/Patlabor 2.mkv", 5),
+            ("/movies/[Group] Patlabor 2 - 01.mkv", 5),
+        ] {
+            let matched = match_title(&matchers, "", path).unwrap();
+            assert_eq!(matched.media_id, expected, "{path}");
+            let filename = basename(path);
+            assert_eq!(
+                match_title(&matchers, &filename, path).unwrap().media_id,
+                expected,
+                "{path}"
+            );
+            assert_eq!(
+                crate::library::resolve_bound_episode(matched, &[&filename], None),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn corner_release_groups_allow_unbound_movie_inference() {
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk_status(1, "Some Movie", "COMPLETED")
+        };
+        for path in [
+            "/movies/【Group】 Some Movie.mkv",
+            "file:///movies/%E3%80%90Group%E3%80%91%20Some%20Movie.mkv",
+            "/movies/[Group] Some Movie.mkv",
+        ] {
+            let filename = basename(path);
+            assert_eq!(
+                match_title(std::slice::from_ref(&movie), "", path)
+                    .unwrap()
+                    .media_id,
+                movie.media_id
+            );
+            assert_eq!(
+                crate::library::resolve_bound_episode(&movie, &[&filename], None),
+                Some(1),
+                "{path}"
+            );
+        }
+        for filename in [
+            "【Group】 Other Movie.mkv",
+            "【Group】 Some Movie Trailer.mkv",
+            "【Some Movie】 Other Movie.mkv",
+        ] {
+            assert_eq!(
+                crate::library::resolve_bound_episode(&movie, &[filename], None),
+                None,
+                "{filename}"
+            );
+        }
+        let bracketed = Matcher {
+            episodes: Some(1),
+            ..mk(2, "【推しの子】")
+        };
+        assert_eq!(
+            resolve_playback_episode(&bracketed, &["【推しの子】.mkv"], false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn numbered_no_title_is_not_a_season() {
+        let matchers = vec![mk(1, "No.6"), mk(2, "Some Show"), mk(3, "Some Show 6")];
+        for title in ["No.6 S01E03.mkv", "[Group] No.6 - 03 [1080p].mkv", "No.6"] {
+            let matched = match_title(&matchers, title, "").expect(title);
+            assert_eq!(matched.media_id, 1, "{title}");
+            assert_eq!(
+                resolve_episode(matched, &[title]),
+                if title == "No.6" { None } else { Some(3) }
+            );
+        }
+        assert!(match_title(&matchers, "No.6 S02E03", "").is_none());
+        assert_eq!(
+            match_title(&matchers, "Some Show S06E03", "")
+                .unwrap()
+                .media_id,
+            3
+        );
+    }
+    #[test]
+    fn corner_groups_do_not_become_competing_catalog_titles() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        for (id, title, episodes) in [
+            (1, "Some Movie", 1),
+            (2, "Group Some Movie", 1),
+            (3, "【推しの子】", 11),
+            (4, "Group 推しの子", 11),
+            (5, "Ghost in the Shell 2.0", 1),
+            (6, "Group Ghost in the Shell 2.0", 1),
+            (7, "86", 1),
+            (8, "Group 86", 1),
+            (9, "【映画】", 1),
+            (10, "Group 映画", 1),
+            (11, "【映画】 Another Movie", 1),
+        ] {
+            db.upsert_media(&crate::models::Media {
+                id,
+                title_english: Some(title.into()),
+                episodes: Some(episodes),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&crate::models::ListEntry {
+                media_id: id,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let matchers = build_matchers(&db);
+        for (filename, id, episode) in [
+            ("【Group】 【推しの子】 - 03.mkv", 3, 3),
+            ("【Group】 Some Movie.mkv", 1, 1),
+            ("[Group] Some Movie.mkv", 1, 1),
+            ("【Group】 推しの子 - 03.mkv", 3, 3),
+            ("【推しの子】 - 03.mkv", 3, 3),
+            ("【Group】 Ghost in the Shell 2.0.mkv", 5, 1),
+            ("【Group】 86.mkv", 7, 1),
+            ("Group Some Movie.mkv", 2, 1),
+            ("【Group】 【映画】.mkv", 9, 1),
+            ("【映画】.mkv", 9, 1),
+            ("【映画】 Another Movie.mkv", 11, 1),
+            ("【Other】【Group】 Some Movie.mkv", 1, 1),
+        ] {
+            let path = format!("file:///movies/{filename}")
+                .replace('【', "%E3%80%90")
+                .replace('】', "%E3%80%91")
+                .replace(' ', "%20");
+            for title in ["", filename] {
+                let matched = match_title(&matchers, title, &path).expect(filename);
+                assert_eq!(matched.media_id, id, "{filename}");
+                assert_eq!(
+                    crate::library::resolve_bound_episode(matched, &[filename], None),
+                    Some(episode),
+                    "{filename}"
+                );
+            }
+        }
+        for filename in [
+            "【Group】 Some Movie Trailer.mkv",
+            "【Group】 Some Movie - 02.mkv",
+            "【Group】 Some Movie - 00.mkv",
+            "【Group】 Some Movie - 01.5.mkv",
+            "【Group】 Some Movie - 01-02.mkv",
+            "【Group】 【推しの子】 - 12.mkv",
+        ] {
+            let matched = match_title(&matchers, filename, "").expect(filename);
+            assert_eq!(
+                crate::library::resolve_bound_episode(matched, &[filename], None),
+                None,
+                "{filename}"
+            );
+        }
+    }
+    #[test]
+    fn corner_catalog_competition_on_playback_and_scan_paths() {
+        let mut failures = Vec::new();
+        for (catalog, filename, expected, episode) in [
+            (
+                vec!["Some Movie", "Group Some Movie"],
+                "[Other]【Group】 Some Movie.mkv",
+                1,
+                1,
+            ),
+            (
+                vec!["Some Movie", "Group Some Movie"],
+                "[Other](More)【Group】 Some Movie.mkv",
+                1,
+                1,
+            ),
+            (
+                vec!["Some Movie", "Group Some Movie"],
+                "【Other】[More]【Group】 Some Movie.mkv",
+                1,
+                1,
+            ),
+            (
+                vec!["Some Movie", "Group Some Movie", "【Group】 Another Movie"],
+                "【Group】 Some Movie.mkv",
+                1,
+                1,
+            ),
+            (
+                vec!["Another Movie", "【映画】 Another Movie"],
+                "【映画】 Another Movie - 01.mkv",
+                2,
+                1,
+            ),
+            (
+                vec!["【Some Show】", "Other Show"],
+                "【some show】 - 03.mkv",
+                1,
+                3,
+            ),
+            (
+                vec!["Ghost in the Shell", "【Ghost in the Shell 2.0】"],
+                "【Ghost in the Shell 2.0】 - 01.mkv",
+                2,
+                1,
+            ),
+        ] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            for (index, title) in catalog.iter().enumerate() {
+                let id = index as i64 + 1;
+                db.upsert_media(&crate::models::Media {
+                    id,
+                    title_english: Some((*title).into()),
+                    episodes: Some(if episode == 3 { 12 } else { 1 }),
+                    ..Default::default()
+                })
+                .unwrap();
+                db.upsert_entry(&crate::models::ListEntry {
+                    media_id: id,
+                    status: if id == 1 { "CURRENT" } else { "COMPLETED" }.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            }
+            let matchers = Arc::new(build_matchers(&db));
+            let path = format!("file:///movies/{filename}")
+                .replace('【', "%E3%80%90")
+                .replace('】', "%E3%80%91")
+                .replace(' ', "%20");
+            for title in ["", filename] {
+                let matched = match_title(&matchers, title, &path);
+                if matched.map(|m| m.media_id) != Some(expected) {
+                    failures.push(format!(
+                        "{filename}: got {:?}, expected {expected}",
+                        matched.map(|m| m.media_id)
+                    ));
+                    continue;
+                }
+                let matched = matched.unwrap();
+                assert_eq!(
+                    resolve_playback_episode(matched, &[filename], false),
+                    Some(episode),
+                    "{filename}"
+                );
+                assert_eq!(
+                    crate::library::resolve_bound_episode(matched, &[filename], None),
+                    Some(episode),
+                    "{filename}"
+                );
+            }
+            let folder = std::env::temp_dir().join(format!(
+                "kurisu-corner-review-{}-{expected}-{episode}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(filename), []).unwrap();
+            let mut cache = crate::library::ScanCache::default();
+            for _ in 0..2 {
+                let scan = cache.scan(
+                    &[folder.to_string_lossy().into_owned()],
+                    &matchers,
+                    &std::collections::HashMap::new(),
+                );
+                assert_eq!(scan.files.len(), 1);
+                assert_eq!(scan.files[0].media_id, Some(expected), "{filename}");
+                assert_eq!(scan.files[0].episode, Some(episode), "{filename}");
+            }
+            std::fs::remove_dir_all(folder).unwrap();
+        }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }

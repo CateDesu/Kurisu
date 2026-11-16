@@ -19,9 +19,9 @@ python3 native/build.py
 
 The helper discovers the newest published stable version, builds with the committed Cargo lock, checks the executable's version, and writes the updater's existing checksum sidecar. Discovery failure stops the build. It does not install or publish anything.
 
-Build artifacts include `LICENSE` and `THIRD_PARTY_NOTICES.txt`. Keep these beside the executable when distributing it. The Windows installer includes both. Notices cover the target's locked normal and build dependencies, bundled fonts, and the local GPUI changes. Missing dependency license texts stop packaging. Sourced supplements for crates that omit their license files are in `packaging/licenses/`.
+Build artifacts include `LICENSE` and `THIRD_PARTY_NOTICES.txt`. Keep these beside the executable when distributing it. Release executables also embed these texts. On Linux, startup creates missing `kurisu.LICENSE` and `kurisu.THIRD_PARTY_NOTICES.txt` companions, including after an update from the frozen bridge. Existing files are preserved. Use `--license` or `--notices` to read the current bundled texts, including when the installation directory is read only. The Windows installer includes both. Notices cover the target's locked normal and build dependencies, bundled fonts, and the local GPUI changes. Missing dependency license texts stop packaging. Sourced supplements for crates that omit their license files are in `packaging/licenses/`.
 
-For a repeatable build with a verified release version, pass `--build-version VERSION`. Add `--offline` only after Cargo dependencies are cached. An offline build requires an explicit version. `KURISU_BUILD_VERSION` is also accepted. `--print-version` resolves the stamp without building.
+For a repeatable build with a verified release version, pass `--build-version VERSION`. Add `--offline` only after Cargo dependencies are cached. An offline build requires an explicit version. `KURISU_BUILD_VERSION` is also accepted. `--print-version` resolves the stamp without building. Use this helper for release builds so the executable embeds its current dependency notices. Linux packaging supports x86_64 GNU and musl hosts. The helper explicitly selects the host target on Linux and x86_64 MSVC on Windows, overriding Cargo target configuration.
 
 Use a dedicated directory for an isolated profile:
 

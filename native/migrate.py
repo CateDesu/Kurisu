@@ -305,7 +305,7 @@ def _snapshot(source: Path, files: list[Path], stage: Path, backup: Path) -> dic
     if before != _fingerprints(_source_files(source)):
         raise TransferError("Source changed during transfer; stop both programs and retry")
     os.chmod(backup, 0o600)
-    for suffix in ("-wal", "-shm"):
+    for suffix in ("-wal", "-shm", "-journal"):
         if os.path.lexists(Path(f"{backup}{suffix}")):
             raise TransferError("Backup still has SQLite sidecars")
     return before
@@ -340,7 +340,7 @@ def _populate_native(backup: Path, stage: Path, values: dict[str, str | None]) -
             if (converted := _native_preference_value(key, value)) is not None
         }:
             raise TransferError("Native preference verification failed")
-    for suffix in ("-wal", "-shm"):
+    for suffix in ("-wal", "-shm", "-journal"):
         if os.path.lexists(Path(f"{database}{suffix}")):
             raise TransferError("Native profile still has SQLite sidecars")
     marker = stage / ".kurisu-native-profile"
@@ -388,7 +388,7 @@ def transfer(source: Path, preferences: Path, backup: Path, destination: Path) -
     files = _source_files(source)
     values = _load_preferences(preferences)
     _new_path(backup)
-    for suffix in ("-wal", "-shm"):
+    for suffix in ("-wal", "-shm", "-journal"):
         _new_path(Path(f"{backup}{suffix}"))
     _new_path(destination)
 

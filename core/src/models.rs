@@ -55,16 +55,16 @@ impl Media {
     pub fn display_title(&self) -> String {
         self.title_english
             .as_deref()
-            .filter(|title| !title.is_empty())
+            .filter(|title| !title.trim().is_empty())
             .or_else(|| {
                 self.title_romaji
                     .as_deref()
-                    .filter(|title| !title.is_empty())
+                    .filter(|title| !title.trim().is_empty())
             })
             .or_else(|| {
                 self.title_native
                     .as_deref()
-                    .filter(|title| !title.is_empty())
+                    .filter(|title| !title.trim().is_empty())
             })
             .map(str::to_owned)
             .unwrap_or_else(|| format!("#{}", self.id))
@@ -77,6 +77,7 @@ pub struct ListEntry {
     pub media_id: i64,
     pub status: String,
     pub progress: i64,
+    // None is unknown. Some(0.0) is known unrated.
     pub score: Option<f64>,
     pub repeat: i64,
     pub updated_at: Option<i64>,
@@ -468,10 +469,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_title_uses_the_first_nonempty_title_or_media_id() {
-        for english in [None, Some("")] {
-            for romaji in [None, Some("")] {
-                for native in [None, Some("")] {
+    fn display_title_uses_the_first_nonblank_title_or_media_id() {
+        for english in [None, Some(""), Some(" \t\n"), Some("\u{3000}")] {
+            for romaji in [None, Some(""), Some(" \t\n"), Some("\u{3000}")] {
+                for native in [None, Some(""), Some(" \t\n"), Some("\u{3000}")] {
                     let mut media = Media {
                         id: 42,
                         title_english: english.map(str::to_owned),
@@ -487,7 +488,9 @@ mod tests {
                     media.title_english = Some("English".into());
                     assert_eq!(media.display_title(), "English");
                     media.title_english = Some(" ".into());
-                    assert_eq!(media.display_title(), " ");
+                    assert_eq!(media.display_title(), "Romaji");
+                    media.title_english = Some(" English ".into());
+                    assert_eq!(media.display_title(), " English ");
                 }
             }
         }

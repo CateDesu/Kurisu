@@ -645,6 +645,8 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
         None => sane_exe_path(std::env::current_exe().map_err(|e| e.to_string())?)?,
     };
     let dir = exe.parent().ok_or("cannot locate install dir")?;
+    let _installation = lock_install_dir(dir)
+        .map_err(|error| format!("could not lock the installation: {error}"))?;
     let name = exe
         .file_name()
         .and_then(|n| n.to_str())
@@ -785,6 +787,10 @@ pub fn sweep_update_leftovers(dir: &Path) {
 
 /// Keep backups whose executable is missing. They may be the only working copy.
 pub fn sweep_install_leftovers(exe_dir: &Path) {
+    #[cfg(target_os = "linux")]
+    let Ok(_installation) = lock_install_dir(exe_dir) else {
+        return;
+    };
     if let Ok(entries) = std::fs::read_dir(exe_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -798,6 +804,28 @@ pub fn sweep_install_leftovers(exe_dir: &Path) {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn lock_install_dir(dir: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Keep the inode in place so every process locks the same installation.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(".kurisu-install.lock"))?;
+    if !lock.metadata()?.is_file() {
+        return Err(io::Error::other("installation lock is not a regular file"));
+    }
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => io::Error::other("an update is already in progress"),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(lock)
 }
 
 #[cfg(test)]

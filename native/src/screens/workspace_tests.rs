@@ -2638,3 +2638,68 @@ fn stage05_empty_filter_retires_cover_owners(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+fn profile_format_change_resets_editor_scale_and_clear_submits_zero(cx: &mut TestAppContext) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.generation = workspace.core.generation();
+        let user = User {
+            id: 7,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        workspace.profile = Some(user.clone());
+        workspace.list.apply_one(
+            ListEntry {
+                media_id: 9,
+                status: "CURRENT".into(),
+                score: Some(80.0),
+                ..Default::default()
+            },
+            now_seconds(),
+        );
+        workspace.open_editor(9, window, cx);
+        workspace
+            .editor_inputs
+            .as_ref()
+            .unwrap()
+            .progress
+            .update(cx, |input, cx| input.set_value("5", cx));
+        workspace.read_editor_inputs(cx).unwrap();
+        workspace.set_profile(
+            Some(User {
+                score_format: Some("POINT_5".into()),
+                ..user
+            }),
+            window,
+            cx,
+        );
+        assert_eq!(
+            workspace
+                .editor
+                .as_ref()
+                .unwrap()
+                .displayed_format
+                .as_deref(),
+            Some("POINT_5")
+        );
+        assert_eq!(
+            workspace
+                .editor_inputs
+                .as_ref()
+                .unwrap()
+                .score
+                .read(cx)
+                .value(),
+            ""
+        );
+        assert_eq!(workspace.list.entry(9).unwrap().score, None);
+        workspace.clear_editor_score(cx);
+        workspace.read_editor_inputs(cx).unwrap();
+        let patch = workspace.editor.as_ref().unwrap().basic_patch(true);
+        assert_eq!(patch.score, Some(0.0));
+        assert_eq!(patch.progress, Some(5));
+    });
+}

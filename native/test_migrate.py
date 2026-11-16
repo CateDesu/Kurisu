@@ -349,6 +349,23 @@ os._exit(0)
         self.assertEqual(self.backup.read_bytes(), b"existing")
         self.assertFalse(self.native.exists())
 
+    def test_existing_backup_sidecars_stop_before_publication(self):
+        self.make_source()
+        before = digest(self.source)
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                sidecar = Path(f"{self.backup}{suffix}")
+                sidecar.write_bytes(b"preserve recovery data")
+                try:
+                    with self.assertRaises(MIGRATE.TransferError):
+                        MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+                    self.assertFalse(self.backup.exists())
+                    self.assertFalse(self.native.exists())
+                    self.assertEqual(sidecar.read_bytes(), b"preserve recovery data")
+                    self.assertEqual(digest(self.source), before)
+                finally:
+                    sidecar.unlink()
+
     def test_publication_failure_keeps_a_complete_backup_and_no_profile(self):
         self.make_source()
         original = digest(self.source)

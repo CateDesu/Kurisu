@@ -128,6 +128,16 @@ pub struct FeedFetch {
     pub failures: Vec<FeedFailure>,
 }
 
+struct FeedTasks(Vec<tokio::task::JoinHandle<(String, Result<String>)>>);
+
+impl Drop for FeedTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 fn http_client() -> Result<reqwest::Client> {
     let mut cached = HTTP_CLIENT.lock();
     if let Some(http) = cached.as_ref() {
@@ -174,7 +184,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let http = http_client()?;
     #[cfg(feature = "test-support")]
     let fixture_origin = configured_fixture_rss_origin()?;
-    let mut tasks = Vec::with_capacity(feeds.len());
+    let mut tasks = FeedTasks(Vec::with_capacity(feeds.len()));
     for feed in feeds {
         #[cfg(feature = "test-support")]
         let http = if fixture_origin
@@ -188,7 +198,7 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
         #[cfg(not(feature = "test-support"))]
         let http = http.clone();
         let feed = feed.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.0.push(tokio::spawn(async move {
             let _slot = FETCH_SLOTS.acquire().await.expect("RSS semaphore is open");
             let fetched: Result<String> = async {
                 validate_feed_url(&reqwest::Url::parse(&feed)?)?;
@@ -216,8 +226,9 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
             (feed, fetched)
         }));
     }
-    let mut results = Vec::with_capacity(tasks.len());
-    for (i, task) in tasks.into_iter().enumerate() {
+    let mut results = Vec::with_capacity(tasks.0.len());
+    // Retain every handle while awaiting so cancellation also stops the current task.
+    for (i, task) in tasks.0.iter_mut().enumerate() {
         match task.await {
             Ok(pair) => results.push(pair),
             Err(e) => results.push((feeds[i].clone(), Err(anyhow!("feed task failed: {e}")))),
@@ -1255,6 +1266,292 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    struct ObservedFeedServer {
+        origin: reqwest::Url,
+        requests:
+            tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<String>)>,
+        closed: tokio::sync::mpsc::UnboundedReceiver<String>,
+        stop: tokio::sync::oneshot::Sender<()>,
+        tasks: tokio::task::JoinSet<()>,
+    }
+
+    fn closing_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    impl ObservedFeedServer {
+        async fn start() -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin =
+                reqwest::Url::parse(&format!("http://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+            let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+            let (closed_tx, closed) = tokio::sync::mpsc::unbounded_channel();
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted.unwrap();
+                            let requests = requests_tx.clone();
+                            let closed = closed_tx.clone();
+                            handlers.spawn(async move {
+                                let mut socket = BufReader::new(socket);
+                                let mut line = String::new();
+                                socket.read_line(&mut line).await.unwrap();
+                                let target = line.split_whitespace().nth(1).unwrap().to_owned();
+                                loop {
+                                    line.clear();
+                                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                                    if line == "\r\n" {
+                                        break;
+                                    }
+                                }
+                                let (respond, response) = tokio::sync::oneshot::channel::<String>();
+                                requests.send((target.clone(), respond)).unwrap();
+                                let mut byte = [0];
+                                tokio::select! {
+                                    response = response => {
+                                        socket.get_mut().write_all(response.unwrap().as_bytes()).await.unwrap();
+                                    }
+                                    read = socket.read(&mut byte) => {
+                                        assert_eq!(read.unwrap(), 0, "unexpected request body");
+                                        closed.send(target).unwrap();
+                                    }
+                                }
+                            });
+                        }
+                        Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                            result.unwrap();
+                        }
+                    }
+                }
+                drop(listener);
+                while let Some(result) = handlers.join_next().await {
+                    result.unwrap();
+                }
+            });
+            Self {
+                origin,
+                requests,
+                closed,
+                stop,
+                tasks,
+            }
+        }
+
+        async fn request(&mut self) -> (String, tokio::sync::oneshot::Sender<String>) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.requests.recv())
+                .await
+                .expect("feed request did not dispatch")
+                .expect("feed observer stopped")
+        }
+
+        async fn assert_idle(&mut self) {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), self.requests.recv())
+                    .await
+                    .is_err(),
+                "unexpected feed request"
+            );
+        }
+
+        async fn finish(mut self) {
+            self.stop.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.tasks.join_next())
+                .await
+                .expect("feed handlers did not finish")
+                .unwrap()
+                .unwrap();
+            assert!(self.tasks.is_empty());
+            assert!(self.requests.try_recv().is_err());
+            assert!(self.closed.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn cancelled_searches_release_active_and_queued_feed_work() {
+        const CHILD: &str = "KURISU_TEST_RSS_CANCELLATION";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the shared semaphore and client from parallel tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rss::tests::cancelled_searches_release_active_and_queued_feed_work",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("KURISU_FIXTURE_RSS")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                exercise_feed_cancellation(),
+            )
+            .await
+            .expect("feed cancellation regression exceeded its deadline");
+        });
+    }
+
+    async fn exercise_feed_cancellation() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let mut server = ObservedFeedServer::start().await;
+        let mut jobs = tokio::task::JoinSet::new();
+        for count in [1, 8] {
+            let origin = server.origin.clone();
+            let feeds: Vec<String> = (0..count)
+                .map(|i| origin.join(&format!("old-{i}")).unwrap().into())
+                .collect();
+            let job = jobs.spawn(async move {
+                if count == 1 {
+                    SEARCH_ORIGIN
+                        .scope(origin, search("old", "1_2", "0"))
+                        .await
+                        .unwrap();
+                } else {
+                    fetch_all(&feeds).await.unwrap();
+                }
+            });
+            let mut held = std::collections::BTreeMap::new();
+            for _ in 0..count.min(4) {
+                let (target, respond) = server.request().await;
+                assert!(held.insert(target, respond).is_none());
+            }
+            assert_eq!(FETCH_SLOTS.available_permits(), 4 - count.min(4));
+            server.assert_idle().await;
+            job.abort();
+            assert!(jobs.join_next().await.unwrap().unwrap_err().is_cancelled());
+            let mut closed = std::collections::BTreeSet::new();
+            for _ in 0..held.len() {
+                closed.insert(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), server.closed.recv())
+                        .await
+                        .expect("cancelled feed connection stayed open")
+                        .unwrap(),
+                );
+            }
+            assert_eq!(closed, held.keys().cloned().collect());
+            assert_eq!(FETCH_SLOTS.available_permits(), 4);
+            let origin = server.origin.clone();
+            jobs.spawn(async move {
+                let items = SEARCH_ORIGIN
+                    .scope(origin, search("fresh", "1_3", "2"))
+                    .await
+                    .unwrap();
+                assert_eq!(items.len(), 3);
+            });
+            let (target, respond) = server.request().await;
+            let url = server.origin.join(&target).unwrap();
+            assert!(url
+                .query_pairs()
+                .any(|(key, value)| key == "q" && value == "fresh"));
+            respond.send(closing_response(SAMPLE)).unwrap();
+            jobs.join_next().await.unwrap().unwrap();
+            server.assert_idle().await;
+            drop(held);
+        }
+
+        let feeds: Vec<String> = (0..4)
+            .map(|i| server.origin.join(&format!("held-{i}")).unwrap().into())
+            .collect();
+        let expected = feeds.clone();
+        jobs.spawn(async move {
+            let fetched = fetch_all(&expected).await.unwrap();
+            assert_eq!(fetched.items.len(), 6);
+            assert!(fetched.items[..3]
+                .iter()
+                .all(|item| item.guid.starts_with(&expected[0])));
+            assert!(fetched.items[3..]
+                .iter()
+                .all(|item| item.guid.starts_with(&expected[2])));
+            assert_eq!(
+                fetched
+                    .failures
+                    .iter()
+                    .map(|failure| failure.url.as_str())
+                    .collect::<Vec<_>>(),
+                [expected[1].as_str(), expected[3].as_str()]
+            );
+            assert!(fetched.failures[0].error.contains("503"));
+            assert!(fetched.failures[1].error.contains("not an RSS feed"));
+        });
+        let mut held = std::collections::BTreeMap::new();
+        for _ in 0..4 {
+            let (target, respond) = server.request().await;
+            held.insert(target, respond);
+        }
+        assert_eq!(FETCH_SLOTS.available_permits(), 0);
+        for (category, filter) in [("1_0", "0"), ("1_1", "1"), ("1_2", "2"), ("1_3", "0")] {
+            let mut stale = Box::pin(SEARCH_ORIGIN.scope(
+                server.origin.clone(),
+                search("queued-old", category, filter),
+            ));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(stale.as_mut().poll(cx).is_pending())).await
+            );
+            server.assert_idle().await;
+            drop(stale);
+        }
+        let origin = server.origin.clone();
+        jobs.spawn(async move {
+            assert_eq!(
+                SEARCH_ORIGIN
+                    .scope(origin, search("queued-fresh", "1_4", "1"))
+                    .await
+                    .unwrap()
+                    .len(),
+                3
+            );
+        });
+        server.assert_idle().await;
+        assert_eq!(FETCH_SLOTS.available_permits(), 0);
+        for (target, respond) in held.into_iter().rev() {
+            let response = match target.as_str() {
+                "/held-1" => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                "/held-3" => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                _ => closing_response(SAMPLE),
+            };
+            respond.send(response).unwrap();
+        }
+        let (target, respond) = server.request().await;
+        let url = server.origin.join(&target).unwrap();
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "q" && value == "queued-fresh"));
+        respond.send(closing_response(SAMPLE)).unwrap();
+        while let Some(result) = jobs.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(FETCH_SLOTS.available_permits(), 4);
+        server.assert_idle().await;
+        server.finish().await;
     }
 
     #[tokio::test]

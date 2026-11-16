@@ -13,6 +13,7 @@ use image::{
     DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType,
 };
 use reqwest::{Url, blocking::Client, redirect::Policy};
+use tokio::sync::Notify;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SOURCE_SIDE: u32 = 4096;
@@ -60,6 +61,7 @@ pub struct CoverCache {
     workers: usize,
     send: mpsc::SyncSender<Work>,
     recv: mpsc::Receiver<Complete>,
+    completed: Arc<Notify>,
     wanted: VecDeque<CoverTicket>,
     active: HashSet<CoverTicket>,
     visible: HashSet<CoverTicket>,
@@ -69,6 +71,8 @@ pub struct CoverCache {
     total_bytes: usize,
     clock: u64,
     revision: u64,
+    #[cfg(test)]
+    ownership_updates: usize,
 }
 
 impl CoverCache {
@@ -76,10 +80,12 @@ impl CoverCache {
         let workers = workers.clamp(1, 4);
         let (send, work_recv) = mpsc::sync_channel::<Work>(workers * 2);
         let (complete_send, recv) = mpsc::sync_channel::<Complete>(workers * 2);
+        let completed = Arc::new(Notify::new());
         let work_recv = Arc::new(Mutex::new(work_recv));
         for _ in 0..workers {
             let work_recv = work_recv.clone();
             let complete_send = complete_send.clone();
+            let completed = completed.clone();
             thread::spawn(move || {
                 let client = remote_client();
                 loop {
@@ -96,6 +102,7 @@ impl CoverCache {
                     {
                         break;
                     }
+                    completed.notify_one();
                 }
             });
         }
@@ -105,6 +112,7 @@ impl CoverCache {
             workers,
             send,
             recv,
+            completed,
             wanted: VecDeque::new(),
             active: HashSet::new(),
             visible: HashSet::new(),
@@ -114,9 +122,12 @@ impl CoverCache {
             total_bytes: 0,
             clock: 0,
             revision: 0,
+            #[cfg(test)]
+            ownership_updates: 0,
         }
     }
 
+    // Dispatch follows ownership reconciliation or polling so batches prioritize visible work.
     pub fn request(
         &mut self,
         source: CoverSource,
@@ -143,15 +154,15 @@ impl CoverCache {
         if !self.entries.contains_key(&ticket)
             && !self.running.contains(&ticket)
             && !self.wanted.contains(&ticket)
+            && (visible || self.wanted.len() < 128)
         {
-            if visible {
-                self.wanted.push_front(ticket.clone());
-            } else if self.wanted.len() < 128 {
-                self.wanted.push_back(ticket.clone());
-            }
+            self.wanted.push_back(ticket.clone());
         }
-        self.pump();
         ticket
+    }
+
+    pub fn completion_signal(&self) -> Arc<Notify> {
+        self.completed.clone()
     }
 
     pub fn retain_visible(&mut self, tickets: &[CoverTicket]) {
@@ -159,6 +170,10 @@ impl CoverCache {
     }
 
     pub fn retain_active(&mut self, visible: &[CoverTicket], nearby: &[CoverTicket]) {
+        #[cfg(test)]
+        {
+            self.ownership_updates += 1;
+        }
         self.visible = visible
             .iter()
             .filter(|ticket| ticket.revision == self.revision)
@@ -176,12 +191,16 @@ impl CoverCache {
         self.pump();
     }
 
+    #[cfg(test)]
+    pub fn audit_ownership_updates(&self) -> usize {
+        self.ownership_updates
+    }
+
     pub fn poll(&mut self) -> Vec<CoverReady> {
         let mut ready = Vec::new();
         while let Ok(complete) = self.recv.try_recv() {
             self.running.remove(&complete.ticket);
-            if complete.ticket.revision != self.revision || !self.active.contains(&complete.ticket)
-            {
+            if complete.ticket.revision != self.revision {
                 if let Some(image) = complete.image {
                     self.disposed.push(image);
                 }
@@ -199,10 +218,12 @@ impl CoverCache {
                     failed_at: (!available).then(Instant::now),
                 },
             );
-            ready.push(CoverReady {
-                ticket: complete.ticket,
-                available,
-            });
+            if self.active.contains(&complete.ticket) {
+                ready.push(CoverReady {
+                    ticket: complete.ticket,
+                    available,
+                });
+            }
         }
         self.retry_failed_active();
         self.evict();
@@ -236,7 +257,12 @@ impl CoverCache {
 
     fn pump(&mut self) {
         while self.running.len() < self.workers {
-            let Some(ticket) = self.wanted.pop_front() else {
+            let next = self
+                .wanted
+                .iter()
+                .position(|ticket| self.visible.contains(ticket))
+                .unwrap_or(0);
+            let Some(ticket) = self.wanted.remove(next) else {
                 break;
             };
             if self.entries.contains_key(&ticket) || self.running.contains(&ticket) {
@@ -274,9 +300,7 @@ impl CoverCache {
             .collect();
         for ticket in due {
             self.entries.remove(&ticket);
-            if self.visible.contains(&ticket) {
-                self.wanted.push_front(ticket);
-            } else if self.wanted.len() < 128 {
+            if self.visible.contains(&ticket) || self.wanted.len() < 128 {
                 self.wanted.push_back(ticket);
             }
         }
@@ -452,6 +476,193 @@ fn thumbnail(bytes: &[u8], width: u32, height: u32) -> Option<(Arc<RenderImage>,
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgba};
+
+    fn controlled_cache(
+        max_bytes: usize,
+        workers: usize,
+    ) -> (CoverCache, mpsc::Receiver<Work>, mpsc::SyncSender<Complete>) {
+        let (send, work) = mpsc::sync_channel(workers * 2);
+        let (complete, recv) = mpsc::sync_channel(workers * 2);
+        let mut cache = CoverCache::new(max_bytes, workers);
+        cache.send = send;
+        cache.recv = recv;
+        (cache, work, complete)
+    }
+
+    fn request(cache: &mut CoverCache, source: &str, visible: bool) -> CoverTicket {
+        cache.request(CoverSource::Remote(source.into()), 1, 1, 1., visible)
+    }
+
+    fn complete(ticket: &CoverTicket) -> Complete {
+        Complete {
+            ticket: ticket.clone(),
+            image: Some(Arc::new(RenderImage::new(vec![Frame::new(
+                ImageBuffer::from_pixel(1, 1, Rgba([1, 2, 3, 255])),
+            )]))),
+            bytes: 4,
+        }
+    }
+
+    #[test]
+    fn visible_promotion_precedes_prefetch_and_keeps_fifo_order() {
+        let (mut cache, work, completed) = controlled_cache(16, 1);
+        let running = request(&mut cache, "running", true);
+        cache.retain_visible(std::slice::from_ref(&running));
+        assert_eq!(work.try_recv().unwrap().ticket, running);
+        let nearby = request(&mut cache, "nearby", false);
+        let promoted = request(&mut cache, "promoted", false);
+        let visible = request(&mut cache, "visible", true);
+        assert_eq!(request(&mut cache, "promoted", true), promoted);
+        cache.retain_active(
+            &[running.clone(), promoted.clone(), visible.clone()],
+            std::slice::from_ref(&nearby),
+        );
+        completed.send(complete(&running)).unwrap();
+        cache.poll();
+        assert_eq!(work.try_recv().unwrap().ticket, promoted);
+        completed.send(complete(&promoted)).unwrap();
+        cache.poll();
+        assert_eq!(work.try_recv().unwrap().ticket, visible);
+        completed.send(complete(&visible)).unwrap();
+        cache.poll();
+        assert_eq!(work.try_recv().unwrap().ticket, nearby);
+        assert!(work.try_recv().is_err());
+    }
+
+    #[test]
+    fn ownership_batch_discards_departed_work_and_demotes_prefetch() {
+        let (mut cache, work, _) = controlled_cache(16, 2);
+        let departed = request(&mut cache, "departed", true);
+        let demoted = request(&mut cache, "demoted", true);
+        let visible = request(&mut cache, "visible", false);
+        assert!(work.try_recv().is_err());
+        cache.retain_active(
+            std::slice::from_ref(&visible),
+            std::slice::from_ref(&demoted),
+        );
+        assert_eq!(work.try_recv().unwrap().ticket, visible);
+        assert_eq!(work.try_recv().unwrap().ticket, demoted);
+        assert!(!cache.running.contains(&departed));
+        assert!(cache.wanted.is_empty());
+    }
+
+    #[test]
+    fn departed_completion_is_reused_without_pinning_or_redownloading() {
+        let (mut cache, work, completed) = controlled_cache(8, 1);
+        let ticket = request(&mut cache, "returning", true);
+        cache.retain_visible(std::slice::from_ref(&ticket));
+        assert_eq!(work.try_recv().unwrap().ticket, ticket);
+        cache.retain_visible(&[]);
+        let completion = complete(&ticket);
+        let image = completion.image.clone().unwrap();
+        completed.send(completion).unwrap();
+        assert!(cache.poll().is_empty());
+        assert!(cache.active.is_empty());
+        assert_eq!(request(&mut cache, "returning", true), ticket);
+        cache.retain_visible(std::slice::from_ref(&ticket));
+        assert!(Arc::ptr_eq(&cache.image(&ticket).unwrap(), &image));
+        assert!(work.try_recv().is_err());
+        let next = request(&mut cache, "next", true);
+        cache.retain_visible(std::slice::from_ref(&next));
+        assert_eq!(work.try_recv().unwrap().ticket, next);
+        completed.send(complete(&next)).unwrap();
+        cache.poll();
+        cache.retain_visible(&[]);
+        let last = request(&mut cache, "last", true);
+        cache.retain_visible(std::slice::from_ref(&last));
+        assert_eq!(work.try_recv().unwrap().ticket, last);
+        completed.send(complete(&last)).unwrap();
+        cache.poll();
+        assert_eq!(cache.total_bytes, 8);
+        assert!(cache.image(&ticket).is_none());
+        assert!(cache.image(&next).is_some());
+        assert!(cache.image(&last).is_some());
+        assert_eq!(cache.take_disposed().len(), 1);
+    }
+
+    #[test]
+    fn clear_rejects_inflight_images_and_releases_the_worker_for_new_revision() {
+        let (mut cache, work, completed) = controlled_cache(8, 1);
+        let old = request(&mut cache, "same-source", true);
+        cache.retain_visible(std::slice::from_ref(&old));
+        assert_eq!(work.try_recv().unwrap().ticket, old);
+        cache.clear();
+        let current = request(&mut cache, "same-source", true);
+        assert_ne!(old, current);
+        cache.retain_visible(std::slice::from_ref(&current));
+        assert!(work.try_recv().is_err());
+        completed.send(complete(&old)).unwrap();
+        assert!(cache.poll().is_empty());
+        assert_eq!(cache.total_bytes, 0);
+        assert_eq!(cache.take_disposed().len(), 1);
+        assert_eq!(work.try_recv().unwrap().ticket, current);
+        completed.send(complete(&current)).unwrap();
+        let ready = cache.poll();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].ticket, current);
+        assert!(ready[0].available);
+        assert!(cache.image(&old).is_none());
+    }
+
+    #[test]
+    fn invalidation_handles_all_workers_finishing_out_of_order() {
+        let (mut cache, work, completed) = controlled_cache(32, 4);
+        let old: Vec<_> = (0..4)
+            .map(|i| request(&mut cache, &format!("cover-{i}"), true))
+            .collect();
+        cache.retain_visible(&old);
+        for ticket in &old {
+            assert_eq!(&work.try_recv().unwrap().ticket, ticket);
+        }
+        cache.clear();
+        let current: Vec<_> = (0..4)
+            .map(|i| request(&mut cache, &format!("cover-{i}"), true))
+            .collect();
+        cache.retain_visible(&current);
+        assert!(work.try_recv().is_err());
+        for (next, index) in [2, 0, 3, 1].into_iter().enumerate() {
+            completed.send(complete(&old[index])).unwrap();
+            assert!(cache.poll().is_empty());
+            assert_eq!(work.try_recv().unwrap().ticket, current[next]);
+            assert_eq!(cache.total_bytes, 0);
+        }
+        assert_eq!(cache.take_disposed().len(), 4);
+        for index in [3, 1, 0, 2] {
+            completed.send(complete(&current[index])).unwrap();
+        }
+        assert_eq!(cache.poll().len(), 4);
+        assert_eq!(cache.total_bytes, 16);
+        for (old, current) in old.iter().zip(&current) {
+            assert!(cache.image(old).is_none());
+            assert!(cache.image(current).is_some());
+        }
+        assert!(cache.running.is_empty());
+    }
+
+    #[test]
+    fn worker_completion_wakes_a_waiter_without_a_poll_timer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cache = CoverCache::new(8, 1);
+        let completed = cache.completion_signal();
+        let first = request(&mut cache, "invalid-first", true);
+        let next = request(&mut cache, "invalid-next", true);
+        cache.retain_visible(&[first.clone(), next.clone()]);
+        for ticket in [first, next] {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), completed.notified())
+                    .await
+                    .unwrap();
+            });
+            let ready = cache.poll();
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].ticket, ticket);
+            assert!(!ready[0].available);
+        }
+        assert!(cache.running.is_empty());
+    }
 
     #[test]
     fn local_cover_fixtures_require_an_explicit_build_feature() {

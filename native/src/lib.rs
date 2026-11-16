@@ -1,5 +1,6 @@
 pub mod components;
 pub mod contracts;
+pub mod notices;
 pub mod platform;
 pub mod screens;
 pub mod shell;

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = "CateDesu/Kurisu"
@@ -97,10 +98,19 @@ def collect_notices(metadata, supplements=ROOT / "packaging/licenses"):
     return "\n".join(sections)
 
 
-def write_notices(destination, offline):
+def build_target():
+    if sys.platform == "win32":
+        return "x86_64-pc-windows-msvc"
     rustc = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, encoding="utf-8")
     host = next(line.removeprefix("host: ") for line in rustc.stdout.splitlines() if line.startswith("host: "))
-    command = ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", host,
+    if sys.platform == "linux" and host not in ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"):
+        raise ValueError("Linux release packaging requires an x86_64 Linux host")
+    return host
+
+
+def write_notices(destination, offline, target=None):
+    target = target or build_target()
+    command = ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", target,
                "--manifest-path", str(ROOT / "Cargo.toml")]
     if offline:
         command.append("--offline")
@@ -216,18 +226,21 @@ def main(argv=None):
         if args.print_version:
             print(version)
             return 0
-        command = ["cargo", "build", "--locked", "--release", "--manifest-path",
+        target = build_target()
+        notice_dir = ROOT / "target/notice-input" / target
+        notice_dir.mkdir(parents=True, exist_ok=True)
+        write_notices(notice_dir, args.offline, target)
+        command = ["cargo", "build", "--locked", "--release", "--target", target, "--manifest-path",
                    str(ROOT / "Cargo.toml"), "--target-dir", str(ROOT / "target")]
         if args.offline:
             command.append("--offline")
         environment = os.environ.copy()
         environment["KURISU_BUILD_VERSION"] = version
+        environment["KURISU_BUNDLED_NOTICES"] = str(notice_dir / "THIRD_PARTY_NOTICES.txt")
         environment.setdefault("CARGO_BUILD_JOBS", "3")
         binary = ROOT / "target/release" / ("kurisu-native.exe" if sys.platform == "win32" else "kurisu-native")
-        compiled = binary
+        compiled = ROOT / "target" / target / "release" / binary.name
         if sys.platform == "win32":
-            target = "x86_64-pc-windows-msvc"
-            command.extend(["--target", target])
             if "CARGO_ENCODED_RUSTFLAGS" in environment:
                 environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(filter(None, [
                     environment["CARGO_ENCODED_RUSTFLAGS"], "-C", "target-feature=+crt-static",
@@ -236,16 +249,22 @@ def main(argv=None):
                 environment["RUSTFLAGS"] = (
                     environment.get("RUSTFLAGS", "") + " -C target-feature=+crt-static"
                 ).strip()
-            compiled = ROOT / "target" / target / "release/kurisu-native.exe"
         subprocess.run(command, check=True, env=environment)
         if compiled != binary:
             binary.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(compiled, binary)
+            with tempfile.NamedTemporaryFile(dir=binary.parent, prefix=f".{binary.name}-", delete=False) as temporary:
+                staged = Path(temporary.name)
+            try:
+                shutil.copy2(compiled, staged)
+                staged.replace(binary)
+            finally:
+                staged.unlink(missing_ok=True)
         actual = subprocess.run([str(binary), "--version"], check=True, capture_output=True, encoding="utf-8")
         if actual.stdout.strip() != f"kurisu-native {version}":
             raise ValueError("The built executable does not report the requested version")
         write_sidecar(binary)
-        write_notices(binary.parent, args.offline)
+        for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
+            shutil.copyfile(notice_dir / name, binary.parent / name)
         shutil.copyfile(ROOT / "PROFILE_TRANSFER.md", binary.parent / "PROFILE_TRANSFER.md")
         print(binary)
         if args.installer:

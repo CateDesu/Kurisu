@@ -341,8 +341,14 @@ impl Drop for Stage {
 }
 
 pub fn validate_database(path: &Path) -> Result<()> {
+    validate_database_with_scratch(path, path.parent().context("Missing database parent")?)
+}
+
+/// Keep disposable validation files outside a strictly owned publication stage.
+pub fn validate_database_with_scratch(path: &Path, scratch_parent: &Path) -> Result<()> {
     regular_file(path)?;
-    let stage = Stage::new(path.parent().context("Missing database parent")?)?;
+    check_path(scratch_parent)?;
+    let stage = Stage::new(scratch_parent)?;
     let (db, original) = open_snapshot(path, &stage.0)?;
     drop(db);
     ensure!(

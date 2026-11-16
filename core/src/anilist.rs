@@ -19,6 +19,10 @@ const OAUTH_EXCHANGE: &str = "https://kurisu-anilist-exchange.vercel.app/api/exc
 /// Must match the registered OAuth redirect port.
 pub const OAUTH_PORT: u16 = 39417;
 
+pub(crate) fn valid_account_id(id: i64) -> bool {
+    (1..=i64::from(i32::MAX)).contains(&id)
+}
+
 #[cfg(feature = "test-support")]
 fn fixture_graphql_endpoint(value: &str) -> Result<String> {
     Ok(fixture_loopback_http_url(value)?.to_string())
@@ -183,6 +187,18 @@ pub struct SavedEntry {
     pub repeat: i64,
     #[serde(rename = "updatedAt")]
     pub updated_at: Option<i64>,
+}
+
+impl SavedEntry {
+    fn retain_score_in_format(&mut self, score_format: Option<&str>) {
+        self.score = score_in_format(self.score, score_format);
+    }
+}
+
+fn score_in_format(score: Option<f64>, score_format: Option<&str>) -> Option<f64> {
+    // Fresh null means unrated. Local null means the score is unknown.
+    let score = score.unwrap_or(0.0);
+    (score == 0.0 || score_format.is_some()).then_some(score)
 }
 
 /// Clones share the rate budget, including limits reported by failed requests.
@@ -473,6 +489,7 @@ impl AniList {
                 serde_json::json!({}),
             )
             .await?;
+        anyhow::ensure!(valid_account_id(r.viewer.id), "Invalid AniList account ID");
         Ok(User {
             id: r.viewer.id,
             name: r.viewer.name,
@@ -872,7 +889,8 @@ impl AniList {
         })
     }
 
-    pub async fn user_statistics(&self, user_name: &str) -> Result<UserStats> {
+    pub async fn user_statistics(&self, account_id: i64) -> Result<UserStats> {
+        anyhow::ensure!(valid_account_id(account_id), "Invalid AniList account ID");
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "User")]
@@ -880,6 +898,7 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct UserNode {
+            id: i64,
             statistics: Option<Statistics>,
         }
         #[derive(Deserialize)]
@@ -938,8 +957,9 @@ impl AniList {
             release_year: Option<i64>,
             count: i64,
         }
-        let q = "query ($name: String!) {
-            User(name: $name) {
+        let q = "query ($accountId: Int!) {
+            User(id: $accountId) {
+                id
                 statistics {
                     anime {
                         count episodesWatched minutesWatched meanScore standardDeviation
@@ -953,8 +973,12 @@ impl AniList {
             }
         }";
         let r: R = self
-            .gql(q, serde_json::json!({ "name": user_name }))
+            .gql(q, serde_json::json!({ "accountId": account_id }))
             .await?;
+        anyhow::ensure!(
+            r.user.id == account_id,
+            "AniList returned statistics for a different account"
+        );
         let a = r
             .user
             .statistics
@@ -1124,7 +1148,12 @@ impl AniList {
     }
 
     /// Return only a complete list. Sync deletes local entries absent from this result.
-    pub async fn user_list(&self, user_name: &str) -> Result<Vec<ListEntry>> {
+    pub async fn user_list(
+        &self,
+        account_id: i64,
+        score_format: Option<&str>,
+    ) -> Result<Vec<ListEntry>> {
+        anyhow::ensure!(valid_account_id(account_id), "Invalid AniList account ID");
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "MediaListCollection")]
@@ -1133,8 +1162,13 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Collection {
+            user: Owner,
             lists: Option<Vec<AniList>>,
             has_next_chunk: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        struct Owner {
+            id: i64,
         }
         #[derive(Deserialize)]
         struct AniList {
@@ -1153,12 +1187,13 @@ impl AniList {
             media_id: i64,
             media: Option<AniMedia>,
         }
-        let q = "query ($userName: String!, $chunk: Int!) {
-            MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk, perChunk: 500) {
+        let q = "query ($accountId: Int!, $chunk: Int!, $scoreFormat: ScoreFormat) {
+            MediaListCollection(userId: $accountId, type: ANIME, chunk: $chunk, perChunk: 500) {
+                user { id }
                 hasNextChunk
                 lists {
                     entries {
-                        id status progress score repeat updatedAt mediaId
+                        id status progress score(format: $scoreFormat) repeat updatedAt mediaId
                         media {
                             id idMal title { romaji english native }
                             coverImage { medium large }
@@ -1174,9 +1209,13 @@ impl AniList {
             let r: R = self
                 .gql(
                     q,
-                    serde_json::json!({ "userName": user_name, "chunk": chunk }),
+                    serde_json::json!({ "accountId": account_id, "chunk": chunk, "scoreFormat": score_format }),
                 )
                 .await?;
+            anyhow::ensure!(
+                r.collection.user.id == account_id,
+                "AniList returned a list for a different account"
+            );
             let before = out.len();
             let lists = r.collection.lists.ok_or_else(|| {
                 anyhow!("AniList returned null lists, refusing to sync a partial list")
@@ -1195,7 +1234,7 @@ impl AniList {
                         media_id: e.media_id,
                         status: e.status,
                         progress: e.progress,
-                        score: e.score,
+                        score: score_in_format(e.score, score_format),
                         repeat: e.repeat,
                         updated_at: e.updated_at,
                         media: e.media.map(Media::from),
@@ -1221,7 +1260,11 @@ impl AniList {
         ))
     }
 
-    pub async fn entry_by_media_id(&self, media_id: i64) -> Result<Option<SavedEntry>> {
+    pub async fn entry_by_media_id(
+        &self,
+        media_id: i64,
+        score_format: Option<&str>,
+    ) -> Result<Option<SavedEntry>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Media")]
@@ -1232,15 +1275,21 @@ impl AniList {
             #[serde(rename = "mediaListEntry", deserialize_with = "Option::deserialize")]
             entry: Option<SavedEntry>,
         }
-        let q = "query ($mediaId: Int!) {
+        let q = "query ($mediaId: Int!, $scoreFormat: ScoreFormat) {
             Media(id: $mediaId, type: ANIME) {
-                mediaListEntry { id status progress score repeat updatedAt }
+                mediaListEntry { id status progress score(format: $scoreFormat) repeat updatedAt }
             }
         }";
         let r: R = self
-            .gql(q, serde_json::json!({ "mediaId": media_id }))
+            .gql(
+                q,
+                serde_json::json!({ "mediaId": media_id, "scoreFormat": score_format }),
+            )
             .await?;
-        Ok(r.media.entry)
+        Ok(r.media.entry.map(|mut entry| {
+            entry.retain_score_in_format(score_format);
+            entry
+        }))
     }
 
     /// Omitted fields stay unchanged on AniList.
@@ -1251,6 +1300,7 @@ impl AniList {
         progress: Option<i64>,
         score: Option<f64>,
         repeat: Option<i64>,
+        score_format: Option<&str>,
     ) -> Result<SavedEntry> {
         self.save_entry_target(
             serde_json::json!({"mediaId": media_id}),
@@ -1258,6 +1308,7 @@ impl AniList {
             progress,
             score,
             repeat,
+            score_format,
         )
         .await
     }
@@ -1269,6 +1320,7 @@ impl AniList {
         progress: Option<i64>,
         score: Option<f64>,
         repeat: Option<i64>,
+        score_format: Option<&str>,
     ) -> Result<SavedEntry> {
         let entry = self
             .save_entry_target(
@@ -1277,6 +1329,7 @@ impl AniList {
                 progress,
                 score,
                 repeat,
+                score_format,
             )
             .await?;
         if entry.id != entry_id {
@@ -1297,16 +1350,18 @@ impl AniList {
         progress: Option<i64>,
         score: Option<f64>,
         repeat: Option<i64>,
+        score_format: Option<&str>,
     ) -> Result<SavedEntry> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "SaveMediaListEntry")]
             entry: SavedEntry,
         }
-        let q = "mutation ($id: Int, $mediaId: Int, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int) {
-            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score repeat updatedAt }
+        let q = "mutation ($id: Int, $mediaId: Int, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int, $scoreFormat: ScoreFormat) {
+            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score(format: $scoreFormat) repeat updatedAt }
         }";
         let obj = vars.as_object_mut().expect("vars object");
+        obj.insert("scoreFormat".into(), score_format.into());
         if let Some(st) = status {
             obj.insert("status".into(), st.as_str().into());
         }
@@ -1319,7 +1374,8 @@ impl AniList {
         if let Some(r) = repeat {
             obj.insert("repeat".into(), r.into());
         }
-        let r: R = self.gql(q, vars).await?;
+        let mut r: R = self.gql(q, vars).await?;
+        r.entry.retain_score_in_format(score_format);
         Ok(r.entry)
     }
 
@@ -2205,6 +2261,18 @@ pub(crate) async fn mock_api_gated(
     AniList,
     tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
 ) {
+    mock_api_mapped(responses, gate, |_, _| {}).await
+}
+
+#[cfg(test)]
+pub(crate) async fn mock_api_mapped(
+    responses: Vec<(u16, serde_json::Value)>,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    map_response: impl Fn(&serde_json::Value, &mut serde_json::Value) + Send + 'static,
+) -> (
+    AniList,
+    tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2217,7 +2285,7 @@ pub(crate) async fn mock_api_gated(
                 _ = requests.closed(), if response.is_none() => return,
                 accepted = listener.accept() => accepted.unwrap(),
             };
-            let (status, body) = response.unwrap_or_else(|| {
+            let (status, mut body) = response.unwrap_or_else(|| {
                 (400, serde_json::json!({"errors":[{"message":"Unexpected AniList test request","status":400}]}))
             });
             let mut request = Vec::new();
@@ -2253,12 +2321,19 @@ pub(crate) async fn mock_api_gated(
             }
             let request =
                 serde_json::from_slice(&request[body_start..body_start + length]).unwrap();
+            map_response(&request, &mut body);
             let _ = requests.send(request);
             if let Some(gate) = &gate {
-                gate.acquire().await.unwrap().forget();
+                tokio::select! {
+                    permit = gate.acquire() => permit.unwrap().forget(),
+                    _ = requests.closed() => return,
+                }
             }
-            let body = body.to_string();
-            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let (content_type, body) = match body {
+                serde_json::Value::String(raw) => ("text/html", raw),
+                body => ("application/json", body.to_string()),
+            };
+            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.shutdown().await.unwrap();
         }
@@ -2278,6 +2353,16 @@ pub(crate) async fn mock_api_gated(
 mod regression_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_account_ids_do_not_send_identity_queries() {
+        let (api, mut requests) = mock_api(vec![]).await;
+        for id in [-1, 0, i64::from(i32::MAX) + 1, i64::MAX] {
+            assert!(api.user_list(id, None).await.is_err());
+            assert!(api.user_statistics(id).await.is_err());
+        }
+        assert!(requests.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn oauth_exchange_sends_only_the_code_to_the_service() {
@@ -2382,12 +2467,54 @@ mod regression_tests {
             "Media": {"mediaListEntry": {"id": 22, "status": "CURRENT", "progress": 4, "score": 8.5, "repeat": 2}},
             "MediaList": {"id": 999, "status": "COMPLETED", "progress": 12, "score": 10.0, "repeat": 0}
         }}))]).await;
-        let entry = api.entry_by_media_id(1).await.unwrap().unwrap();
+        let entry = api.entry_by_media_id(1, None).await.unwrap().unwrap();
         assert_eq!(entry.id, 22);
         let request = requests.recv().await.unwrap();
         let query = request["query"].as_str().unwrap();
         assert!(query.contains("mediaListEntry"));
         assert!(!query.contains("MediaList(mediaId:"));
+    }
+
+    #[tokio::test]
+    async fn unknown_score_format_drops_only_unscaled_nonzero_scores() {
+        for format in [None, Some("POINT_5")] {
+            for score in [json!(null), json!(0), json!(4)] {
+                let entry =
+                    json!({"id":22,"status":"CURRENT","progress":4,"score":score,"repeat":0});
+                let mut listed = entry.clone();
+                listed["mediaId"] = json!(1);
+                let (api, mut requests) = mock_api(vec![
+                (200, json!({"data":{"Media":{"mediaListEntry":entry}}})),
+                (200, json!({"data":{"SaveMediaListEntry":entry}})),
+                (200, json!({"data":{"MediaListCollection":{"user":{"id":7},"lists":[{"entries":[listed]}],"hasNextChunk":false}}})),
+            ])
+            .await;
+                let expected = Some(score.as_f64().unwrap_or(0.0))
+                    .filter(|score| format.is_some() || *score == 0.0);
+                assert_eq!(
+                    api.entry_by_media_id(1, format)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .score,
+                    expected
+                );
+                assert_eq!(
+                    api.save_entry_by_id(22, None, Some(4), None, None, format)
+                        .await
+                        .unwrap()
+                        .score,
+                    expected
+                );
+                assert_eq!(api.user_list(7, format).await.unwrap()[0].score, expected);
+                for _ in 0..3 {
+                    let request = requests.recv().await.unwrap();
+                    assert_eq!(request["variables"]["scoreFormat"], json!(format));
+                    assert!(request["variables"].get("score").is_none());
+                }
+                assert!(requests.try_recv().is_err());
+            }
+        }
     }
 
     #[tokio::test]
@@ -2397,7 +2524,7 @@ mod regression_tests {
             json!({"data": {"Media": {"mediaListEntry": null}}}),
         )])
         .await;
-        assert!(api.entry_by_media_id(1).await.unwrap().is_none());
+        assert!(api.entry_by_media_id(1, None).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2409,20 +2536,20 @@ mod regression_tests {
         ] {
             let (api, _) = mock_api(vec![(
                 200,
-                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+                json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": lists, "hasNextChunk": false}}}),
             )])
             .await;
-            assert!(api.user_list("Tester").await.is_err());
+            assert!(api.user_list(7, None).await.is_err());
         }
     }
 
     #[tokio::test]
     async fn a_missing_later_chunk_is_not_a_complete_list() {
         let (api, _) = mock_api(vec![
-            (200, json!({"data": {"MediaListCollection": {"lists": [{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "score": 0}]}], "hasNextChunk": true}}})),
-            (200, json!({"data": {"MediaListCollection": {"lists": [], "hasNextChunk": false}}})),
+            (200, json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": [{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "score": 0}]}], "hasNextChunk": true}}})),
+            (200, json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": [], "hasNextChunk": false}}})),
         ]).await;
-        assert!(api.user_list("Tester").await.is_err());
+        assert!(api.user_list(7, None).await.is_err());
     }
 
     #[tokio::test]
@@ -2437,10 +2564,10 @@ mod regression_tests {
         ] {
             let (api, _) = mock_api(vec![(
                 200,
-                json!({"data": {"MediaListCollection": {"lists": lists, "hasNextChunk": false}}}),
+                json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": lists, "hasNextChunk": false}}}),
             )])
             .await;
-            assert_eq!(api.user_list("Tester").await.unwrap().len(), count);
+            assert_eq!(api.user_list(7, None).await.unwrap().len(), count);
         }
     }
 }
@@ -2560,7 +2687,7 @@ mod feature_tests {
                 json!({"errors":[{"status":reported,"message":message}],"data":null}),
             )])
             .await;
-            let error = api.entry_by_media_id(1).await.err().unwrap();
+            let error = api.entry_by_media_id(1, None).await.err().unwrap();
             assert_eq!(is_retryable(&error), retry, "{transport}: {message}");
             assert_eq!(is_auth_rejection(&error), auth, "{transport}: {message}");
             assert_eq!(media_not_found(&error), missing, "{transport}: {message}");
@@ -2572,7 +2699,7 @@ mod feature_tests {
         for status in [401, 404, 502, 503] {
             let (api, _) =
                 mock_api(vec![(status, json!({"message": "Gateway unavailable"}))]).await;
-            let error = api.entry_by_media_id(1).await.err().unwrap();
+            let error = api.entry_by_media_id(1, None).await.err().unwrap();
             assert_eq!(
                 error.downcast_ref::<ApiError>().unwrap().status.as_u16(),
                 status
@@ -2689,9 +2816,13 @@ mod feature_tests {
 
     #[tokio::test]
     async fn statistics_null_is_unavailable_instead_of_an_empty_account() {
-        let (api, _) = mock_api(vec![(200, json!({"data":{"User":{"statistics":null}}}))]).await;
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"User":{"id":7,"statistics":null}}}),
+        )])
+        .await;
         assert!(api
-            .user_statistics("Tester")
+            .user_statistics(7)
             .await
             .unwrap_err()
             .to_string()
@@ -2745,10 +2876,10 @@ mod feature_tests {
             }
             let (api, _) = mock_api(vec![(
                 200,
-                json!({"data":{"User":{"statistics":{"anime":anime}}}}),
+                json!({"data":{"User":{"id":7,"statistics":{"anime":anime}}}}),
             )])
             .await;
-            let found = api.user_statistics("Tester").await.unwrap();
+            let found = api.user_statistics(7).await.unwrap();
             assert_eq!(found.count, 0);
             assert_eq!(found.episodes_watched, 0);
             assert!(found.scores.is_empty());
@@ -2785,10 +2916,12 @@ mod feature_tests {
                         "airingAt":1000,"episode":1,"media":airing
                     }]}})
                 }
-                "list" => json!({"MediaListCollection":{"hasNextChunk":false,"lists":[{"entries":[{
-                    "id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,
-                    "repeat":0,"updatedAt":null,"media":media
-                }]}]}}),
+                "list" => {
+                    json!({"MediaListCollection":{"user":{"id":7},"hasNextChunk":false,"lists":[{"entries":[{
+                        "id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,
+                        "repeat":0,"updatedAt":null,"media":media
+                    }]}]}})
+                }
                 "relations" => {
                     let mut parent = mock_media(2);
                     let mut relation = media.clone();
@@ -2805,7 +2938,7 @@ mod feature_tests {
                 "season" => api.season_all("WINTER", 2026).await.map(|_| ()),
                 "recommendations" => api.recommendations(1).await.map(|_| ()),
                 "calendar" => api.airing_schedule(1, 2000).await.map(|_| ()),
-                "list" => api.user_list("Tester").await.map(|_| ()),
+                "list" => api.user_list(7, None).await.map(|_| ()),
                 "relations" => api.media_detail(2).await.map(|_| ()),
                 _ => unreachable!(),
             };

@@ -9,7 +9,40 @@ use icu_collator::{
     preferences::CollationNumericOrdering,
 };
 use icu_locale_core::Locale;
-use kurisu_core::models::{EntryDetails, FuzzyDate, ListEntry, Media, MediaDetail};
+use kurisu_core::models::{EntryDetails, FuzzyDate, LibraryFile, ListEntry, Media, MediaDetail};
+
+#[derive(Default)]
+pub(super) struct LibraryFiles {
+    files: Vec<LibraryFile>,
+    episodes: HashMap<(i64, i64), usize>,
+}
+
+impl LibraryFiles {
+    pub(super) fn replace(&mut self, files: Vec<LibraryFile>) {
+        self.episodes.clear();
+        for (index, file) in files.iter().enumerate() {
+            if let Some(key) = file.media_id.zip(file.episode) {
+                self.episodes.entry(key).or_insert(index);
+            }
+        }
+        self.files = files;
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.files.clear();
+        self.episodes.clear();
+    }
+
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, LibraryFile> {
+        self.files.iter()
+    }
+
+    pub(super) fn episode(&self, media_id: i64, episode: i64) -> Option<&LibraryFile> {
+        self.episodes
+            .get(&(media_id, episode))
+            .map(|&index| &self.files[index])
+    }
+}
 
 pub const STATUSES: [&str; 6] = [
     "CURRENT",
@@ -157,6 +190,13 @@ impl ListState {
         self.error.clear();
         self.step_error.clear();
         self.next_airing_boundary = None;
+        self.revision += 1;
+    }
+
+    pub fn clear_scores(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.score = None;
+        }
         self.revision += 1;
     }
 
@@ -826,9 +866,14 @@ pub struct EditorState {
     pub status: String,
     pub progress: i64,
     pub score: Option<f64>,
+    pub displayed_format: Option<String>,
+    score_format_revision: u64,
+    pub score_cleared: bool,
     pub repeat: i64,
     status_before_completion: Option<String>,
     status_chosen: bool,
+    completion_pending: bool,
+    progress_edited: bool,
     pub details: Option<EntryDetails>,
     pub notes: String,
     pub started_at: FuzzyDate,
@@ -836,6 +881,7 @@ pub struct EditorState {
     pub custom_lists: Vec<String>,
     pub busy: bool,
     pub confirming_delete: bool,
+    pub review_progress: Option<i64>,
     pub error: String,
 }
 
@@ -847,10 +893,15 @@ impl EditorState {
             status: entry.status.clone(),
             progress: entry.progress,
             score: entry.score,
+            displayed_format: None,
+            score_format_revision: 0,
+            score_cleared: false,
             repeat: entry.repeat,
             snapshot: entry,
             status_before_completion: None,
             status_chosen: false,
+            completion_pending: false,
+            progress_edited: false,
             details: None,
             notes: String::new(),
             started_at: FuzzyDate::default(),
@@ -858,6 +909,7 @@ impl EditorState {
             custom_lists: Vec::new(),
             busy: false,
             confirming_delete: false,
+            review_progress: None,
             error: String::new(),
         }
     }
@@ -873,14 +925,24 @@ impl EditorState {
         self.status = status.into();
         self.status_chosen = true;
         self.status_before_completion = None;
+        self.completion_pending = false;
         if status == "COMPLETED"
             && let Some(total) = self.total()
         {
             self.progress = total;
+            self.completion_pending = true;
         }
     }
 
+    pub fn edit_progress(&mut self, progress: i64) {
+        self.progress_edited = true;
+        self.set_progress(progress);
+    }
+
     pub fn set_progress(&mut self, progress: i64) {
+        if self.progress == progress {
+            return;
+        }
         self.progress = progress;
         if self.status_chosen {
             return;
@@ -910,18 +972,57 @@ impl EditorState {
         self.details = Some(details);
     }
 
+    pub fn accept_details(&mut self, submitted: &Self, details: EntryDetails) {
+        if self.notes == submitted.notes {
+            self.notes = details.notes.clone();
+        }
+        accept_date(
+            &mut self.started_at,
+            &submitted.started_at,
+            details.started_at.as_ref(),
+        );
+        accept_date(
+            &mut self.completed_at,
+            &submitted.completed_at,
+            details.completed_at.as_ref(),
+        );
+        if self.custom_lists == submitted.custom_lists {
+            self.custom_lists = details.custom_lists.clone();
+        }
+        self.details = Some(details);
+    }
+
+    pub fn score_available(&self) -> bool {
+        matches!(
+            self.displayed_format.as_deref(),
+            Some("POINT_100" | "POINT_10_DECIMAL" | "POINT_10" | "POINT_5" | "POINT_3")
+        )
+    }
+
+    pub fn review_progress(&mut self) {
+        if let Some(current) = self.review_progress.take() {
+            if self.progress == self.snapshot.progress
+                && !self.progress_edited
+                && !self.completion_pending
+            {
+                self.progress = current;
+            }
+            self.snapshot.progress = current;
+            self.error = "Progress refreshed. Review your draft before saving.".into();
+        }
+    }
+
     pub fn basic_patch(&self, score_available: bool) -> EntryPatch {
-        let progress_touched =
-            self.progress != self.snapshot.progress || self.status_before_completion.is_some();
+        let progress_touched = self.progress != self.snapshot.progress
+            || self.status_before_completion.is_some()
+            || self.completion_pending;
         EntryPatch {
             status: (self.status_before_completion.is_none()
                 && (self.status != self.snapshot.status || self.status_chosen && progress_touched))
                 .then(|| self.status.clone()),
-            progress: progress_touched.then(|| {
-                self.progress
-                    .clamp(0, self.total().unwrap_or(i64::MAX).max(0))
-            }),
-            score: (score_available && self.score != self.snapshot.score)
+            // Core distinguishes exact completion from overshoot before clamping.
+            progress: progress_touched.then_some(self.progress),
+            score: (score_available && (self.score_cleared || self.score != self.snapshot.score))
                 .then_some(self.score.unwrap_or(0.0)),
             repeat: (self.repeat != self.snapshot.repeat).then_some(self.repeat.max(0)),
         }
@@ -937,6 +1038,8 @@ impl EditorState {
 
     pub fn accept_progress(&mut self, entry: &ListEntry) {
         self.snapshot.progress = entry.progress;
+        self.completion_pending = false;
+        self.progress_edited = false;
     }
 
     pub fn details_patch(&self) -> DetailsPatch {
@@ -957,10 +1060,65 @@ impl EditorState {
         }
     }
 
-    pub fn accept_basic(&mut self, entry: ListEntry) {
+    pub fn refresh_score_format(&mut self, format: Option<String>) -> bool {
+        if self.displayed_format == format {
+            return false;
+        }
+        self.displayed_format = format;
+        self.score_format_revision = self.score_format_revision.wrapping_add(1);
+        self.score = None;
+        self.snapshot.score = None;
+        self.score_cleared = false;
+        self.error = "Score format changed. Re-enter the score before saving.".into();
+        true
+    }
+
+    pub fn score_format_matches(&self, submitted: &Self) -> bool {
+        self.score_format_revision == submitted.score_format_revision
+            && self.displayed_format == submitted.displayed_format
+    }
+
+    pub fn accept_basic(&mut self, submitted: &Self, mut entry: ListEntry) {
+        if self.status == submitted.status
+            && self.status_chosen == submitted.status_chosen
+            && self.status_before_completion == submitted.status_before_completion
+        {
+            self.status = entry.status.clone();
+            self.status_before_completion = None;
+            self.status_chosen = false;
+        }
+        if self.progress == submitted.progress
+            && self.completion_pending == submitted.completion_pending
+            && self.progress_edited == submitted.progress_edited
+        {
+            self.progress = entry.progress;
+            self.completion_pending = false;
+            self.progress_edited = false;
+        }
+        if !self.score_format_matches(submitted) {
+            // A format refresh invalidates both the draft score and its baseline.
+            entry.score = self.snapshot.score;
+        } else if self.score == submitted.score && self.score_cleared == submitted.score_cleared {
+            self.score = entry.score;
+            self.score_cleared = false;
+        }
+        if self.repeat == submitted.repeat {
+            self.repeat = entry.repeat;
+        }
         self.snapshot = entry;
-        self.status_before_completion = None;
-        self.status_chosen = false;
+    }
+}
+
+fn accept_date(current: &mut FuzzyDate, submitted: &FuzzyDate, accepted: Option<&FuzzyDate>) {
+    let accepted = accepted.cloned().unwrap_or_default();
+    if current.year == submitted.year {
+        current.year = accepted.year;
+    }
+    if current.month == submitted.month {
+        current.month = accepted.month;
+    }
+    if current.day == submitted.day {
+        current.day = accepted.day;
     }
 }
 
@@ -1080,6 +1238,75 @@ impl DetailState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn library_episode_index_matches_first_file_in_scan_order() {
+        let files: Vec<_> = (0..25_000)
+            .map(|index| LibraryFile {
+                path: format!("/synthetic/{index}.mkv"),
+                media_id: (index % 7 != 0).then_some(index % 101 - 1),
+                episode: (index % 11 != 0).then_some(index % 23 - 1),
+                ..Default::default()
+            })
+            .collect();
+        let mut library = LibraryFiles::default();
+        library.replace(files.clone());
+        for media_id in -1..=101 {
+            for episode in -1..=23 {
+                let expected = files
+                    .iter()
+                    .find(|file| file.media_id == Some(media_id) && file.episode == Some(episode));
+                assert_eq!(
+                    library.episode(media_id, episode).map(|file| &file.path),
+                    expected.map(|file| &file.path),
+                    "media {media_id}, episode {episode}"
+                );
+            }
+        }
+        assert_eq!(
+            library.iter().map(|file| &file.path).collect::<Vec<_>>(),
+            files.iter().map(|file| &file.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn library_episode_index_tracks_replacements_and_clear() {
+        let file = |path: &str, media_id, episode| LibraryFile {
+            path: path.into(),
+            media_id,
+            episode,
+            ..Default::default()
+        };
+        let mut library = LibraryFiles::default();
+        assert!(library.episode(7, 2).is_none());
+        let first = file("first.mkv", Some(7), Some(2));
+        let second = file("second.mkv", Some(7), Some(2));
+        library.replace(vec![first.clone(), second.clone()]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "first.mkv");
+        library.replace(vec![second.clone(), first]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "second.mkv");
+        library.replace(vec![second]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "second.mkv");
+        library.replace(vec![file("renamed.mkv", Some(7), Some(2))]);
+        assert_eq!(library.episode(7, 2).unwrap().path, "renamed.mkv");
+        library.replace(vec![file("renamed.mkv", Some(8), Some(2))]);
+        assert!(library.episode(7, 2).is_none());
+        assert!(library.episode(8, 2).is_some());
+        library.replace(vec![file("renamed.mkv", Some(8), Some(1))]);
+        assert!(library.episode(8, 2).is_none());
+        assert!(library.episode(8, 1).is_some());
+        library.replace(vec![file("renamed.mkv", None, Some(1))]);
+        assert!(library.episode(8, 1).is_none());
+        library.replace(vec![file("renamed.mkv", Some(8), None)]);
+        assert!(library.episode(8, 1).is_none());
+        library.replace(Vec::new());
+        assert_eq!(library.iter().len(), 0);
+        assert!(library.episode(8, 1).is_none());
+        library.replace(vec![file("fresh.mkv", Some(8), Some(1))]);
+        library.clear();
+        assert_eq!(library.iter().len(), 0);
+        assert!(library.episode(8, 1).is_none());
+    }
+
     fn assert_full_rebuild_equivalent(list: &ListState, now: i64) {
         let mut reference = ListState::new();
         reference.entries = list.entries.clone();
@@ -1115,6 +1342,23 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn list_titles_and_sorting_fall_back_past_blank_translations() {
+        let mut translated = entry(1, " \t\u{3000}", "CURRENT", 0, None);
+        translated.media.as_mut().unwrap().title_romaji = Some("Zebra".into());
+        let restored: ListEntry =
+            serde_json::from_str(&serde_json::to_string(&translated).unwrap()).unwrap();
+        assert_eq!(title_key(&restored), "Zebra");
+        let mut list = ListState::new();
+        list.replace(vec![restored, entry(2, "Alpha", "CURRENT", 0, None)], 0);
+        assert_eq!(list.visible(), &[2, 1]);
+        translated.media.as_mut().unwrap().title_romaji = Some("\n".into());
+        translated.media.as_mut().unwrap().title_native = Some("原題".into());
+        assert_eq!(title_key(&translated), "原題");
+        translated.media.as_mut().unwrap().title_native = None;
+        assert_eq!(title_key(&translated), "#1");
     }
 
     #[test]
@@ -1297,12 +1541,14 @@ mod tests {
 
     #[test]
     fn completion_dropdown_sets_known_total_immediately() {
-        let mut editor = EditorState::new(entry(4, "A", "CURRENT", 3, Some(12)));
-        editor.choose_status("COMPLETED");
-        assert_eq!(editor.progress, 12);
-        let patch = editor.basic_patch(true);
-        assert_eq!(patch.status.as_deref(), Some("COMPLETED"));
-        assert_eq!(patch.progress, Some(12));
+        for (status, progress) in [("CURRENT", 3), ("COMPLETED", 12)] {
+            let mut editor = EditorState::new(entry(4, "A", status, progress, Some(12)));
+            editor.choose_status("COMPLETED");
+            assert_eq!(editor.progress, 12);
+            let patch = editor.basic_patch(true);
+            assert_eq!(patch.status.as_deref(), Some("COMPLETED"));
+            assert_eq!(patch.progress, Some(12));
+        }
     }
 
     #[test]
@@ -1333,6 +1579,59 @@ mod tests {
         let remaining = editor.basic_patch(true);
         assert_eq!(remaining.progress, None);
         assert_eq!(remaining.status.as_deref(), Some("COMPLETED"));
+    }
+
+    #[test]
+    fn progress_review_keeps_explicit_progress_completion_and_saved_details() {
+        for (status, progress) in [("CURRENT", 3), ("COMPLETED", 12)] {
+            let mut editor = EditorState::new(entry(4, "A", status, progress, Some(12)));
+            editor.apply_details(EntryDetails {
+                notes: "saved note".into(),
+                ..Default::default()
+            });
+            editor.choose_status("COMPLETED");
+            editor.score = Some(80.0);
+            for current in [6, 12, 1] {
+                editor.review_progress = Some(current);
+                editor.review_progress();
+                assert_eq!(editor.saved_progress(), current);
+                assert_eq!(editor.progress, 12);
+                let patch = editor.basic_patch(true);
+                assert_eq!(patch.status.as_deref(), Some("COMPLETED"));
+                assert_eq!(patch.progress, Some(12));
+                assert_eq!(patch.score, Some(80.0));
+                assert!(editor.details_patch().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn progress_review_retains_explicit_progress_until_saved() {
+        for accept_all in [false, true] {
+            let original = entry(4, "A", "CURRENT", 5, Some(12));
+            let mut editor = EditorState::new(original.clone());
+            editor.edit_progress(8);
+            editor.edit_progress(5);
+            for current in [6, 5, 7] {
+                editor.review_progress = Some(current);
+                editor.review_progress();
+                assert_eq!(editor.saved_progress(), current);
+                assert_eq!(editor.progress, 5);
+                assert_eq!(
+                    editor.basic_patch(true).progress,
+                    (current != 5).then_some(5)
+                );
+            }
+            if accept_all {
+                editor.accept_basic(&editor.clone(), original);
+            } else {
+                editor.accept_progress(&original);
+            }
+            editor.review_progress = Some(9);
+            editor.review_progress();
+            assert_eq!(editor.progress, 9);
+            assert!(editor.basic_patch(true).is_empty());
+        }
     }
 
     #[test]
@@ -1703,5 +2002,78 @@ mod tests {
         assert!(!registry.resolve_review(9, 4, None, true));
         assert!(registry.resolve_review(9, 4, None, false));
         assert!(registry.edit(9, 4).is_none());
+    }
+    #[test]
+    fn format_change_ack_preserves_invalidated_score() {
+        for score in [None, Some(80.0)] {
+            for round_trip in [false, true] {
+                let mut editor = EditorState::new(entry(4, "A", "CURRENT", 3, Some(12)));
+                editor.displayed_format = Some("POINT_100".into());
+                editor.score = score;
+                let submitted = editor.clone();
+                editor.refresh_score_format(Some("POINT_5".into()));
+                if round_trip {
+                    editor.refresh_score_format(Some("POINT_100".into()));
+                }
+                editor.repeat = 7;
+                let accepted = ListEntry {
+                    score: Some(80.0),
+                    repeat: 3,
+                    progress: 5,
+                    ..submitted.snapshot.clone()
+                };
+                editor.accept_basic(&submitted, accepted);
+                assert_eq!(editor.score, None);
+                assert_eq!(editor.basic_patch(true).score, None);
+                assert_eq!(editor.progress, 5);
+                assert_eq!(editor.basic_patch(true).progress, None);
+                assert_eq!(editor.basic_patch(true).repeat, Some(7));
+                editor.score_cleared = true;
+                assert_eq!(editor.basic_patch(true).score, Some(0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn format_change_ack_preserves_newer_score_baseline() {
+        let mut editor = EditorState::new(entry(4, "A", "CURRENT", 3, Some(12)));
+        editor.displayed_format = Some("POINT_100".into());
+        editor.score = Some(80.0);
+        let old = editor.clone();
+        editor.refresh_score_format(Some("POINT_5".into()));
+        editor.score = Some(4.0);
+        let new = editor.clone();
+        editor.accept_basic(
+            &new,
+            ListEntry {
+                score: Some(4.0),
+                ..new.snapshot.clone()
+            },
+        );
+        editor.accept_basic(
+            &old,
+            ListEntry {
+                score: Some(80.0),
+                ..old.snapshot.clone()
+            },
+        );
+        assert_eq!(editor.score, Some(4.0));
+        assert_eq!(editor.basic_patch(true).score, None);
+    }
+
+    #[test]
+    fn format_refresh_and_explicit_clear_preserve_other_editor_intent() {
+        let mut editor = EditorState::new(ListEntry {
+            score: Some(80.0),
+            ..Default::default()
+        });
+        editor.displayed_format = Some("POINT_100".into());
+        editor.progress = 5;
+        assert!(editor.refresh_score_format(Some("POINT_5".into())));
+        assert_eq!(editor.score, None);
+        assert_eq!(editor.basic_patch(true).score, None);
+        editor.score_cleared = true;
+        assert_eq!(editor.basic_patch(true).score, Some(0.0));
+        assert_eq!(editor.basic_patch(true).progress, Some(5));
     }
 }

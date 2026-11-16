@@ -27,6 +27,7 @@ icu_locale_core = "=2.4.0"
 sys-locale = "=0.3.2"
 open = "5"
 log = "0.4"
+same-file = "1.0.6"
 env_logger = "0.11"
 tray-icon = { version = "=0.25.1", default-features = false, features = ["ksni"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "system-proxy"] }

@@ -23,13 +23,12 @@ use crate::{
     components::{
         button, dialog, eyebrow, heading,
         input::{TextInput, TextInputEvent},
-        scrollbar::list_scrollbar,
+        scrollbar::{list_scrollbar, replace_list_rows},
     },
     contracts::Route,
     theme::{ACCENT, BASE, DIM, EDGE, ERROR, INK, PANEL, PANEL_2, mono_font},
 };
 
-#[derive(Clone)]
 struct Group {
     media_id: i64,
     title: String,
@@ -37,7 +36,6 @@ struct Group {
     files: Vec<LibraryFile>,
     bound: bool,
 }
-#[derive(Clone)]
 enum LibraryRow {
     Group(Box<Group>),
     File(LibraryFile, i64, i64, String),
@@ -85,6 +83,19 @@ pub(super) struct LibraryDraft {
     query: String,
     offset: String,
 }
+
+struct BindingCandidate {
+    media_id: i64,
+    label: gpui::SharedString,
+    text: gpui::SharedString,
+}
+
+struct BindingCandidates {
+    query: String,
+    total: usize,
+    rows: Vec<BindingCandidate>,
+}
+
 impl BindDialog {
     fn folder(&self) -> String {
         Path::new(&self.path)
@@ -137,6 +148,7 @@ pub(super) struct LibraryState {
     pending_draft: Option<LibraryDraft>,
     bind_request: u64,
     link_query: Option<Entity<TextInput>>,
+    binding_candidates: Option<Arc<BindingCandidates>>,
     link_cover_query: String,
     offset: Option<Entity<TextInput>>,
     subscriptions: Vec<Subscription>,
@@ -182,6 +194,7 @@ impl Default for LibraryState {
             pending_draft: None,
             bind_request: 0,
             link_query: None,
+            binding_candidates: None,
             link_cover_query: String::new(),
             offset: None,
             subscriptions: Vec::new(),
@@ -200,6 +213,45 @@ impl Default for LibraryState {
 }
 
 impl LibraryState {
+    fn replace_entries(&mut self, entries: Vec<ListEntry>) {
+        self.entries = entries;
+        self.binding_candidates = None;
+        self.entries_loaded = true;
+        self.list_error.clear();
+    }
+
+    fn prepare_binding_candidates(&mut self, query: &str) {
+        if self
+            .binding_candidates
+            .as_ref()
+            .is_some_and(|candidates| candidates.query == query)
+        {
+            return;
+        }
+        let candidates = link_candidates(&self.entries, query);
+        self.binding_candidates = Some(Arc::new(BindingCandidates {
+            query: query.to_owned(),
+            total: candidates.len(),
+            rows: candidates
+                .into_iter()
+                .take(100)
+                .map(|entry| {
+                    let title = entry
+                        .media
+                        .as_ref()
+                        .map(|media| media.display_title())
+                        .unwrap_or_else(|| format!("#{}", entry.media_id));
+                    BindingCandidate {
+                        media_id: entry.media_id,
+                        label: format!("Link {title}").into(),
+                        text: format!("{title} · {}", super::state::status_label(&entry.status))
+                            .into(),
+                    }
+                })
+                .collect(),
+        }));
+    }
+
     fn scan_due(&self, list_revision: u64, now: Instant) -> bool {
         !self.scan_loaded
             || self.list_revision != list_revision
@@ -430,32 +482,19 @@ impl Workspace {
     }
 
     fn rebuild_library_rows(&mut self) {
-        let old = self.library_screen.list_widget.logical_scroll_top();
-        let anchor = self
-            .library_screen
-            .rows
-            .get(old.item_ix)
-            .map(LibraryRow::key);
-        self.library_screen.rows = Arc::new(group_library_rows(
+        let rows = group_library_rows(
             &self.library_screen.files,
             &self.library_screen.entries,
             &self.library_screen.expanded,
-        ));
-        self.library_screen
-            .list_widget
-            .reset_with_uniform_height(self.library_screen.rows.len(), px(68.));
-        if let Some(key) = anchor
-            && let Some(index) = self
-                .library_screen
-                .rows
-                .iter()
-                .position(|row| row.key() == key)
-        {
-            self.library_screen.list_widget.scroll_to(ListOffset {
-                item_ix: index,
-                offset_in_item: old.offset_in_item,
-            });
-        }
+        );
+        replace_list_rows(
+            &self.library_screen.list_widget,
+            &self.library_screen.rows,
+            &rows,
+            px(68.),
+            LibraryRow::key,
+        );
+        self.library_screen.rows = Arc::new(rows);
         self.refresh_library_covers();
     }
 
@@ -527,16 +566,14 @@ impl Workspace {
                         }
                         match entries {
                             Ok(entries) => {
-                                this.library_screen.entries = entries;
-                                this.library_screen.entries_loaded = true;
-                                this.library_screen.list_error.clear();
+                                this.library_screen.replace_entries(entries);
                             }
                             Err(error) => this.library_screen.list_error = error,
                         }
                         match scan {
                             Ok(scan) => {
                                 this.library_screen.files = scan.files.clone();
-                                this.library_files = scan.files;
+                                this.library_files.replace(scan.files);
                                 this.library_screen.unreadable = scan.unreadable;
                                 this.library_screen.scan_loaded = true;
                                 this.library_screen.list_revision = list_revision;
@@ -1330,43 +1367,33 @@ impl Workspace {
                         list(
                             self.library_screen.list_widget.clone(),
                             move |index, _, app| {
-                                let data = weak.update(app, |this, _| {
-                                    this.library_screen.rows.get(index).cloned().map(|row| {
-                                        let cover = match &row {
-                                            LibraryRow::Group(group) => this
-                                                .cover_images
-                                                .get(&(group.media_id, 46, 63))
-                                                .cloned(),
-                                            _ => None,
-                                        };
-                                        let expanded = match &row {
-                                            LibraryRow::Group(group) => this
-                                                .library_screen
-                                                .expanded
-                                                .contains(&group.media_id),
-                                            _ => false,
-                                        };
-                                        (
-                                            row,
-                                            cover,
-                                            expanded,
-                                            this.generation,
-                                            this.profile.as_ref().map(|user| user.id),
-                                        )
-                                    })
-                                });
-                                let Ok(Some((row, cover, expanded, generation, account))) = data
-                                else {
-                                    return div().into_any();
-                                };
-                                render_library_row(
-                                    row,
-                                    cover,
-                                    expanded,
-                                    weak.clone(),
-                                    generation,
-                                    account,
-                                )
+                                weak.read_with(app, |this, _| {
+                                    let Some(row) = this.library_screen.rows.get(index) else {
+                                        return div().into_any();
+                                    };
+                                    let cover = match row {
+                                        LibraryRow::Group(group) => this
+                                            .cover_images
+                                            .get(&(group.media_id, 46, 63))
+                                            .cloned(),
+                                        _ => None,
+                                    };
+                                    let expanded = match row {
+                                        LibraryRow::Group(group) => {
+                                            this.library_screen.expanded.contains(&group.media_id)
+                                        }
+                                        _ => false,
+                                    };
+                                    render_library_row(
+                                        row,
+                                        cover,
+                                        expanded,
+                                        weak.clone(),
+                                        this.generation,
+                                        this.profile.as_ref().map(|user| user.id),
+                                    )
+                                })
+                                .unwrap_or_else(|_| div().into_any())
                             },
                         )
                         .flex_1(),
@@ -1606,6 +1633,20 @@ impl Workspace {
     }
 
     fn render_library_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self
+            .library_screen
+            .bind
+            .as_ref()
+            .is_some_and(|bind| bind.mode == BindMode::Link)
+        {
+            let query = self
+                .library_screen
+                .link_query
+                .as_ref()
+                .map(|input| input.read(cx).value().trim().to_lowercase())
+                .unwrap_or_default();
+            self.library_screen.prepare_binding_candidates(&query);
+        }
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         if let Some(path) = self.library_screen.remove_folder.clone() {
@@ -1806,17 +1847,11 @@ impl Workspace {
                         .child(query.clone()),
                 );
             }
-            let search = self
-                .library_screen
-                .link_query
-                .as_ref()
-                .map(|input| input.read(cx).value().trim().to_lowercase())
-                .unwrap_or_default();
-            let candidates = link_candidates(&self.library_screen.entries, &search);
-            if candidates.is_empty() {
+            let candidates = self.library_screen.binding_candidates.as_ref().unwrap();
+            if candidates.total == 0 {
                 body = body.child(div().text_color(rgb(DIM)).child("No matches on your list."));
             }
-            if candidates.len() > 100 {
+            if candidates.total > 100 {
                 body = body.child(
                     div()
                         .text_color(rgb(DIM))
@@ -1830,13 +1865,8 @@ impl Workspace {
                 .overflow_y_scroll()
                 .flex()
                 .flex_col();
-            for entry in candidates.into_iter().take(100) {
-                let id = entry.media_id;
-                let label = entry
-                    .media
-                    .as_ref()
-                    .map(|media| media.display_title())
-                    .unwrap_or_else(|| format!("#{id}"));
+            for candidate in &candidates.rows {
+                let id = candidate.media_id;
                 let image = self.cover_images.get(&(id, 32, 44)).cloned();
                 let cover = if let Some(image) = image {
                     img(image)
@@ -1854,16 +1884,19 @@ impl Workspace {
                         busy || !bind.checked
                             || bind.current.is_some_and(|current| current.media_id == id),
                     )
-                    .aria_label(format!("Link {label}"))
+                    .aria_label(candidate.label.clone())
                     .w_full()
                     .flex()
                     .items_center()
                     .gap(px(8.))
                     .child(cover)
-                    .child(div().flex_1().min_w_0().whitespace_normal().child(format!(
-                        "{label} · {}",
-                        super::state::status_label(&entry.status)
-                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(candidate.text.clone()),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if scope_matches(this, generation, account) {
                             this.save_library_bind(id, window, cx);
@@ -1918,7 +1951,7 @@ fn link_candidates<'a>(entries: &'a [ListEntry], query: &str) -> Vec<&'a ListEnt
                 })
         })
         .collect();
-    candidates.sort_by_key(|entry| {
+    candidates.sort_by_cached_key(|entry| {
         (
             status_order(&entry.status),
             entry
@@ -2082,7 +2115,7 @@ fn open_file(
     cx.notify();
 }
 fn render_library_row(
-    row: LibraryRow,
+    row: &LibraryRow,
     image: Option<Arc<RenderImage>>,
     expanded: bool,
     weak: WeakEntity<Workspace>,
@@ -2097,7 +2130,7 @@ fn render_library_row(
                 .as_ref()
                 .and_then(|entry| entry.media.as_ref())
                 .map(|media| media.display_title())
-                .unwrap_or(group.title.clone());
+                .unwrap_or_else(|| group.title.clone());
             let progress = group.entry.as_ref().map(|entry| entry.progress);
             let total = group
                 .entry
@@ -2107,8 +2140,7 @@ fn render_library_row(
             let next = group
                 .files
                 .iter()
-                .find(|file| file.episode == Some(progress.unwrap_or(0) + 1))
-                .cloned();
+                .find(|file| file.episode == Some(progress.unwrap_or(0) + 1));
             let weak_toggle = weak.clone();
             let weak_detail = weak.clone();
             let weak_unlink = weak.clone();
@@ -2127,6 +2159,11 @@ fn render_library_row(
                         if expanded { "▾" } else { "▸" },
                         false,
                     )
+                    .aria_label(format!(
+                        "{} files for {title}",
+                        if expanded { "Collapse" } else { "Expand" }
+                    ))
+                    .aria_expanded(expanded)
                     .on_click(move |_, _, app| {
                         let _ = weak_toggle.update(app, |this, cx| {
                             if !scope_matches(this, generation, account) {
@@ -2186,7 +2223,7 @@ fn render_library_row(
                 );
             }
             if let Some(file) = next {
-                let path = file.path;
+                let path = file.path.clone();
                 let episode = file.episode.unwrap_or(0);
                 let movie = group
                     .entry
@@ -2215,6 +2252,8 @@ fn render_library_row(
             line.into_any()
         }
         LibraryRow::File(file, id, progress, title) => {
+            let id = *id;
+            let progress = *progress;
             let path = file.path.clone();
             let weak_play = weak.clone();
             let weak_reveal = weak.clone();
@@ -2261,6 +2300,7 @@ fn render_library_row(
                 );
             if progress >= 0 {
                 let path = file.path.clone();
+                let title = title.clone();
                 line = line.child(
                     button(
                         format!("library-file-number-{}", file.path),
@@ -2376,6 +2416,118 @@ fn render_library_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_candidates_cache_order_limit_and_alias_search() {
+        let mut state = LibraryState::default();
+        state.replace_entries(
+            (1..=101)
+                .map(|id| ListEntry {
+                    media_id: id,
+                    status: if id == 101 { "CURRENT" } else { "PLANNING" }.into(),
+                    media: Some(kurisu_core::models::Media {
+                        id,
+                        title_english: Some(format!("Show {id:03}")),
+                        title_romaji: (id == 100).then(|| "Different alias".into()),
+                        title_native: (id == 100).then(|| "別名".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        state.prepare_binding_candidates("");
+        let first = Arc::clone(state.binding_candidates.as_ref().unwrap());
+        assert_eq!(first.total, 101);
+        assert_eq!(first.rows.len(), 100);
+        assert_eq!(first.rows[0].media_id, 101);
+        assert_eq!(first.rows[99].media_id, 99);
+        state.prepare_binding_candidates("");
+        assert!(Arc::ptr_eq(
+            &first,
+            state.binding_candidates.as_ref().unwrap()
+        ));
+
+        for query in ["different alias", "別名", "show 100"] {
+            state.prepare_binding_candidates(query);
+            let candidates = state.binding_candidates.as_ref().unwrap();
+            assert_eq!(candidates.total, 1);
+            assert_eq!(candidates.rows[0].media_id, 100);
+            assert_eq!(candidates.rows[0].label, "Link Show 100");
+            assert_eq!(candidates.rows[0].text, "Show 100 · Plan to Watch");
+        }
+        state.replace_entries(vec![ListEntry {
+            media_id: 200,
+            status: "COMPLETED".into(),
+            ..Default::default()
+        }]);
+        state.prepare_binding_candidates("show 100");
+        assert_eq!(state.binding_candidates.as_ref().unwrap().total, 0);
+        state.prepare_binding_candidates("");
+        let candidates = state.binding_candidates.as_ref().unwrap();
+        assert_eq!(candidates.total, 1);
+        assert_eq!(candidates.rows[0].media_id, 200);
+        assert_eq!(candidates.rows[0].label, "Link #200");
+        assert_eq!(candidates.rows[0].text, "#200 · Completed");
+    }
+
+    #[test]
+    fn replacing_entry_fields_invalidates_labels_without_changing_old_snapshot() {
+        let mut state = LibraryState::default();
+        let entry = |title: &str, status: &str| ListEntry {
+            media_id: 1,
+            status: status.into(),
+            media: Some(kurisu_core::models::Media {
+                id: 1,
+                title_english: Some(title.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.replace_entries(vec![entry("Before", "CURRENT")]);
+        state.prepare_binding_candidates("");
+        let snapshot = state.binding_candidates.clone().unwrap();
+        state.replace_entries(vec![entry("After", "COMPLETED")]);
+        state.prepare_binding_candidates("");
+        assert_eq!(snapshot.rows[0].label, "Link Before");
+        assert_eq!(snapshot.rows[0].text, "Before · Watching");
+        let current = state.binding_candidates.as_ref().unwrap();
+        assert_eq!(current.rows[0].label, "Link After");
+        assert_eq!(current.rows[0].text, "After · Completed");
+        assert!(!Arc::ptr_eq(&snapshot, current));
+    }
+
+    #[test]
+    fn binding_candidate_sort_keeps_status_order_and_title_ties() {
+        let entries: Vec<_> = [
+            (1, "CURRENT", "Same"),
+            (2, "COMPLETED", "A"),
+            (3, "CURRENT", "same"),
+            (4, "REPEATING", "A"),
+            (5, "PLANNING", "A"),
+            (6, "PAUSED", "A"),
+            (7, "DROPPED", "A"),
+        ]
+        .into_iter()
+        .map(|(id, status, title)| ListEntry {
+            media_id: id,
+            status: status.into(),
+            media: Some(kurisu_core::models::Media {
+                id,
+                title_english: Some(title.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+        assert_eq!(
+            link_candidates(&entries, "")
+                .iter()
+                .map(|entry| entry.media_id)
+                .collect::<Vec<_>>(),
+            [1, 3, 4, 5, 6, 7, 2]
+        );
+    }
 
     #[gpui::test]
     fn link_dialog_refreshes_candidates_when_library_scan_fails(cx: &mut gpui::TestAppContext) {

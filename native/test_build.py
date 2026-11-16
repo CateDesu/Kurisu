@@ -1,10 +1,13 @@
 import importlib.util
 import json
 import os
+import select
+import shutil
 from pathlib import Path
 import sys
 import tempfile
 import tarfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -75,14 +78,198 @@ class PackagingTests(unittest.TestCase):
                         self.assertEqual(Path(command[0]).read_bytes(), b"standalone Windows executable")
                     return BUILD.subprocess.CompletedProcess(command, 0, stdout="kurisu-native 1.1.0\n")
 
+                def notices(destination, offline, target=None):
+                    self.assertEqual(target, "x86_64-pc-windows-msvc")
+                    for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
+                        (destination / name).write_text(name)
+
                 with patch.object(BUILD, "ROOT", root), patch.object(BUILD.sys, "platform", "win32"), \
                         patch.dict(os.environ, flags, clear=True), \
                         patch.object(BUILD.subprocess, "run", side_effect=build), \
-                        patch.object(BUILD, "write_notices"):
+                        patch.object(BUILD, "write_notices", side_effect=notices):
                     self.assertEqual(BUILD.main(["--offline", "--build-version", "1.1.0"]), 0)
                 staged = root / "target/release/kurisu-native.exe"
                 self.assertEqual(staged.read_bytes(), b"standalone Windows executable")
                 self.assertTrue(staged.with_name(staged.name + ".sha256").is_file())
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux release artifact")
+    def test_linux_build_overrides_configured_target_and_embeds_current_notices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "native"
+            (root / "src").mkdir(parents=True)
+            (root / "packaging").mkdir()
+            (root / "Cargo.toml").write_text('[package]\nname="kurisu-native"\nversion="1.2.3"\nedition="2024"\n')
+            (root / "PROFILE_TRANSFER.md").write_text("Fixture transfer guide")
+            for name in ("kurisu.png", "kurisu.desktop"):
+                (root / "packaging" / name).write_text("fixture")
+            environment = os.environ.copy()
+            for name in ("CARGO_BUILD_TARGET", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "KURISU_BUNDLED_NOTICES"):
+                environment.pop(name, None)
+            target = BUILD.build_target()
+            source = root / "src/main.rs"
+            source.write_text('fn main() { if std::env::args().any(|s|s=="--version") { println!("kurisu-native 1.2.3"); } else { println!("old"); std::thread::sleep(std::time::Duration::from_secs(60)); } }')
+            BUILD.subprocess.run(["cargo", "build", "--offline", "--release", "--target", target,
+                                  "--manifest-path", str(root / "Cargo.toml"), "--target-dir", str(root / "target")],
+                                 check=True, cwd=root, env=environment, capture_output=True, timeout=60)
+            binary = root / "target/release/kurisu-native"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / "target" / target / "release/kurisu-native", binary)
+            shutil.copyfile(BUILD.ROOT / "build.rs", root / "build.rs")
+            shutil.copyfile(BUILD.ROOT / "src/notices.rs", root / "src/notices.rs")
+            license_text = (BUILD.ROOT.parent / "LICENSE").read_text()
+            (root.parent / "LICENSE").write_text(license_text)
+            shutil.copyfile(BUILD.ROOT / "src/main.rs", source)
+            # Exercise the real entry point without starting GPUI or a user's profile.
+            (root / "src/lib.rs").write_text(textwrap.dedent('''\
+                pub mod notices;
+
+                pub fn run(profile: Option<std::path::PathBuf>) -> Result<(), String> {
+                    let profile = profile.ok_or("test requires an explicit profile")?;
+                    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+                    let directory = executable.parent().unwrap();
+                    let installed = format!("{}:{}",
+                        directory.join("kurisu.LICENSE").is_file(),
+                        directory.join("kurisu.THIRD_PARTY_NOTICES.txt").is_file());
+                    std::fs::create_dir_all(&profile).map_err(|error| error.to_string())?;
+                    std::fs::write(profile.join("started"), installed)
+                        .map_err(|error| error.to_string())
+                }
+            '''))
+            version_provider = root / "fixture-core"
+            (version_provider / "src").mkdir(parents=True)
+            (version_provider / "Cargo.toml").write_text(
+                '[package]\nname="kurisu-core"\nversion="1.0.0"\nedition="2024"\n')
+            (version_provider / "src/lib.rs").write_text(
+                'pub mod updater { pub fn current_version() -> &\'static str { env!("KURISU_BUILD_VERSION") } }')
+            with (root / "Cargo.toml").open("a") as manifest:
+                manifest.write('[dependencies]\nlog="0.4"\nenv_logger="0.11"\n'
+                               'kurisu-core={path="fixture-core"}\n')
+            BUILD.subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path",
+                                  str(root / "Cargo.toml")], check=True, env=environment,
+                                 capture_output=True, timeout=60)
+            def notices(destination, offline, selected=None):
+                self.assertEqual(selected, target)
+                (destination / "LICENSE").write_text(license_text)
+                (destination / "THIRD_PARTY_NOTICES.txt").write_text("current embedded dependency texts")
+            environment["CARGO_BUILD_TARGET"] = "unsupported-environment-target"
+            running = BUILD.subprocess.Popen([binary], stdout=BUILD.subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(select.select([running.stdout], [], [], 5)[0], "old binary did not start")
+                self.assertEqual(running.stdout.readline(), "old\n")
+                with patch.object(BUILD, "ROOT", root), patch.object(BUILD, "write_notices", side_effect=notices), \
+                        patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(BUILD.main(["--offline", "--build-version", "1.2.3"]), 0)
+                self.assertIsNone(running.poll())
+            finally:
+                running.terminate()
+                running.wait(timeout=5)
+                running.stdout.close()
+            with tarfile.open(root / "target/release/bundle/Kurisu_1.2.3_linux-x64.tar.gz") as archive:
+                self.assertEqual(archive.extractfile("Kurisu/kurisu").read(), binary.read_bytes())
+            # Frozen bridge clients install only these executable bytes.
+            installed = root / "bare-install"
+            installed.mkdir()
+            payload = installed / "kurisu"
+            shutil.copy2(binary, payload)
+            profile = root / "disposable-profile"
+
+            def launch(*arguments, status=0):
+                result = BUILD.subprocess.run([payload, *arguments], capture_output=True,
+                                              text=True, env=dict(environment, RUST_LOG="warn"), timeout=5)
+                self.assertEqual(result.returncode, status, result.stderr)
+                return result
+
+            for option, expected in (("--license", license_text),
+                                     ("--notices", "current embedded dependency texts"),
+                                     ("--version", "kurisu-native 1.2.3\n")):
+                with self.subTest(option=option):
+                    result = launch("--data-dir", profile, option)
+                    self.assertEqual(result.stdout, expected)
+                    self.assertEqual(result.stderr, "")
+            help_text = launch("--help").stdout
+            for option in ("--license", "--notices", "--version", "--data-dir"):
+                self.assertIn(option, help_text)
+            self.assertIn("--data-dir requires a path", launch("--data-dir", status=2).stderr)
+            self.assertIn("Unknown option", launch("--unknown", status=2).stderr)
+            self.assertFalse(profile.exists())
+            self.assertEqual({path.name for path in installed.iterdir()}, {"kurisu"})
+            originals = {}
+            for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt", ".kurisu-notices-unrelated"):
+                (installed / name).write_text(f"user text for {name}")
+                originals[name] = (installed / name).stat().st_ino
+            self.assertEqual(launch("--data-dir", profile).stderr, "")
+            self.assertEqual((profile / "started").read_text(), "true:true")
+            self.assertEqual((installed / "kurisu.LICENSE").read_text(), license_text)
+            self.assertEqual((installed / "kurisu.THIRD_PARTY_NOTICES.txt").read_text(), "current embedded dependency texts")
+            (installed / "kurisu.THIRD_PARTY_NOTICES.txt").write_text("user edited companion")
+            companion_inode = (installed / "kurisu.THIRD_PARTY_NOTICES.txt").stat().st_ino
+            (profile / "started").unlink()
+            launch("--data-dir", profile)
+            self.assertEqual((profile / "started").read_text(), "true:true")
+            self.assertEqual((installed / "kurisu.THIRD_PARTY_NOTICES.txt").read_text(), "user edited companion")
+            self.assertEqual((installed / "kurisu.THIRD_PARTY_NOTICES.txt").stat().st_ino, companion_inode)
+            self.assertEqual(launch("--notices").stdout, "current embedded dependency texts")
+            for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt", ".kurisu-notices-unrelated"):
+                self.assertEqual((installed / name).read_text(), f"user text for {name}")
+                self.assertEqual((installed / name).stat().st_ino, originals[name])
+            self.assertEqual({path.name for path in installed.iterdir()}, {
+                "kurisu", "LICENSE", "THIRD_PARTY_NOTICES.txt", ".kurisu-notices-unrelated",
+                "kurisu.LICENSE", "kurisu.THIRD_PARTY_NOTICES.txt",
+            })
+            if os.geteuid() != 0:
+                (installed / "kurisu.LICENSE").unlink()
+                (installed / "kurisu.THIRD_PARTY_NOTICES.txt").unlink()
+                (profile / "started").unlink()
+                installed.chmod(0o555)
+                try:
+                    self.assertEqual(launch("--license").stdout, license_text)
+                    self.assertEqual(launch("--notices").stdout, "current embedded dependency texts")
+                    self.assertFalse((profile / "started").exists())
+                    self.assertIn("Could not create companion notices", launch("--data-dir", profile).stderr)
+                    self.assertEqual((profile / "started").read_text(), "false:false")
+                    self.assertFalse((installed / "kurisu.LICENSE").exists())
+                    self.assertFalse((installed / "kurisu.THIRD_PARTY_NOTICES.txt").exists())
+                finally:
+                    installed.chmod(0o755)
+
+    @unittest.skipUnless(sys.platform == "linux", "Standalone Linux build script")
+    def test_companion_notices_preserve_shared_directory_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "THIRD_PARTY_NOTICES.txt").write_text("fixture dependency texts")
+            harness = root / "notices-tests"
+            BUILD.subprocess.run(["rustc", "--edition=2024", "--test", str(BUILD.ROOT / "src/notices.rs"),
+                                  "-o", str(harness)], check=True, env=dict(os.environ, OUT_DIR=str(root)))
+            BUILD.subprocess.run([harness], check=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "Standalone Linux build script")
+    def test_release_build_script_requires_nonempty_embedded_notices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "build-script"
+            BUILD.subprocess.run(["rustc", str(BUILD.ROOT / "build.rs"), "-o", str(script)], check=True)
+            environment = dict(os.environ, OUT_DIR=str(root), PROFILE="release")
+            environment.pop("KURISU_BUNDLED_NOTICES", None)
+            result = BUILD.subprocess.run([script], env=environment, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Release builds require dependency notices", result.stderr)
+            source = root / "source-notices"
+            source.write_text("")
+            environment["KURISU_BUNDLED_NOTICES"] = str(source)
+            result = BUILD.subprocess.run([script], env=environment, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("dependency notices are empty", result.stderr)
+            source.write_text("current dependency notices")
+            BUILD.subprocess.run([script], env=environment, check=True, capture_output=True)
+            self.assertEqual((root / "THIRD_PARTY_NOTICES.txt").read_text(), "current dependency notices")
+
+    def test_linux_packaging_refuses_an_arm_host_before_building(self):
+        response = BUILD.subprocess.CompletedProcess([], 0, stdout="host: aarch64-unknown-linux-gnu\n")
+        with patch.object(BUILD.sys, "platform", "linux"), \
+                patch.object(BUILD.subprocess, "run", return_value=response) as run:
+            with self.assertRaisesRegex(ValueError, "x86_64 Linux host"):
+                BUILD.build_target()
+            self.assertEqual(run.call_count, 1)
 
     def test_windows_artifact_cannot_match_published_legacy_updater(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -244,6 +431,23 @@ class DependencyNoticeTests(unittest.TestCase):
         self.assertIn("with-font@1.0.0: assets/font/license.txt", notices)
         self.assertIn("Font permission text\n", notices)
 
+    def test_windows_notices_use_binary_target_on_arm_host(self):
+        metadata = self.metadata([self.package("app")], {})
+
+        def tool_output(command, **options):
+            if command[0] == "rustc":
+                output = "host: aarch64-pc-windows-msvc\n"
+            else:
+                target = command[command.index("--filter-platform") + 1]
+                self.assertEqual(target, "x86_64-pc-windows-msvc")
+                output = json.dumps(metadata)
+            return BUILD.subprocess.CompletedProcess(command, 0, stdout=output)
+
+        with patch.object(BUILD.sys, "platform", "win32"), \
+                patch.object(BUILD.subprocess, "run", side_effect=tool_output), \
+                patch.object(BUILD, "collect_notices", return_value="notices"):
+            BUILD.write_notices(self.root, offline=True)
+
     def test_metadata_preserves_unicode_under_windows_code_page(self):
         package = self.package("unicode", "Permission for Māori authors\n")
         package["authors"] = ["Māori author"]
@@ -262,7 +466,8 @@ class DependencyNoticeTests(unittest.TestCase):
                 **options,
             )
 
-        with patch.object(BUILD.subprocess, "run", side_effect=tool_output), \
+        with patch.object(BUILD.sys, "platform", "win32"), \
+                patch.object(BUILD.subprocess, "run", side_effect=tool_output), \
                 patch.object(BUILD.subprocess, "_text_encoding", return_value="cp1252"), \
                 patch.object(BUILD, "collect_notices", side_effect=lambda value: original_notices(value, self.supplements)):
             BUILD.write_notices(self.root, offline=True)

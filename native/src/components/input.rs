@@ -323,7 +323,7 @@ impl TextInput {
             let text = if self.multiline {
                 text
             } else {
-                text.replace("\n", " ")
+                text.replace(['\r', '\n'], " ")
             };
             self.replace_text_in_range(None, &text, window, cx);
         }
@@ -1220,6 +1220,20 @@ mod tests {
             input.read_with(cx, |input, _| input.value().to_owned()),
             "Original 日本語"
         );
+    }
+
+    #[gpui::test]
+    fn clipboard_line_endings_respect_single_and_multiline_fields(cx: &mut TestAppContext) {
+        let (input, cx) = cx.add_window_view(|window, cx| TextInput::new("", "Notes", window, cx));
+        input.update_in(cx, |input, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("日本\r\n語\rtext".into()));
+            input.paste(&Paste, window, cx);
+            assert_eq!(input.value(), "日本  語 text");
+            input.set_value("", cx);
+            input.set_multiline(true, cx);
+            input.paste(&Paste, window, cx);
+            assert_eq!(input.value(), "日本\r\n語\rtext");
+        });
     }
 
     #[test]

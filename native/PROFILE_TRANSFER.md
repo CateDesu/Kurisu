@@ -14,6 +14,8 @@ Older updaters always choose the highest stable release. For this reason, legacy
 
 An existing valid native profile takes precedence and keeps its native-only changes. Earlier native candidate profiles remain usable. An explicit `--data-dir` opens only that isolated native profile and never searches for a previous Tauri profile.
 
+Fresh native initialization prepares and syncs the database and marker privately before publication. Retry and restart can finish interrupted publication under a profile initialization lock. Filesystems without hard links use a synced publication record and atomic moves that refuse existing destinations. Existing unmarked databases remain refused. Unrelated files are preserved, including private staging directories left by an interrupted preparation.
+
 ## What is kept
 
 The original Tauri profile and its database sidecars remain unchanged. The native profile is published only after the complete copy passes validation. The backup is a standalone SQLite snapshot stored outside both profiles as `kurisu-legacy-backup.db` in your local application data directory. On Linux this is normally `$XDG_DATA_HOME` or `~/.local/share`; on Windows it is `%LOCALAPPDATA%`.
