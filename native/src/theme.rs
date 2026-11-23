@@ -59,7 +59,7 @@ pub fn init_fonts(available: &[String]) {
         mono: resolve_font(FONT_MONO_FALLBACK, available),
     };
     log::info!(
-        "GPUI fonts: sans={}, serif={}, mono={}",
+        "Fonts: sans={}, serif={}, mono={}",
         resolved.sans.family,
         resolved.serif.family,
         resolved.mono.family

@@ -9,8 +9,8 @@ use crate::theme::{ACCENT, DIM, EDGE, ERROR, INK, PANEL, PANEL_2};
 
 pub(super) struct StatsState {
     data: Option<UserStats>,
-    loading: bool,
-    error: String,
+    pub(super) loading: bool,
+    pub(super) error: String,
     request: u64,
     scroll: ScrollHandle,
 }
@@ -37,7 +37,7 @@ impl Workspace {
     pub(super) fn refresh_stats_covers(&mut self) {}
 
     fn load_stats(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() || self.stats.loading {
+        if self.stopping || self.writes_fenced() || self.profile.is_none() || self.stats.loading {
             return;
         }
         self.stats.request += 1;
@@ -53,7 +53,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.stats.request != request
                 {

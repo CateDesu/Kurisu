@@ -1,3 +1,8 @@
+use std::{
+    collections::HashSet,
+    sync::{Arc, Weak},
+};
+
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
@@ -5,8 +10,60 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::models::{ListEntry, Media};
 
 const SCHEMA_VERSION: i64 = 7;
+pub(crate) const LIST_OWNER_KEY: &str = "native_preference:kurisu.list.owner";
+pub(crate) const SCOPED_LIST_PREFERENCE_KEYS: &[&str] = &[
+    "native_preference:kurisu.list.q",
+    "native_preference:kurisu.list.filter",
+    "native_preference:kurisu.list.synced",
+];
 
-pub struct Db(pub Mutex<Connection>);
+fn parse_valid_account_id(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| value.parse().ok())
+        .filter(|id| crate::anilist::valid_account_id(*id))
+}
+
+pub struct Db(pub Mutex<Connection>, Mutex<Vec<Weak<CatalogRead>>>);
+
+#[derive(Default)]
+pub(crate) struct CatalogRead {
+    confirmed_totals: Mutex<HashSet<i64>>,
+    removed: Mutex<HashSet<i64>>,
+}
+
+impl CatalogRead {
+    // Keep the entry lock through the cache write so a lookup cannot intervene.
+    pub(crate) fn preserve_totals<'a>(
+        &self,
+        db: &Db,
+        media: impl IntoIterator<Item = &'a mut Media>,
+    ) {
+        let confirmed = std::mem::take(&mut *self.confirmed_totals.lock());
+        if confirmed.is_empty() {
+            return;
+        }
+        db.restore_cached_totals(
+            media
+                .into_iter()
+                .filter(|item| confirmed.contains(&item.id)),
+        );
+    }
+
+    pub(crate) fn removed_media(&self) -> HashSet<i64> {
+        std::mem::take(&mut *self.removed.lock())
+    }
+
+    // Call after the cache write commits, while holding the entry lock.
+    pub(crate) fn record_totals(&self, db: &Db, media_ids: impl Iterator<Item = i64> + Clone) {
+        mark_catalog_reads(&mut db.1.lock(), Some(self), media_ids);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ListPreferences {
+    Preserve,
+    Native { last_account: Option<i64> },
+}
 
 #[cfg(test)]
 thread_local! {
@@ -24,7 +81,7 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        // Rebuildable cache writes use NORMAL. Local intent uses durable_write.
+        // Writes default to NORMAL. Queued list changes and watch history use durable_write.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )?;
@@ -41,7 +98,7 @@ impl Db {
                 let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
             }
         }
-        Ok(Db(Mutex::new(conn)))
+        Ok(Db(Mutex::new(conn), Mutex::default()))
     }
 
     pub(crate) fn durable_write(
@@ -188,6 +245,54 @@ impl Db {
         upsert_media_row(&c, m)
     }
 
+    pub(crate) fn catalog_read(&self) -> Arc<CatalogRead> {
+        let read = Arc::new(CatalogRead::default());
+        let mut reads = self.1.lock();
+        reads.retain(|read| read.strong_count() != 0);
+        reads.push(Arc::downgrade(&read));
+        read
+    }
+
+    pub(crate) fn restore_cached_totals<'a>(&self, media: impl IntoIterator<Item = &'a mut Media>) {
+        let conn = self.0.lock();
+        for item in media {
+            if let Ok(Some(total)) = cached_episode_total(&conn, item.id) {
+                item.episodes = total;
+            }
+        }
+    }
+
+    pub(crate) fn restore_cached_relations(
+        &self,
+        relations: &mut Vec<crate::models::MediaRelation>,
+    ) {
+        let conn = self.0.lock();
+        relations.retain_mut(|relation| {
+            let id = relation.media.id;
+            match cached_episode_total(&conn, id) {
+                Ok(Some(total)) => {
+                    relation.media.episodes = total;
+                    true
+                }
+                Ok(None) => !conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ? AND value = 'null')",
+                        [format!("media_detail:{id}")],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false),
+                Err(_) => true,
+            }
+        });
+    }
+
+    pub(crate) fn cache_episode_total(&self, media_id: i64, episodes: Option<i64>) -> Result<bool> {
+        let mut reads = self.1.lock();
+        let changed = write_episode_total(&self.0.lock(), media_id, episodes)?;
+        mark_catalog_reads(&mut reads, None, std::iter::once(media_id));
+        Ok(changed)
+    }
+
     pub fn upsert_media_batch(&self, media: &[Media]) -> Result<()> {
         let mut c = self.0.lock();
         let tx = c.transaction()?;
@@ -223,7 +328,7 @@ impl Db {
               cached_at=excluded.cached_at",
             rusqlite::params![
                 m.id, m.id_mal, m.title_romaji, m.title_english, m.title_native,
-                m.cover_medium, m.cover_large, m.episodes, m.format, m.status,
+                m.cover_medium, m.cover_large, m.episodes.filter(|total| *total > 0), m.format, m.status,
                 m.average_score, m.season, m.season_year, m.description,
                 m.next_airing_episode, m.next_airing_at,
                 m.banner_image,
@@ -245,11 +350,23 @@ impl Db {
              FROM media WHERE id = ?",
         )?;
         let row = stmt.query_row([id], row_to_media).optional()?;
-        Ok(row)
+        Ok(row.filter(Media::has_metadata))
+    }
+
+    pub fn episode_total(&self, id: i64) -> Result<Option<i64>> {
+        Ok(self.cached_episode_total(id)?.flatten())
+    }
+
+    pub(crate) fn cached_episode_total(&self, id: i64) -> Result<Option<Option<i64>>> {
+        cached_episode_total(&self.0.lock(), id)
     }
 
     pub fn upsert_entry(&self, e: &ListEntry) -> Result<()> {
         let c = self.0.lock();
+        Self::write_entry(&c, e)
+    }
+
+    pub(crate) fn write_entry(c: &Connection, e: &ListEntry) -> Result<()> {
         c.prepare_cached(
             "INSERT OR REPLACE INTO list_entry
              (media_id,entry_id,status,progress,score,repeat,updated_at)
@@ -274,6 +391,36 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn restore_and_remove_pending(
+        &self,
+        account: i64,
+        media_id: i64,
+        base: Option<&ListEntry>,
+        reported_total: crate::anilist::ReportedEpisodes,
+    ) -> Result<()> {
+        let mut reads = self.1.lock();
+        self.durable_write(|tx| {
+            if let Some(total) = reported_total {
+                write_episode_total(tx, media_id, total)?;
+            }
+            match base {
+                Some(e) => Self::write_entry(tx, e)?,
+                None => {
+                    tx.execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM pending_change WHERE account_id = ? AND media_id = ?",
+                [account, media_id],
+            )?;
+            Ok(())
+        })?;
+        if reported_total.is_some() {
+            mark_catalog_reads(&mut reads, None, std::iter::once(media_id));
+        }
+        Ok(())
+    }
+
     pub fn delete_media(&self, media_id: i64) -> Result<()> {
         self.0
             .lock()
@@ -281,9 +428,42 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn commit_media_removal(
+        &self,
+        remove_public_id: Option<i64>,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let Some(id) = remove_public_id else {
+            return self.durable_write(write);
+        };
+        let mut reads = self.1.lock();
+        self.durable_write(|tx| {
+            write(tx)?;
+            tx.execute("DELETE FROM media WHERE id = ?", [id])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES (?, 'null')",
+                [format!("media_detail:{id}")],
+            )?;
+            Ok(())
+        })?;
+        reads.retain(|read| {
+            let Some(read) = read.upgrade() else {
+                return false;
+            };
+            read.removed.lock().insert(id);
+            true
+        });
+        Ok(())
+    }
+
     pub fn replace_list_snapshot(&self, entries: &[ListEntry]) -> Result<()> {
         let mut c = self.0.lock();
         let tx = c.transaction()?;
+        Self::write_list_snapshot(&tx, entries)?;
+        Ok(tx.commit()?)
+    }
+
+    fn write_list_snapshot(tx: &rusqlite::Transaction<'_>, entries: &[ListEntry]) -> Result<()> {
         {
             let mut statement = tx.prepare_cached(
                 "INSERT INTO list_entry
@@ -300,7 +480,7 @@ impl Db {
             )?;
             for e in entries {
                 if let Some(m) = &e.media {
-                    upsert_media_row(&tx, m)?;
+                    upsert_media_row(tx, m)?;
                 }
                 statement.execute(rusqlite::params![
                     e.media_id,
@@ -319,10 +499,17 @@ impl Db {
             "DELETE FROM list_entry WHERE media_id NOT IN (SELECT value FROM json_each(?))",
             [serde_json::to_string(&keep)?],
         )?;
-        Ok(tx.commit()?)
+        Ok(())
     }
 
     pub fn entries_with_media(&self) -> Result<Vec<ListEntry>> {
+        self.entries_with_saved_media(Default::default())
+    }
+
+    pub(crate) fn entries_with_saved_media(
+        &self,
+        mut saved_media: std::collections::HashMap<i64, Media>,
+    ) -> Result<Vec<ListEntry>> {
         let c = self.0.lock();
         let mut stmt = c.prepare(
             // NULLs preserve row_to_media_offset's layout without loading details.
@@ -334,15 +521,19 @@ impl Db {
              FROM list_entry e LEFT JOIN media m ON m.id = e.media_id",
         )?;
         let rows = stmt.query_map([], |r| {
+            let media_id = r.get(0)?;
             Ok(ListEntry {
                 id: r.get::<_, Option<i64>>(1)?,
-                media_id: r.get(0)?,
+                media_id,
                 status: r.get(2)?,
                 progress: r.get(3)?,
                 score: r.get(4)?,
                 repeat: r.get(5)?,
                 updated_at: r.get(6)?,
-                media: row_to_media_offset(r, 7).ok(),
+                media: row_to_media_offset(r, 7)
+                    .ok()
+                    .filter(Media::has_metadata)
+                    .or_else(|| saved_media.remove(&media_id)),
             })
         })?;
         let mut out = Vec::new();
@@ -384,7 +575,7 @@ impl Db {
                         score: r.get(4)?,
                         repeat: r.get(5)?,
                         updated_at: r.get(6)?,
-                        media: row_to_media_offset(r, 7).ok(),
+                        media: row_to_media_offset(r, 7).ok().filter(Media::has_metadata),
                     })
                 },
             )
@@ -410,6 +601,25 @@ impl Db {
     }
 
     pub fn replace_account(&self, token: &str, user: &crate::models::User) -> Result<bool> {
+        self.replace_account_with_preferences(token, user, ListPreferences::Preserve)
+    }
+
+    pub(crate) fn replace_account_with_preferences(
+        &self,
+        token: &str,
+        user: &crate::models::User,
+        preferences: ListPreferences,
+    ) -> Result<bool> {
+        self.replace_account_and_list(token, user, preferences, None)
+    }
+
+    pub(crate) fn replace_account_and_list(
+        &self,
+        token: &str,
+        user: &crate::models::User,
+        preferences: ListPreferences,
+        entries: Option<&[ListEntry]>,
+    ) -> Result<bool> {
         let profile = serde_json::to_string(user)?;
         let mut c = self.0.lock();
         let tx = c.transaction()?;
@@ -438,6 +648,35 @@ impl Db {
         } else if previous_format != user.score_format {
             tx.execute("UPDATE list_entry SET score = NULL WHERE score != 0", [])?;
         }
+        if let ListPreferences::Native { last_account } = preferences {
+            let persisted_owner: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?",
+                    [LIST_OWNER_KEY],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            // Persisted ownership survives sign-out and restart without an open workspace.
+            let verified_owner = parse_valid_account_id(persisted_owner.as_deref());
+            let list_owner = verified_owner
+                .or_else(|| parse_valid_account_id(previous.as_deref()))
+                .or(last_account.filter(|id| crate::anilist::valid_account_id(*id)));
+            if (persisted_owner.is_some() && verified_owner.is_none())
+                || list_owner.is_some_and(|owner| owner != user.id)
+            {
+                tx.execute(
+                    "DELETE FROM settings WHERE key IN ('native_preference:kurisu.list.q',
+                     'native_preference:kurisu.list.filter', 'native_preference:kurisu.list.synced')",
+                    [],
+                )?;
+            }
+            if crate::anilist::valid_account_id(user.id) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                    [LIST_OWNER_KEY, id.as_str()],
+                )?;
+            }
+        }
         for (key, value) in [
             ("anilist_token", token),
             ("anilist_username", user.name.as_str()),
@@ -449,8 +688,160 @@ impl Db {
                 [key, value],
             )?;
         }
+        if let Some(entries) = entries {
+            Self::write_list_snapshot(&tx, entries)?;
+        }
         tx.commit()?;
         Ok(changed)
+    }
+
+    pub(crate) fn saved_list_owner(&self) -> Option<i64> {
+        let settings = self
+            .get_settings_batch(&[LIST_OWNER_KEY, "anilist_user_id"])
+            .ok()?;
+        parse_valid_account_id(settings.get(LIST_OWNER_KEY).map(String::as_str))
+            .or_else(|| parse_valid_account_id(settings.get("anilist_user_id").map(String::as_str)))
+    }
+
+    pub(crate) fn get_scoped_preference(
+        &self,
+        db_key: &str,
+        has_token: bool,
+    ) -> Result<Option<String>> {
+        let c = self.0.lock();
+        let raw_owner: Option<String> = c
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?",
+                [LIST_OWNER_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let owner = parse_valid_account_id(raw_owner.as_deref());
+        if raw_owner.is_some() && owner.is_none() {
+            return Ok(None);
+        }
+        let raw_saved: Option<String> = c
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'anilist_user_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let saved = parse_valid_account_id(raw_saved.as_deref());
+        if owner.is_some() && (raw_saved.is_some() || has_token) && owner != saved {
+            return Ok(None);
+        }
+        Ok(
+            c.query_row("SELECT value FROM settings WHERE key = ?", [db_key], |r| {
+                r.get(0)
+            })
+            .optional()?,
+        )
+    }
+
+    pub(crate) fn set_scoped_preference(
+        &self,
+        db_key: &str,
+        value: Option<&str>,
+        account: Option<i64>,
+        has_token: bool,
+    ) -> Result<()> {
+        let mut c = self.0.lock();
+        let tx = c.transaction()?;
+        let saved: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'anilist_user_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let raw_owner: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?",
+                [LIST_OWNER_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let saved = parse_valid_account_id(saved.as_deref());
+        let owner = parse_valid_account_id(raw_owner.as_deref());
+        let verified = account.filter(|id| crate::anilist::valid_account_id(*id));
+        let allowed = match verified {
+            Some(id) => has_token && saved == Some(id),
+            None => saved.is_none() && raw_owner.is_none(),
+        };
+        if !allowed {
+            return Ok(());
+        }
+        // Wipe all scoped keys before claiming ownership over a foreign or corrupt owner record.
+        if verified.is_some_and(|id| raw_owner.is_some() && owner != Some(id)) {
+            tx.execute(
+                "DELETE FROM settings WHERE key IN ('native_preference:kurisu.list.q',
+                 'native_preference:kurisu.list.filter', 'native_preference:kurisu.list.synced')",
+                [],
+            )?;
+        }
+        match value {
+            Some(value) => {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                    [db_key, value],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM settings WHERE key = ?", [db_key])?;
+            }
+        }
+        if let Some(id) = verified {
+            let id_str = id.to_string();
+            if raw_owner.as_deref() != Some(id_str.as_str()) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                    [LIST_OWNER_KEY, id_str.as_str()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn preserve_list_owner(&self) -> Result<()> {
+        let mut c = self.0.lock();
+        let tx = c.transaction()?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?",
+                [LIST_OWNER_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if parse_valid_account_id(existing.as_deref()).is_some() {
+            return Ok(());
+        }
+        let saved: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'anilist_user_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing.is_none() {
+            if let Some(id) = parse_valid_account_id(saved.as_deref()) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                    [LIST_OWNER_KEY, id.to_string().as_str()],
+                )?;
+                tx.commit()?;
+                return Ok(());
+            }
+        }
+        // Corrupt or unowned scoped preferences must not carry over to the next session.
+        tx.execute(
+            "DELETE FROM settings WHERE key IN ('native_preference:kurisu.list.q',
+             'native_preference:kurisu.list.filter', 'native_preference:kurisu.list.synced', ?)",
+            [LIST_OWNER_KEY],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn cached_user(&self) -> Result<Option<crate::models::User>> {
@@ -458,7 +849,10 @@ impl Db {
         let user = settings
             .get("anilist_profile")
             .and_then(|value| serde_json::from_str::<crate::models::User>(value).ok())
-            .filter(|user| settings.get("anilist_user_id") == Some(&user.id.to_string()));
+            .filter(|user| {
+                crate::anilist::valid_account_id(user.id)
+                    && settings.get("anilist_user_id") == Some(&user.id.to_string())
+            });
         Ok(user)
     }
 
@@ -586,6 +980,48 @@ impl Db {
     }
 }
 
+fn mark_catalog_reads(
+    reads: &mut Vec<Weak<CatalogRead>>,
+    source: Option<&CatalogRead>,
+    media_ids: impl Iterator<Item = i64> + Clone,
+) {
+    // Reads register in request order. Confirmed lookup totals have no catalog source.
+    let mut older = true;
+    reads.retain(|read| {
+        let Some(read) = read.upgrade() else {
+            return false;
+        };
+        if source.is_some_and(|source| std::ptr::eq(read.as_ref(), source)) {
+            older = false;
+        }
+        if older {
+            read.confirmed_totals.lock().extend(media_ids.clone());
+        }
+        true
+    });
+}
+
+fn write_episode_total(conn: &Connection, media_id: i64, episodes: Option<i64>) -> Result<bool> {
+    let changed = cached_episode_total(conn, media_id)? != Some(episodes);
+    if changed {
+        conn.execute(
+            "INSERT INTO media (id,episodes,cached_at) VALUES (?,?,?)
+                 ON CONFLICT(id) DO UPDATE SET episodes=excluded.episodes",
+            rusqlite::params![media_id, episodes, chrono::Utc::now().timestamp()],
+        )?;
+    }
+    Ok(changed)
+}
+
+fn cached_episode_total(conn: &Connection, id: i64) -> Result<Option<Option<i64>>> {
+    Ok(conn
+        .query_row("SELECT episodes FROM media WHERE id = ?", [id], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .map(|episodes| episodes.filter(|total| *total > 0)))
+}
+
 /// Preserve cached detail fields that lean queries never fetch.
 fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
     c.prepare_cached(
@@ -618,7 +1054,7 @@ fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
         m.title_native,
         m.cover_medium,
         m.cover_large,
-        m.episodes,
+        m.episodes.filter(|total| *total > 0),
         m.format,
         m.status,
         m.average_score,
@@ -657,7 +1093,7 @@ fn row_to_media_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Media> {
         title_native: r.get(o + 4)?,
         cover_medium: r.get(o + 5)?,
         cover_large: r.get(o + 6)?,
-        episodes: r.get(o + 7)?,
+        episodes: r.get::<_, Option<i64>>(o + 7)?.filter(|total| *total > 0),
         format: r.get(o + 8)?,
         status: r.get(o + 9)?,
         average_score: r.get(o + 10)?,
@@ -768,6 +1204,151 @@ mod tests {
     }
 
     #[test]
+    fn native_list_preferences_only_adopt_keys_when_owner_is_absent() {
+        for owner in [None, Some("corrupt"), Some("0")] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            if let Some(owner) = owner {
+                db.set_setting(LIST_OWNER_KEY, owner).unwrap();
+            }
+            for key in SCOPED_LIST_PREFERENCE_KEYS {
+                db.set_setting(key, "old preference").unwrap();
+            }
+            assert!(db.get_setting("anilist_user_id").unwrap().is_none());
+            db.replace_account_with_preferences(
+                "new-token",
+                &crate::User {
+                    id: 7,
+                    ..Default::default()
+                },
+                ListPreferences::Native { last_account: None },
+            )
+            .unwrap();
+            for key in SCOPED_LIST_PREFERENCE_KEYS {
+                assert_eq!(
+                    db.get_setting(key).unwrap().as_deref(),
+                    owner.is_none().then_some("old preference"),
+                    "owner={owner:?}, key={key}"
+                );
+            }
+            assert_eq!(db.saved_list_owner(), Some(7));
+        }
+    }
+
+    #[test]
+    fn native_list_preferences_follow_only_a_verified_replacement() {
+        let keys = [
+            "native_preference:kurisu.list.q",
+            "native_preference:kurisu.list.filter",
+            "native_preference:kurisu.list.synced",
+        ];
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let user = crate::User {
+            id: 7,
+            ..Default::default()
+        };
+        let other = crate::User {
+            id: 8,
+            ..Default::default()
+        };
+        for key in keys {
+            db.set_setting(key, "original").unwrap();
+        }
+        db.set_setting("native_preference:kurisu.list.sort", "title")
+            .unwrap();
+        let assert_preferences = |value| {
+            for key in keys {
+                assert_eq!(db.get_setting(key).unwrap().as_deref(), value);
+            }
+        };
+        db.replace_account_with_preferences(
+            "first",
+            &user,
+            ListPreferences::Native { last_account: None },
+        )
+        .unwrap();
+        assert_preferences(Some("original"));
+        db.delete_setting("anilist_user_id").unwrap();
+        let previous = ListPreferences::Native {
+            last_account: Some(user.id),
+        };
+        db.replace_account_with_preferences("same", &user, previous)
+            .unwrap();
+        assert_preferences(Some("original"));
+
+        for trigger in [
+            "CREATE TRIGGER fail_reset BEFORE DELETE ON settings
+             WHEN OLD.key='native_preference:kurisu.list.filter'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            "CREATE TRIGGER fail_reset BEFORE INSERT ON settings
+             WHEN NEW.key='anilist_profile'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        ] {
+            db.0.lock().execute_batch(trigger).unwrap();
+            let error = db
+                .replace_account_with_preferences(
+                    "other",
+                    &other,
+                    ListPreferences::Native { last_account: None },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("injected failure"));
+            assert_eq!(
+                db.get_setting("anilist_token").unwrap().as_deref(),
+                Some("same")
+            );
+            assert_eq!(db.cached_user().unwrap().unwrap().id, user.id);
+            assert_preferences(Some("original"));
+            db.0.lock()
+                .execute_batch("DROP TRIGGER fail_reset")
+                .unwrap();
+        }
+        db.replace_account("legacy", &other).unwrap();
+        assert_eq!(db.saved_list_owner(), Some(user.id));
+        assert_preferences(Some("original"));
+        db.delete_setting("anilist_user_id").unwrap();
+        db.replace_account_with_preferences(
+            "same-after-restart",
+            &user,
+            ListPreferences::Native { last_account: None },
+        )
+        .unwrap();
+        assert_preferences(Some("original"));
+        db.delete_setting("anilist_user_id").unwrap();
+        db.replace_account_with_preferences(
+            "other-after-restart",
+            &other,
+            ListPreferences::Native { last_account: None },
+        )
+        .unwrap();
+        assert_preferences(None);
+        assert_eq!(
+            db.get_setting("native_preference:kurisu.list.sort")
+                .unwrap()
+                .as_deref(),
+            Some("title")
+        );
+    }
+
+    #[test]
+    fn cached_user_rejects_invalid_account_ids_even_with_matching_profile_json() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        for invalid in [0, -1, i64::from(i32::MAX) + 1] {
+            let user = crate::User {
+                id: invalid,
+                name: "Tester".into(),
+                score_format: Some("POINT_10".into()),
+                ..Default::default()
+            };
+            db.set_settings(&[
+                ("anilist_user_id", &invalid.to_string()),
+                ("anilist_profile", &serde_json::to_string(&user).unwrap()),
+            ])
+            .unwrap();
+            assert!(db.cached_user().unwrap().is_none(), "invalid={invalid}");
+        }
+    }
+
+    #[test]
     fn account_ownership_uses_ids_and_clears_unknown_owners() {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
         let mut user = crate::models::User {
@@ -831,6 +1412,7 @@ mod tests {
                 media: Some(Media {
                     id: 1,
                     episodes: Some(12),
+                    title_english: Some("Fixture Title".into()),
                     ..Default::default()
                 }),
             },
@@ -1170,7 +1752,11 @@ mod tests {
                     conflict: false,
                     missing_media: false,
                     score_format: None,
+                    playback: false,
                     base_score_format: None,
+                    rejected_progress: None,
+                    retry_error: None,
+                    rejected_total: None,
                 },
             )
             .unwrap();
@@ -1221,7 +1807,11 @@ mod tests {
             conflict: false,
             missing_media: false,
             score_format: None,
+            playback: false,
             base_score_format: None,
+            rejected_progress: None,
+            retry_error: None,
+            rejected_total: None,
         })
         .unwrap();
         {
@@ -1557,6 +2147,7 @@ mod tests {
         .unwrap();
         db.upsert_media_detail(&Media {
             id: 1,
+            title_english: Some("Updated Title".into()),
             ..Default::default()
         })
         .unwrap();
@@ -1571,11 +2162,13 @@ mod tests {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
         db.upsert_media(&Media {
             id: 1,
+            title_english: Some("On List".into()),
             ..Default::default()
         })
         .unwrap();
         db.upsert_media(&Media {
             id: 2,
+            title_english: Some("Off List".into()),
             ..Default::default()
         })
         .unwrap();
@@ -1705,6 +2298,141 @@ mod tests {
             let _ = std::fs::remove_file(f);
         }
     }
+
+    #[test]
+    fn scoped_preference_write_or_clear_wipes_all_foreign_or_corrupt_owner_keys() {
+        for (initial_owner, new_q) in [
+            ("1", None),
+            ("1", Some("bob-search")),
+            ("corrupt", None),
+            ("0", Some("bob-search")),
+        ] {
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            db.set_settings(&[
+                (LIST_OWNER_KEY, initial_owner),
+                ("native_preference:kurisu.list.q", "alice-search"),
+                ("native_preference:kurisu.list.filter", "DROPPED"),
+                ("native_preference:kurisu.list.synced", "98765"),
+                ("native_preference:kurisu.list.sort", "title"),
+                ("anilist_user_id", "2"),
+            ])
+            .unwrap();
+
+            db.set_scoped_preference("native_preference:kurisu.list.q", new_q, Some(2), true)
+                .unwrap();
+
+            assert_eq!(
+                db.get_setting("native_preference:kurisu.list.q")
+                    .unwrap()
+                    .as_deref(),
+                new_q,
+                "owner={initial_owner}, new_q={new_q:?}"
+            );
+            assert_eq!(
+                db.get_setting("native_preference:kurisu.list.filter")
+                    .unwrap(),
+                None,
+                "owner={initial_owner}, new_q={new_q:?}"
+            );
+            assert_eq!(
+                db.get_setting("native_preference:kurisu.list.synced")
+                    .unwrap(),
+                None,
+                "owner={initial_owner}, new_q={new_q:?}"
+            );
+            assert_eq!(
+                db.get_setting("native_preference:kurisu.list.sort")
+                    .unwrap()
+                    .as_deref(),
+                Some("title")
+            );
+            assert_eq!(
+                db.get_setting(LIST_OWNER_KEY).unwrap().as_deref(),
+                Some("2"),
+                "owner={initial_owner}, new_q={new_q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_preference_reads_hide_foreign_owner_and_keep_matching_or_signed_out() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let entries = [
+            ("native_preference:kurisu.list.q", "alice-search"),
+            ("native_preference:kurisu.list.filter", "DROPPED"),
+            ("native_preference:kurisu.list.synced", "98765"),
+        ];
+        db.set_settings(&[
+            (LIST_OWNER_KEY, "1"),
+            entries[0],
+            entries[1],
+            entries[2],
+            ("anilist_user_id", "2"),
+        ])
+        .unwrap();
+
+        for has_token in [false, true] {
+            for (key, _) in entries {
+                assert_eq!(
+                    db.get_scoped_preference(key, has_token).unwrap(),
+                    None,
+                    "foreign owner key={key} has_token={has_token}"
+                );
+            }
+        }
+
+        for corrupt_saved in ["corrupt", "0", "-1", "2147483648"] {
+            db.set_setting("anilist_user_id", corrupt_saved).unwrap();
+            for has_token in [false, true] {
+                for (key, _) in entries {
+                    assert_eq!(
+                        db.get_scoped_preference(key, has_token).unwrap(),
+                        None,
+                        "corrupt saved={corrupt_saved} key={key} has_token={has_token}"
+                    );
+                }
+            }
+        }
+
+        db.delete_setting("anilist_user_id").unwrap();
+        for (key, expected) in entries {
+            assert_eq!(
+                db.get_scoped_preference(key, false).unwrap().as_deref(),
+                Some(expected),
+                "signed out key={key}"
+            );
+            assert_eq!(
+                db.get_scoped_preference(key, true).unwrap(),
+                None,
+                "unidentified token key={key}"
+            );
+        }
+
+        db.set_setting("anilist_user_id", "1").unwrap();
+        for has_token in [false, true] {
+            for (key, expected) in entries {
+                assert_eq!(
+                    db.get_scoped_preference(key, has_token).unwrap().as_deref(),
+                    Some(expected),
+                    "matching owner key={key} has_token={has_token}"
+                );
+            }
+        }
+
+        db.delete_setting(LIST_OWNER_KEY).unwrap();
+        for saved in ["2", "2147483648"] {
+            db.set_setting("anilist_user_id", saved).unwrap();
+            for has_token in [false, true] {
+                for (key, expected) in entries {
+                    assert_eq!(
+                        db.get_scoped_preference(key, has_token).unwrap().as_deref(),
+                        Some(expected),
+                        "unowned legacy saved={saved} key={key} has_token={has_token}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1741,6 +2469,46 @@ mod durability_tests {
         assert_eq!(
             db.get_setting("durability-test").unwrap().as_deref(),
             Some("saved")
+        );
+    }
+
+    #[test]
+    fn preserve_list_owner_clears_corrupt_or_unowned_preferences_and_hides_corrupt_reads() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.set_setting("anilist_user_id", "10").unwrap();
+        db.set_setting(LIST_OWNER_KEY, "corrupt").unwrap();
+        db.set_setting("native_preference:kurisu.list.q", "secret")
+            .unwrap();
+        for has_token in [false, true] {
+            assert_eq!(
+                db.get_scoped_preference("native_preference:kurisu.list.q", has_token)
+                    .unwrap(),
+                None
+            );
+        }
+        db.set_scoped_preference("native_preference:kurisu.list.q", Some("new"), None, false)
+            .unwrap();
+        assert_eq!(
+            db.get_setting("native_preference:kurisu.list.q")
+                .unwrap()
+                .as_deref(),
+            Some("secret")
+        );
+        db.preserve_list_owner().unwrap();
+        assert_eq!(db.get_setting(LIST_OWNER_KEY).unwrap(), None);
+        assert_eq!(
+            db.get_setting("native_preference:kurisu.list.q").unwrap(),
+            None
+        );
+
+        db.delete_setting("anilist_user_id").unwrap();
+        db.set_setting("native_preference:kurisu.list.filter", "CURRENT")
+            .unwrap();
+        db.preserve_list_owner().unwrap();
+        assert_eq!(
+            db.get_setting("native_preference:kurisu.list.filter")
+                .unwrap(),
+            None
         );
     }
 }

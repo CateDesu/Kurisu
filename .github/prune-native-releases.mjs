@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { bridgeAssets, compare, nativeAssets, plan, transition } from "./release-transition.mjs";
+import { bridgeAssets, compare, nativeAssets, originalWindowsSelector, plan, transition } from "./release-transition.mjs";
 
 const stable = release => !release.draft && !release.prerelease;
 const numeric = tag => /^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(tag);
@@ -16,8 +16,11 @@ export function retentionPlan(releases, tag) {
   const keep = releases.find(release => release.tag_name === tag);
   const bridge = releases.find(release => release.tag_name === transition.bridgeTag);
   if (!keep || !stable(keep) || !bridge) throw new Error("Published native release and frozen bridge are required");
-  bridgeAssets(bridge);
+  const legacy = bridgeAssets(bridge);
   nativeNames(keep);
+  if (originalWindowsSelector(keep.assets.map(asset => asset.name)) !== originalWindowsSelector(legacy)) {
+    throw new Error("Published native release does not expose the exact frozen bridge Windows installer");
+  }
   if (releases.some(release => stable(release) && numeric(release.tag_name) && compare(release.tag_name, tag) > 0)) {
     throw new Error("Only the newest stable release may prune older native releases");
   }
@@ -31,10 +34,17 @@ export function retentionPlan(releases, tag) {
   return { keep, bridge, remove };
 }
 
+const MAX_BUFFER = 64 * 1024 * 1024;
+const RELEASE_PROJECTION = ".[] | {id, tag_name, draft, prerelease, assets: [.assets[] | {id, name, size, state, digest, updated_at}]}";
+
 function gh(args) {
-  const result = spawnSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = spawnSync("gh", args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "pipe"] });
   if (result.error || result.status !== 0) throw new Error(result.error?.message || result.stderr || "GitHub command failed");
   return result.stdout.trim();
+}
+
+function parseReleaseLines(text) {
+  return text ? text.split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 }
 
 function identity(release) {
@@ -44,7 +54,9 @@ function identity(release) {
 
 export function pruneNativeReleases(tag, directory, execute = gh) {
   const repo = process.env.GITHUB_REPOSITORY || "CateDesu/Kurisu";
-  const list = () => JSON.parse(execute(["api", "--paginate", "--slurp", `repos/${repo}/releases?per_page=100`])).flat();
+  const list = () => parseReleaseLines(execute([
+    "api", "--paginate", "--jq", RELEASE_PROJECTION, `repos/${repo}/releases?per_page=100`,
+  ]));
   const initial = retentionPlan(list(), tag);
   const legacy = bridgeAssets(initial.bridge);
   const names = [...nativeNames(initial.keep), ...legacy];

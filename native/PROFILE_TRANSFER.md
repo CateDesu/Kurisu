@@ -4,7 +4,7 @@ Kurisu's native desktop uses a separate profile. Upgrading copies your previous 
 
 ## Normal upgrade
 
-1. Use the previous Kurisu program's normal update action. It first installs the final Tauri transition release, which saves your interface preferences.
+1. Use the previous Kurisu program's normal update action. It first installs the final transition release, which saves your interface preferences.
 2. Use its update action to move to the native desktop. The usual Kurisu shortcut and Windows installation identity remain.
 3. Let the old program quit. The native program waits briefly for it to close, then transfers your profile automatically. If a recovery message appears, follow it and select **Retry**.
 
@@ -12,13 +12,13 @@ No Python or manual copying is needed. Accounts, pending local changes, library 
 
 Older updaters always choose the highest stable release. For this reason, legacy downloads on later native release pages still contain the frozen transition program. Fresh installations should choose the native downloads instead. If you downloaded native Kurisu directly and preferences are missing, run the final transition release once with the original profile, quit it fully, then retry native Kurisu.
 
-An existing valid native profile takes precedence and keeps its native-only changes. Earlier native candidate profiles remain usable. An explicit `--data-dir` opens only that isolated native profile and never searches for a previous Tauri profile.
+An existing valid native profile takes precedence and keeps its native-only changes. Earlier native candidate profiles remain usable. An explicit `--data-dir` opens only that isolated native profile and never searches for a legacy profile.
 
 Fresh native initialization prepares and syncs the database and marker privately before publication. Retry and restart can finish interrupted publication under a profile initialization lock. Filesystems without hard links use a synced publication record and atomic moves that refuse existing destinations. Existing unmarked databases remain refused. Unrelated files are preserved, including private staging directories left by an interrupted preparation.
 
 ## What is kept
 
-The original Tauri profile and its database sidecars remain unchanged. The native profile is published only after the complete copy passes validation. The backup is a standalone SQLite snapshot stored outside both profiles as `kurisu-legacy-backup.db` in your local application data directory. On Linux this is normally `$XDG_DATA_HOME` or `~/.local/share`; on Windows it is `%LOCALAPPDATA%`.
+The original profile and its database sidecars remain unchanged. The native profile is published only after the complete copy passes validation. The backup is a standalone SQLite snapshot stored outside both profiles as `kurisu-legacy-backup.db` in your local application data directory. On Linux this is normally `$XDG_DATA_HOME` or `~/.local/share`; on Windows it is `%LOCALAPPDATA%`.
 
 New native profiles use a separate `kurisu-native` application data directory. On Windows, new transfers use local application data; an existing candidate in the earlier roaming location stays there. If both default native locations contain profiles, Kurisu asks you to choose one through `--data-dir` instead of silently picking data.
 
@@ -47,8 +47,8 @@ Paths must be absolute and local and cannot use symlinks, reparse points or proh
 
 The optional `native/migrate.py` source helper remains available for controlled recovery into an explicitly chosen new destination. It requires Python 3.10 or newer and the transition release's exported UI preferences. Run `python3 native/migrate.py --help` from the program root. Existing destination and backup paths are refused by this helper. Normal packages omit this helper because ordinary updates do not need it. Do not point either program at the other's database directory.
 
-## Return to the Tauri program
+## Return to the legacy program
 
-Quit native Kurisu fully. Download and install or run the retained final Tauri transition release from its original release page. It uses the preserved original Tauri profile. Avoid its native update action while you need to remain on that release.
+Quit native Kurisu fully. Download and install or run the retained final transition release from its original release page. It uses the preserved original profile. Avoid its native update action while you need to remain on that release.
 
 Changes made only in the native profile are not copied back. This includes unsynced pending edits, local playback history and interface choices. Sync or resolve what you need before switching, and preserve the native profile for returning later. Do not replace the original database with the native database or delete either profile as part of rollback.

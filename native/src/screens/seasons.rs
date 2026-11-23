@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use chrono::Datelike;
 use gpui::{
-    AnyElement, Context, Entity, ListAlignment, ListState as GpuiListState, Subscription, Window,
-    deferred, div, list, prelude::*, px, rgb,
+    AnyElement, Context, Entity, ListAlignment, ListState, Subscription, Window, deferred, div,
+    list, prelude::*, px, rgb,
 };
 use kurisu_core::models::Media;
 
@@ -105,7 +105,7 @@ pub(super) struct SeasonsState {
     pub error: String,
     pub action_error: String,
     pub request: u64,
-    pub rows: Option<GpuiListState>,
+    pub rows: Option<ListState>,
     pub columns: usize,
 }
 
@@ -175,7 +175,7 @@ impl SeasonsState {
 }
 
 impl Workspace {
-    pub(super) fn enter_seasons(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn enter_seasons(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.seasons.year_input.is_none() {
             let year = self.seasons.selected_year.clone();
             let input = cx.new(|cx| TextInput::new(year, "Year", window, cx));
@@ -183,7 +183,16 @@ impl Workspace {
                 &input,
                 window,
                 |this, _, event, window, cx| match event {
-                    TextInputEvent::Changed(value) => this.seasons.selected_year = value.clone(),
+                    TextInputEvent::Changed(value) => {
+                        if this.stopping || this.writes_fenced() {
+                            let current = this.seasons.selected_year.clone();
+                            if let Some(input) = &this.seasons.year_input {
+                                input.update(cx, |input, cx| input.set_value(current, cx));
+                            }
+                            return;
+                        }
+                        this.seasons.selected_year = value.clone();
+                    }
                     TextInputEvent::Submitted => this.jump_season(window, cx),
                 },
             ));
@@ -194,8 +203,13 @@ impl Workspace {
             let input = cx.new(|cx| TextInput::new(title, "Filter titles…", window, cx));
             self.seasons
                 .subscriptions
-                .push(cx.subscribe(&input, |this, _, event, cx| {
+                .push(cx.subscribe(&input, |this, input, event, cx| {
                     if let TextInputEvent::Changed(value) = event {
+                        if this.stopping || this.writes_fenced() {
+                            let current = this.seasons.title_filter.clone();
+                            input.update(cx, |input, cx| input.set_value(current, cx));
+                            return;
+                        }
                         this.seasons.title_filter = value.clone();
                         this.refresh_season_visible();
                         cx.notify();
@@ -204,7 +218,7 @@ impl Workspace {
             self.seasons.title_input = Some(input);
         }
         if self.seasons.rows.is_none() {
-            let rows = GpuiListState::new(0, ListAlignment::Top, px(290.))
+            let rows = ListState::new(0, ListAlignment::Top, px(290.))
                 .with_uniform_item_height(px(CARD_ROW_HEIGHT));
             let weak = cx.weak_entity();
             rows.set_scroll_handler(move |event, _window, app| {
@@ -235,7 +249,7 @@ impl Workspace {
     }
 
     fn load_season(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() || self.seasons.loading {
+        if self.stopping || self.writes_fenced() || self.profile.is_none() || self.seasons.loading {
             return;
         }
         self.seasons.request += 1;
@@ -256,7 +270,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.seasons.request != request
                 {
@@ -278,8 +293,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn shift_season(&mut self, delta: i64, window: &Window, cx: &mut Context<Self>) {
-        if self.seasons.loading {
+    pub(super) fn shift_season(&mut self, delta: i64, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() || self.seasons.loading {
             return;
         }
         let (season, year) = shifted(&self.seasons.season, self.seasons.year, delta);
@@ -293,8 +308,8 @@ impl Workspace {
         self.load_season(window, cx);
     }
 
-    fn jump_season(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.seasons.loading {
+    pub(super) fn jump_season(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() || self.seasons.loading {
             return;
         }
         let Ok(year) = self.seasons.selected_year.trim().parse::<i64>() else {
@@ -712,7 +727,7 @@ impl Workspace {
                                         media.clone(),
                                         this.list.entry(media.id).cloned(),
                                         this.cover_images.get(&(media.id, 174, 176)).cloned(),
-                                        this.editor_adding.contains(&media.id),
+                                        this.discovery_status_blocked(media.id),
                                     )
                                 })
                             })
@@ -950,7 +965,7 @@ mod tests {
     use super::*;
     #[test]
     fn end_request_survives_filtering_before_layout() {
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        let rows = ListState::new(0, ListAlignment::Top, px(0.));
         let mut state = SeasonsState {
             rows: Some(rows.clone()),
             columns: 3,
@@ -967,7 +982,7 @@ mod tests {
 
     #[test]
     fn filters_and_reflow_keep_the_top_media_and_inset() {
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(290.));
+        let rows = ListState::new(0, ListAlignment::Top, px(290.));
         let mut state = SeasonsState {
             rows: Some(rows.clone()),
             columns: 3,

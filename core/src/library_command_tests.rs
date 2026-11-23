@@ -26,8 +26,8 @@ impl Fixture {
             db: Arc::new(Db::open(std::path::Path::new(":memory:")).unwrap()),
             user: Mutex::new(None),
             auth_intent: tokio::sync::watch::channel(0).0,
-            entry_lock: tokio::sync::Mutex::new(()),
-            remote_lock: tokio::sync::Mutex::new(()),
+            entry_lock: Default::default(),
+            remote_lock: Default::default(),
             matchers: Mutex::new(Arc::new(vec![])),
             library_cache: Default::default(),
             events: tokio::sync::broadcast::channel(128).0,
@@ -184,6 +184,14 @@ async fn folder_and_binding_commands_preserve_validation_and_offsets() {
     );
     fixture.entry(1);
     assert_eq!(
+        bind_library_path_inner(folder.clone(), 1, None, state)
+            .await
+            .unwrap_err(),
+        "only shows on your list can be linked"
+    );
+    fixture.account(7);
+    fixture.entry(1);
+    assert_eq!(
         bind_library_path_inner(folder.clone(), 1, Some(10000), state)
             .await
             .unwrap_err(),
@@ -259,6 +267,7 @@ async fn library_commands_propagate_storage_errors_without_overwriting_data() {
     let fixture = Fixture::new();
     let state = &fixture.state;
     let path = fixture.path("season");
+    fixture.account(7);
     fixture.entry(1);
     for key in ["library_folders", "library_bindings"] {
         state.db.set_setting(key, "{invalid").unwrap();
@@ -481,6 +490,46 @@ async fn queued_library_writes_reject_a_new_intent_for_the_same_account() {
 }
 
 #[test]
+fn library_write_is_cancellable_until_admitted_and_keeps_its_guard_afterwards() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let state = super::tests::test_state();
+        let wait = Duration::from_secs(5);
+        let guard = state.entry_lock.lock().await;
+        let mut unadmitted = Box::pin(add_library_folder("fixture-cancelled".into(), &state));
+        assert!(poll_once(unadmitted.as_mut()).is_pending());
+        drop(unadmitted);
+        drop(guard);
+
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = mpsc::channel();
+        let occupied = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            blocked.recv_timeout(wait).unwrap();
+        });
+        tokio::time::timeout(wait, started).await.unwrap().unwrap();
+        let mut admitted = Box::pin(add_library_folder("fixture-admitted".into(), &state));
+        assert!(poll_once(admitted.as_mut()).is_pending());
+        drop(admitted);
+        assert!(state.entry_lock.try_lock().is_err());
+        release.send(()).unwrap();
+        occupied.await.unwrap();
+
+        let _guard = tokio::time::timeout(wait, state.entry_lock.lock())
+            .await
+            .unwrap();
+        assert_eq!(
+            library::get_folders(&state.db).unwrap(),
+            ["fixture-admitted"]
+        );
+    });
+}
+
+#[test]
 fn library_account_checks_hold_the_guard_until_blocking_work_finishes() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -529,4 +578,75 @@ async fn library_worker_panics_return_command_errors() {
     .await
     .unwrap_err();
     assert!(error.contains("synthetic library worker failure"));
+}
+
+#[tokio::test]
+async fn signed_out_binding_details_and_rejected_session_binds_do_not_expose_or_link_shows() {
+    let fixture = Fixture::new();
+    let state = &fixture.state;
+    let folder = fixture.path("season");
+    let file = fixture.path("season/episode01.mkv");
+    fixture.entry(1);
+    library::bind_path(&state.db, &folder, 1, -12).unwrap();
+    assert!(!state.anilist.lock().has_token());
+    assert_eq!(
+        library_binding_for_inner(folder.clone(), state)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        library_binding_details_inner(file.clone(), state)
+            .await
+            .unwrap(),
+        None
+    );
+
+    fixture.account(7);
+    fixture.entry(1);
+    assert_eq!(
+        library_binding_details_inner(file.clone(), state)
+            .await
+            .unwrap(),
+        Some(library::LibraryBinding {
+            media_id: 1,
+            episode_offset: -12,
+        })
+    );
+    state
+        .db
+        .0
+        .lock()
+        .execute_batch(
+            "CREATE TEMP TRIGGER keep_list_on_expiry BEFORE DELETE ON list_entry
+             BEGIN SELECT RAISE(ABORT, 'fixture list clear blocked'); END;",
+        )
+        .unwrap();
+    let other_folder = fixture.path("season2");
+    let guard = state.entry_lock.lock().await;
+    let mut bind = Box::pin(bind_library_path_inner(
+        other_folder.clone(),
+        1,
+        None,
+        state,
+    ));
+    assert!(poll_once(bind.as_mut()).is_pending());
+    clear_rejected_session(state);
+    drop(guard);
+    assert_eq!(
+        bind.await.unwrap_err(),
+        "Your AniList account changed. Try again."
+    );
+    assert_eq!(
+        bind_library_path_inner(other_folder.clone(), 1, None, state)
+            .await
+            .unwrap_err(),
+        "only shows on your list can be linked"
+    );
+    assert_eq!(
+        library_binding_for_inner(other_folder, state)
+            .await
+            .unwrap(),
+        None
+    );
 }

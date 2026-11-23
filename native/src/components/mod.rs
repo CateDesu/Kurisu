@@ -7,7 +7,7 @@ use gpui::{Div, ElementId, FontWeight, Role, SharedString, Stateful, div, prelud
 
 use crate::theme::{ACCENT, DIM, EDGE, INK, PANEL_2, mono_font, serif_font};
 
-fn disable_control_node(node: &mut gpui::accesskit::Node) {
+pub(crate) fn disable_control_node(node: &mut gpui::accesskit::Node) {
     node.set_disabled();
     node.remove_action(gpui::AccessibleAction::Click);
     node.remove_action(gpui::AccessibleAction::Focus);
@@ -273,7 +273,12 @@ mod tests {
 
     #[test]
     fn disabled_control_accessibility_removes_actions() {
-        for role in [Role::Button, Role::ComboBox] {
+        for role in [
+            Role::Button,
+            Role::ComboBox,
+            Role::RadioButton,
+            Role::CheckBox,
+        ] {
             let mut node = gpui::accesskit::Node::new(role);
             node.add_action(gpui::AccessibleAction::Click);
             node.add_action(gpui::AccessibleAction::Focus);

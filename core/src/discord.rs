@@ -220,8 +220,13 @@ fn state_line(episode: Option<i64>, total: Option<i64>, playing: bool) -> String
 }
 
 fn build_activity(d: &PresenceInfo, end_ms: i64) -> Value {
-    // Discord limits title fields to 128 characters.
-    let title: String = d.title.chars().take(128).collect();
+    // Discord requires 2 to 128 characters for details and large_text.
+    let mut title: String = d.title.chars().take(128).collect();
+    if title.is_empty() {
+        title = "Kurisu".into();
+    } else if title.chars().count() < 2 {
+        title.push(' ');
+    }
     let mut activity = json!({
         "details": title,
         "state": state_line(d.episode, d.total_episodes, d.playing),
@@ -293,6 +298,18 @@ mod tests {
         let payload = build_activity(&bare, 123_456);
         assert!(payload.get("assets").is_none());
         assert_eq!(payload["timestamps"]["end"], 123_456);
+
+        let one_char = PresenceInfo {
+            title: "K".into(),
+            ..playing()
+        };
+        let payload = build_activity(&one_char, 0);
+        assert_eq!(payload["details"], "K ");
+        let empty = PresenceInfo {
+            title: String::new(),
+            ..playing()
+        };
+        assert_eq!(build_activity(&empty, 0)["details"], "Kurisu");
     }
 
     #[cfg(unix)]

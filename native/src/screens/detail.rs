@@ -15,17 +15,18 @@ use crate::contracts::Route;
 use crate::theme::{ACCENT, BASE, DIM, EDGE, ERROR, PANEL, PANEL_2, serif_font};
 
 impl Workspace {
-    fn detail_entry_retry_current(
+    pub(super) fn detail_entry_current(
         &self,
         id: i64,
         request: u64,
         generation: u64,
         entry_revision: u64,
     ) -> bool {
-        generation == self.generation
+        !self.stopping
+            && generation == self.generation
             && self.route == Route::Anime(id)
             && self.detail.current(id, request)
-            && (!self.list.loaded || self.list.revision() == entry_revision)
+            && self.detail.entry_revision == entry_revision
     }
 
     pub(super) fn render_detail(
@@ -38,6 +39,8 @@ impl Workspace {
         let detail = self.detail.detail.clone();
         let entry = self.detail.entry.clone();
         let compact = f32::from(window.viewport_size().width) <= 960.;
+        let reads_fenced = self.stopping || self.writes_fenced();
+        let edits_fenced = self.edits_fenced() || self.modal_open();
         let mut root = div()
             .id("detail-scroll")
             .flex_1()
@@ -73,11 +76,17 @@ impl Workspace {
                             self.detail.detail_error.clone()
                         },
                     ))
-                    .child(button("retry-detail", "Retry details", false).on_click(
-                        cx.listener(move |this, _, window, cx| this.load_detail(id, window, cx)),
-                    ));
+                    .child(
+                        button("retry-detail", "Retry details", reads_fenced).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.load_detail(id, window, cx)
+                            }),
+                        ),
+                    );
             }
-            return root.child(page).into_any();
+            return root
+                .child(page.children(self.render_detail_progress_review(id, cx)))
+                .into_any();
         }
         let detail = detail.unwrap();
         let media = &detail.media;
@@ -164,21 +173,40 @@ impl Workspace {
             );
         }
         heading_area = heading_area.child(
-            button("open-anilist", "Open on AniList ↗", false)
+            button("open-anilist", "Open on AniList ↗", id <= 0 || edits_fenced)
                 .bg(rgb(PANEL))
                 .border_color(rgb(PANEL))
                 .text_color(rgb(ACCENT))
                 .px(px(0.))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if id <= 0 {
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if id <= 0 || this.edits_fenced() || this.modal_open() {
                         return;
                     }
-                    if let Err(error) = crate::platform::NativePlatform
-                        .open_url(&format!("https://anilist.co/anime/{id}"))
-                    {
-                        this.global_error = error;
-                        cx.notify();
-                    }
+                    let url = format!("https://anilist.co/anime/{id}");
+                    let generation = this.generation;
+                    let core = this.core.clone();
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = super::joined(
+                            core.spawn(async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::platform::NativePlatform.open_url(&url)
+                                })
+                                .await
+                                .map_err(|error| error.to_string())?
+                            })
+                            .await,
+                        );
+                        let _ = this.update_in(cx, |this, _, cx| {
+                            if !this.stopping
+                                && this.generation == generation
+                                && let Err(error) = result
+                            {
+                                this.global_error = error;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
                 })),
         );
         intro = intro.child(heading_area);
@@ -210,13 +238,19 @@ impl Workspace {
                         }
                     ))
                     .child(
-                        button("retry-partial-detail", "Retry details", self.detail.loading)
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        button(
+                            "retry-partial-detail",
+                            "Retry details",
+                            reads_fenced || self.detail.loading,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 if this.detail.loading {
                                     return;
                                 }
                                 this.load_detail(id, window, cx)
-                            })),
+                            },
+                        )),
                     ),
             );
         }
@@ -229,9 +263,11 @@ impl Workspace {
                         self.detail.entry_error
                     ))
                     .child(
-                        button("retry-entry", "Retry list entry", false).on_click(cx.listener(
-                            move |this, _, window, cx| this.reload_detail_entry(id, window, cx),
-                        )),
+                        button("retry-entry", "Retry list entry", reads_fenced).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.reload_detail_entry(id, window, cx)
+                            }),
+                        ),
                     ),
             );
         }
@@ -258,11 +294,17 @@ impl Workspace {
             .flex_wrap()
             .items_center()
             .gap(px(8.));
+        let pending_edit = self.progress.edit(self.generation, id);
         if let Some(entry) = entry {
-            let progress = self
-                .progress
-                .edit(self.generation, id)
-                .map_or(entry.progress, |edit| edit.pending);
+            let progress = pending_edit.map_or(entry.progress, |edit| edit.pending);
+            let review = pending_edit.is_some_and(|edit| edit.requires_review);
+            let stepper_locked = edits_fenced || self.progress.busy(self.generation, id) || review;
+            let edit_locked = edits_fenced || self.progress.deleting(self.generation, id) || review;
+            let edit_label = if self.pending_editor_error(id).is_some() {
+                "Retry edit"
+            } else {
+                "Edit entry"
+            };
             list_card =
                 list_card
                     .child(
@@ -271,7 +313,7 @@ impl Workspace {
                             .child(format!("✓ {}", status_label(&entry.status))),
                     )
                     .child(
-                        button("detail-less", "−", progress <= 0)
+                        button("detail-less", "−", stepper_locked || progress <= 0)
                             .aria_label("One less episode")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.step_progress(id, -1, window, cx)
@@ -286,7 +328,7 @@ impl Workspace {
                         button(
                             "detail-more",
                             "+",
-                            media.episodes.is_some_and(|total| progress >= total),
+                            stepper_locked || media.episodes.is_some_and(|total| progress >= total),
                         )
                         .aria_label("One more episode")
                         .on_click(cx.listener(
@@ -310,19 +352,44 @@ impl Workspace {
                 let path = file.path.clone();
                 let episode = file.episode.unwrap_or(entry.progress + 1);
                 list_card = list_card.child(
-                    button("play-next-local", format!("Play Ep {episode}"), false).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            if let Err(error) = crate::platform::NativePlatform
-                                .open_path(std::path::Path::new(&path))
-                            {
-                                this.global_error = error;
-                                cx.notify();
-                            }
-                        }),
-                    ),
+                    button(
+                        "play-next-local",
+                        format!("Play Ep {episode}"),
+                        edits_fenced,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.edits_fenced() || this.modal_open() {
+                            return;
+                        }
+                        let path = std::path::PathBuf::from(&path);
+                        let generation = this.generation;
+                        let core = this.core.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let result = super::joined(
+                                core.spawn(async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        crate::platform::NativePlatform.open_path(&path)
+                                    })
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                })
+                                .await,
+                            );
+                            let _ = this.update_in(cx, |this, _, cx| {
+                                if !this.stopping
+                                    && this.generation == generation
+                                    && let Err(error) = result
+                                {
+                                    this.global_error = error;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    })),
                 );
             }
-            list_card = list_card.child(button("detail-edit", "Edit entry", false).on_click(
+            list_card = list_card.child(button("detail-edit", edit_label, edit_locked).on_click(
                 cx.listener(move |this, _, window, cx| this.open_editor(id, window, cx)),
             ));
         } else if self.detail.entry_available {
@@ -335,17 +402,25 @@ impl Workspace {
                     button(
                         format!("add-{status}"),
                         label,
-                        self.editor_adding.contains(&id),
+                        self.add_media_blocked(id, None),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.add_media(id, status, window, cx)
+                        this.add_media(id, status, None, window, cx)
                     })),
                 );
             }
         } else {
-            list_card = list_card.child(div().text_color(rgb(DIM)).child("List entry unavailable"));
+            list_card = list_card.child(div().text_color(rgb(DIM)).child(
+                if self.detail.entry_error.is_empty() {
+                    "Loading list entry…"
+                } else {
+                    "List entry unavailable"
+                },
+            ));
         }
-        page = page.child(list_card);
+        page = page
+            .child(list_card)
+            .children(self.render_detail_progress_review(id, cx));
         let description = plain_description(media.description.as_deref().unwrap_or(""));
         if !description.is_empty() {
             let mut synopsis = div()
@@ -542,7 +617,7 @@ impl Workspace {
                         button(
                             "retry-recommendations",
                             "Retry recommendations",
-                            self.detail.recommendations_loading,
+                            reads_fenced || self.detail.recommendations_loading,
                         )
                         .bg(rgb(PANEL))
                         .border_color(rgb(PANEL))
@@ -616,12 +691,11 @@ impl Workspace {
                             } else {
                                 "Add to planning"
                             },
-                            self.editor_adding.contains(&rec_id)
-                                || self.added_recommendations.contains(&rec_id),
+                            self.add_media_blocked(rec_id, None),
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.add_media(rec_id, "PLANNING", window, cx)
+                                this.add_media(rec_id, "PLANNING", None, window, cx)
                             },
                         )),
                     ),
@@ -630,18 +704,87 @@ impl Workspace {
         root.child(page.child(recommendations)).into_any()
     }
 
+    fn render_detail_progress_review(
+        &self,
+        id: i64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<AnyElement> {
+        let edit = self.progress.edit(self.generation, id)?;
+        if edit.error.is_none() && !edit.requires_review {
+            return None;
+        }
+        let disabled = self.edits_fenced()
+            || self.modal_open()
+            || self.progress.busy(self.generation, id)
+            || edit.requires_review && !self.list.loaded;
+        let mut banner =
+            div()
+                .border_1()
+                .border_color(rgb(ERROR))
+                .bg(rgb(PANEL))
+                .p(px(10.))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .text_color(rgb(ERROR))
+                .child(edit.error.clone().unwrap_or_else(|| {
+                    "Progress changed on your list. Review before saving.".into()
+                }));
+        if edit.requires_review {
+            if edit.remote_progress.is_some() {
+                banner = banner.child(button("detail-use-edit", "Use my edit", disabled).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.resolve_progress_review(id, true, window, cx)
+                    }),
+                ));
+            }
+            let label = if edit.remote_progress.is_some() {
+                "Keep latest"
+            } else {
+                "Discard edit"
+            };
+            banner = banner.child(button("detail-keep-latest", label, disabled).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.resolve_progress_review(id, false, window, cx)
+                }),
+            ));
+        } else {
+            banner = banner.child(
+                button(
+                    "detail-retry-progress",
+                    "Retry",
+                    disabled || !self.can_retry_progress_errors(),
+                )
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.retry_progress_errors(window, cx)),
+                ),
+            );
+        }
+        Some(banner.into_any())
+    }
+
     fn reload_detail_entry(
         &mut self,
         id: i64,
         window: &gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        if self.route != Route::Anime(id) || self.detail.media_id != Some(id) {
+        if self.stopping
+            || self.writes_fenced()
+            || self.route != Route::Anime(id)
+            || self.detail.media_id != Some(id)
+            || self.detail.entry_error.is_empty()
+        {
             return;
         }
+        self.detail.entry_error.clear();
+        cx.notify();
         let request = self.detail.request();
         let generation = self.generation;
-        let entry_revision = self.list.revision();
+        let account = self.profile.as_ref().map(|user| user.id);
+        self.detail.entry_revision += 1;
+        let entry_revision = self.detail.entry_revision;
         let core = self.core.clone();
         let worker = core.clone();
         let job = core.spawn(async move { worker.get_entry(id).await });
@@ -649,7 +792,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = super::joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
-                if !this.detail_entry_retry_current(id, request, generation, entry_revision) {
+                if this.profile.as_ref().map(|user| user.id) != account
+                    || !this.detail_entry_current(id, request, generation, entry_revision)
+                {
                     return;
                 }
                 this.detail.finish_entry(id, request, result);
@@ -665,7 +810,9 @@ impl Workspace {
         window: &gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        if self.detail.recommendations_loading
+        if self.stopping
+            || self.writes_fenced()
+            || self.detail.recommendations_loading
             || self.route != Route::Anime(id)
             || self.detail.media_id != Some(id)
         {
@@ -673,6 +820,7 @@ impl Workspace {
         }
         let request = self.detail.request();
         let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
         self.detail.recommendations_loading = true;
         self.detail.recommendation_error.clear();
         let core = self.core.clone();
@@ -682,7 +830,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = super::joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.generation
+                if this.stopping
+                    || generation != this.generation
+                    || this.profile.as_ref().map(|user| user.id) != account
                     || this.route != Route::Anime(id)
                     || !this.detail.current(id, request)
                 {
@@ -871,6 +1021,7 @@ fn plain_description(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{BarrierAction, CloseIntent};
     use super::{Route, Workspace, airing_label, plain_description, score_label};
     use gpui::{TestAppContext, px, size};
     use kurisu_core::models::{ListEntry, Media, MediaDetail, User};
@@ -981,12 +1132,109 @@ mod tests {
     }
 
     #[gpui::test]
+    fn deleted_entry_shows_review_and_locks_add_until_the_save_settles(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1000.)));
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Anime(9);
+            let request = w.detail.start(9);
+            w.detail.finish_detail(
+                9,
+                request,
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 9,
+                        episodes: Some(12),
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            let entry = ListEntry {
+                media_id: 9,
+                progress: 2,
+                status: "CURRENT".into(),
+                ..Default::default()
+            };
+            let edit = w.progress.entry(w.generation, &entry);
+            assert!(edit.step(1, std::time::Instant::now()));
+            assert_eq!(edit.begin_save(), Some((3, 2)));
+            w.list.replace(vec![], 0);
+            w.progress.reconcile_entries(w.generation, &w.list);
+            w.reconcile_open_entries(None, cx);
+            w.resolve_progress_review(9, false, window, cx);
+            w.add_media(9, "CURRENT", None, window, cx);
+            assert!(!w.editor_adding.contains(&9));
+            assert!(w.progress.edit(w.generation, 9).unwrap().in_flight);
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        for label in ["Discard edit", "Watching", "Plan to watch", "Completed"] {
+            let node = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing {label}"));
+            assert!(node.1.is_disabled());
+        }
+        workspace.update_in(cx, |w, _, cx| {
+            w.progress
+                .edit_mut(w.generation, 9)
+                .unwrap()
+                .finish_save(Err("Save failed".into()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (id, node) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Discard edit"))
+            .expect("missing recovery action");
+        assert!(!node.is_disabled());
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Click,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert!(w.progress.edit(w.generation, 9).is_none());
+            assert!(!w.progress.blocks_add(w.generation, 9));
+        });
+    }
+
+    #[gpui::test]
     fn detail_entry_retry_cannot_replace_canonical_deletion(cx: &mut TestAppContext) {
         let (core, _runtime, _dir) = fixture();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
-        workspace.update_in(cx, |workspace, _, _| {
+        workspace.update_in(cx, |workspace, window, cx| {
             workspace.route = Route::Anime(9);
             let request = workspace.detail.start(9);
+            workspace
+                .detail
+                .finish_entry(9, request, Err("Unavailable".into()));
+            workspace.reload_detail_entry(9, window, cx);
+            assert!(workspace.detail.entry_error.is_empty());
+            let retry = workspace.detail.entry_revision;
+            workspace.reload_detail_entry(9, window, cx);
+            assert_eq!(workspace.detail.entry_revision, retry);
             workspace.list.replace(
                 vec![ListEntry {
                     media_id: 9,
@@ -995,34 +1243,307 @@ mod tests {
                 }],
                 0,
             );
-            let revision = workspace.list.revision();
+            let revision = workspace.detail.entry_revision;
             let generation = workspace.generation;
-            assert!(workspace.detail_entry_retry_current(9, request, generation, revision));
+            assert!(workspace.detail_entry_current(9, request, generation, revision));
+
+            workspace.list.apply_scoped(&[10], vec![None], 0);
+            workspace.reconcile_open_entries(Some(&[10]), cx);
+            assert!(workspace.detail_entry_current(9, request, generation, revision));
+            assert!(!workspace.detail.entry_available);
 
             workspace.list.apply_scoped(&[9], vec![None], 0);
-            workspace.reconcile_detail_entry();
-            assert!(workspace.detail.entry.is_none());
-            assert!(!workspace.detail_entry_retry_current(9, request, generation, revision));
-            assert!(!workspace.detail_entry_retry_current(
-                9,
-                request + 1,
-                generation,
-                workspace.list.revision()
-            ));
-            assert!(!workspace.detail_entry_retry_current(
-                9,
-                request,
-                generation + 1,
-                workspace.list.revision()
-            ));
+            workspace.reconcile_open_entries(Some(&[9]), cx);
+            assert!(workspace.detail.entry_available && workspace.detail.entry.is_none());
+            assert!(!workspace.detail_entry_current(9, request, generation, revision));
+            let revision = workspace.detail.entry_revision;
+            assert!(workspace.detail_entry_current(9, request, generation, revision));
+            assert!(!workspace.detail_entry_current(9, request + 1, generation, revision));
+            assert!(!workspace.detail_entry_current(9, request, generation + 1, revision));
             workspace.route = Route::MyList;
-            assert!(!workspace.detail_entry_retry_current(
+            assert!(!workspace.detail_entry_current(9, request, generation, revision));
+        });
+    }
+
+    #[gpui::test]
+    fn detail_retry_controls_and_reads_obey_write_fence(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1000.)));
+        cx.simulate_accessibility_activation();
+
+        let assert_buttons_disabled =
+            |cx: &mut gpui::VisualTestContext, labels: &[&str], expected: bool| {
+                cx.run_until_parked();
+                let tree = cx.take_accessibility_tree_update().unwrap();
+                for &label in labels {
+                    let node = tree
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .unwrap_or_else(|| panic!("missing {label}"));
+                    assert_eq!(
+                        node.1.is_disabled(),
+                        expected,
+                        "{label} disabled state mismatch"
+                    );
+                }
+            };
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Anime(9);
+            let request = w.detail.start(9);
+            w.detail
+                .finish_detail(9, request, Err("Detail unavailable".into()));
+            cx.notify();
+        });
+        assert_buttons_disabled(cx, &["Retry details"], false);
+
+        for close_ready in [false, true] {
+            workspace.update_in(cx, |w, win, cx| {
+                w.barrier = (!close_ready).then_some(BarrierAction::Close(CloseIntent::Window));
+                w.close_ready = close_ready;
+                assert!(w.writes_fenced());
+                let request = w.detail.request();
+                w.load_detail(9, win, cx);
+                assert_eq!(w.detail.request(), request);
+                assert!(!w.detail.loading);
+                assert!(!w.read_aborts.contains_key("detail"));
+                cx.notify();
+            });
+            assert_buttons_disabled(cx, &["Retry details"], true);
+        }
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.barrier = None;
+            w.close_ready = false;
+            assert!(!w.writes_fenced());
+            cx.notify();
+        });
+        assert_buttons_disabled(cx, &["Retry details"], false);
+        workspace.update_in(cx, |w, win, cx| {
+            let request = w.detail.request();
+            w.load_detail(9, win, cx);
+            assert_eq!(w.detail.request(), request + 1);
+            assert!(w.detail.loading);
+            assert_eq!(w.read_aborts.get("detail").map(Vec::len), Some(3));
+            w.cancel_reads("detail");
+        });
+
+        workspace.update_in(cx, |w, _, cx| {
+            let request = w.detail.start(9);
+            w.detail.finish_detail(
                 9,
                 request,
-                generation,
-                workspace.list.revision()
-            ));
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 9,
+                        title_english: Some("Partial detail".into()),
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: Some("Cached copy.".into()),
+                    unavailable_sections: vec!["staff".into()],
+                }),
+            );
+            w.detail
+                .finish_entry(9, request, Err("Entry unavailable".into()));
+            w.detail
+                .finish_recommendations(9, request, Err("Recs unavailable".into()));
+            cx.notify();
         });
+        assert_buttons_disabled(
+            cx,
+            &["Retry details", "Retry list entry", "Retry recommendations"],
+            false,
+        );
+
+        for close_ready in [false, true] {
+            workspace.update_in(cx, |w, win, cx| {
+                w.barrier = (!close_ready).then_some(BarrierAction::Close(CloseIntent::Window));
+                w.close_ready = close_ready;
+                assert!(w.writes_fenced());
+                let request = w.detail.request();
+                let entry_revision = w.detail.entry_revision;
+                w.load_detail(9, win, cx);
+                w.reload_detail_entry(9, win, cx);
+                w.reload_detail_recommendations(9, win, cx);
+                assert_eq!(w.detail.request(), request);
+                assert_eq!(w.detail.entry_revision, entry_revision);
+                assert!(!w.detail.loading);
+                assert!(!w.detail.recommendations_loading);
+                assert_eq!(w.detail.entry_error, "Entry unavailable");
+                assert_eq!(w.detail.recommendation_error, "Recs unavailable");
+                for group in ["detail", "detail-entry", "detail-recommendations"] {
+                    assert!(!w.read_aborts.contains_key(group), "unexpected {group}");
+                }
+                cx.notify();
+            });
+            assert_buttons_disabled(
+                cx,
+                &["Retry details", "Retry list entry", "Retry recommendations"],
+                true,
+            );
+        }
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.barrier = None;
+            w.close_ready = false;
+            cx.notify();
+        });
+        assert_buttons_disabled(
+            cx,
+            &["Retry details", "Retry list entry", "Retry recommendations"],
+            false,
+        );
+        workspace.update_in(cx, |w, win, cx| {
+            let entry_revision = w.detail.entry_revision;
+            w.reload_detail_entry(9, win, cx);
+            assert_eq!(w.detail.entry_revision, entry_revision + 1);
+            assert!(w.detail.entry_error.is_empty());
+            assert!(w.read_aborts.contains_key("detail-entry"));
+
+            w.reload_detail_recommendations(9, win, cx);
+            assert!(w.detail.recommendations_loading);
+            assert!(w.detail.recommendation_error.is_empty());
+            assert!(w.read_aborts.contains_key("detail-recommendations"));
+
+            let request = w.detail.request();
+            w.load_detail(9, win, cx);
+            assert_eq!(w.detail.request(), request + 1);
+            assert!(w.detail.loading);
+            assert!(w.read_aborts.contains_key("detail"));
+            w.cancel_reads_for_quit();
+        });
+    }
+
+    #[gpui::test]
+    fn detail_action_controls_obey_edit_fence(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1000.)));
+        cx.simulate_accessibility_activation();
+
+        let labels = [
+            "Open on AniList ↗",
+            "One less episode",
+            "One more episode",
+            "Play Ep 4",
+            "Edit entry",
+        ];
+        let assert_controls = |cx: &mut gpui::VisualTestContext, expected: bool, mode: &str| {
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            for label in labels {
+                let (_, node) = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap_or_else(|| panic!("missing {label} in {mode}"));
+                assert_eq!(
+                    node.is_disabled(),
+                    expected,
+                    "{label} disabled state mismatch in {mode}"
+                );
+            }
+        };
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Anime(9);
+            w.back_stack.push(Route::MyList);
+            let request = w.detail.start(9);
+            w.detail.finish_detail(
+                9,
+                request,
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 9,
+                        title_english: Some("Detail actions".into()),
+                        episodes: Some(12),
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            w.detail.finish_entry(
+                9,
+                request,
+                Ok(Some(ListEntry {
+                    media_id: 9,
+                    status: "CURRENT".into(),
+                    progress: 3,
+                    ..Default::default()
+                })),
+            );
+            w.library_files
+                .replace(vec![kurisu_core::models::LibraryFile {
+                    path: "/controlled/ep4.mkv".into(),
+                    media_id: Some(9),
+                    episode: Some(4),
+                    ..Default::default()
+                }]);
+            cx.notify();
+        });
+        assert_controls(cx, false, "unfenced");
+
+        for mode in [
+            "barrier",
+            "close_ready",
+            "auth_busy",
+            "update_busy",
+            "modal",
+            "stopping",
+        ] {
+            workspace.update_in(cx, |w, win, cx| {
+                w.barrier =
+                    (mode == "barrier").then_some(BarrierAction::Close(CloseIntent::Window));
+                w.close_ready = mode == "close_ready";
+                w.auth_busy = mode == "auth_busy";
+                w.update_busy = mode == "update_busy";
+                w.logout_confirming = mode == "modal";
+                w.stopping = mode == "stopping";
+                if mode == "stopping" {
+                    w.navigate(Route::MyList, win, cx);
+                    w.back(win, cx);
+                    assert_eq!(w.route, Route::Anime(9));
+                }
+                cx.notify();
+            });
+            assert_controls(cx, true, mode);
+        }
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.barrier = None;
+            w.close_ready = false;
+            w.auth_busy = false;
+            w.update_busy = false;
+            w.logout_confirming = false;
+            w.stopping = false;
+            cx.notify();
+        });
+        assert_controls(cx, false, "cleared");
     }
 
     #[test]

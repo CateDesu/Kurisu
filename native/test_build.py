@@ -43,6 +43,24 @@ class BuildVersionTests(unittest.TestCase):
                 BUILD.resolve_version(None, True)
             self.assertEqual(BUILD.resolve_version("1.0.0.77", True), "1.0.0.77")
 
+    def test_paginated_discovery_uses_upstream_in_forks_and_allows_staging(self):
+        page1 = [{"tag_name": f"v1.0.0.{i}", "draft": True, "prerelease": False} for i in range(100)]
+        page2 = [{"tag_name": "v1.4.2", "draft": False, "prerelease": False}]
+        response = BUILD.subprocess.CompletedProcess([], 0, stdout=json.dumps([page1, page2]))
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "Fork/Kurisu"}, clear=True), \
+                patch.object(BUILD.subprocess, "run", return_value=response) as run:
+            self.assertEqual(BUILD.resolve_version(None, False), "1.4.2")
+            self.assertEqual(
+                run.call_args.args[0],
+                ["gh", "api", "--paginate", "--slurp", "repos/CateDesu/Kurisu/releases?per_page=100"],
+            )
+            with patch.dict(os.environ, {"KURISU_RELEASE_REPOSITORY": "Staging/Kurisu"}):
+                self.assertEqual(BUILD.resolve_version(None, False), "1.4.2")
+            self.assertEqual(
+                run.call_args.args[0],
+                ["gh", "api", "--paginate", "--slurp", "repos/Staging/Kurisu/releases?per_page=100"],
+            )
+
     def test_sidecar_matches_artifact_and_existing_updater_format(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "kurisu-native"
@@ -119,7 +137,7 @@ class PackagingTests(unittest.TestCase):
             license_text = (BUILD.ROOT.parent / "LICENSE").read_text()
             (root.parent / "LICENSE").write_text(license_text)
             shutil.copyfile(BUILD.ROOT / "src/main.rs", source)
-            # Exercise the real entry point without starting GPUI or a user's profile.
+            # Exercise the real entry point without opening a window or loading a user profile.
             (root / "src/lib.rs").write_text(textwrap.dedent('''\
                 pub mod notices;
 
@@ -130,8 +148,9 @@ class PackagingTests(unittest.TestCase):
                     let installed = format!("{}:{}",
                         directory.join("kurisu.LICENSE").is_file(),
                         directory.join("kurisu.THIRD_PARTY_NOTICES.txt").is_file());
+                    let capture = kurisu_core::updater::NOTICES_AT_CAPTURE.get();
                     std::fs::create_dir_all(&profile).map_err(|error| error.to_string())?;
-                    std::fs::write(profile.join("started"), installed)
+                    std::fs::write(profile.join("started"), format!("{capture:?} -> {installed}"))
                         .map_err(|error| error.to_string())
                 }
             '''))
@@ -139,8 +158,29 @@ class PackagingTests(unittest.TestCase):
             (version_provider / "src").mkdir(parents=True)
             (version_provider / "Cargo.toml").write_text(
                 '[package]\nname="kurisu-core"\nversion="1.0.0"\nedition="2024"\n')
-            (version_provider / "src/lib.rs").write_text(
-                'pub mod updater { pub fn current_version() -> &\'static str { env!("KURISU_BUILD_VERSION") } }')
+            (version_provider / "src/lib.rs").write_text(textwrap.dedent('''\
+                pub mod updater {
+                    pub static NOTICES_AT_CAPTURE: std::sync::OnceLock<(bool, bool)> =
+                        std::sync::OnceLock::new();
+
+                    pub fn current_version() -> &'static str {
+                        env!("KURISU_BUILD_VERSION")
+                    }
+
+                    pub fn init_install_path() -> Result<(), String> {
+                        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+                        let directory = executable.parent().unwrap();
+                        NOTICES_AT_CAPTURE.set((
+                            directory.join("kurisu.LICENSE").exists(),
+                            directory.join("kurisu.THIRD_PARTY_NOTICES.txt").exists(),
+                        )).unwrap();
+                        if std::env::var_os("KURISU_FIXTURE_CAPTURE_ERROR").is_some() {
+                            return Err("fixture capture error".into());
+                        }
+                        Ok(())
+                    }
+                }
+            '''))
             with (root / "Cargo.toml").open("a") as manifest:
                 manifest.write('[dependencies]\nlog="0.4"\nenv_logger="0.11"\n'
                                'kurisu-core={path="fixture-core"}\n')
@@ -173,9 +213,13 @@ class PackagingTests(unittest.TestCase):
             shutil.copy2(binary, payload)
             profile = root / "disposable-profile"
 
-            def launch(*arguments, status=0):
+            def launch(*arguments, status=0, capture_error=False):
+                launch_env = dict(environment, RUST_LOG="warn")
+                launch_env.pop("KURISU_FIXTURE_CAPTURE_ERROR", None)
+                if capture_error:
+                    launch_env["KURISU_FIXTURE_CAPTURE_ERROR"] = "1"
                 result = BUILD.subprocess.run([payload, *arguments], capture_output=True,
-                                              text=True, env=dict(environment, RUST_LOG="warn"), timeout=5)
+                                              text=True, env=launch_env, timeout=5)
                 self.assertEqual(result.returncode, status, result.stderr)
                 return result
 
@@ -183,12 +227,13 @@ class PackagingTests(unittest.TestCase):
                                      ("--notices", "current embedded dependency texts"),
                                      ("--version", "kurisu-native 1.2.3\n")):
                 with self.subTest(option=option):
-                    result = launch("--data-dir", profile, option)
+                    result = launch("--data-dir", profile, option, capture_error=True)
                     self.assertEqual(result.stdout, expected)
                     self.assertEqual(result.stderr, "")
-            help_text = launch("--help").stdout
+            help_result = launch("--help", capture_error=True)
+            self.assertEqual(help_result.stderr, "")
             for option in ("--license", "--notices", "--version", "--data-dir"):
-                self.assertIn(option, help_text)
+                self.assertIn(option, help_result.stdout)
             self.assertIn("--data-dir requires a path", launch("--data-dir", status=2).stderr)
             self.assertIn("Unknown option", launch("--unknown", status=2).stderr)
             self.assertFalse(profile.exists())
@@ -198,14 +243,15 @@ class PackagingTests(unittest.TestCase):
                 (installed / name).write_text(f"user text for {name}")
                 originals[name] = (installed / name).stat().st_ino
             self.assertEqual(launch("--data-dir", profile).stderr, "")
-            self.assertEqual((profile / "started").read_text(), "true:true")
+            self.assertEqual((profile / "started").read_text(), "Some((false, false)) -> true:true")
             self.assertEqual((installed / "kurisu.LICENSE").read_text(), license_text)
             self.assertEqual((installed / "kurisu.THIRD_PARTY_NOTICES.txt").read_text(), "current embedded dependency texts")
             (installed / "kurisu.THIRD_PARTY_NOTICES.txt").write_text("user edited companion")
             companion_inode = (installed / "kurisu.THIRD_PARTY_NOTICES.txt").stat().st_ino
             (profile / "started").unlink()
-            launch("--data-dir", profile)
-            self.assertEqual((profile / "started").read_text(), "true:true")
+            result = launch("--data-dir", profile, capture_error=True)
+            self.assertIn("Could not capture the install path: fixture capture error", result.stderr)
+            self.assertEqual((profile / "started").read_text(), "Some((true, true)) -> true:true")
             self.assertEqual((installed / "kurisu.THIRD_PARTY_NOTICES.txt").read_text(), "user edited companion")
             self.assertEqual((installed / "kurisu.THIRD_PARTY_NOTICES.txt").stat().st_ino, companion_inode)
             self.assertEqual(launch("--notices").stdout, "current embedded dependency texts")
@@ -226,7 +272,7 @@ class PackagingTests(unittest.TestCase):
                     self.assertEqual(launch("--notices").stdout, "current embedded dependency texts")
                     self.assertFalse((profile / "started").exists())
                     self.assertIn("Could not create companion notices", launch("--data-dir", profile).stderr)
-                    self.assertEqual((profile / "started").read_text(), "false:false")
+                    self.assertEqual((profile / "started").read_text(), "Some((false, false)) -> false:false")
                     self.assertFalse((installed / "kurisu.LICENSE").exists())
                     self.assertFalse((installed / "kurisu.THIRD_PARTY_NOTICES.txt").exists())
                 finally:
@@ -310,7 +356,10 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(path.with_name(path.name + ".sha256").exists())
 
     def test_installer_retains_normal_identity_and_never_deletes_profile_trees(self):
-        script = (BUILD.ROOT / "packaging/windows.nsi").read_text()
+        script = "\n".join(
+            (BUILD.ROOT / "packaging" / name).read_text()
+            for name in ("windows.nsi", "windows-registration.nsh")
+        )
         for contract in ['Name "Kurisu"', 'InstallDir "$LOCALAPPDATA\\Kurisu"',
                          'Software\\CateDesu\\Kurisu', 'Uninstall\\Kurisu"',
                          'File /oname=kurisu.exe', 'Call EnsureStopped', 'Call un.EnsureStopped',
@@ -324,6 +373,47 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn('Delete "$LOCALAPPDATA', script)
         self.assertNotIn('Delete "$APPDATA', script)
         self.assertIn('$CandidateDir == "$LOCALAPPDATA\\Programs\\Kurisu Native"', script)
+
+    def test_installer_registration_ownership_and_partial_restore_contracts(self):
+        windows_nsi = (BUILD.ROOT / "packaging/windows.nsi").read_text()
+        registration_nsh = (BUILD.ROOT / "packaging/windows-registration.nsh").read_text()
+        proof_ps1 = (BUILD.ROOT.parent / ".github/test-native-installer.ps1").read_text()
+
+        self.assertIn("Var KeyOwned", windows_nsi)
+        check_owner = windows_nsi.split("Function un.CheckRegistrationOwner", 1)[1].split("FunctionEnd", 1)[0]
+        self.assertEqual(check_owner.count("StrCpy $KeyOwned 0"), 2)
+        self.assertNotIn("$OwnsRegistration == -1", check_owner)
+        finish_check = windows_nsi.split("Function un.FinishRegistrationCheck", 1)[1].split("FunctionEnd", 1)[0]
+        self.assertIn("${AndIf} $KeyOwned == 0", finish_check)
+        self.assertIn("StrCpy $RegFailed 1", finish_check)
+        self.assertNotIn("StrCpy $OwnsRegistration -1", finish_check)
+
+        self.assertIn("Var RegKeyBlocked", registration_nsh)
+        restore_key = registration_nsh.split("!macro RestoreRegistrationKey", 1)[1].split("!macroend", 1)[0]
+        self.assertIn("StrCpy $RegKeyBlocked 0", restore_key)
+        self.assertIn("StrCpy $RegKeyBlocked 1", restore_key)
+        self.assertIn("${AndIf} $RegKeyBlocked == 0", restore_key)
+        delete_key_block = registration_nsh.split('DeleteRegKey /ifempty HKCU "${Path}"', 1)[1].split("${EndIf}", 1)[0]
+        self.assertIn("StrCpy $RestoreFailed 1", delete_key_block)
+        self.assertNotIn("StrCpy $RegFailed 1", delete_key_block)
+        restore_value = registration_nsh.split("Function ${Prefix}RestoreRegistrationValue", 1)[1].split("FunctionEnd", 1)[0]
+        self.assertIn("${If} $RegKeyBlocked != 0", restore_value)
+        read_error_block = restore_value.split("Call ${Prefix}ReadRegistrationValue", 1)[1].split("${EndIf}", 1)[0]
+        self.assertIn("StrCpy $RegFailed 0", read_error_block)
+        self.assertIn("StrCpy $RestoreFailed 1", read_error_block)
+        write_error_block = restore_value.rsplit("${If} $0 != 0", 1)[1].split("${EndIf}", 1)[0]
+        self.assertIn("StrCpy $RestoreFailed 1", write_error_block)
+        self.assertNotIn("StrCpy $RegFailed 1", write_error_block)
+        shortcut_block = registration_nsh.split('Delete "$SMPROGRAMS\\Kurisu.lnk"', 1)[1].split("${EndIf}", 1)[0]
+        self.assertIn('${OrIf} ${FileExists} "$SMPROGRAMS\\Kurisu.lnk"', shortcut_block)
+        self.assertIn("StrCpy $RestoreFailed 1", shortcut_block)
+        self.assertNotIn("StrCpy $RegFailed 1", shortcut_block)
+
+        for mode in ("product-owned-arp-no-location", "arp-owned-product-no-location"):
+            self.assertIn(mode, proof_ps1)
+        self.assertIn("Shortcut or ARP write failure skipped restoring the product key", proof_ps1)
+        self.assertIn("Locked shortcut delete failure skipped restoring registry keys", proof_ps1)
+        self.assertNotIn("(Get-Item $key)", proof_ps1)
 
 
 class InstallerVersionTests(unittest.TestCase):

@@ -72,14 +72,14 @@ pub fn run(data_dir_override: Option<PathBuf>) -> Result<(), String> {
                     crate::theme::init_fonts(&window.text_system().all_font_names());
                     if let Some(gpu) = window.gpu_specs() {
                         log::info!(
-                            "GPUI renderer: device={}, driver={}, info={}, software={}",
+                            "Renderer: device={}, driver={}, info={}, software={}",
                             gpu.device_name,
                             gpu.driver_name,
                             gpu.driver_info,
                             gpu.is_software_emulated
                         );
                     } else {
-                        log::info!("GPUI renderer: GPU specs unavailable");
+                        log::info!("Renderer: GPU specs unavailable");
                     }
                     cx.new(|cx| {
                         Startup::new(data_dir_override, runtime_handle, services, window, cx)

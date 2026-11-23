@@ -10,7 +10,7 @@ Browse seasonal anime and airing schedules, search torrent feeds, view watch sta
 
 ## Getting started
 
-1. Download the native Windows installer or Linux archive from [Releases](https://github.com/CateDesu/Kurisu/releases). On Windows, install and open **Kurisu**. On Linux, extract the archive, run `chmod +x kurisu`, then launch `./kurisu`. Keep its license files beside the executable.
+1. Download the native Windows installer or Linux archive from [Releases](https://github.com/CateDesu/Kurisu/releases). On Windows, install and open **Kurisu**. On Linux, extract the archive, enter `Kurisu`, and launch `./kurisu` (run `chmod +x kurisu` if needed). Keep its license files beside the executable.
 2. Choose **Connect via AniList** and authorize Kurisu in your browser to sync your list.
 3. Optionally add media folders in **Library**. Configure **Settings → Playback tracking** and click **Save tracking**. Automatic progress updates are off by default.
 
@@ -41,7 +41,7 @@ In Library, use **Episode numbering** to adjust files that continue numbering fr
 <details>
 <summary>Build from source</summary>
 
-Kurisu uses GPUI and a shared Rust core. Building requires Rust, a C/C++ toolchain, Python 3.10 or newer, and GitHub CLI for release version discovery. Linux and Windows dependencies are listed in the [build guide](native/README.md#platform-dependencies).
+Building Kurisu requires Rust, a C/C++ toolchain, Python 3.10 or newer, and GitHub CLI for release version discovery (plus Node.js for the release protocol checks). Linux and Windows dependencies are listed in the [build guide](native/README.md#platform-dependencies).
 
 ```sh
 python3 native/build.py
@@ -55,6 +55,8 @@ The build helper stamps the newest published stable version to prevent repeated 
 Run the checks from the program root. Core playback tests need MPV on `PATH`; Linux MPRIS tests need `dbus-daemon`. Tests use controlled profiles and playback sessions.
 
 ```sh
+node --test .github/release-transition.test.mjs .github/prune-native-releases.test.mjs
+python3 .github/test_discord_notify.py
 python3 -m unittest discover -s native -p test_build.py
 python3 -m unittest discover -s native -p test_migrate.py
 cargo fmt --manifest-path core/Cargo.toml -- --check

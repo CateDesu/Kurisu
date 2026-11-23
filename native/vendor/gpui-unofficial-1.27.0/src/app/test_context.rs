@@ -1,3 +1,4 @@
+// Modified for Kurisu: simulate test-window accessibility activation, actions, and tree updates, and run test teardown on drop.
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
     BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DisplayId, DrawPhase,
@@ -12,13 +13,81 @@ use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
 
 use std::{
-    cell::RefCell, future::Future, ops::Deref, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
+    cell::{Cell, RefCell},
+    future::Future,
+    ops::Deref,
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
 };
+
+struct QuitOwner {
+    on_quit: Rc<RefCell<Vec<Box<dyn FnOnce() + 'static>>>>,
+    app: Rc<AppCell>,
+    test_platform: Rc<TestPlatform>,
+    quitting: Rc<Cell<bool>>,
+}
+
+impl Drop for QuitOwner {
+    fn drop(&mut self) {
+        quit_parts(
+            &self.on_quit,
+            &self.app,
+            &self.test_platform,
+            &self.quitting,
+        );
+    }
+}
+
+struct ResetQuitting<'a>(&'a Cell<bool>);
+
+impl Drop for ResetQuitting<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+fn quit_parts(
+    on_quit: &RefCell<Vec<Box<dyn FnOnce() + 'static>>>,
+    app: &AppCell,
+    test_platform: &TestPlatform,
+    quitting: &Cell<bool>,
+) {
+    if quitting.replace(true) {
+        return;
+    }
+    let _reset = ResetQuitting(quitting);
+    loop {
+        let callbacks = match on_quit.try_borrow_mut() {
+            Ok(mut on_quit) => std::mem::take(&mut *on_quit),
+            Err(_) => break,
+        };
+        if callbacks.is_empty() {
+            break;
+        }
+        for callback in callbacks {
+            callback();
+        }
+    }
+    if let Ok(mut app) = app.try_borrow_mut() {
+        if std::thread::panicking() {
+            app.windows.clear();
+            app.window_handles.clear();
+        } else {
+            app.shutdown();
+        }
+    }
+    if let Ok(mut active_window) = test_platform.active_window.try_borrow_mut() {
+        active_window.take();
+    }
+}
 
 /// A TestAppContext is provided to tests created with `#[gpui::test]`, it provides
 /// an implementation of `Context` with additional methods that are useful in tests.
 #[derive(Clone)]
 pub struct TestAppContext {
+    quit_owner: Option<Rc<QuitOwner>>,
     #[doc(hidden)]
     pub background_executor: BackgroundExecutor,
     #[doc(hidden)]
@@ -29,6 +98,7 @@ pub struct TestAppContext {
     text_system: Arc<TextSystem>,
     fn_name: Option<&'static str>,
     on_quit: Rc<RefCell<Vec<Box<dyn FnOnce() + 'static>>>>,
+    quitting: Rc<Cell<bool>>,
     #[doc(hidden)]
     pub app: Rc<AppCell>,
 }
@@ -179,8 +249,17 @@ impl TestAppContext {
 
         let app = App::new_app(platform.clone(), asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::test();
+        let on_quit = Rc::new(RefCell::new(Vec::default()));
+        let quitting = Rc::new(Cell::new(false));
+        let quit_owner = Some(Rc::new(QuitOwner {
+            on_quit: on_quit.clone(),
+            app: app.clone(),
+            test_platform: platform.clone(),
+            quitting: quitting.clone(),
+        }));
 
         Self {
+            quit_owner,
             app,
             background_executor,
             foreground_executor,
@@ -188,7 +267,8 @@ impl TestAppContext {
             test_platform: platform,
             text_system,
             fn_name,
-            on_quit: Rc::new(RefCell::new(Vec::default())),
+            on_quit,
+            quitting,
         }
     }
 
@@ -241,8 +321,11 @@ impl TestAppContext {
     /// Called by the test helper to end the test.
     /// public so the macro can call it.
     pub fn quit(&self) {
-        self.on_quit.borrow_mut().drain(..).for_each(|f| f());
-        self.app.borrow_mut().shutdown();
+        let on_quit = self.on_quit.clone();
+        let app = self.app.clone();
+        let test_platform = self.test_platform.clone();
+        let quitting = self.quitting.clone();
+        quit_parts(&on_quit, &app, &test_platform, &quitting);
     }
 
     /// Register cleanup to run when the test ends.
@@ -873,6 +956,19 @@ pub struct VisualTestContext {
     window: AnyWindowHandle,
 }
 
+struct RestoreA11yCallbacks<'a> {
+    window: &'a TestWindow,
+    callbacks: Option<crate::A11yCallbacks>,
+}
+
+impl Drop for RestoreA11yCallbacks<'_> {
+    fn drop(&mut self) {
+        if let Some(callbacks) = self.callbacks.take() {
+            self.window.0.lock().a11y_callbacks = Some(callbacks);
+        }
+    }
+}
+
 impl VisualTestContext {
     /// Provides a `Window` and `App` for the duration of the closure.
     pub fn update<R>(&mut self, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
@@ -907,6 +1003,52 @@ impl VisualTestContext {
     /// Read the title off the window (set by `Window#set_window_title`)
     pub fn window_title(&mut self) -> Option<String> {
         self.cx.test_window(self.window).0.lock().title.clone()
+    }
+
+    fn with_accessibility_callbacks(&self, f: impl FnOnce(&crate::A11yCallbacks)) {
+        let window = self.cx.test_window(self.window);
+        let callbacks = window
+            .0
+            .lock()
+            .a11y_callbacks
+            .take()
+            .expect("accessibility is disabled for this test window");
+        let guard = RestoreA11yCallbacks {
+            window: &window,
+            callbacks: Some(callbacks),
+        };
+        f(guard.callbacks.as_ref().unwrap());
+    }
+
+    /// Simulates an assistive technology connecting to this window.
+    pub fn simulate_accessibility_activation(&self) {
+        self.with_accessibility_callbacks(|callbacks| drop((callbacks.activation)()));
+    }
+
+    /// Simulates an assistive technology disconnecting from this window.
+    pub fn simulate_accessibility_deactivation(&self) {
+        self.with_accessibility_callbacks(|callbacks| (callbacks.deactivation)());
+    }
+
+    /// Queues an action without draining the foreground executor.
+    pub fn queue_accessibility_action(&self, request: accesskit::ActionRequest) {
+        self.with_accessibility_callbacks(|callbacks| (callbacks.action)(request));
+    }
+
+    /// Drains pending work after dispatching the request.
+    pub fn simulate_accessibility_action(&self, request: accesskit::ActionRequest) {
+        self.queue_accessibility_action(request);
+        self.run_until_parked();
+    }
+
+    /// Takes the most recent accessibility tree update sent to this test window.
+    pub fn take_accessibility_tree_update(&self) -> Option<accesskit::TreeUpdate> {
+        self.cx
+            .test_window(self.window)
+            .0
+            .lock()
+            .a11y_tree_update
+            .take()
     }
 
     /// Read the document path off the window (set by `Window#set_document_path`)
@@ -1110,7 +1252,16 @@ impl VisualTestContext {
 
     /// Get an &mut VisualTestContext (which is mostly what you need to pass to other methods).
     /// This method internally retains the VisualTestContext until the end of the test.
-    pub fn into_mut(self) -> &'static mut Self {
+    pub fn into_mut(mut self) -> &'static mut Self {
+        // Release strong quit ownership when an external TestAppContext still owns the app so on_quit does not cycle.
+        if self
+            .cx
+            .quit_owner
+            .as_ref()
+            .is_some_and(|owner| Rc::strong_count(owner) > 1)
+        {
+            self.cx.quit_owner = None;
+        }
         let ptr = Box::into_raw(Box::new(self));
         // safety: on_quit will be called after the test has finished.
         // the executor will ensure that all tasks related to the test have stopped.

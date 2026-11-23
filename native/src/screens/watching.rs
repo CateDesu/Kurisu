@@ -61,6 +61,7 @@ pub(super) struct WatchingState {
     cover_visible: HashSet<CoverKey>,
     updating: bool,
     update_error: String,
+    launch_error: String,
     update_request: u64,
 }
 
@@ -138,6 +139,7 @@ impl Default for WatchingState {
             cover_visible: HashSet::new(),
             updating: false,
             update_error: String::new(),
+            launch_error: String::new(),
             update_request: 0,
         }
     }
@@ -214,6 +216,11 @@ impl WatchingState {
     fn begin_playback(&mut self, id: Option<i64>) -> Option<u64> {
         if self.playback_id == id && (self.playback_loading || self.playback_checked) {
             return None;
+        }
+        if self.playback_id != id {
+            self.update_error.clear();
+            self.update_request = self.update_request.wrapping_add(1);
+            self.updating = false;
         }
         self.playback_id = id;
         self.playback_entry = None;
@@ -546,6 +553,7 @@ impl Workspace {
         self.watching.loading.hash(&mut key);
         self.watching.error.hash(&mut key);
         self.watching.update_error.hash(&mut key);
+        self.watching.launch_error.hash(&mut key);
         self.watching.updating.hash(&mut key);
         self.list.step_error.hash(&mut key);
         self.cover_scale.to_bits().hash(&mut key);
@@ -604,12 +612,15 @@ impl Workspace {
     }
 
     pub(super) fn refresh_watching_list(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_some() {
+        if !self.stopping && self.profile.is_some() {
             self.load_watching(window, cx);
         }
     }
 
     pub(super) fn refresh_watching_playback(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         let id = self
             .now_playing
             .as_ref()
@@ -633,7 +644,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.watching.playback_request != request
                     || this.watching.playback_id != Some(id)
@@ -652,6 +664,9 @@ impl Workspace {
     }
 
     fn load_watching(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         self.watching.request += 1;
         let request = self.watching.request;
         let generation = self.generation;
@@ -670,6 +685,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.stopping {
+                    return;
+                }
                 let current = WatchingRead {
                     generation: this.generation,
                     account: this.profile.as_ref().map(|user| user.id),
@@ -687,7 +705,15 @@ impl Workspace {
         cx.notify();
     }
 
-    fn step_watching(&mut self, id: i64, delta: i64, window: &Window, cx: &mut Context<Self>) {
+    fn step_watching(&mut self, id: i64, delta: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.writes_fenced()
+            || self.update_busy
+            || self.auth_busy
+            || self.modal_open()
+            || self.watching.updating
+        {
+            return;
+        }
         if self.list.entry(id).is_none()
             && let Some(entry) = self
                 .watching
@@ -711,17 +737,16 @@ impl Workspace {
         };
         if self.watching.updating
             || self.profile.is_none()
-            || self.barrier.is_some()
+            || self.writes_fenced()
             || self.auth_busy
             || self.update_busy
+            || self.modal_open()
         {
             return;
         }
-        if self
-            .progress
-            .edit(self.generation, id)
-            .is_some_and(|edit| edit.dirty() || edit.in_flight)
-        {
+        if self.progress.edit(self.generation, id).is_some_and(|edit| {
+            edit.dirty() || edit.in_flight || edit.deleting || edit.requires_review
+        }) {
             self.watching.update_error = "Finish the pending episode change first.".into();
             cx.notify();
             return;
@@ -744,10 +769,22 @@ impl Workspace {
                     if fresh.progress >= episode {
                         Ok(Some(fresh))
                     } else {
-                        worker
+                        let saved = worker
                             .set_progress(id, episode, Some(fresh.progress))
-                            .await
-                            .map(Some)
+                            .await?;
+                        if saved.progress < episode
+                            && saved
+                                .media
+                                .as_ref()
+                                .and_then(|media| media.episodes)
+                                .is_none_or(|total| saved.progress < total)
+                        {
+                            return Err(
+                                "Progress changed on your list. Review your list before updating."
+                                    .into(),
+                            );
+                        }
+                        Ok(Some(saved))
                     }
                 })
                 .await,
@@ -771,14 +808,20 @@ impl Workspace {
                             this.cancel_reads("watching-entry");
                         }
                         let change = this.list.apply_one(entry.clone(), now_seconds());
+                        this.progress.reconcile_entry(generation, &entry);
+                        this.update_step_error();
                         this.apply_list_change(change);
-                        if let Some(current) = this
-                            .watching
-                            .current
-                            .iter_mut()
-                            .find(|current| current.media_id == id)
-                        {
-                            *current = entry;
+                        if entry.status == "CURRENT" {
+                            if let Some(current) = this
+                                .watching
+                                .current
+                                .iter_mut()
+                                .find(|current| current.media_id == id)
+                            {
+                                *current = entry;
+                            }
+                        } else {
+                            this.watching.remove_row(id);
                         }
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
@@ -858,7 +901,7 @@ impl Workspace {
             }
             if can_update && playing.matched.is_some() {
                 let disabled = self.watching.updating
-                    || self.barrier.is_some()
+                    || self.writes_fenced()
                     || self.auth_busy
                     || self.update_busy;
                 controls = controls.child(
@@ -1014,6 +1057,12 @@ impl Workspace {
                             .child("Play an anime in MPV, VLC, or Haruna and it'll show up here."),
                     ),
             );
+        }
+        if !self.watching.launch_error.is_empty() {
+            page = page.child(div().text_color(rgb(ERROR)).child(format!(
+                "Could not open file: {}",
+                self.watching.launch_error
+            )));
         }
         if !self.list.step_error.is_empty() {
             page = page.child(
@@ -1244,13 +1293,36 @@ fn open_local(
     account: Option<i64>,
     cx: &mut Context<Workspace>,
 ) {
-    if !scope_matches(this, generation, account) {
+    if !scope_matches(this, generation, account)
+        || this.stopping
+        || this.edits_fenced()
+        || this.modal_open()
+    {
         return;
     }
-    if let Err(error) = crate::platform::NativePlatform.open_path(std::path::Path::new(path)) {
-        this.watching.update_error = error;
+    if !this.watching.launch_error.is_empty() {
+        this.watching.launch_error.clear();
         cx.notify();
     }
+    let path = std::path::PathBuf::from(path);
+    let job = this.core.spawn(async move {
+        tokio::task::spawn_blocking(move || crate::platform::NativePlatform.open_path(&path))
+            .await
+            .map_err(|error| error.to_string())?
+    });
+    cx.spawn(async move |this, cx| {
+        let result = joined(job.await);
+        let _ = this.update(cx, |this, cx| {
+            if !scope_matches(this, generation, account) || this.stopping {
+                return;
+            }
+            if let Err(error) = result {
+                this.watching.launch_error = error;
+                cx.notify();
+            }
+        });
+    })
+    .detach();
 }
 fn watching_row(
     entry: ListEntry,
@@ -1342,9 +1414,10 @@ fn watching_row(
         .p(px(10.))
         .child(cover)
         .child(info);
-    let saving = pending
-        .as_ref()
-        .is_some_and(|edit| edit.in_flight || edit.deleting || edit.requires_review);
+    let saving = pending.as_ref().is_some_and(|edit| edit.busy());
+    let review = pending.as_ref().is_some_and(|edit| edit.requires_review);
+    let progress_locked = saving || review;
+    let has_error = pending.as_ref().is_some_and(|edit| edit.error.is_some());
     let at_min = progress <= 0;
     let at_max = progress >= total.unwrap_or(9999);
     let mut progress_value = div()
@@ -1382,7 +1455,7 @@ fn watching_row(
                 _ => return,
             };
             app.stop_propagation();
-            if saving || (delta < 0 && at_min) || (delta > 0 && at_max) {
+            if progress_locked || (delta < 0 && at_min) || (delta > 0 && at_max) {
                 return;
             }
             let _ = weak_keys.update(app, |this, cx| {
@@ -1393,21 +1466,28 @@ fn watching_row(
         })
         .child(
             div()
-                .w(px(12.))
+                .id(format!("watching-progress-state-{id}"))
+                .w(px(if review { 42. } else { 12. }))
                 .flex_shrink_0()
                 .text_size(px(10.))
                 .flex()
                 .justify_center()
-                .text_color(rgb(
-                    if pending.as_ref().is_some_and(|edit| edit.error.is_some()) {
-                        ERROR
-                    } else {
-                        ACCENT
-                    },
-                ))
-                .child(if saving {
+                .text_color(rgb(if review || has_error { ERROR } else { ACCENT }))
+                .when(review, |indicator| {
+                    indicator
+                        .role(gpui::Role::Status)
+                        .aria_label("Review saved progress")
+                })
+                .when(saving && !review, |indicator| {
+                    indicator
+                        .role(gpui::Role::Status)
+                        .aria_label("Saving progress")
+                })
+                .child(if review {
+                    "Review"
+                } else if saving {
                     "…"
-                } else if pending.as_ref().is_some_and(|edit| edit.error.is_some()) {
+                } else if has_error {
                     "!"
                 } else if pending.as_ref().is_some_and(|edit| edit.dirty()) {
                     "●"
@@ -1416,57 +1496,65 @@ fn watching_row(
                 }),
         )
         .child(
-            button(format!("watching-less-{id}"), "−", at_min || saving)
-                .debug_selector(move || format!("watching-less-{id}"))
-                .w(px(24.))
-                .h(px(24.))
-                .px(px(0.))
-                .py(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .bg(rgb(0x221a16))
-                .border_color(rgb(0x221a16))
-                .opacity(if at_min || saving { 0.3 } else { 1. })
-                .aria_label("One less episode")
-                .on_click(move |_, window, app| {
-                    if at_min || saving {
-                        return;
+            button(
+                format!("watching-less-{id}"),
+                "−",
+                at_min || progress_locked,
+            )
+            .debug_selector(move || format!("watching-less-{id}"))
+            .w(px(24.))
+            .h(px(24.))
+            .px(px(0.))
+            .py(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .bg(rgb(0x221a16))
+            .border_color(rgb(0x221a16))
+            .opacity(if at_min || progress_locked { 0.3 } else { 1. })
+            .aria_label("One less episode")
+            .on_click(move |_, window, app| {
+                if at_min || progress_locked {
+                    return;
+                }
+                let _ = weak_less.update(app, |this, cx| {
+                    if scope_matches(this, generation, account) {
+                        this.step_watching(id, -1, window, cx);
                     }
-                    let _ = weak_less.update(app, |this, cx| {
-                        if scope_matches(this, generation, account) {
-                            this.step_watching(id, -1, window, cx);
-                        }
-                    });
-                }),
+                });
+            }),
         )
         .child(progress_value)
         .child(
-            button(format!("watching-more-{id}"), "+", at_max || saving)
-                .debug_selector(move || format!("watching-more-{id}"))
-                .w(px(24.))
-                .h(px(24.))
-                .px(px(0.))
-                .py(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .bg(rgb(0x221a16))
-                .border_color(rgb(0x221a16))
-                .opacity(if at_max || saving { 0.3 } else { 1. })
-                .aria_label("One more episode")
-                .on_click(move |_, window, app| {
-                    if at_max || saving {
-                        return;
+            button(
+                format!("watching-more-{id}"),
+                "+",
+                at_max || progress_locked,
+            )
+            .debug_selector(move || format!("watching-more-{id}"))
+            .w(px(24.))
+            .h(px(24.))
+            .px(px(0.))
+            .py(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .bg(rgb(0x221a16))
+            .border_color(rgb(0x221a16))
+            .opacity(if at_max || progress_locked { 0.3 } else { 1. })
+            .aria_label("One more episode")
+            .on_click(move |_, window, app| {
+                if at_max || progress_locked {
+                    return;
+                }
+                let _ = weak_more.update(app, |this, cx| {
+                    if scope_matches(this, generation, account) {
+                        this.step_watching(id, 1, window, cx);
                     }
-                    let _ = weak_more.update(app, |this, cx| {
-                        if scope_matches(this, generation, account) {
-                            this.step_watching(id, 1, window, cx);
-                        }
-                    });
-                }),
+                });
+            }),
         );
     row = row.child(stepper);
     if let Some(file) = next {
@@ -1600,6 +1688,41 @@ mod tests {
         state.remove_row(1);
         assert_eq!(state.list_widget.item_count(), 4);
         assert_eq!(state.list_widget.logical_scroll_top().item_ix, 2);
+    }
+
+    #[gpui::test]
+    fn watching_distinguishes_review_from_saving_in_accessibility(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Now;
+            let rows = cover_rows(2);
+            let edit = w.progress.entry(w.generation, &rows[0]);
+            edit.requires_review = true;
+            let edit = w.progress.entry(w.generation, &rows[1]);
+            edit.in_flight = true;
+            w.watching.replace_rows(rows);
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        for label in ["Review saved progress", "Saving progress"] {
+            assert!(
+                tree.nodes.iter().any(|(_, node)| {
+                    node.label() == Some(label)
+                        && node.role() == gpui::Role::Status
+                        && !node.is_hidden()
+                }),
+                "{label}"
+            );
+        }
     }
 
     #[gpui::test]
@@ -2166,6 +2289,11 @@ mod tests {
         let (core, runtime, dir) = fixture();
         drop(core);
         let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = User {
+            id: 47,
+            ..Default::default()
+        };
+        db.replace_account("fixture-session", &user).unwrap();
         for id in [7, 8] {
             db.upsert_media(&Media {
                 id,
@@ -2200,15 +2328,13 @@ mod tests {
         runtime
             .block_on(core.bind_library_path(path.clone(), 7, Some(-12)))
             .unwrap();
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
         workspace.update_in(cx, |workspace, _, _| {
             workspace.auth_intent += 1;
             workspace.restoring_session = false;
-            workspace.profile = Some(User {
-                id: 47,
-                ..Default::default()
-            });
+            workspace.profile = Some(user);
             workspace.route = Route::Now;
         });
         let refresh = |cx: &mut VisualTestContext, expected: &[(Option<i64>, Option<i64>)]| {
@@ -2599,6 +2725,40 @@ mod tests {
             with_button,
             workspace.read_with(cx, |workspace, _| workspace.watching_cover_layout_key())
         );
+        let layout = |cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                (
+                    workspace.watching_cover_layout_key(),
+                    workspace
+                        .watching
+                        .list_widget
+                        .bounds_for_item(0)
+                        .unwrap()
+                        .size
+                        .height,
+                )
+            })
+        };
+        let (without_error, header_height) = layout(cx);
+        workspace.update_in(cx, |workspace, _, cx| {
+            workspace.watching.launch_error =
+                "No video player could open this episode. ".repeat(12);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cover_frames(cx, 5);
+        let (with_error, taller_header) = layout(cx);
+        assert_ne!(without_error, with_error);
+        assert!(taller_header > header_height);
+        assert_measured_cover_owners(&workspace, cx);
+        workspace.update_in(cx, |workspace, _, cx| {
+            workspace.watching.launch_error.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cover_frames(cx, 5);
+        assert_eq!(layout(cx), (without_error, header_height));
+        assert_measured_cover_owners(&workspace, cx);
         assert_eq!(cover_frames(cx, 20), 0);
     }
 

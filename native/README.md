@@ -1,25 +1,25 @@
 # Kurisu desktop
 
-Kurisu's primary desktop uses GPUI and the shared Rust Core. It keeps the usual **Kurisu** window title, shortcut and Windows installation identity. The native profile remains separate from the previous Tauri profile. Existing native candidate profiles stay usable.
+Kurisu keeps the usual window title, shortcut and Windows installation identity. The native profile remains separate from the legacy profile. Existing native candidate profiles stay usable.
 
 ## Install and upgrade
 
 Choose the native Windows installer or Linux archive on [Releases](https://github.com/CateDesu/Kurisu/releases) for a fresh installation. Extract the Linux archive and keep its license files beside `kurisu`. Native release downloads are distinct from the retained legacy bridge downloads.
 
-An existing Tauri installation updates through the final transition release. It saves your interface preferences and hands off to the native program, which copies your stopped profile safely and creates a standalone backup. This also works when you skip releases: the legacy downloads on every later native release contain the same frozen transition program. Normal upgrades do not require Python or manual file copying. See [Profile transfer and rollback](PROFILE_TRANSFER.md) for recovery and returning to the Tauri release.
+An existing legacy installation updates through the final transition release. It saves your interface preferences and hands off to the native program, which copies your stopped profile safely and creates a standalone backup. This also works when you skip releases: the legacy downloads on every later native release contain the same frozen transition program. Normal upgrades do not require Python or manual file copying. See [Profile transfer and rollback](PROFILE_TRANSFER.md) for recovery and returning to the legacy release.
 
 ## Build and launch
 
-Run from the program root with Rust, a C/C++ toolchain, Python 3.10 or newer, and GitHub CLI:
+Run from the program root with Rust, a C/C++ toolchain, Python 3.10 or newer, and GitHub CLI (plus Node.js for the release protocol checks):
 
 ```sh
 python3 native/build.py
 ./native/target/release/kurisu-native
 ```
 
-The helper discovers the newest published stable version, builds with the committed Cargo lock, checks the executable's version, and writes the updater's existing checksum sidecar. Discovery failure stops the build. It does not install or publish anything.
+The helper discovers the newest published stable version from `CateDesu/Kurisu`, builds with the committed Cargo lock, checks the executable's version, and writes the updater's existing checksum sidecar. Discovery failure stops the build. It does not install or publish anything. For staging, set `KURISU_RELEASE_REPOSITORY` to the staging repository. In GitHub Actions, the repository variable of the same name also selects where the candidate workflow finds the pinned bridge fixture.
 
-Build artifacts include `LICENSE` and `THIRD_PARTY_NOTICES.txt`. Keep these beside the executable when distributing it. Release executables also embed these texts. On Linux, startup creates missing `kurisu.LICENSE` and `kurisu.THIRD_PARTY_NOTICES.txt` companions, including after an update from the frozen bridge. Existing files are preserved. Use `--license` or `--notices` to read the current bundled texts, including when the installation directory is read only. The Windows installer includes both. Notices cover the target's locked normal and build dependencies, bundled fonts, and the local GPUI changes. Missing dependency license texts stop packaging. Sourced supplements for crates that omit their license files are in `packaging/licenses/`.
+Build artifacts include `LICENSE` and `THIRD_PARTY_NOTICES.txt`. Keep these beside the executable when distributing it. Release executables also embed these texts. On Linux, startup creates missing `kurisu.LICENSE` and `kurisu.THIRD_PARTY_NOTICES.txt` companions, including after an update from the frozen bridge. Existing files are preserved. Use `--license` or `--notices` to read the current bundled texts, including when the installation directory is read only. The Windows installer includes both. Notices cover the target's locked normal and build dependencies, bundled fonts, and local dependency patches. Missing dependency license texts stop packaging. Sourced supplements for crates that omit their license files are in `packaging/licenses/`.
 
 For a repeatable build with a verified release version, pass `--build-version VERSION`. Add `--offline` only after Cargo dependencies are cached. An offline build requires an explicit version. `KURISU_BUILD_VERSION` is also accepted. `--print-version` resolves the stamp without building. Use this helper for release builds so the executable embeds its current dependency notices. Linux packaging supports x86_64 GNU and musl hosts. The helper explicitly selects the host target on Linux and x86_64 MSVC on Windows, overriding Cargo target configuration.
 
@@ -30,13 +30,13 @@ Use a dedicated directory for an isolated profile:
 ./native/target/release/kurisu-native --version
 ```
 
-An explicit `--data-dir` never discovers or imports the normal legacy profile. Do not point it at a Tauri profile: databases without a native marker are refused. Launching a second instance of an open native profile activates its existing window. A normal launch uses an existing native profile first, including the earlier Windows candidate location. Two competing default native profiles require an explicit choice through `--data-dir`.
+An explicit `--data-dir` never discovers or imports the normal legacy profile. Do not point it at a legacy profile: databases without a native marker are refused. A second launch of an open native profile can activate its existing window when both instances support the authenticated activation protocol. If activation is unavailable, the second launch exits and the profile stays open in the first instance. A normal launch uses an existing native profile first, including the earlier Windows candidate location. Two competing default native profiles require an explicit choice through `--data-dir`.
 
 ## Platform dependencies
 
 Linux builds require a C/C++ compiler, CMake, pkg-config, OpenSSL, D-Bus, Fontconfig, FreeType, XKB, XCB, Wayland and Vulkan development packages. Runtime needs a working graphics driver, system fonts, D-Bus, and an X11 or Wayland session. The tray uses StatusNotifierItem.
 
-Windows builds require the MSVC toolchain and Windows SDK, including `fxc.exe` for GPUI release shaders. NSIS 3 packages the installer:
+Windows builds require the MSVC toolchain and Windows SDK, including `fxc.exe` to compile release shaders. NSIS 3 packages the installer:
 
 ```powershell
 python native/build.py --installer
@@ -47,6 +47,8 @@ The installer is written to `native/target/release/bundle/`. It keeps the normal
 ## Checks
 
 ```sh
+node --test .github/release-transition.test.mjs .github/prune-native-releases.test.mjs
+python3 .github/test_discord_notify.py
 python3 -m unittest discover -s native -p test_build.py
 python3 -m unittest discover -s native -p test_migrate.py
 cargo fmt --manifest-path core/Cargo.toml -- --check
@@ -63,12 +65,12 @@ On Linux, check the pinned accessibility adapter with `cargo test --locked --man
 
 ## Release transition
 
-Release publication is manual. Pin the final bridge tag in `.github/release-transition.json`, then freeze and publish that Tauri transition release at a version above the previous stable release. Keep its frontend source, commit, tag and original legacy assets. Verify both platforms and profile handoff before publishing a native release with a higher version.
+Native releases are published manually. The Windows candidate check installs the published bridge pinned in `.github/release-transition.json` and upgrades it with the candidate installer. Verify both platforms and profile handoff before publishing.
 
 Every native release must republish the exact frozen bridge assets under their legacy names beside the native downloads. Old updaters select the highest stable release, so retaining the bridge only on its original release would strand users who skip it. Never rebuild those aliases from later source or prune the bridge release. The Windows native installer uses a different suffix from legacy setup installers so older selectors find only the bridge.
 
-After publication, the release workflow downloads and verifies the new assets and frozen bridge aliases before removing older stable native releases. Tauri releases, drafts, prereleases and Git tags are retained. Users can skip intermediate native versions and update directly to the newest release.
+After publication, the release workflow downloads and verifies the new assets and frozen bridge aliases before removing older stable native releases. Legacy releases, drafts, prereleases and Git tags are retained. Users can skip intermediate native versions and update directly to the newest release.
 
 The native updater selects native assets. The transition release can hand off to the same published native release without requiring a second newer tag. The native executable carries that release's version, preventing a repeated update prompt.
 
-The primary branch contains the GPUI program and shared Core. The old frontend and Tauri adapter remain in the frozen bridge tag. Keep the frozen release and rollback downloads permanently. See [Profile transfer and rollback](PROFILE_TRANSFER.md) before returning to it: native-only changes, including pending edits, are not copied back automatically.
+The primary branch contains the native program and shared Core. The legacy frontend and desktop adapter remain in the frozen bridge tag. Keep the frozen release and rollback downloads permanently. See [Profile transfer and rollback](PROFILE_TRANSFER.md) before returning to it: native-only changes, including pending edits, are not copied back automatically.

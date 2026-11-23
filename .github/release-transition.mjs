@@ -1,8 +1,10 @@
 import { readFileSync, appendFileSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+const MAX_BUFFER = 64 * 1024 * 1024;
 export const transition = JSON.parse(readFileSync(new URL("release-transition.json", import.meta.url), "utf8"));
 
 export function version(tag) {
@@ -20,14 +22,9 @@ export function compare(left, right) {
 }
 
 export function plan(kind, tag) {
-  version(tag);
-  if (kind === "bridge") {
-    if (tag !== transition.bridgeTag) throw new Error("Only the pinned final bridge tag may build Tauri");
-    if (compare(tag, transition.previousStableTag) <= 0) throw new Error("Bridge must advance the previous stable release");
-  } else if (kind === "native") {
-    if (compare(tag, transition.bridgeTag) <= 0) throw new Error("Native release must be newer than the pinned bridge");
-  } else throw new Error("Unknown release kind");
-  return { tag, ver: tag.slice(1), bridge: transition.bridgeTag };
+  if (kind !== "native") throw new Error("Only native releases can be built or published");
+  if (compare(tag, transition.bridgeTag) <= 0) throw new Error("Native release must be newer than the pinned bridge");
+  return { tag, ver: tag.slice(1) };
 }
 
 // This predicate is shipped in v1.0.0.77 and cannot be changed remotely.
@@ -65,72 +62,107 @@ export function nativeAssets(names, tag) {
 }
 
 function run(program, args) {
-  const result = spawnSync(program, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = spawnSync(program, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "pipe"] });
   if (result.error || result.status !== 0) throw new Error(result.error?.message || result.stderr || `${program} failed`);
   return result.stdout.trim();
 }
 
+function repository() {
+  return process.env.GITHUB_REPOSITORY || "CateDesu/Kurisu";
+}
+
 function gh(args) {
-  return run("gh", [...args, "--repo", process.env.GITHUB_REPOSITORY || "CateDesu/Kurisu"]);
+  return run("gh", [...args, "--repo", repository()]);
+}
+
+function parseJsonLines(text) {
+  return text ? text.split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 }
 
 function refusePublished(tag) {
-  const releases = JSON.parse(gh(["release", "list", "--limit", "100", "--json", "tagName,isDraft,isPrerelease"]));
-  if (releases.some(release => release.tagName === tag)) throw new Error("Release already exists; do not overwrite or reuse its assets");
-  for (const release of releases.filter(release => !release.isDraft && !release.isPrerelease)) {
-    if (/^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(release.tagName) && compare(release.tagName, tag) >= 0) {
+  const releases = parseJsonLines(run("gh", [
+    "api", "--paginate", "--jq", ".[] | {tag_name, draft, prerelease}",
+    `repos/${repository()}/releases?per_page=100`,
+  ]));
+  if (releases.some(release => release.tag_name === tag)) throw new Error("Release already exists; do not overwrite or reuse its assets");
+  for (const release of releases.filter(release => !release.draft && !release.prerelease)) {
+    if (/^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(release.tag_name) && compare(release.tag_name, tag) >= 0) {
       throw new Error("A stable release at this or a higher version is already published");
     }
+  }
+}
+
+function verifyPinnedBridgeInstaller(directory, installerName) {
+  if (!/^[0-9a-f]{64}$/.test(transition.bridgeInstallerSha256)) {
+    throw new Error("Pinned bridge installer SHA-256 is missing or invalid");
+  }
+  const actual = createHash("sha256").update(readFileSync(join(directory, installerName))).digest("hex");
+  if (actual !== transition.bridgeInstallerSha256) {
+    throw new Error("Bridge installer SHA-256 does not match the pinned transition digest");
   }
 }
 
 function verifySidecars(directory, names) {
   for (const name of names.filter(name => !name.endsWith(".sha256"))) {
     const sidecar = readFileSync(join(directory, `${name}.sha256`), "utf8").trim();
-    if (!new RegExp(`^[0-9a-fA-F]{64}  ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`).test(sidecar)) {
+    if (!new RegExp(`^[0-9a-f]{64}  ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`).test(sidecar)) {
       throw new Error(`Invalid existing checksum sidecar: ${name}`);
     }
     run("sha256sum", ["--check", "--strict", join(directory, `${name}.sha256`)]);
   }
 }
 
-function releaseNotes(kind, tag) {
-  if (kind === "bridge") return `Final Tauri transition release. Keep this release and its tag for rollback and legacy updater compatibility. Open Kurisu once to prepare your preferences, then install the native update from Settings. Your original profile and a standalone backup are preserved. Native release publication follows separately.`;
-  return `Kurisu ${tag.slice(1)} uses GPUI. Fresh Linux installs: download Kurisu_${tag.slice(1)}_linux-x64.tar.gz. Fresh Windows installs: download Kurisu-Native_${tag.slice(1)}_x64-install.exe. Ordinary upgrades need no Python. Existing native profiles remain separate from legacy profiles.\n\nLegacy assets named kurisu, kurisu.exe and Kurisu_*-setup.exe are the unchanged ${transition.bridgeTag} transition bridge for old updaters. They are kept intentionally; fresh installs should use the native downloads above. Keep the pinned bridge release for rollback. Changes made only in the native profile are not copied back to the legacy profile.`;
+function verifyRemoteTagCommit(tag, expectedCommit) {
+  const git = `repos/${repository()}/git`;
+  let { object } = JSON.parse(run("gh", ["api", `${git}/ref/tags/${encodeURIComponent(tag)}`]));
+  while (object.type === "tag") {
+    ({ object } = JSON.parse(run("gh", ["api", `${git}/tags/${object.sha}`])));
+  }
+  if (object.type !== "commit" || object.sha.toLowerCase() !== expectedCommit.toLowerCase()) {
+    throw new Error("Remote release tag no longer points to the planned commit");
+  }
+}
+
+function releaseNotes(tag) {
+  return `Kurisu ${tag.slice(1)}. Fresh Linux installs: download Kurisu_${tag.slice(1)}_linux-x64.tar.gz. Fresh Windows installs: download Kurisu-Native_${tag.slice(1)}_x64-install.exe. Ordinary upgrades need no Python. Existing native profiles remain separate from legacy profiles.\n\nLegacy assets named kurisu, kurisu.exe and Kurisu_*-setup.exe are the unchanged ${transition.bridgeTag} transition bridge for old updaters. They are kept intentionally; fresh installs should use the native downloads above. Keep the pinned bridge release for rollback. Changes made only in the native profile are not copied back to the legacy profile.`;
 }
 
 async function main() {
   const [command, kind, tag, directory] = process.argv.slice(2);
   const result = plan(kind, tag);
   const commit = run("git", ["rev-parse", `refs/tags/${tag}^{commit}`]);
+  const plannedCommit = process.env.RELEASE_COMMIT;
+  if (command === "publish" && plannedCommit !== undefined) {
+    if (!/^[0-9a-f]{40}$/i.test(plannedCommit)) throw new Error("Invalid planned release commit");
+    if (commit !== plannedCommit.toLowerCase()) throw new Error("Release tag no longer points to the planned commit");
+  }
   if (commit !== run("git", ["rev-parse", "HEAD"])) throw new Error("Build the exact tagged source commit");
   if (command === "plan") {
-    if (process.env.GITHUB_OUTPUT) for (const [key, value] of Object.entries(result)) {
+    const outputs = { ...result, commit };
+    if (process.env.GITHUB_OUTPUT) for (const [key, value] of Object.entries(outputs)) {
       appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
     }
-    console.log(JSON.stringify({ ...result, commit }));
+    console.log(JSON.stringify(outputs));
     return;
   }
   if (command !== "publish" || !directory) throw new Error("Use plan or publish with an artifact directory");
   refusePublished(tag);
   const absoluteDirectory = run("realpath", [directory]);
   const paths = readdirSync(absoluteDirectory).filter(name => statSync(join(absoluteDirectory, name)).isFile());
-  let names;
-  if (kind === "native") {
-    names = nativeAssets(paths, tag);
-    const bridge = JSON.parse(run("gh", ["api", `repos/${process.env.GITHUB_REPOSITORY || "CateDesu/Kurisu"}/releases/tags/${transition.bridgeTag}`]));
-    const legacy = bridgeAssets(bridge);
-    gh(["release", "download", transition.bridgeTag, "--dir", absoluteDirectory, ...legacy.flatMap(name => ["--pattern", name])]);
-    names.push(...legacy);
-    if (originalWindowsSelector(names) !== originalWindowsSelector(legacy)) throw new Error("Native assets collide with the published updater");
-  } else {
-    names = bridgeAssets({ tag_name: tag, draft: false, prerelease: false, assets: paths.map(name => ({ name })) });
-  }
+  const names = nativeAssets(paths, tag);
+  const bridge = JSON.parse(run("gh", ["api", `repos/${repository()}/releases/tags/${transition.bridgeTag}`]));
+  const legacy = bridgeAssets(bridge);
+  gh(["release", "download", transition.bridgeTag, "--dir", absoluteDirectory, ...legacy.flatMap(name => ["--pattern", name])]);
+  names.push(...legacy);
+  if (originalWindowsSelector(names) !== originalWindowsSelector(legacy)) throw new Error("Native assets collide with the published updater");
   process.chdir(absoluteDirectory);
   verifySidecars(absoluteDirectory, names);
-  gh(["release", "create", tag, "--verify-tag", "--title", kind === "native" ? `Kurisu ${result.ver}` : `Kurisu ${result.ver} transition bridge`, "--notes", releaseNotes(kind, tag), "--draft"]);
+  verifyPinnedBridgeInstaller(absoluteDirectory, originalWindowsSelector(legacy));
+  verifyRemoteTagCommit(tag, commit);
+  gh(["release", "create", tag, "--verify-tag", "--target", commit, "--title", `Kurisu ${result.ver}`, "--notes", releaseNotes(tag), "--draft"]);
   gh(["release", "upload", tag, ...names.map(name => join(absoluteDirectory, basename(name)))]);
-  gh(["release", "edit", tag, "--draft=false", "--latest"]);
+  verifyRemoteTagCommit(tag, commit);
+  gh(["release", "edit", tag, "--tag", tag, "--verify-tag", "--target", commit, "--draft=false", "--latest"]);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

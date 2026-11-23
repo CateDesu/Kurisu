@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Context, InteractiveElement, Window, div, prelude::*, px, rgb};
+use gpui::{AnyElement, Context, InteractiveElement, Window, deferred, div, prelude::*, px, rgb};
 use kurisu_core::Platform;
 
 use super::state::status_label;
@@ -7,9 +7,9 @@ use crate::components::{button, dialog, eyebrow, heading};
 use crate::theme::{ACCENT, BASE, DIM, EDGE, ERROR, PANEL, PANEL_2};
 
 impl Workspace {
-    fn escape_active_modal(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn escape_active_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_modal() {
-            Some(ModalLayer::Barrier | ModalLayer::BarrierError) => self.cancel_barrier(cx),
+            Some(ModalLayer::Barrier | ModalLayer::BarrierError) => self.cancel_barrier(window, cx),
             Some(ModalLayer::UpdateFailed) => {
                 self.update_failed.clear();
                 cx.notify();
@@ -20,7 +20,7 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            Some(ModalLayer::Prompt) if !self.prompt_busy => self.dismiss_prompt(cx),
+            Some(ModalLayer::Prompt) => self.dismiss_prompt(self.prompt_revision, cx),
             Some(ModalLayer::Logout) => {
                 self.logout_confirming = false;
                 cx.notify();
@@ -29,12 +29,14 @@ impl Workspace {
                 self.editor_status_open = false;
                 cx.notify();
             }
-            Some(ModalLayer::Editor) => self.close_editor(cx),
+            Some(ModalLayer::Editor) => self.dismiss_editor(cx),
             Some(
                 ModalLayer::LibraryRemove | ModalLayer::LibraryUnlink | ModalLayer::LibraryBind,
             ) => self.dismiss_library_dialog(cx),
+            Some(ModalLayer::TorrentRemove) => self.dismiss_torrent_remove(cx),
             _ => {}
         }
+        self.resume_overdue_progress(window, cx);
     }
 
     pub(super) fn render_now_playing(&self) -> AnyElement {
@@ -206,6 +208,7 @@ impl Workspace {
             return div().into_any();
         }
         let count = self.pending.len();
+        let actions_disabled = self.pending_actions_disabled();
         let mut bar = div()
             .border_b_1()
             .border_color(rgb(EDGE))
@@ -231,9 +234,12 @@ impl Workspace {
                             } else {
                                 "Sync status unavailable".into()
                             },
-                            false,
+                            self.modal_open() || self.edits_fenced(),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
+                            if this.modal_open() || this.edits_fenced() || this.profile.is_none() {
+                                return;
+                            }
                             this.pending_expanded = !this.pending_expanded;
                             cx.notify();
                         })),
@@ -246,8 +252,9 @@ impl Workspace {
                             } else {
                                 "Retry sync"
                             },
-                            self.pending_busy,
+                            actions_disabled,
                         )
+                        .debug_selector(|| "pending-retry".into())
                         .on_click(
                             cx.listener(|this, _, window, cx| this.retry_pending(window, cx)),
                         ),
@@ -321,7 +328,7 @@ impl Workspace {
                         button(
                             format!("pending-remote-{id}"),
                             remote_action,
-                            self.pending_busy,
+                            actions_disabled,
                         )
                         .aria_label(format!("{remote_action} for {}", item.title))
                         .aria_description(action_description.clone())
@@ -334,7 +341,7 @@ impl Workspace {
                             button(
                                 format!("pending-local-{id}"),
                                 "Send saved change",
-                                self.pending_busy,
+                                actions_disabled,
                             )
                             .aria_label(format!("Send saved change for {}", item.title))
                             .aria_description(action_description)
@@ -361,39 +368,78 @@ impl Workspace {
     ) -> AnyElement {
         let active = self.active_modal();
         let focus = self.modal_focus();
-        if self.editor.is_none()
-            && !self.logout_confirming
-            && self.prompt.is_none()
-            && self.update.is_none()
-            && self.update_failed.is_empty()
-            && self.barrier.is_none()
-            && self.barrier_error.is_empty()
-            && self.global_error.is_empty()
-            && (self.preference_alert_dismissed || self.preference_error().is_none())
-        {
-            return div().into_any();
+        let preference_error = (active.is_none() && !self.preference_alert_dismissed)
+            .then(|| self.preference_error_message())
+            .flatten();
+        let mut notices = Vec::new();
+        if let Some(error) = &self.tray_error {
+            let tray_alert = div()
+                .id("tray-error")
+                .role(gpui::Role::Alert)
+                .aria_label(error.clone())
+                .absolute()
+                .top(px(10.))
+                .right(px(20.))
+                .max_w(px(420.))
+                .p(px(10.))
+                .border_1()
+                .border_color(rgb(ERROR))
+                .bg(rgb(PANEL_2))
+                .text_color(rgb(ERROR))
+                .child(error.clone());
+            notices.push(if active.is_none() {
+                deferred(tray_alert).into_any()
+            } else {
+                tray_alert.into_any()
+            });
         }
-        let mut layers = div()
-            .id("workspace-overlays")
-            .absolute()
-            .inset_0()
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.active_modal().is_some() {
-                    this.escape_active_modal(cx);
-                    cx.stop_propagation();
-                }
-            }));
+        if matches!(active, None | Some(ModalLayer::Editor))
+            && preference_error.is_none()
+            && !self.global_error.is_empty()
+        {
+            notices.push(
+                error_alert(self.global_error.clone())
+                    .child(
+                        button("dismiss-global-error", "Dismiss", false).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.global_error.clear();
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .into_any(),
+            );
+        }
+        let mut present = |content, layer, shade| {
+            let foreground = active == Some(layer);
+            let notices = if foreground {
+                std::mem::take(&mut notices)
+            } else {
+                Vec::new()
+            };
+            backdrop(content, foreground, &focus, shade, notices)
+        };
+        let mut layers = div().id("workspace-overlays").absolute().inset_0();
+        if let Some(layer) = self.library_modal_layer() {
+            layers = layers.child(present(self.render_library_overlay(cx), layer, true));
+        }
+        if self.torrent_remove_open() {
+            layers = layers.child(present(
+                self.render_torrent_remove(cx),
+                ModalLayer::TorrentRemove,
+                true,
+            ));
+        }
         if self.editor.is_some() {
-            layers = layers.child(backdrop(
+            layers = layers.child(present(
                 self.render_editor(window, cx),
-                active == Some(ModalLayer::Editor),
-                &focus,
+                ModalLayer::Editor,
                 true,
             ));
         }
         if self.logout_confirming {
             layers =
-                layers.child(backdrop(
+                layers.child(present(
                     dialog("logout-confirm-dialog", "Sign out")
                         .w(px(400.))
                         .flex()
@@ -411,32 +457,52 @@ impl Workspace {
                                 .gap(px(8.))
                                 .child(button("logout-cancel", "Cancel", false).on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.logout_confirming = false;
-                                        cx.notify();
+                                        if this.active_modal() == Some(ModalLayer::Logout) {
+                                            this.logout_confirming = false;
+                                            cx.notify();
+                                        }
                                     }),
                                 ))
-                                .child(button("logout-confirm", "Sign out", false).on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.logout_confirming = false;
-                                        this.start_barrier(BarrierAction::Logout, window, cx);
-                                    }),
-                                )),
+                                .child(
+                                    button(
+                                        "logout-confirm",
+                                        "Sign out",
+                                        self.edits_fenced() || active != Some(ModalLayer::Logout),
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            if this.edits_fenced()
+                                                || this.active_modal() != Some(ModalLayer::Logout)
+                                            {
+                                                return;
+                                            }
+                                            this.logout_confirming = false;
+                                            this.start_barrier(BarrierAction::Logout, window, cx);
+                                        },
+                                    )),
+                                ),
                         )
                         .into_any(),
-                    active == Some(ModalLayer::Logout),
-                    &focus,
+                    ModalLayer::Logout,
                     true,
                 ));
         }
         if let Some(prompt) = self.prompt.as_ref() {
+            let revision = self.prompt_revision;
             let title = prompt.title.clone();
             let episode = prompt.episode;
-            let progress = prompt.progress;
-            let context = format!(
-                "Detected playback: {title}. Episode {episode}. Current progress: {progress}.{}",
-                if episode <= progress { " Rewatch." } else { "" }
+            let progress = self.prompt_current_progress(prompt);
+            let progress_text = progress.map_or_else(
+                || "This title is no longer on your list".to_string(),
+                |value| format!("Current progress: {value}"),
             );
-            let mut contents = dialog("tracking-prompt", "Update your list?")
+            let rewatch =
+                episode <= prompt.progress || progress.is_some_and(|value| episode <= value);
+            let context = format!(
+                "Detected playback: {title}. Episode {episode}. {progress_text}.{}",
+                if rewatch { " Rewatch." } else { "" }
+            );
+            let mut contents = dialog(("tracking-prompt", revision), "Update your list?")
                 .aria_description(context)
                 .w(px(460.))
                 .flex()
@@ -449,12 +515,13 @@ impl Workspace {
                     div()
                         .text_color(rgb(DIM))
                         .child(format!("Episode {episode}")),
-                );
-            if episode <= progress {
+                )
+                .child(div().text_color(rgb(DIM)).child(progress_text));
+            if rewatch {
                 contents = contents.child(
                     div()
                         .text_color(rgb(DIM))
-                        .child(format!("Already past Ep {episode} (rewatch)")),
+                        .child(format!("Rewatch of Ep {episode}")),
                 );
             }
             if !self.prompt_error.is_empty() {
@@ -467,30 +534,37 @@ impl Workspace {
                         .child(format!("Update failed: {}", self.prompt_error)),
                 );
             }
+            let disabled = !self.prompt_action_allowed(revision);
             let mut actions = div().flex().gap(px(8.)).child(
-                button("prompt-skip", "Skip", self.prompt_busy)
+                button("prompt-skip", "Skip", disabled)
                     .aria_description(format!("Skip the playback update for {title}."))
-                    .on_click(cx.listener(|this, _, _, cx| this.dismiss_prompt(cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dismiss_prompt(revision, cx);
+                    })),
             );
-            if episode > progress {
+            if let Some(target) = self.prompt_target(prompt) {
+                let settling_progress = self.prompt_progress_pending(prompt.media_id);
                 actions = actions.child(
                     button(
-                        "prompt-confirm",
+                        ("prompt-confirm", target as u64),
                         if self.prompt_busy {
                             "Updating…".into()
+                        } else if settling_progress {
+                            "Saving list change…".into()
                         } else {
-                            format!("Set progress to Ep {episode}")
+                            format!("Set progress to Ep {target}")
                         },
-                        self.prompt_busy,
+                        disabled || settling_progress,
                     )
-                    .aria_description(format!("Set {title} progress to episode {episode}."))
-                    .on_click(cx.listener(|this, _, window, cx| this.confirm_prompt(window, cx))),
+                    .aria_description(format!("Set {title} progress to episode {target}."))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.confirm_prompt(revision, target, window, cx);
+                    })),
                 );
             }
-            layers = layers.child(backdrop(
+            layers = layers.child(present(
                 contents.child(actions).into_any(),
-                active == Some(ModalLayer::Prompt),
-                &focus,
+                ModalLayer::Prompt,
                 true,
             ));
         }
@@ -538,10 +612,10 @@ impl Workspace {
                         button(
                             "update-later",
                             if restart_pending { "Got it" } else { "Later" },
-                            self.update_busy,
+                            self.update_busy || active != Some(ModalLayer::Update),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if this.update_busy {
+                            if this.update_busy || this.active_modal() != Some(ModalLayer::Update) {
                                 return;
                             }
                             if let Some(update) = this.update.take() {
@@ -560,11 +634,14 @@ impl Workspace {
                             } else {
                                 "View release"
                             },
-                            self.update_busy || restart_pending,
+                            self.edits_fenced()
+                                || restart_pending
+                                || active != Some(ModalLayer::Update),
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                if this.update_busy
+                                if this.edits_fenced()
+                                    || this.active_modal() != Some(ModalLayer::Update)
                                     || this.restart_pending
                                     || this
                                         .update
@@ -575,26 +652,38 @@ impl Workspace {
                                 }
                                 if can_install {
                                     this.start_barrier(BarrierAction::Install, window, cx);
-                                } else if let Err(error) =
-                                    crate::platform::NativePlatform.open_url(&url)
-                                {
-                                    this.update_failed = error;
-                                    cx.notify();
+                                } else {
+                                    let url = url.clone();
+                                    let core = this.core.clone();
+                                    cx.spawn_in(window, async move |this, cx| {
+                                        let result = super::joined(
+                                            core.spawn(async move {
+                                                tokio::task::spawn_blocking(move || {
+                                                    crate::platform::NativePlatform.open_url(&url)
+                                                })
+                                                .await
+                                                .map_err(|error| error.to_string())?
+                                            })
+                                            .await,
+                                        );
+                                        let _ = this.update_in(cx, |this, _, cx| {
+                                            if let Err(error) = result {
+                                                this.update_failed = error;
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
+                                    .detach();
                                 }
                             },
                         )),
                     ),
             );
-            layers = layers.child(backdrop(
-                notice.into_any(),
-                active == Some(ModalLayer::Update),
-                &focus,
-                true,
-            ));
+            layers = layers.child(present(notice.into_any(), ModalLayer::Update, true));
         }
         if !self.update_failed.is_empty() {
             layers =
-                layers.child(backdrop(
+                layers.child(present(
                     dialog("update-failed", "Update failed")
                         .w(px(440.))
                         .flex()
@@ -608,62 +697,47 @@ impl Workspace {
                         )
                         .child(button("dismiss-update-error", "Got it", false).on_click(
                             cx.listener(|this, _, _, cx| {
-                                this.update_failed.clear();
-                                cx.notify();
+                                if this.active_modal() == Some(ModalLayer::UpdateFailed) {
+                                    this.update_failed.clear();
+                                    cx.notify();
+                                }
                             }),
                         ))
                         .into_any(),
-                    active == Some(ModalLayer::UpdateFailed),
-                    &focus,
+                    ModalLayer::UpdateFailed,
                     true,
                 ));
         }
-        if self.barrier.is_some() && self.barrier_error.is_empty() {
-            layers = layers.child(backdrop(
+        if self.close_ready {
+            layers = layers.child(present(
+                dialog("closing-window", "Closing Kurisu")
+                    .w(px(400.))
+                    .child("Closing Kurisu…")
+                    .into_any(),
+                ModalLayer::Barrier,
+                true,
+            ));
+        } else if self.barrier.is_some() && self.barrier_error.is_empty() {
+            layers = layers.child(present(
                 dialog("saving-before-close", "Saving changes")
                     .w(px(400.))
                     .child("Saving changes before continuing…")
-                    .child(
-                        button("cancel-barrier", "Cancel", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_barrier(cx))),
-                    )
+                    .child(button("cancel-barrier", "Cancel", false).on_click(
+                        cx.listener(|this, _, window, cx| this.cancel_barrier(window, cx)),
+                    ))
                     .into_any(),
-                active == Some(ModalLayer::Barrier),
-                &focus,
+                ModalLayer::Barrier,
                 true,
             ));
         }
-        let preference_error = (!self.preference_alert_dismissed)
-            .then(|| self.preference_error_message())
-            .flatten();
-        if !self.barrier_error.is_empty()
-            || preference_error.is_some()
-            || !self.global_error.is_empty()
+        let show_barrier_error = active == Some(ModalLayer::BarrierError);
+        if let Some(error) = show_barrier_error
+            .then(|| self.barrier_error.clone())
+            .or(preference_error)
         {
-            let error = if !self.barrier_error.is_empty() {
-                self.barrier_error.clone()
-            } else if let Some(error) = &preference_error {
-                error.clone()
-            } else {
-                self.global_error.clone()
-            };
-            let mut alert = div()
-                .id("workspace-error")
-                .role(gpui::Role::Alert)
-                .aria_label(error.clone())
-                .occlude()
-                .absolute()
-                .bottom(px(12.))
-                .left(px(12.))
-                .right(px(12.))
-                .border_1()
-                .border_color(rgb(ERROR))
-                .bg(rgb(PANEL))
-                .p(px(10.))
-                .text_color(rgb(ERROR))
-                .child(error);
-            if self.barrier.is_some() {
-                if self.has_inactive_drafts() {
+            let mut alert = error_alert(error);
+            if show_barrier_error {
+                if self.barrier_blocked_by_inactive_drafts {
                     alert = alert.child(
                         button(
                             "discard-other-account-drafts",
@@ -671,8 +745,24 @@ impl Workspace {
                             false,
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.discard_inactive_drafts(window, cx)
+                            this.discard_inactive_drafts(window, cx);
                         })),
+                    );
+                } else {
+                    let discard_label = if matches!(
+                        self.barrier,
+                        Some(BarrierAction::Close(_) | BarrierAction::LogoutThenClose(_))
+                    ) {
+                        "Close without saving"
+                    } else {
+                        "Continue without saving"
+                    };
+                    alert = alert.child(
+                        button("discard-barrier", discard_label, false)
+                            .debug_selector(|| "discard-barrier".into())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.discard_barrier(window, cx)),
+                            ),
                     );
                 }
                 alert = alert
@@ -685,16 +775,23 @@ impl Workspace {
                     )
                     .child(
                         button("cancel-failed-barrier", "Cancel", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_barrier(cx))),
+                            .debug_selector(|| "cancel-failed-barrier".into())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.cancel_barrier(window, cx)),
+                            ),
                     );
-            } else if preference_error.is_some() {
+            } else {
                 alert = alert
                     .child(
-                        button("retry-preferences", "Retry save", false)
-                            .debug_selector(|| "retry-preferences".into())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.retry_preferences(window, cx)
-                            })),
+                        button(
+                            "retry-preferences",
+                            "Retry save",
+                            self.edits_fenced() || self.modal_open(),
+                        )
+                        .debug_selector(|| "retry-preferences".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.retry_preferences(window, cx)),
+                        ),
                     )
                     .child(
                         button("dismiss-preference-error", "Dismiss", false).on_click(cx.listener(
@@ -704,30 +801,47 @@ impl Workspace {
                             },
                         )),
                     );
-            } else {
-                alert = alert.child(button("dismiss-global-error", "Dismiss", false).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.barrier_error.clear();
-                        this.global_error.clear();
-                        cx.notify();
-                    }),
-                ));
             }
-            if active == Some(ModalLayer::BarrierError) {
-                layers = layers.child(backdrop(alert.into_any(), true, &focus, false));
+            if show_barrier_error {
+                layers = layers.child(present(alert.into_any(), ModalLayer::BarrierError, false));
             } else {
                 layers = layers.child(alert);
             }
         }
-        layers.into_any()
+        layers.children(notices).into_any()
     }
 }
 
-fn backdrop(content: AnyElement, active: bool, focus: &ModalFocus, shade: bool) -> AnyElement {
+fn error_alert(error: String) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("workspace-error")
+        .role(gpui::Role::Alert)
+        .aria_label(error.clone())
+        .occlude()
+        .absolute()
+        .bottom(px(12.))
+        .left(px(12.))
+        .right(px(12.))
+        .border_1()
+        .border_color(rgb(ERROR))
+        .bg(rgb(PANEL))
+        .p(px(10.))
+        .text_color(rgb(ERROR))
+        .child(error)
+}
+
+fn backdrop(
+    content: AnyElement,
+    active: bool,
+    focus: &ModalFocus,
+    shade: bool,
+    notices: Vec<AnyElement>,
+) -> AnyElement {
     let mut layer = div()
         .absolute()
         .inset_0()
         .occlude()
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .flex()
         .items_center()
         .justify_center()
@@ -735,24 +849,141 @@ fn backdrop(content: AnyElement, active: bool, focus: &ModalFocus, shade: bool) 
     if shade {
         layer = layer.bg(gpui::rgba(0x000000b8));
     }
-    modal_container(layer, content, active, focus)
+    modal_container(layer, content, active, focus, notices)
 }
 
-pub(super) fn modal_container(
+fn modal_container(
     layer: gpui::Div,
     content: AnyElement,
     active: bool,
     focus: &ModalFocus,
+    notices: Vec<AnyElement>,
 ) -> AnyElement {
     if active {
         return layer
             .id("active-modal-backdrop")
+            .role(gpui::Role::Group)
+            .a11y_synthetic_children(|builder| builder.parent_node().set_modal())
             .track_focus(&focus.root)
             .tab_group()
             .child(div().id("modal-tab-start").track_focus(&focus.start))
             .child(content)
+            .children(notices)
             .child(div().id("modal-tab-end").track_focus(&focus.end))
             .into_any();
     }
     layer.child(content).into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::accesskit::{Action, ActionRequest, TreeId};
+
+    struct OverlappingButtons {
+        modal: Option<ModalFocus>,
+        clicks: usize,
+    }
+
+    impl Render for OverlappingButtons {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let bounds = |button: gpui::Stateful<gpui::Div>| button.absolute().inset_0();
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    bounds(button("covered", "Covered", false))
+                        .on_click(cx.listener(|this, _, _, _| this.clicks += 1)),
+                )
+                .when_some(self.modal.as_ref(), |root, focus| {
+                    root.child(modal_container(
+                        div().absolute().inset_0().occlude(),
+                        bounds(button("foreground", "Foreground", false))
+                            .on_click(cx.listener(|this, _, _, _| this.clicks += 1))
+                            .into_any(),
+                        true,
+                        focus,
+                        Vec::new(),
+                    ))
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn stale_click_cannot_hit_the_foreground_at_the_same_coordinates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| OverlappingButtons {
+            modal: None,
+            clicks: 0,
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let button = |tree: gpui::accesskit::TreeUpdate, label| {
+            tree.nodes
+                .into_iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .map(|(id, node)| (id, node.bounds()))
+                .unwrap()
+        };
+        let click = |cx: &gpui::VisualTestContext, target_node| {
+            cx.simulate_accessibility_action(ActionRequest {
+                action: Action::Click,
+                target_tree: TreeId::ROOT,
+                target_node,
+                data: None,
+            });
+        };
+        let (covered, bounds) = button(cx.take_accessibility_tree_update().unwrap(), "Covered");
+        view.update(cx, |view, cx| {
+            view.modal = Some(ModalFocus {
+                root: cx.focus_handle(),
+                start: cx.focus_handle(),
+                end: cx.focus_handle(),
+            });
+            cx.notify();
+        });
+        click(cx, covered);
+        assert_eq!(view.read_with(cx, |view, _| view.clicks), 0);
+        let (foreground, foreground_bounds) =
+            button(cx.take_accessibility_tree_update().unwrap(), "Foreground");
+        assert_eq!(foreground_bounds, bounds);
+        click(cx, covered);
+        assert_eq!(view.read_with(cx, |view, _| view.clicks), 0);
+        click(cx, foreground);
+        assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
+    }
+
+    #[gpui::test]
+    fn accessibility_actions_require_the_current_published_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| OverlappingButtons {
+            modal: None,
+            clicks: 0,
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Covered"))
+            .unwrap();
+        let click = || ActionRequest {
+            action: Action::Click,
+            target_tree: TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        };
+        cx.queue_accessibility_action(click());
+        cx.simulate_accessibility_deactivation();
+        cx.simulate_accessibility_activation();
+        cx.queue_accessibility_action(click());
+        cx.update(|win, app| win.draw(app).clear(app));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.clicks), 0);
+        cx.simulate_accessibility_action(click());
+        assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
+    }
 }

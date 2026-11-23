@@ -3144,6 +3144,7 @@ dependencies = [
  "icu_locale_core",
  "image",
  "kurisu-core",
+ "libc",
  "log",
  "open",
  "reqwest",

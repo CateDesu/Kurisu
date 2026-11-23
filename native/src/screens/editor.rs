@@ -8,8 +8,10 @@ use kurisu_core::Platform;
 use kurisu_core::models::{EntryDetails, FuzzyDate, ListEntry, Media};
 
 use super::covers::CoverOwner;
-use super::state::{EditorState, STATUSES, status_label};
-use super::{EditorInputs, ModalLayer, Workspace, joined, now_seconds};
+use super::state::{EditorState, EntryPatch, STATUSES, status_label};
+use super::{
+    EditorInputs, ModalLayer, PendingEditor, PendingEditorWait, Workspace, joined, now_seconds,
+};
 use crate::components::input::{TextInput, TextInputEvent};
 use crate::components::{button, dialog, eyebrow, select_with_disabled};
 use crate::contracts::Route;
@@ -122,27 +124,44 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((id, route)) = self.pending_editor.clone() else {
+        let Some(pending) = self.pending_editor.as_ref() else {
             return;
         };
-        if id != completed_id {
+        let id = pending.id;
+        if id != completed_id || !matches!(pending.wait, PendingEditorWait::Progress) {
             return;
         }
-        if route != self.route || self.list.entry(id).is_none() {
+        if pending.route != self.route || self.list_or_detail_entry(id).is_none() {
             self.pending_editor = None;
             return;
         }
         if self.progress.edit(self.generation, id).is_some_and(|edit| {
-            edit.dirty()
-                || edit.in_flight
-                || edit.deleting
-                || edit.requires_review
-                || edit.error.is_some()
+            edit.dirty() || edit.busy() || edit.requires_review || edit.error.is_some()
         }) {
             return;
         }
+        let auto_open = pending.auto_open && !self.edits_fenced() && !self.modal_open();
         self.pending_editor = None;
-        self.open_editor(id, window, cx);
+        if auto_open {
+            self.open_editor(id, window, cx);
+        }
+    }
+
+    pub(super) fn pending_editor_error(&self, id: i64) -> Option<&str> {
+        let pending = self.pending_editor.as_ref()?;
+        if !pending.auto_open || pending.id != id || pending.route != self.route {
+            return None;
+        }
+        match &pending.wait {
+            PendingEditorWait::Progress => self
+                .progress
+                .edit(self.generation, id)
+                .filter(|edit| !edit.busy() && !edit.requires_review)?
+                .error
+                .as_deref(),
+            PendingEditorWait::RefreshFailed(error) => Some(error),
+            PendingEditorWait::Refresh => None,
+        }
     }
 
     pub(super) fn set_editor_inputs_disabled(&self, disabled: bool, cx: &mut Context<Self>) {
@@ -173,51 +192,68 @@ impl Workspace {
     }
 
     pub(super) fn open_editor(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.as_ref().is_some_and(|editor| editor.busy) {
+        if self.edits_fenced() || self.modal_open() {
             return;
         }
-        if self
-            .pending_editor
-            .as_ref()
-            .is_some_and(|(waiting, route)| *waiting == id && *route == self.route)
+        if self.progress.deleting(self.generation, id)
+            || self
+                .progress
+                .edit(self.generation, id)
+                .is_some_and(|edit| edit.requires_review)
         {
             return;
+        }
+        if let Some(pending) = self
+            .pending_editor
+            .as_mut()
+            .filter(|pending| pending.id == id && pending.route == self.route)
+        {
+            match pending.wait {
+                PendingEditorWait::RefreshFailed(_) => {
+                    pending.wait = PendingEditorWait::Refresh;
+                    pending.auto_open = true;
+                    self.queue_list_refresh(Some(vec![id]), window, cx);
+                    cx.notify();
+                    return;
+                }
+                PendingEditorWait::Progress => {
+                    if self
+                        .progress
+                        .edit(self.generation, id)
+                        .is_some_and(|edit| edit.dirty() || edit.busy() || edit.error.is_some())
+                    {
+                        pending.auto_open = true;
+                        self.progress.retry_error(self.generation, id);
+                        self.save_progress(id, window, cx);
+                        return;
+                    }
+                }
+                PendingEditorWait::Refresh => {
+                    pending.auto_open = true;
+                    return;
+                }
+            }
         }
         self.pending_editor = None;
         if let Some(edit) = self.progress.edit(self.generation, id)
             && (edit.dirty() || edit.in_flight)
         {
-            let in_flight = edit.in_flight;
-            self.pending_editor = Some((id, self.route.clone()));
-            if !in_flight {
-                self.save_progress(id, window, cx);
-            }
+            self.pending_editor = Some(PendingEditor {
+                id,
+                route: self.route.clone(),
+                wait: PendingEditorWait::Progress,
+                auto_open: true,
+            });
+            self.progress.retry_error(self.generation, id);
+            self.save_progress(id, window, cx);
             cx.notify();
             return;
         }
         self.cancel_reads("editor-recs");
         self.cancel_reads("editor-details");
-        let entry = self
-            .list
-            .entry(id)
-            .or_else(|| {
-                self.detail
-                    .entry
-                    .as_ref()
-                    .filter(|entry| entry.media_id == id)
-            })
-            .cloned();
-        let Some(mut entry) = entry else {
+        let Some(entry) = self.entry_for_edit(id) else {
             return;
         };
-        if entry.media.is_none() {
-            entry.media = self
-                .detail
-                .detail
-                .as_ref()
-                .filter(|detail| detail.media.id == id)
-                .map(|detail| detail.media.clone());
-        }
         let cover_url = entry
             .media
             .as_ref()
@@ -232,7 +268,6 @@ impl Workspace {
         self.editor_status_open = false;
         self.editor_recs.clear();
         self.editor_recs_error.clear();
-        self.editor_adding.clear();
         self.added_recommendations.clear();
         self.editor_details_open = false;
         self.editor_details_loading = false;
@@ -265,39 +300,61 @@ impl Workspace {
         self.editor_subscriptions.push(cx.subscribe_in(
             &inputs.progress,
             window,
-            |this, _, event, window, cx| match event {
+            |this, field, event, window, cx| match event {
                 TextInputEvent::Changed(value) => {
+                    if this.edits_fenced() {
+                        this.restore_fenced_editor_input(0, cx);
+                        return;
+                    }
                     if let (Some(editor), Ok(number)) =
                         (this.editor.as_mut(), value.trim().parse::<i64>())
                     {
                         editor.edit_progress(number);
+                        if editor.status == "COMPLETED" && editor.progress != number {
+                            field.update(cx, |input, cx| {
+                                input.set_value(editor.progress.to_string(), cx)
+                            });
+                        }
                         cx.notify();
                     }
                 }
-                TextInputEvent::Submitted => this.save_editor(window, cx),
+                TextInputEvent::Submitted => this.submit_editor(window, cx),
             },
         ));
-        for field in [
-            &inputs.score,
-            &inputs.repeat,
-            &inputs.started_year,
-            &inputs.started_month,
-            &inputs.started_day,
-            &inputs.completed_year,
-            &inputs.completed_month,
-            &inputs.completed_day,
+        for (index, field) in [
+            (1, &inputs.score),
+            (2, &inputs.repeat),
+            (4, &inputs.started_year),
+            (5, &inputs.started_month),
+            (6, &inputs.started_day),
+            (7, &inputs.completed_year),
+            (8, &inputs.completed_month),
+            (9, &inputs.completed_day),
         ] {
             self.editor_subscriptions.push(cx.subscribe_in(
                 field,
                 window,
-                |this, _, event, window, cx| {
-                    if matches!(event, TextInputEvent::Submitted) {
-                        this.save_editor(window, cx);
+                move |this, _, event, window, cx| match event {
+                    TextInputEvent::Changed(_) => {
+                        if this.edits_fenced() {
+                            this.restore_fenced_editor_input(index, cx);
+                        }
                     }
+                    TextInputEvent::Submitted => this.submit_editor(window, cx),
                 },
             ));
         }
+        self.editor_subscriptions.push(cx.subscribe_in(
+            &inputs.notes,
+            window,
+            |this, _, event, _window, cx| {
+                if matches!(event, TextInputEvent::Changed(_)) && this.edits_fenced() {
+                    this.restore_fenced_editor_input(3, cx);
+                }
+            },
+        ));
         self.editor_inputs = Some(inputs);
+        self.fenced_editor_inputs = None;
         self.set_editor_inputs_disabled(false, cx);
         let editor_input = self
             .editor_inputs
@@ -311,7 +368,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this
                         .editor_inputs
                         .as_ref()
@@ -348,6 +406,65 @@ impl Workspace {
         cx.notify();
     }
 
+    fn editor_controls_disabled(&self) -> bool {
+        self.edits_fenced()
+            || self.active_modal() != Some(ModalLayer::Editor)
+            || self.editor.as_ref().is_none_or(|editor| editor.busy)
+    }
+
+    pub(super) fn dismiss_editor(&mut self, cx: &mut Context<Self>) {
+        if !self.editor_controls_disabled() {
+            self.close_editor(cx);
+        }
+    }
+
+    pub(super) fn capture_fenced_editor_inputs(&mut self, cx: &gpui::App) {
+        if self.fenced_editor_inputs.is_none()
+            && let Some(inputs) = self.editor_inputs.as_ref()
+        {
+            self.fenced_editor_inputs =
+                Some(editor_fields(inputs).map(|field| field.read(cx).value().to_owned()));
+        }
+    }
+
+    pub(super) fn sync_fenced_editor_inputs(&mut self, cx: &gpui::App) {
+        if self.fenced_editor_inputs.is_some()
+            && let Some(inputs) = self.editor_inputs.as_ref()
+        {
+            self.fenced_editor_inputs =
+                Some(editor_fields(inputs).map(|field| field.read(cx).value().to_owned()));
+        }
+    }
+
+    fn restore_fenced_editor_input(&self, index: usize, cx: &mut Context<Self>) {
+        let Some(inputs) = self.editor_inputs.as_ref() else {
+            return;
+        };
+        let fallback = || {
+            self.editor.as_ref().map(|editor| match index {
+                0 => editor.progress.to_string(),
+                1 => optional_score(editor.score),
+                2 => editor.repeat.to_string(),
+                3 => editor.notes.clone(),
+                4 => optional_number(editor.started_at.year),
+                5 => optional_number(editor.started_at.month),
+                6 => optional_number(editor.started_at.day),
+                7 => optional_number(editor.completed_at.year),
+                8 => optional_number(editor.completed_at.month),
+                9 => optional_number(editor.completed_at.day),
+                _ => String::new(),
+            })
+        };
+        if let Some(value) = self
+            .fenced_editor_inputs
+            .as_ref()
+            .map(|values| values[index].clone())
+            .or_else(fallback)
+        {
+            editor_fields(inputs)[index].update(cx, |input, cx| input.set_value(value, cx));
+        }
+    }
+
     pub(super) fn close_editor(&mut self, cx: &mut Context<Self>) {
         if self.editor.as_ref().is_some_and(|editor| editor.busy) {
             return;
@@ -358,10 +475,9 @@ impl Workspace {
         self.cancel_reads("editor-details");
         self.editor_status_open = false;
         self.editor_inputs = None;
+        self.fenced_editor_inputs = None;
         self.editor_subscriptions.clear();
         self.editor_recs.clear();
-        self.editor_adding.clear();
-        self.delete_waiting = false;
         cx.notify();
     }
 
@@ -386,6 +502,9 @@ impl Workspace {
     }
 
     fn load_editor_details(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping {
+            return;
+        }
         let Some(editor) = self.editor.as_ref() else {
             return;
         };
@@ -406,7 +525,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
-                if generation != this.generation
+                if this.stopping
+                    || generation != this.generation
                     || this
                         .editor_inputs
                         .as_ref()
@@ -425,10 +545,11 @@ impl Workspace {
                         if let Some(inputs) = this.editor_inputs.as_ref() {
                             set_detail_inputs(inputs, &details, cx);
                         }
+                        this.sync_fenced_editor_inputs(cx);
                         this.editor.as_mut().unwrap().apply_details(details);
                     }
                     Err(error) => {
-                        this.editor.as_mut().unwrap().error =
+                        this.editor.as_mut().unwrap().details_error =
                             format!("Entry details are unavailable. {error}")
                     }
                 }
@@ -439,6 +560,9 @@ impl Workspace {
     }
 
     fn review_editor_progress(&mut self, cx: &mut Context<Self>) {
+        if self.editor_controls_disabled() {
+            return;
+        }
         if let Some(editor) = self.editor.as_mut().filter(|editor| !editor.busy) {
             editor.review_progress();
             if let Some(inputs) = self.editor_inputs.as_ref() {
@@ -451,6 +575,9 @@ impl Workspace {
     }
 
     pub(super) fn clear_editor_score(&mut self, cx: &mut Context<Self>) {
+        if self.edits_fenced() {
+            return;
+        }
         if let Some(editor) = self
             .editor
             .as_mut()
@@ -478,7 +605,9 @@ impl Workspace {
             .trim()
             .parse()
             .map_err(|_| "Enter a valid episode progress.".to_string())?;
-        editor.set_progress(progress);
+        if editor.progress != progress {
+            editor.set_progress(progress);
+        }
         editor.repeat = inputs
             .repeat
             .read(cx)
@@ -525,8 +654,35 @@ impl Workspace {
         Ok(())
     }
 
+    fn submit_editor(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.editor_controls_disabled() {
+            return;
+        }
+        self.save_editor(window, cx);
+    }
+
+    pub(super) fn editor_basic_patch(&self, editor: &EditorState) -> EntryPatch {
+        let mut basic_patch = editor.basic_patch(editor.score_available());
+        if basic_patch.status.is_none()
+            && let Some(status @ ("CURRENT" | "REPEATING")) = editor.chosen_status()
+            && self.pending.iter().any(|change| {
+                change.media_id == editor.media_id
+                    && change.conflict
+                    && change.status.as_deref() == Some(status)
+                    && change.progress == Some(editor.progress)
+            })
+        {
+            basic_patch.status = Some(status.into());
+        }
+        basic_patch
+    }
+
+    pub(super) fn editor_is_dirty(&self, editor: &EditorState) -> bool {
+        !self.editor_basic_patch(editor).is_empty() || !editor.details_patch().is_empty()
+    }
+
     pub(super) fn save_editor(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.editor.as_ref().is_none_or(|editor| editor.busy) {
+        if self.close_ready || self.editor.as_ref().is_none_or(|editor| editor.busy) {
             return;
         }
         if let Err(error) = self.read_editor_inputs(cx) {
@@ -534,14 +690,15 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let editor = self.editor.as_mut().unwrap();
-        let details_patch = editor.details_patch();
-        let basic_patch = editor.basic_patch(editor.score_available());
+        let details_patch = self.editor.as_ref().unwrap().details_patch();
+        let basic_patch = self.editor_basic_patch(self.editor.as_ref().unwrap());
         if details_patch.is_empty() && basic_patch.is_empty() {
             self.close_editor(cx);
             return;
         }
-        if self.offline && !details_patch.is_empty() {
+        let offline = self.offline;
+        let editor = self.editor.as_mut().unwrap();
+        if offline && !details_patch.is_empty() {
             editor.error =
                 "Reconnect to AniList before saving notes, dates or custom lists.".into();
             cx.notify();
@@ -661,6 +818,9 @@ impl Workspace {
                                 basic.as_ref().ok().and_then(|entry| entry.as_ref()),
                                 cx,
                             );
+                            if same_editor {
+                                this.sync_fenced_editor_inputs(cx);
+                            }
                         }
                     }
                     this.check_barrier(window, cx);
@@ -677,6 +837,7 @@ impl Workspace {
                             basic.as_ref().ok().and_then(|entry| entry.as_ref()),
                             cx,
                         );
+                        this.sync_fenced_editor_inputs(cx);
                         match basic {
                             Ok(entry) => {
                                 if let Some(entry) = entry {
@@ -684,12 +845,10 @@ impl Workspace {
                                         let change =
                                             this.list.apply_one(entry.clone(), now_seconds());
                                         this.progress.reconcile_entry(generation, &entry);
+                                        this.update_step_error();
                                         this.apply_list_change(change);
                                         this.discovery_list_changed();
-                                        if this.detail.media_id == Some(id) {
-                                            this.detail.entry = Some(entry);
-                                            this.detail.entry_available = true;
-                                        }
+                                        this.reconcile_open_entries(Some(&[id]), cx);
                                     } else {
                                         // A later snapshot owns the visible entry, including deletion.
                                         this.queue_list_refresh(Some(vec![id]), window, cx);
@@ -709,7 +868,7 @@ impl Workspace {
                     Err(error) => this.editor.as_mut().unwrap().error = error.to_string(),
                 }
                 if this.editor.is_some() {
-                    this.set_editor_inputs_disabled(false, cx);
+                    this.set_editor_inputs_disabled(this.edits_fenced(), cx);
                 }
                 this.check_barrier(window, cx);
                 cx.notify();
@@ -719,6 +878,9 @@ impl Workspace {
     }
 
     fn delete_editor(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.editor_controls_disabled() {
+            return;
+        }
         if self.offline {
             if let Some(editor) = self.editor.as_mut() {
                 editor.error = "Reconnect to AniList before removing this entry.".into();
@@ -729,7 +891,7 @@ impl Workspace {
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
-        if editor.busy {
+        if editor.busy || self.progress.busy(self.generation, editor.media_id) {
             return;
         }
         if !editor.confirming_delete {
@@ -766,15 +928,7 @@ impl Workspace {
         self.editor_status_open = false;
         self.set_editor_inputs_disabled(true, cx);
         cx.notify();
-        if self
-            .progress
-            .edit(self.generation, id)
-            .is_some_and(|edit| edit.in_flight)
-        {
-            self.delete_waiting = true;
-        } else {
-            self.perform_delete(window, cx);
-        }
+        self.perform_delete(window, cx);
     }
 
     pub(super) fn perform_delete(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -807,6 +961,13 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
                 this.progress.finish_delete(generation, id, result.is_ok());
+                if generation == this.generation {
+                    this.list.step_error = this
+                        .progress
+                        .first_error(generation)
+                        .unwrap_or_default()
+                        .into();
+                }
                 // Expiry can stash the editor before deletion is acknowledged.
                 if result.is_ok()
                     && let Some(account) = account
@@ -843,17 +1004,14 @@ impl Workspace {
                             let change = this.list.apply_scoped(&[id], vec![None], now_seconds());
                             this.apply_list_change(change);
                             this.discovery_list_changed();
-                            if this.detail.media_id == Some(id) {
-                                this.detail.entry = None;
-                                this.detail.entry_available = true;
-                            }
+                            this.reconcile_open_entries(Some(&[id]), cx);
                         }
                         this.close_editor(cx);
                     }
                     Err(error) => this.editor.as_mut().unwrap().error = error,
                 }
                 if this.editor.is_some() {
-                    this.set_editor_inputs_disabled(false, cx);
+                    this.set_editor_inputs_disabled(this.edits_fenced(), cx);
                 }
                 this.check_barrier(window, cx);
                 cx.notify();
@@ -863,14 +1021,56 @@ impl Workspace {
     }
 
     fn open_editor_detail(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.as_ref().is_none_or(|editor| editor.busy) {
+        if self.editor_controls_disabled() {
             return;
         }
         self.close_editor(cx);
         self.navigate(Route::Anime(id), window, cx);
     }
 
+    fn open_editor_episode(&mut self, path: &str, window: &Window, cx: &mut Context<Self>) {
+        if self.editor_controls_disabled() {
+            return;
+        }
+        let path = std::path::PathBuf::from(path);
+        let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
+        let core = self.core.clone();
+        #[cfg(test)]
+        let controlled = tests::take_open_path_hook(&path);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = joined(
+                core.spawn(async move {
+                    #[cfg(test)]
+                    if let Some(controlled) = controlled {
+                        return controlled.await.map_err(|error| error.to_string())?;
+                    }
+                    tokio::task::spawn_blocking(move || {
+                        crate::platform::NativePlatform.open_path(&path)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                })
+                .await,
+            );
+            let _ = this.update_in(cx, |this, _, cx| {
+                if !this.stopping
+                    && this.generation == generation
+                    && this.profile.as_ref().map(|user| user.id) == account
+                    && let Err(error) = result
+                {
+                    this.global_error = error;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn choose_editor_status(&mut self, status: &'static str, cx: &mut Context<Self>) {
+        if self.editor_controls_disabled() {
+            return;
+        }
         let Some(editor) = self.editor.as_mut().filter(|editor| !editor.busy) else {
             return;
         };
@@ -891,8 +1091,9 @@ impl Workspace {
         let Some(inputs) = self.editor_inputs.as_ref() else {
             return div().into_any();
         };
+        let disabled = self.editor_controls_disabled();
         if self.editor_status_open
-            && (editor.busy
+            && (disabled
                 || (self.editor_status_focus_subscription.is_some()
                     && !self.editor_status_focus.contains_focused(window, cx)))
         {
@@ -956,7 +1157,7 @@ impl Workspace {
                         .role(gpui::Role::Button)
                         .aria_label(format!("Open details for {title}"))
                         .focusable()
-                        .tab_stop(true)
+                        .tab_stop(!disabled)
                         .cursor_pointer()
                         .font(serif_font())
                         .text_size(px(21.))
@@ -970,24 +1171,23 @@ impl Workspace {
                 )
                 .child(div().text_size(px(12.)).text_color(rgb(DIM)).child(watched)),
         );
-        if let Some(file) = self
-            .library_files
-            .iter()
-            .find(|file| file.media_id == Some(id) && file.episode == Some(editor.progress + 1))
+        if let Some(next_episode) = editor.progress.checked_add(1)
+            && let Some(file) = self
+                .library_files
+                .iter()
+                .find(|file| file.media_id == Some(id) && file.episode == Some(next_episode))
         {
             let path = file.path.clone();
-            let episode = file.episode.unwrap_or(editor.progress + 1);
             header = header.child(
-                button("editor-play-next", format!("Play Ep {episode}"), false).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        if let Err(error) =
-                            crate::platform::NativePlatform.open_path(std::path::Path::new(&path))
-                        {
-                            this.global_error = error;
-                            cx.notify();
-                        }
-                    }),
-                ),
+                button(
+                    "editor-play-next",
+                    format!("Play Ep {next_episode}"),
+                    disabled,
+                )
+                .debug_selector(|| "editor-play-next".into())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_editor_episode(&path, window, cx);
+                })),
             );
         }
         form = form.child(header);
@@ -1002,11 +1202,11 @@ impl Workspace {
             );
         }
         form = form.child(div().text_size(px(14.)).child("Status"));
-        let mut status = select_with_disabled("editor-status", "Status", editor.busy)
-            .when(!editor.busy, |control| {
+        let mut status = select_with_disabled("editor-status", "Status", disabled)
+            .when(!disabled, |control| {
                 control.track_focus(&self.editor_status_focus)
             })
-            .aria_expanded(self.editor_status_open && !editor.busy)
+            .aria_expanded(self.editor_status_open && !disabled)
             .debug_selector(|| "editor-status".into())
             .relative()
             .w_full()
@@ -1017,7 +1217,7 @@ impl Workspace {
             .child(status_label(&editor.status))
             .child("▾")
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if this.editor.as_ref().is_none_or(|editor| editor.busy) {
+                if this.editor_controls_disabled() {
                     return;
                 }
                 match event.keystroke.key.as_str() {
@@ -1045,7 +1245,7 @@ impl Workspace {
                 }
             }))
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.editor.as_ref().is_none_or(|editor| editor.busy) {
+                if this.editor_controls_disabled() {
                     return;
                 }
                 if this.editor_status_focus_subscription.is_none() {
@@ -1080,11 +1280,14 @@ impl Workspace {
                     button(
                         format!("edit-status-{value}"),
                         status_label(value),
-                        editor.busy,
+                        disabled,
                     )
                     .debug_selector(move || format!("edit-status-choice-{value}"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
+                        if this.editor_controls_disabled() {
+                            return;
+                        }
                         this.choose_editor_status(value, cx);
                         window.focus(&this.editor_status_focus, cx);
                     })),
@@ -1138,7 +1341,7 @@ impl Workspace {
                 button(
                     "review-editor-progress",
                     format!("Review current progress: {current}"),
-                    editor.busy,
+                    disabled,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.review_editor_progress(cx);
@@ -1147,10 +1350,12 @@ impl Workspace {
         }
         if matches!(score_format, "POINT_3" | "POINT_5") {
             let mut ratings = div().flex().gap(px(4.));
-            ratings = ratings.child(button("score-clear", "Clear score", editor.busy).on_click(
+            ratings = ratings.child(button("score-clear", "Clear score", disabled).on_click(
                 cx.listener(|this, _, _, cx| {
-                    this.clear_editor_score(cx);
-                    cx.notify();
+                    if !this.editor_controls_disabled() {
+                        this.clear_editor_score(cx);
+                        cx.notify();
+                    }
                 }),
             ));
             let limit = if score_format == "POINT_3" { 3 } else { 5 };
@@ -1164,7 +1369,7 @@ impl Workspace {
                     button(
                         format!("score-choice-{rating}"),
                         format!("{label} {rating}"),
-                        editor.busy,
+                        disabled,
                     )
                     .bg(rgb(if editor.score == Some(rating as f64) {
                         ACCENT
@@ -1172,15 +1377,17 @@ impl Workspace {
                         PANEL_2
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.editor.as_ref().is_none_or(|editor| editor.busy) {
+                        if this.editor_controls_disabled() {
                             return;
                         }
                         if let Some(editor) = this.editor.as_mut() {
-                            editor.score = if editor.score == Some(rating as f64) {
-                                None
-                            } else {
-                                Some(rating as f64)
-                            };
+                            let rating = rating as f64;
+                            let score = (editor.score != Some(rating)).then_some(rating);
+                            let format = this
+                                .profile
+                                .as_ref()
+                                .and_then(|u| u.score_format.as_deref());
+                            editor.set_score(score, format);
                             if let Some(inputs) = this.editor_inputs.as_ref() {
                                 inputs.score.update(cx, |input, cx| {
                                     input.set_value(optional_score(editor.score), cx)
@@ -1207,7 +1414,7 @@ impl Workspace {
                         } else {
                             "Notes, viewing dates and custom lists ▾"
                         },
-                        editor.busy,
+                        disabled,
                     )
                     .bg(rgb(PANEL))
                     .border_color(rgb(PANEL))
@@ -1215,7 +1422,7 @@ impl Workspace {
                     .px(px(0.))
                     .py(px(0.))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if this.editor.as_ref().is_none_or(|editor| editor.busy) {
+                        if this.editor_controls_disabled() {
                             return;
                         }
                         this.editor_details_open = !this.editor_details_open;
@@ -1229,6 +1436,14 @@ impl Workspace {
         if self.editor_details_open {
             if self.editor_details_loading {
                 form = form.child(div().text_color(rgb(DIM)).child("Loading entry details…"));
+            }
+            if !editor.details_error.is_empty() {
+                form = form.child(
+                    div()
+                        .text_color(rgb(ERROR))
+                        .text_size(px(12.))
+                        .child(editor.details_error.clone()),
+                );
             }
             if let Some(details) = editor.details.as_ref() {
                 if let Some(warning) = details.warning.as_ref() {
@@ -1278,11 +1493,11 @@ impl Workspace {
                             button(
                                 format!("custom-{name}"),
                                 format!("{} {name}", if selected { "☑" } else { "☐" }),
-                                editor.busy,
+                                disabled,
                             )
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    if this.editor.as_ref().is_none_or(|editor| editor.busy) {
+                                    if this.editor_controls_disabled() {
                                         return;
                                     }
                                     if let Some(editor) = this.editor.as_mut() {
@@ -1319,7 +1534,9 @@ impl Workspace {
                         } else {
                             "Remove from list"
                         },
-                        editor.busy || self.offline,
+                        disabled
+                            || self.offline
+                            || self.progress.busy(self.generation, editor.media_id),
                     )
                     .text_color(rgb(ERROR))
                     .bg(rgb(PANEL))
@@ -1331,22 +1548,22 @@ impl Workspace {
                         .flex()
                         .gap(px(8.))
                         .child(
-                            button("cancel-editor", "Cancel", editor.busy)
+                            button("cancel-editor", "Cancel", disabled)
                                 .bg(rgb(PANEL_2))
                                 .border_color(rgb(PANEL_2))
-                                .on_click(cx.listener(|this, _, _, cx| this.close_editor(cx))),
+                                .on_click(cx.listener(|this, _, _, cx| this.dismiss_editor(cx))),
                         )
                         .child(
                             button(
                                 "save-editor",
                                 if editor.busy { "Saving…" } else { "Save" },
-                                editor.busy,
+                                disabled,
                             )
                             .bg(rgb(ACCENT))
                             .border_color(rgb(ACCENT))
                             .text_color(rgb(INK))
                             .on_click(
-                                cx.listener(|this, _, window, cx| this.save_editor(window, cx)),
+                                cx.listener(|this, _, window, cx| this.submit_editor(window, cx)),
                             ),
                         ),
                 ),
@@ -1364,7 +1581,8 @@ impl Workspace {
             for media in self.editor_recs.iter().take(12) {
                 let rec_id = media.id;
                 let added = self.added_recommendations.contains(&rec_id);
-                let busy = self.editor_adding.contains(&rec_id) || added;
+                let origin = Some(ModalLayer::Editor);
+                let busy = self.add_media_blocked(rec_id, origin);
                 let title = media.display_title();
                 let cover = self.cover_images.get(&(rec_id, 96, 128)).cloned();
                 let cover = if let Some(image) = cover {
@@ -1391,7 +1609,7 @@ impl Workspace {
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if !busy {
-                                this.add_media(rec_id, "PLANNING", window, cx);
+                                this.add_media(rec_id, "PLANNING", origin, window, cx);
                             }
                         }))
                         .child(
@@ -1580,6 +1798,99 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn reselecting_pending_status_rechecks_the_fresh_total(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "KURISU_EDITOR_PENDING_STATUS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut mutations = 0;
+            run_graphql_fixture(
+                CHILD,
+                "screens::editor::tests::reselecting_pending_status_rechecks_the_fresh_total",
+                |request| {
+                    let query = request["query"].as_str().unwrap();
+                    let entry = |status| json!({"id":22,"mediaId":71,"status":status,"progress":12,"score":70,"repeat":2});
+                    if query.contains("SaveMediaListEntry") {
+                        mutations += 1;
+                        assert_eq!(request["variables"]["status"], "CURRENT");
+                        assert_eq!(request["variables"]["progress"], 12);
+                        json!({"SaveMediaListEntry":entry(if mutations == 1 {"COMPLETED"} else {"CURRENT"})})
+                    } else if query.contains("mediaListEntry") {
+                        json!({"Media":{"id":71,"episodes":24,"mediaListEntry":entry("COMPLETED")}})
+                    } else if query.contains("Viewer") {
+                        json!({"Viewer":{"id":47,"name":"Fixture","mediaListOptions":{"scoreFormat":"POINT_100"}}})
+                    } else {
+                        assert!(query.contains("recommendations"), "{query}");
+                        json!({"Page":{"recommendations":[]}})
+                    }
+                },
+            );
+            assert_eq!(mutations, 2);
+            return;
+        }
+
+        let (initial, runtime, dir) = editor_fixture();
+        drop(initial);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = kurisu_core::User {
+            id: 47,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        db.replace_account("synthetic-token", &user).unwrap();
+        let mut entry = total_entry("CURRENT", 11);
+        entry.media.as_mut().unwrap().title_romaji = Some("Fixture show".into());
+        db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
+        db.upsert_entry(&entry).unwrap();
+        let core = kurisu_core::Core::from_db(
+            db,
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        );
+        let entry = runtime
+            .block_on(core.update_entry(71, Some("CURRENT".into()), Some(12), None, None))
+            .unwrap();
+        let pending = runtime.block_on(core.get_pending_changes()).unwrap();
+        assert!(pending[0].conflict);
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.last_sync_attempt = Some(Instant::now());
+            w.pending = pending;
+            w.list.replace(vec![entry], 0);
+            w.open_editor(71, window, cx);
+            w.submit_editor(window, cx);
+            assert_eq!(w.active_writes, 0);
+            w.open_editor(71, window, cx);
+            w.choose_editor_status("CURRENT", cx);
+            w.submit_editor(window, cx);
+            assert_eq!(w.active_writes, 1);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.active_writes != 0) {
+            assert!(Instant::now() < deadline);
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            cx.run_until_parked();
+        }
+        assert!(workspace.read_with(cx, |w, _| w.editor.is_none()));
+        assert!(
+            runtime
+                .block_on(core.sync_pending_changes())
+                .unwrap()
+                .is_empty()
+        );
+        let entry = runtime.block_on(core.get_entry(71)).unwrap().unwrap();
+        assert_eq!((entry.status.as_str(), entry.progress), ("CURRENT", 12));
+        assert_eq!(entry.media.unwrap().episodes, Some(24));
     }
 
     #[gpui::test]
@@ -2141,6 +2452,8 @@ mod tests {
 
     #[gpui::test]
     fn untouched_total_save_and_close_do_not_start_writes(cx: &mut gpui::TestAppContext) {
+        use gpui::AccessibleAction;
+        cx.update(crate::shell::bind_keys);
         let (core, runtime, _dir) = editor_fixture();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         for _ in 0..16 {
@@ -2159,15 +2472,356 @@ mod tests {
             assert!(w.editor.is_none());
             assert_eq!(w.active_writes, 0);
             w.open_editor(71, window, cx);
-            w.request_close(super::super::CloseIntent::Quit, window, cx);
+            w.request_close(super::super::CloseIntent::Window, window, cx);
             assert!(w.barrier.is_none());
             assert!(w.barrier_error.is_empty());
             assert_eq!(w.active_writes, 0);
             assert_eq!(w.editor.as_ref().unwrap().status, "PAUSED");
         });
-        cx.update(|window, _| window.remove_window());
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (field_id, field) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == gpui::Role::TextInput && node.label() == Some("Episodes")
+            })
+            .expect("progress field behind closing dialog");
+        let field_id = *field_id;
+        assert!(field.is_hidden());
+        assert!(field.supports_action(AccessibleAction::SetValue));
+        assert!(field.supports_action(AccessibleAction::Focus));
+        assert_eq!(field.value(), Some("12"));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == gpui::Role::Dialog && node.label() == Some("Closing Kurisu")
+        }));
+
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: field_id,
+            data: None,
+        });
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::SetValue,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: field_id,
+            data: Some(gpui::accesskit::ActionData::Value("7".into())),
+        });
+        cx.simulate_keystrokes("enter");
+        workspace.read_with(cx, |w, app| {
+            assert!(w.close_ready);
+            assert_eq!(w.editor.as_ref().unwrap().progress, 12);
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().progress.read(app).value(),
+                "12"
+            );
+            assert_eq!(
+                w.active_writes, 0,
+                "late editor submission admitted a write"
+            );
+        });
+        workspace.update_in(cx, |w, win, cx| w.resume_after_close(win, cx));
+        cx.run_until_parked();
+        let resumed_tree = cx.take_accessibility_tree_update().unwrap();
+        assert!(!resumed_tree.nodes.iter().any(|(_, node)| {
+            node.role() == gpui::Role::Dialog && node.label() == Some("Closing Kurisu")
+        }));
+        let (resumed_field_id, _) = resumed_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == gpui::Role::TextInput && node.label() == Some("Episodes")
+            })
+            .expect("progress field after close cancel");
+        let resumed_field_id = *resumed_field_id;
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: resumed_field_id,
+            data: None,
+        });
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::SetValue,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: resumed_field_id,
+            data: Some(gpui::accesskit::ActionData::Value("7".into())),
+        });
+        cx.simulate_keystrokes("enter");
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.editor.as_ref().unwrap().progress, 7);
+            assert_eq!(w.active_writes, 1);
+        });
         drop(workspace);
+        cx.update(|window, _| window.remove_window());
         drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn editor_enter_and_delete_are_fenced_during_barrier_and_logout(cx: &mut gpui::TestAppContext) {
+        use gpui::{AccessibleAction, Focusable};
+        cx.update(crate::shell::bind_keys);
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        for _ in 0..16 {
+            cx.run_until_parked();
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            });
+            w.list.replace(vec![total_entry("PAUSED", 12)], 0);
+            w.open_editor(71, window, cx);
+            w.editor.as_mut().unwrap().edit_progress(7);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .update(cx, |input, cx| input.set_value("7", cx));
+            w.query_error = "controlled query failure".into();
+            w.request_close(super::super::CloseIntent::Quit, window, cx);
+            assert!(w.barrier.is_some());
+            assert!(!w.barrier_error.is_empty());
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (field_id, field) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == gpui::Role::TextInput && node.label() == Some("Episodes")
+            })
+            .expect("progress field behind barrier error");
+        let field_id = *field_id;
+        assert!(field.is_hidden());
+        workspace.update_in(cx, |w, win, cx| w.modal_focus().hold(win, cx));
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: field_id,
+            data: None,
+        });
+        assert!(!cx.update(|win, app| {
+            workspace
+                .read(app)
+                .editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .read(app)
+                .focus_handle(app)
+                .is_focused(win)
+        }));
+        cx.simulate_keystrokes("enter");
+        workspace.update_in(cx, |w, window, cx| {
+            w.delete_editor(window, cx);
+            assert_eq!(w.active_writes, 0);
+            assert!(!w.editor.as_ref().unwrap().busy);
+            assert!(!w.editor.as_ref().unwrap().confirming_delete);
+            w.cancel_barrier(window, cx);
+            w.query_error.clear();
+            w.auth_busy = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let resumed_tree = cx.take_accessibility_tree_update().unwrap();
+        let (resumed_field_id, _) = resumed_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == gpui::Role::TextInput && node.label() == Some("Episodes")
+            })
+            .expect("progress field during auth_busy");
+        let resumed_field_id = *resumed_field_id;
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: resumed_field_id,
+            data: None,
+        });
+        assert!(cx.update(|win, app| {
+            workspace
+                .read(app)
+                .editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .read(app)
+                .focus_handle(app)
+                .is_focused(win)
+        }));
+        cx.simulate_keystrokes("enter");
+        workspace.update_in(cx, |w, window, cx| {
+            w.delete_editor(window, cx);
+            assert_eq!(w.active_writes, 0);
+            assert!(!w.editor.as_ref().unwrap().busy);
+            assert!(!w.editor.as_ref().unwrap().confirming_delete);
+        });
+        drop(workspace);
+        cx.update(|window, _| window.remove_window());
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn fenced_editor_snapshot_survives_auth_and_install_barriers(cx: &mut gpui::TestAppContext) {
+        const CHILD: &str = "KURISU_EDITOR_FENCED_SNAPSHOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "screens::editor::tests::fenced_editor_snapshot_survives_auth_and_install_barriers",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("KURISU_FIXTURE_GRAPHQL", "http://127.0.0.1:9/graphql")
+                .env("KURISU_FIXTURE_RELEASES", "http://127.0.0.1:9/releases")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use gpui::AccessibleAction;
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        for _ in 0..16 {
+            cx.run_until_parked();
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            });
+            let mut entry = total_entry("PAUSED", 12);
+            entry.progress = 7;
+            w.list.replace(vec![entry], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .update(cx, |input, cx| input.set_value("07", cx));
+            w.start_barrier(super::super::BarrierAction::Logout, window, cx);
+            assert!(w.auth_busy);
+            assert!(
+                w.fenced_editor_inputs.is_some(),
+                "BarrierAction::Logout cleared fenced_editor_inputs before auth_busy completed"
+            );
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (field_id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == gpui::Role::TextInput && node.label() == Some("Episodes")
+            })
+            .expect("progress field during auth_busy");
+        let field_id = *field_id;
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::SetValue,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: field_id,
+            data: Some(gpui::accesskit::ActionData::Value("99".into())),
+        });
+        workspace.read_with(cx, |w, app| {
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().progress.read(app).value(),
+                "07"
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.auth_busy) {
+            assert!(std::time::Instant::now() < deadline);
+            cx.run_until_parked();
+            runtime.block_on(async {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            assert!(!w.auth_busy);
+            assert!(w.fenced_editor_inputs.is_none());
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            });
+            let mut entry = total_entry("PAUSED", 12);
+            entry.progress = 7;
+            w.list.replace(vec![entry], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .update(cx, |input, cx| input.set_value("07", cx));
+            w.queued_login = Some((false, Some("synthetic".into())));
+            w.start_barrier(super::super::BarrierAction::Login, window, cx);
+            assert!(w.auth_busy);
+            assert!(w.fenced_editor_inputs.is_some());
+            w.cancel_login(window, cx);
+            assert!(!w.auth_busy);
+            assert!(w.fenced_editor_inputs.is_none());
+
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .progress
+                .update(cx, |input, cx| input.set_value("07", cx));
+            w.start_barrier(super::super::BarrierAction::Install, window, cx);
+            assert!(w.update_busy);
+            assert!(w.fenced_editor_inputs.is_some());
+        });
+        cx.run_until_parked();
+        let install_tree = cx.take_accessibility_tree_update().unwrap();
+        let (install_field_id, _) = install_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == gpui::Role::TextInput && node.label() == Some("Episodes")
+            })
+            .expect("progress field during update_busy");
+        let install_field_id = *install_field_id;
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::SetValue,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: install_field_id,
+            data: Some(gpui::accesskit::ActionData::Value("88".into())),
+        });
+        workspace.read_with(cx, |w, app| {
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().progress.read(app).value(),
+                "07"
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.update_busy) {
+            assert!(std::time::Instant::now() < deadline);
+            cx.run_until_parked();
+            runtime.block_on(async {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            });
+        }
+        workspace.read_with(cx, |w, _| {
+            assert!(!w.update_busy);
+            assert!(w.fenced_editor_inputs.is_none());
+        });
+        drop(workspace);
+        cx.update(|window, _| window.remove_window());
+        drop(runtime);
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -2309,6 +2963,7 @@ mod tests {
                 "Old completion cleared the new editor's loading state"
             );
             assert!(w.editor.as_ref().unwrap().error.is_empty());
+            assert!(w.editor.as_ref().unwrap().details_error.is_empty());
         });
         for _ in 0..16 {
             runtime.block_on(async { tokio::task::yield_now().await });
@@ -2316,11 +2971,12 @@ mod tests {
         }
         workspace.read_with(cx, |w, _| {
             assert!(!w.editor_details_loading);
+            assert!(w.editor.as_ref().unwrap().error.is_empty());
             assert!(
                 w.editor
                     .as_ref()
                     .unwrap()
-                    .error
+                    .details_error
                     .starts_with("Entry details are unavailable.")
             );
         });
@@ -2607,7 +3263,7 @@ mod tests {
                     let variables = &request["variables"];
                     mutations.push(variables.clone());
                     json!({"SaveMediaListEntry":{
-                        "id":22, "status":variables.get("status").cloned().unwrap_or(json!(before_status)),
+                        "id":22, "mediaId":71, "status":variables.get("status").cloned().unwrap_or(json!(before_status)),
                         "progress":variables.get("progress").cloned().unwrap_or(json!(12)),
                         "repeat":variables.get("repeat").cloned().unwrap_or(json!(2)),
                         "score":variables.get("score").cloned().unwrap_or(json!(70.0)),
@@ -2769,7 +3425,7 @@ mod tests {
                     if retry && lookups == 1 {
                         return (400, json!({"errors":[{"message":"Lookup refused"}]}));
                     }
-                    json!({"Media":{"mediaListEntry":if present { entry } else { json!(null) }}})
+                    json!({"Media":{"id":71,"mediaListEntry":if present { entry } else { json!(null) }}})
                 } else if query.contains("DeleteMediaListEntry") {
                     trace.push("delete");
                     deletes += 1;
@@ -3129,7 +3785,7 @@ mod tests {
                     let q = request["query"].as_str().unwrap();
                     let v = &request["variables"];
                     let entry = json!({"id":22,"mediaId":71,"status":"CURRENT","progress":3,"repeat":0,"score":score,"updatedAt":100,"media":null});
-                    let detail = |note: &str| json!({"id":22,"notes":note,"startedAt":null,"completedAt":null,"customLists":{}});
+                    let detail = |note: &str| json!({"id":22,"mediaId":71,"notes":note,"startedAt":null,"completedAt":null,"customLists":{}});
                     let data = if q.contains("SaveMediaListEntry") && v.get("notes").is_some() {
                         note_writes += 1;
                         remote_note = v["notes"].as_str().unwrap().to_owned();
@@ -3140,7 +3796,7 @@ mod tests {
                         json!({"Media":{"mediaListEntry":detail(&remote_note)},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}})
                     } else if q.contains("mediaListEntry") {
                         trace.push("basic entry read".to_owned());
-                        json!({"Media":{"mediaListEntry":entry}})
+                        json!({"Media":{"id":71,"mediaListEntry":entry}})
                     } else if q.contains("Viewer") {
                         if expire && !first_failure && !accepted_basic && note_writes == 1 {
                             first_failure = true;
@@ -3704,7 +4360,7 @@ mod tests {
         const CHILD: &str = "KURISU_RETURNED_VALUES_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let mut entry = json!({"id":22,"mediaId":71,"status":if completion {"REPEATING"} else {"CURRENT"},"progress":if completion {11} else {3},"repeat":2,"score":70,"updatedAt":100,"media":null});
-            let mut details = json!({"id":22,"notes":"old note","startedAt":null,"completedAt":null,"customLists":{}});
+            let mut details = json!({"id":22,"mediaId":71,"notes":"old note","startedAt":null,"completedAt":null,"customLists":{}});
             let mut basic_writes = 0;
             let mut detail_writes = 0;
             let mut rejected = false;
@@ -3782,7 +4438,7 @@ mod tests {
                     } else if q.contains("mediaListEntry") && q.contains("notes") {
                         json!({"Media":{"mediaListEntry":details},"Viewer":{"mediaListOptions":{"animeList":{"customLists":["Remote","Local"]}}}})
                     } else if q.contains("mediaListEntry") {
-                        json!({"Media":{"mediaListEntry":entry}})
+                        json!({"Media":{"id":71,"mediaListEntry":entry}})
                     } else if q.contains("Viewer") {
                         json!({"Viewer":{"id":47,"name":"Controlled","mediaListOptions":{"scoreFormat":"POINT_100"}}})
                     } else if q.contains("MediaListCollection") {
@@ -4234,7 +4890,7 @@ mod tests {
                     } else if query.contains("mediaListEntry") {
                         trace.push("lookup");
                         assert_eq!(request["variables"]["mediaId"], 71);
-                        json!({"Media":{"mediaListEntry":if present {entry} else {json!(null)}}})
+                        json!({"Media":{"id":71,"mediaListEntry":if present {entry} else {json!(null)}}})
                     } else if query.contains("recommendations") {
                         json!({"Page":{"recommendations":[]}})
                     } else {
@@ -4367,7 +5023,6 @@ mod tests {
             wait(cx, &|w| w.generation != generation);
         }
         if matches!(case, RestoredBeforeAck) {
-            // Exercise restoration while the original UI acknowledgement is still queued.
             runtime
                 .block_on(core.login_with_token("synthetic-new-token".into()))
                 .unwrap();
@@ -4470,16 +5125,15 @@ mod tests {
             if stashed_replacement || failure {
                 w.request_close(super::super::CloseIntent::Quit, window, cx);
                 assert!(w.barrier_error.contains("Unsaved drafts"));
-                w.cancel_barrier(cx);
+                w.cancel_barrier(window, cx);
             }
             w.editor_drafts.remove(&49);
             if !failure && !stashed_replacement && !active_replacement {
-                w.request_close(super::super::CloseIntent::Quit, window, cx);
-                assert!(
-                    w.barrier.is_none(),
-                    "Successful deletion must release quitting"
-                );
+                w.request_close(super::super::CloseIntent::Window, window, cx);
+                assert!(w.barrier.is_none() && w.close_ready);
                 assert!(w.barrier_error.is_empty());
+                // A window hidden to the tray can accept a later sign-in.
+                w.resume_after_close(window, cx);
             }
         });
         if expire && !matches!(case, RestoredBeforeAck) && !stashed_replacement {
@@ -4515,7 +5169,7 @@ mod tests {
                 assert_eq!(w.editor.as_ref().unwrap().progress, 4);
                 w.request_close(super::super::CloseIntent::Quit, window, cx);
                 assert!(!w.barrier_error.is_empty());
-                w.cancel_barrier(cx);
+                w.cancel_barrier(window, cx);
                 w.delete_editor(window, cx);
                 w.delete_editor(window, cx);
             });
@@ -4525,12 +5179,12 @@ mod tests {
             if active_replacement {
                 w.close_editor(cx);
             }
+            w.request_close(super::super::CloseIntent::Quit, window, cx);
             if stashed_replacement {
                 w.discard_inactive_drafts(window, cx);
             }
-            w.request_close(super::super::CloseIntent::Quit, window, cx);
         });
-        wait(cx, &|w| w.barrier.is_none());
+        wait(cx, &|w| w.barrier.is_none() && w.close_ready);
         assert!(reopened.get_entry(71).unwrap().is_none());
         assert_eq!(pending_count(), 0);
         if !active_replacement && !stashed_replacement {
@@ -4569,7 +5223,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        // Configure the existing loopback seam in a child, without changing test-process globals.
+        // Isolate the fixture environment from parallel tests.
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
             .env(child_flag, "1")
@@ -4639,5 +5293,588 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[gpui::test]
+    fn editor_actions_and_controls_respect_all_edit_fences(cx: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(1400.)));
+        for _ in 0..8 {
+            cx.run_until_parked();
+            runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_5".into()),
+                ..Default::default()
+            });
+            let mut entry = total_entry("CURRENT", 12);
+            entry.progress = 3;
+            entry.score = Some(4.0);
+            w.list.replace(vec![entry], 0);
+            w.library_files
+                .replace(vec![kurisu_core::models::LibraryFile {
+                    path: "/controlled/ep4.mkv".into(),
+                    media_id: Some(71),
+                    episode: Some(4),
+                    ..Default::default()
+                }]);
+            w.open_editor(71, window, cx);
+            let editor = w.editor.as_mut().unwrap();
+            editor.review_progress = Some(6);
+            editor.apply_details(kurisu_core::models::EntryDetails {
+                available_custom_lists: vec!["Favorites".into()],
+                ..Default::default()
+            });
+            w.editor_details_open = true;
+            w.editor_recs = vec![Media {
+                id: 88,
+                title_english: Some("Recommended".into()),
+                ..Default::default()
+            }];
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        for mode in ["barrier", "auth_busy", "update_busy"] {
+            workspace.update_in(cx, |w, window, cx| {
+                w.barrier = (mode == "barrier").then_some(super::super::BarrierAction::Close(
+                    super::super::CloseIntent::Window,
+                ));
+                w.auth_busy = mode == "auth_busy";
+                w.update_busy = mode == "update_busy";
+                w.dismiss_editor(cx);
+                assert!(
+                    w.editor.is_some(),
+                    "dismiss_editor closed editor during {mode}"
+                );
+                w.choose_editor_status("COMPLETED", cx);
+                assert_eq!(
+                    w.editor.as_ref().unwrap().status,
+                    "CURRENT",
+                    "choose_editor_status mutated status during {mode}"
+                );
+                w.clear_editor_score(cx);
+                assert_eq!(
+                    w.editor.as_ref().unwrap().score,
+                    Some(4.0),
+                    "clear_editor_score cleared score during {mode}"
+                );
+                w.review_editor_progress(cx);
+                assert_eq!(
+                    w.editor.as_ref().unwrap().review_progress,
+                    Some(6),
+                    "review_editor_progress ran during {mode}"
+                );
+                w.open_editor_detail(71, window, cx);
+                assert!(
+                    w.editor.is_some() && w.route == super::Route::MyList,
+                    "open_editor_detail navigated during {mode}"
+                );
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            for label in [
+                "Status",
+                "Play Ep 4",
+                "Review current progress: 6",
+                "Clear score",
+                "★ 5",
+                "☐ Favorites",
+                "Cancel",
+                "Save",
+            ] {
+                let (_, node) = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap_or_else(|| panic!("missing editor control {label} during {mode}"));
+                assert!(
+                    node.is_disabled(),
+                    "editor control {label} stayed enabled during {mode}"
+                );
+            }
+        }
+        workspace.update_in(cx, |w, _, cx| {
+            w.barrier = None;
+            w.auth_busy = false;
+            w.update_busy = false;
+            cx.notify();
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    type OpenPathHook =
+        Box<dyn FnOnce(&Path) -> tokio::sync::oneshot::Receiver<Result<(), String>> + Send>;
+
+    static EDITOR_OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static EDITOR_OPEN_PATH_HOOK: std::sync::Mutex<Option<OpenPathHook>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn take_open_path_hook(
+        path: &Path,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        let hook = EDITOR_OPEN_PATH_HOOK.lock().unwrap().take()?;
+        Some(hook(path))
+    }
+
+    struct OpenPathHookGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl OpenPathHookGuard {
+        fn lock() -> Self {
+            let lock = EDITOR_OPEN_PATH_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *EDITOR_OPEN_PATH_HOOK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            Self { _lock: lock }
+        }
+
+        fn install(
+            &self,
+            recorded: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+        ) -> tokio::sync::oneshot::Sender<Result<(), String>> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut slot = EDITOR_OPEN_PATH_HOOK.lock().unwrap();
+            assert!(slot.is_none());
+            *slot = Some(Box::new(move |path| {
+                recorded.lock().unwrap().push(path.to_path_buf());
+                rx
+            }));
+            tx
+        }
+    }
+
+    impl Drop for OpenPathHookGuard {
+        fn drop(&mut self) {
+            *EDITOR_OPEN_PATH_HOOK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+        }
+    }
+
+    #[gpui::test]
+    fn editor_play_next_runs_off_ui_thread_and_scopes_errors_to_session(
+        tc: &mut gpui::TestAppContext,
+    ) {
+        let _hook = OpenPathHookGuard::lock();
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..16 {
+                cx.run_until_parked();
+                runtime.block_on(async {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                });
+                cx.run_until_parked();
+            }
+        };
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            });
+            let mut entry = total_entry("CURRENT", 3);
+            entry.progress = 3;
+            w.list.replace(vec![entry], 0);
+            w.library_files
+                .replace(vec![kurisu_core::models::LibraryFile {
+                    path: "/controlled/ep4.mkv".into(),
+                    media_id: Some(71),
+                    episode: Some(4),
+                    ..Default::default()
+                }]);
+            w.open_editor(71, window, cx);
+            w.cancel_reads("editor-recs");
+        });
+
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tx = _hook.install(opened.clone());
+        cx.update(|win, app| win.draw(app).clear(app));
+        let bounds = cx
+            .debug_bounds("editor-play-next")
+            .expect("editor-play-next button");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            &[std::path::PathBuf::from("/controlled/ep4.mkv")]
+        );
+        assert!(workspace.read_with(cx, |w, _| w.global_error.is_empty()));
+        tx.send(Err("missing player".into())).unwrap();
+        settle(cx);
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.global_error.clone()),
+            "missing player"
+        );
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.global_error.clear();
+            cx.notify();
+        });
+        let tx = _hook.install(opened.clone());
+        cx.update(|win, app| win.draw(app).clear(app));
+        let bounds = cx.debug_bounds("editor-play-next").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        assert_eq!(opened.lock().unwrap().len(), 2);
+        workspace.update_in(cx, |w, _, cx| w.close_editor(cx));
+        tx.send(Err("launch failed after close".into())).unwrap();
+        settle(cx);
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.global_error.clone()),
+            "launch failed after close"
+        );
+
+        for case in ["account", "generation", "stopping"] {
+            workspace.update_in(cx, |w, window, cx| {
+                w.stopping = false;
+                w.global_error.clear();
+                w.profile = Some(kurisu_core::User {
+                    id: 7,
+                    score_format: Some("POINT_100".into()),
+                    ..Default::default()
+                });
+                w.close_editor(cx);
+                w.open_editor(71, window, cx);
+                w.cancel_reads("editor-recs");
+            });
+            let before = opened.lock().unwrap().len();
+            let tx = _hook.install(opened.clone());
+            cx.update(|win, app| win.draw(app).clear(app));
+            let bounds = cx.debug_bounds("editor-play-next").unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            assert_eq!(opened.lock().unwrap().len(), before + 1);
+            workspace.update_in(cx, |w, _, _| match case {
+                "account" => {
+                    w.profile = Some(kurisu_core::User {
+                        id: 8,
+                        ..Default::default()
+                    });
+                }
+                "generation" => w.generation += 1,
+                _ => w.stopping = true,
+            });
+            tx.send(Err(format!("stale {case} error"))).unwrap();
+            settle(cx);
+            assert!(
+                workspace.read_with(cx, |w, _| w.global_error.is_empty()),
+                "late error leaked after {case} change"
+            );
+        }
+
+        let before = opened.lock().unwrap().len();
+        let _unused = _hook.install(opened.clone());
+        workspace.update_in(cx, |w, window, cx| {
+            w.stopping = false;
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            });
+            w.close_editor(cx);
+            w.open_editor(71, window, cx);
+            w.cancel_reads("editor-recs");
+            w.editor.as_mut().unwrap().busy = true;
+            w.open_editor_episode("/controlled/ep4.mkv", window, cx);
+            w.editor.as_mut().unwrap().busy = false;
+            w.close_ready = true;
+            w.open_editor_episode("/controlled/ep4.mkv", window, cx);
+            w.close_ready = false;
+        });
+        assert_eq!(opened.lock().unwrap().len(), before);
+
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn editor_render_handles_max_progress_without_overflow(tc: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                ..Default::default()
+            });
+            let mut entry = total_entry("CURRENT", i64::MAX);
+            entry.media.as_mut().unwrap().episodes = None;
+            w.list.replace(vec![entry], 0);
+            w.open_editor(71, window, cx);
+            w.cancel_reads("editor-recs");
+        });
+        cx.update(|win, app| win.draw(app).clear(app));
+        assert!(cx.debug_bounds("editor-play-next").is_none());
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn reselecting_conflicted_status_marks_editor_dirty_for_barrier_and_expiry(
+        tc: &mut gpui::TestAppContext,
+    ) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        for status in ["CURRENT", "REPEATING"] {
+            let pending_conflict = || kurisu_core::models::PendingChange {
+                media_id: 71,
+                title: "Show".into(),
+                progress: Some(3),
+                status: Some(status.into()),
+                score: None,
+                repeat: None,
+                error: Some("conflict".into()),
+                conflict: true,
+                missing_media: false,
+            };
+            workspace.update_in(cx, |w, window, cx| {
+                w.close_ready = false;
+                w.barrier = None;
+                w.barrier_error.clear();
+                w.profile = Some(kurisu_core::User {
+                    id: 7,
+                    offline: true,
+                    score_format: Some("POINT_100".into()),
+                    ..Default::default()
+                });
+                w.offline = true;
+                w.list.replace(vec![total_entry(status, 3)], 0);
+                w.pending = vec![pending_conflict()];
+                w.close_editor(cx);
+                w.open_editor(71, window, cx);
+                w.cancel_reads("editor-recs");
+                w.editor.as_mut().unwrap().choose_status(status);
+                let editor = w.editor.as_ref().unwrap();
+                assert!(editor.basic_patch(editor.score_available()).is_empty());
+                assert!(w.editor_is_dirty(editor));
+                w.request_close(crate::contracts::CloseIntent::Window, window, cx);
+                assert!(!w.close_ready);
+                assert!(w.editor.as_ref().is_some_and(|e| e.busy));
+                assert_eq!(w.active_writes, 1);
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while workspace.read_with(cx, |w, _| w.active_writes > 0) {
+                assert!(std::time::Instant::now() < deadline);
+                cx.run_until_parked();
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+            }
+
+            workspace.update_in(cx, |w, window, cx| {
+                w.cancel_barrier(window, cx);
+                w.resume_after_close(window, cx);
+                w.editor_drafts.clear();
+                w.list.replace(vec![total_entry(status, 3)], 0);
+                w.pending = vec![pending_conflict()];
+                w.close_editor(cx);
+                w.open_editor(71, window, cx);
+                w.cancel_reads("editor-recs");
+                w.editor.as_mut().unwrap().choose_status(status);
+                w.set_profile_at(None, w.generation + 1, window, cx);
+                assert!(w.editor_drafts.contains_key(&7));
+            });
+        }
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn generation_changed_save_ack_while_fenced_syncs_fenced_editor_inputs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const CHILD: &str = "KURISU_EDITOR_GEN_FENCE_SYNC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "screens::editor::tests::generation_changed_save_ack_while_fenced_syncs_fenced_editor_inputs",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("KURISU_FIXTURE_GRAPHQL", "http://127.0.0.1:9/graphql")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let (initial, runtime, dir) = editor_fixture();
+        drop(initial);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = kurisu_core::User {
+            id: 47,
+            name: "Offline".into(),
+            offline: true,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        db.replace_account("offline-token", &user).unwrap();
+        let entry = total_entry("CURRENT", 3);
+        db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
+        db.upsert_entry(&entry).unwrap();
+        let core = kurisu_core::Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        let (release, gate) = tokio::sync::oneshot::channel();
+        SAVE_ACK_WAITING.store(false, std::sync::atomic::Ordering::SeqCst);
+        *SAVE_ACK_GATE.lock().unwrap() = Some(gate);
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(user.clone());
+            w.offline = true;
+            w.list.replace(vec![entry], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .score
+                .update(cx, |input, cx| input.set_value("080", cx));
+            w.save_editor(window, cx);
+            assert_eq!(w.active_writes, 1);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !SAVE_ACK_WAITING.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "save ack gate not reached"
+            );
+            runtime
+                .block_on(async { tokio::time::sleep(std::time::Duration::from_millis(1)).await });
+            cx.run_until_parked();
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            let next_generation = w.generation + 1;
+            w.set_profile_at(Some(user.clone()), next_generation, window, cx);
+            assert!(w.editor.is_some());
+            assert!(!w.editor.as_ref().unwrap().busy);
+            w.request_close(super::super::CloseIntent::Window, window, cx);
+            assert!(w.edits_fenced());
+            assert_eq!(
+                w.fenced_editor_inputs
+                    .as_ref()
+                    .map(|values| values[1].as_str()),
+                Some("080")
+            );
+        });
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.active_writes != 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation-changed save ack timed out"
+            );
+            runtime
+                .block_on(async { tokio::time::sleep(std::time::Duration::from_millis(1)).await });
+            cx.run_until_parked();
+        }
+        workspace.update_in(cx, |w, _, cx| {
+            assert!(w.edits_fenced());
+            let score = w.editor_inputs.as_ref().unwrap().score.clone();
+            assert_eq!(score.read(cx).value(), "80");
+            score.update(cx, |input, cx| {
+                input.set_value("99", cx);
+                cx.emit(super::super::TextInputEvent::Changed("99".into()));
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, app| {
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().score.read(app).value(),
+                "80",
+                "fenced edit restored stale pre-accept input instead of accepted value"
+            );
+            assert_eq!(
+                w.fenced_editor_inputs
+                    .as_ref()
+                    .map(|values| values[1].as_str()),
+                Some("80")
+            );
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(core);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn restoring_stashed_draft_while_fenced_captures_raw_inputs(cx: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        let user = kurisu_core::User {
+            id: 47,
+            name: "DraftUser".into(),
+            offline: true,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        workspace.update_in(cx, |w, window, cx| {
+            w.set_profile(Some(user.clone()), window, cx);
+            w.list.replace(vec![total_entry("CURRENT", 3)], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .score
+                .update(cx, |input, cx| input.set_value("080", cx));
+            w.set_profile(None, window, cx);
+            assert!(w.editor.is_none());
+            assert!(w.editor_drafts.contains_key(&47));
+            w.update_busy = true;
+            w.set_profile(Some(user.clone()), window, cx);
+            assert!(w.edits_fenced());
+            assert_eq!(
+                w.fenced_editor_inputs
+                    .as_ref()
+                    .map(|values| values[1].as_str()),
+                Some("080")
+            );
+            let score = w.editor_inputs.as_ref().unwrap().score.clone();
+            score.update(cx, |input, cx| {
+                input.set_value("99", cx);
+                cx.emit(super::super::TextInputEvent::Changed("99".into()));
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, app| {
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().score.read(app).value(),
+                "080"
+            );
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(core);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

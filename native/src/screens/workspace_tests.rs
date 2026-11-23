@@ -10,8 +10,8 @@ use super::covers::CoverOwner;
 use super::my_list::MyListSlot;
 use super::same_prompt;
 use super::{
-    BarrierAction, CloseIntent, EditorInputs, ProgressEdit, Route, SortKey, Workspace,
-    freshness_plan, now_seconds,
+    BarrierAction, CloseIntent, EditorInputs, ProgressEdit, QueuedPreference, Route, SortKey,
+    Workspace, freshness_plan, now_seconds,
 };
 use crate::components::input::TextInput;
 
@@ -28,6 +28,10 @@ fn my_list_slots_translate_header_media_and_footer_without_id_sentinels() {
 
 #[path = "auth_tests.rs"]
 mod auth_tests;
+
+#[cfg(feature = "fixture-runtime")]
+#[path = "prompt_restore_tests.rs"]
+pub(super) mod prompt_restore_tests;
 
 #[gpui::test]
 fn startup_waits_for_session_before_showing_sign_in(cx: &mut TestAppContext) {
@@ -132,8 +136,19 @@ fn restored_account_retains_sync_age_but_replacement_clears_it(cx: &mut TestAppC
 fn late_sync_age_read_cannot_cross_a_new_sign_in_intent(cx: &mut TestAppContext) {
     let (core, runtime, _dir) = fixture();
     runtime
-        .block_on(core.set_preference("kurisu.list.synced".into(), Some("123".into())))
+        .block_on(core.set_workspace_preference(
+            "kurisu.list.synced".into(),
+            Some("123".into()),
+            None,
+        ))
         .unwrap();
+    assert_eq!(
+        runtime
+            .block_on(core.get_preference("kurisu.list.synced".into()))
+            .unwrap()
+            .as_deref(),
+        Some("123")
+    );
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
     workspace.update_in(cx, |workspace, _, _| workspace.auth_intent += 1);
     settle(cx, &runtime);
@@ -211,7 +226,7 @@ fn long_detail_keeps_banner_height(cx: &mut TestAppContext) {
     );
 }
 
-struct TestPlatform;
+pub(super) struct TestPlatform;
 
 impl Platform for TestPlatform {
     fn open_url(&self, _: &str) -> Result<(), String> {
@@ -225,7 +240,7 @@ impl Platform for TestPlatform {
     }
 }
 
-struct FixtureDir(PathBuf);
+pub(super) struct FixtureDir(pub(super) PathBuf);
 
 impl Drop for FixtureDir {
     fn drop(&mut self) {
@@ -233,7 +248,7 @@ impl Drop for FixtureDir {
     }
 }
 
-fn fixture() -> (Core, tokio::runtime::Runtime, FixtureDir) {
+pub(super) fn fixture() -> (Core, tokio::runtime::Runtime, FixtureDir) {
     fixture_with_platform(Arc::new(TestPlatform))
 }
 
@@ -262,14 +277,14 @@ fn fixture_with_platform(
     (core, runtime, FixtureDir(path))
 }
 
-fn settle(cx: &mut TestAppContext, runtime: &tokio::runtime::Runtime) {
+pub(super) fn settle(cx: &mut TestAppContext, runtime: &tokio::runtime::Runtime) {
     for _ in 0..16 {
         cx.run_until_parked();
         runtime.block_on(async { tokio::task::yield_now().await });
     }
 }
 
-fn update_fixture() -> kurisu_core::models::UpdateInfo {
+pub(super) fn update_fixture() -> kurisu_core::models::UpdateInfo {
     serde_json::from_value(serde_json::json!({
         "available": true,
         "can_install": true,
@@ -283,7 +298,7 @@ fn update_fixture() -> kurisu_core::models::UpdateInfo {
     .unwrap()
 }
 
-fn tracking_fixture(episode: i64) -> kurisu_core::models::TrackingPrompt {
+pub(super) fn tracking_fixture(episode: i64) -> kurisu_core::models::TrackingPrompt {
     kurisu_core::models::TrackingPrompt {
         media_id: 9,
         episode,
@@ -291,6 +306,10 @@ fn tracking_fixture(episode: i64) -> kurisu_core::models::TrackingPrompt {
         raw_title: format!("Synthetic {episode}"),
         progress: 3,
     }
+}
+
+fn queued_value(edit: &Option<QueuedPreference>) -> Option<Option<&str>> {
+    edit.as_ref().map(|edit| edit.value.as_deref())
 }
 
 #[gpui::test]
@@ -304,7 +323,7 @@ fn quick_close_flushes_latest_query_before_the_debounce(cx: &mut TestAppContext)
     });
     cx.run_until_parked();
     workspace.update_in(cx, |workspace, window, cx| {
-        assert_eq!(workspace.query_pending, Some(Some("x".into())));
+        assert_eq!(queued_value(&workspace.query_pending), Some(Some("x")));
         workspace.request_close(CloseIntent::Quit, window, cx);
         assert!(workspace.barrier.is_some());
         assert!(workspace.query_write_active);
@@ -328,12 +347,42 @@ fn quick_close_flushes_latest_query_before_the_debounce(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn query_reset_and_new_edit_settle_after_an_older_write(cx: &mut TestAppContext) {
-    let (core, runtime, _dir) = fixture();
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    let (seed_core, runtime, dir) = fixture();
+    drop(seed_core);
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "token-47",
+        &User {
+            id: 47,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.set_setting("native_preference:kurisu.list.q", "old account")
+        .unwrap();
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
     workspace.update_in(cx, |workspace, window, cx| {
+        workspace.restoring_session = false;
         workspace.stage_query(Some("old account".into()));
         workspace.save_query(window, cx);
         workspace.last_account = Some(47);
+        db.replace_account(
+            "token-48",
+            &User {
+                id: 48,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         workspace.set_profile(
             Some(User {
                 id: 48,
@@ -343,11 +392,13 @@ fn query_reset_and_new_edit_settle_after_an_older_write(cx: &mut TestAppContext)
             window,
             cx,
         );
-        assert_eq!(workspace.query_pending, Some(None));
+        assert_eq!(queued_value(&workspace.query_pending), Some(None));
     });
-    for _ in 0..12 {
-        cx.run_until_parked();
-        runtime.block_on(async { tokio::task::yield_now().await });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workspace.read_with(cx, |w, _| w.query_write_active || w.query_pending.is_some()) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
     }
     assert_eq!(
         runtime
@@ -394,7 +445,10 @@ fn query_write_failure_blocks_close_until_retry(cx: &mut TestAppContext) {
     workspace.read_with(cx, |workspace, _| {
         assert!(workspace.barrier.is_some());
         assert!(workspace.barrier_error.contains("query storage failure"));
-        assert_eq!(workspace.query_pending, Some(Some("retained".into())));
+        assert_eq!(
+            queued_value(&workspace.query_pending),
+            Some(Some("retained"))
+        );
     });
     db.0.lock()
         .execute_batch("DROP TRIGGER fail_query;")
@@ -443,17 +497,23 @@ fn nonquery_failure_retains_latest_intent_and_blocks_close(cx: &mut TestAppConte
                 .barrier_error
                 .contains("preference storage failure")
         );
-        assert_eq!(
-            workspace.preference_writes["kurisu.list.filter"].pending,
-            Some(Some("COMPLETED".into()))
+        assert!(
+            workspace.preference_writes["kurisu.list.filter"]
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("preference storage failure"))
         );
         assert_eq!(
-            workspace.preference_writes["kurisu.list.sort"].pending,
-            Some(Some("score".into()))
+            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
+            Some(Some("COMPLETED"))
         );
         assert_eq!(
-            workspace.preference_writes["kurisu.list.dir"].pending,
-            Some(Some("asc".into()))
+            queued_value(&workspace.preference_writes["kurisu.list.sort"].pending),
+            Some(Some("score"))
+        );
+        assert_eq!(
+            queued_value(&workspace.preference_writes["kurisu.list.dir"].pending),
+            Some(Some("asc"))
         );
     });
     let attempts: i64 =
@@ -462,7 +522,7 @@ fn nonquery_failure_retains_latest_intent_and_blocks_close(cx: &mut TestAppConte
                 row.get(0)
             })
             .unwrap();
-    assert_eq!(attempts, 3);
+    assert_eq!(attempts, 2);
     let attempted_direction: String = db
         .0
         .lock()
@@ -476,7 +536,9 @@ fn nonquery_failure_retains_latest_intent_and_blocks_close(cx: &mut TestAppConte
     cx.update(|window, app| window.draw(app).clear(app));
     assert!(cx.debug_bounds("retry-barrier").is_some());
 
-    workspace.update_in(cx, |workspace, _, cx| workspace.cancel_barrier(cx));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.cancel_barrier(window, cx)
+    });
     workspace.read_with(cx, |workspace, _| {
         assert!(workspace.barrier.is_none());
         assert!(workspace.preference_has_work());
@@ -559,7 +621,7 @@ fn torrent_preference_failures_block_transitions_until_explicit_retry(cx: &mut T
                     .barrier_error
                     .contains("torrent preference storage failure")
             );
-            workspace.cancel_barrier(cx);
+            workspace.cancel_barrier(window, cx);
         }
     });
     db.0.lock()
@@ -601,14 +663,14 @@ fn nonquery_close_waits_for_locked_sqlite_writer(cx: &mut TestAppContext) {
     let lock_db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
     lock_db.0.lock().execute_batch("BEGIN IMMEDIATE;").unwrap();
     workspace.update_in(cx, |workspace, window, cx| {
-        workspace.select_filter("COMPLETED", window, cx);
+        workspace.select_sort(SortKey::Score, window, cx);
         workspace.request_close(CloseIntent::Quit, window, cx);
         assert!(workspace.barrier.is_some());
     });
     cx.run_until_parked();
     workspace.read_with(cx, |workspace, _| {
         assert!(matches!(workspace.barrier, Some(BarrierAction::Close(_))));
-        assert_eq!(workspace.preference_active, Some("kurisu.list.filter"));
+        assert_eq!(workspace.preference_active, Some("kurisu.list.sort"));
     });
     let unlock = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(120));
@@ -622,21 +684,53 @@ fn nonquery_close_waits_for_locked_sqlite_writer(cx: &mut TestAppContext) {
     workspace.read_with(cx, |workspace, _| assert!(workspace.barrier.is_none()));
     assert_eq!(
         runtime
-            .block_on(core.get_preference("kurisu.list.filter".into()))
+            .block_on(core.get_preference("kurisu.list.sort".into()))
             .unwrap()
             .as_deref(),
-        Some("COMPLETED")
+        Some("score")
     );
 }
 
 #[gpui::test]
 fn nonquery_reset_deletion_settles_after_older_value(cx: &mut TestAppContext) {
-    let (core, runtime, _dir) = fixture();
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    let (seed_core, runtime, dir) = fixture();
+    drop(seed_core);
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "token-47",
+        &User {
+            id: 47,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.set_setting("native_preference:kurisu.list.filter", "COMPLETED")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.synced", "123")
+        .unwrap();
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
     workspace.update_in(cx, |workspace, window, cx| {
+        workspace.restoring_session = false;
         workspace.persist_preference("kurisu.list.filter", Some("COMPLETED".into()), window, cx);
         workspace.persist_preference("kurisu.list.synced", Some("123".into()), window, cx);
         workspace.last_account = Some(47);
+        db.replace_account(
+            "token-48",
+            &User {
+                id: 48,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         workspace.set_profile(
             Some(User {
                 id: 48,
@@ -647,15 +741,20 @@ fn nonquery_reset_deletion_settles_after_older_value(cx: &mut TestAppContext) {
             cx,
         );
         assert_eq!(
-            workspace.preference_writes["kurisu.list.filter"].pending,
+            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
             Some(None)
         );
         assert_eq!(
-            workspace.preference_writes["kurisu.list.synced"].pending,
+            queued_value(&workspace.preference_writes["kurisu.list.synced"].pending),
             Some(None)
         );
     });
-    settle(cx, &runtime);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workspace.read_with(cx, |w, _| w.preference_has_work()) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
     for key in ["kurisu.list.filter", "kurisu.list.synced"] {
         assert_eq!(
             runtime.block_on(core.get_preference(key.into())).unwrap(),
@@ -666,7 +765,11 @@ fn nonquery_reset_deletion_settles_after_older_value(cx: &mut TestAppContext) {
         workspace.select_filter("PLANNING", window, cx);
         workspace.request_close(CloseIntent::Quit, window, cx);
     });
-    settle(cx, &runtime);
+    while workspace.read_with(cx, |w, _| w.preference_has_work()) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
     assert_eq!(
         runtime
             .block_on(core.get_preference("kurisu.list.filter".into()))
@@ -678,11 +781,41 @@ fn nonquery_reset_deletion_settles_after_older_value(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn nonquery_selection_after_reset_supersedes_pending_delete(cx: &mut TestAppContext) {
-    let (core, runtime, _dir) = fixture();
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    let (seed_core, runtime, dir) = fixture();
+    drop(seed_core);
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "token-47",
+        &User {
+            id: 47,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.set_setting("native_preference:kurisu.list.filter", "COMPLETED")
+        .unwrap();
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
     workspace.update_in(cx, |workspace, window, cx| {
+        workspace.restoring_session = false;
         workspace.persist_preference("kurisu.list.filter", Some("COMPLETED".into()), window, cx);
         workspace.last_account = Some(47);
+        db.replace_account(
+            "token-48",
+            &User {
+                id: 48,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         workspace.set_profile(
             Some(User {
                 id: 48,
@@ -693,16 +826,21 @@ fn nonquery_selection_after_reset_supersedes_pending_delete(cx: &mut TestAppCont
             cx,
         );
         assert_eq!(
-            workspace.preference_writes["kurisu.list.filter"].pending,
+            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
             Some(None)
         );
         workspace.select_filter("PLANNING", window, cx);
         assert_eq!(
-            workspace.preference_writes["kurisu.list.filter"].pending,
-            Some(Some("PLANNING".into()))
+            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
+            Some(Some("PLANNING"))
         );
     });
-    settle(cx, &runtime);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workspace.read_with(cx, |w, _| w.preference_has_work()) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
     assert_eq!(
         runtime
             .block_on(core.get_preference("kurisu.list.filter".into()))
@@ -718,17 +856,24 @@ fn nonquery_superseded_failure_saves_newer_value(cx: &mut TestAppContext) {
     let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
     db.0.lock()
         .execute_batch(
-            "CREATE TABLE old_filter_attempts (value TEXT);
+            "CREATE TABLE old_sort_attempts (value TEXT);
         CREATE TRIGGER fail_old_filter BEFORE INSERT ON settings
         WHEN NEW.key = 'native_preference:kurisu.list.filter' AND NEW.value = 'PLANNING'
         BEGIN
-          INSERT INTO old_filter_attempts VALUES (NEW.value);
           SELECT RAISE(FAIL, 'old value rejected');
+        END;
+        CREATE TRIGGER fail_old_sort BEFORE INSERT ON settings
+        WHEN NEW.key = 'native_preference:kurisu.list.sort' AND NEW.value = 'title'
+        BEGIN
+          INSERT INTO old_sort_attempts VALUES (NEW.value);
+          SELECT RAISE(FAIL, 'old sort rejected');
         END;",
         )
         .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
     workspace.update_in(cx, |workspace, window, cx| {
+        workspace.select_sort(SortKey::Title, window, cx);
+        workspace.select_sort(SortKey::Score, window, cx);
         workspace.select_filter("PLANNING", window, cx);
         workspace.select_filter("COMPLETED", window, cx);
         workspace.request_close(CloseIntent::Quit, window, cx);
@@ -742,7 +887,7 @@ fn nonquery_superseded_failure_saves_newer_value(cx: &mut TestAppContext) {
     });
     let old_attempts: i64 =
         db.0.lock()
-            .query_row("SELECT COUNT(*) FROM old_filter_attempts", [], |row| {
+            .query_row("SELECT COUNT(*) FROM old_sort_attempts", [], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -754,13 +899,24 @@ fn nonquery_superseded_failure_saves_newer_value(cx: &mut TestAppContext) {
             .as_deref(),
         Some("COMPLETED")
     );
+    assert_eq!(
+        runtime
+            .block_on(core.get_preference("kurisu.list.sort".into()))
+            .unwrap()
+            .as_deref(),
+        Some("score")
+    );
 }
 
 #[gpui::test]
 fn late_preference_read_preserves_new_local_selection(cx: &mut TestAppContext) {
     let (core, runtime, _dir) = fixture();
     runtime
-        .block_on(core.set_preference("kurisu.list.filter".into(), Some("PLANNING".into())))
+        .block_on(core.set_workspace_preference(
+            "kurisu.list.filter".into(),
+            Some("PLANNING".into()),
+            None,
+        ))
         .unwrap();
     runtime
         .block_on(core.set_preference("kurisu.list.sort".into(), Some("title".into())))
@@ -769,8 +925,26 @@ fn late_preference_read_preserves_new_local_selection(cx: &mut TestAppContext) {
         .block_on(core.set_preference("kurisu.list.dir".into(), Some("asc".into())))
         .unwrap();
     runtime
-        .block_on(core.set_preference("kurisu.list.synced".into(), Some("123".into())))
+        .block_on(core.set_workspace_preference(
+            "kurisu.list.synced".into(),
+            Some("123".into()),
+            None,
+        ))
         .unwrap();
+    assert_eq!(
+        runtime
+            .block_on(core.get_preference("kurisu.list.filter".into()))
+            .unwrap()
+            .as_deref(),
+        Some("PLANNING")
+    );
+    assert_eq!(
+        runtime
+            .block_on(core.get_preference("kurisu.list.synced".into()))
+            .unwrap()
+            .as_deref(),
+        Some("123")
+    );
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.select_filter("COMPLETED", window, cx);
@@ -904,18 +1078,18 @@ fn nonquery_pending_write_holds_logout_install_and_login(cx: &mut TestAppContext
         workspace.select_filter("COMPLETED", window, cx);
         workspace.start_barrier(BarrierAction::Logout, window, cx);
         assert_eq!(workspace.barrier, Some(BarrierAction::Logout));
-        workspace.cancel_barrier(cx);
+        workspace.cancel_barrier(window, cx);
         assert!(workspace.preference_has_work());
 
         workspace.start_barrier(BarrierAction::Install, window, cx);
         assert_eq!(workspace.barrier, Some(BarrierAction::Install));
-        workspace.cancel_barrier(cx);
+        workspace.cancel_barrier(window, cx);
         assert!(workspace.preference_has_work());
 
         workspace.login(false, Some("synthetic test token".into()), window, cx);
         assert_eq!(workspace.barrier, Some(BarrierAction::Login));
         assert!(workspace.queued_login.is_some());
-        workspace.cancel_barrier(cx);
+        workspace.cancel_barrier(window, cx);
         assert!(workspace.preference_has_work());
         assert!(workspace.queued_login.is_none());
     });
@@ -987,7 +1161,7 @@ fn calendar_choice_survives_account_reset(cx: &mut TestAppContext, reject: bool)
         assert!(workspace.calendar.visible.is_empty());
         workspace.request_close(CloseIntent::Quit, window, cx);
         assert!(workspace.barrier.is_some());
-        workspace.cancel_barrier(cx);
+        workspace.cancel_barrier(window, cx);
     });
     settle(cx, &runtime);
     if reject {
@@ -1185,18 +1359,19 @@ fn restart_state_survives_stale_notices_settings_reset_and_dismissal(cx: &mut Te
 #[gpui::test]
 fn prompt_recovery_keeps_exact_event_identity_and_deduplicates(cx: &mut TestAppContext) {
     let (core, _runtime, _dir) = fixture();
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
-    workspace.update_in(cx, |workspace, _, _| {
+    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    workspace.update_in(cx, |workspace, window, cx| {
         let payload = tracking_fixture(4);
+        core.emit(EventKind::TrackingPrompt(payload.clone()));
+        let retained = retained_prompt(&core);
         let event = Event {
-            generation: workspace.generation,
-            account_id: None,
-            prompt_id: Some(1),
-            kind: EventKind::TrackingPrompt(payload.clone()),
+            prompt_id: Some(retained.prompt_id.unwrap() + 1),
+            ..retained.clone()
         };
-        workspace.queue_prompt(event.clone());
-        workspace.queue_prompt(event.clone());
-        assert_eq!(workspace.prompt_queue.len(), 0);
+        assert!(workspace.show_prompt(event.clone()));
+        let first_revision = workspace.prompt_revision;
+        assert!(!workspace.show_prompt(event.clone()));
+        assert_eq!(workspace.prompt_revision, first_revision);
         assert!(same_prompt(
             workspace.prompt_event.as_ref().unwrap(),
             &event
@@ -1205,33 +1380,17 @@ fn prompt_recovery_keeps_exact_event_identity_and_deduplicates(cx: &mut TestAppC
             kind: EventKind::TrackingAsk(payload),
             ..event
         };
-        workspace.queue_prompt(ask.clone());
+        assert!(workspace.show_prompt(ask.clone()));
         assert!(same_prompt(workspace.prompt_event.as_ref().unwrap(), &ask));
-        assert_eq!(workspace.prompt_queue.len(), 0);
+        workspace.handle_event(retained.clone(), window, cx);
+        assert!(
+            workspace
+                .prompt_event
+                .as_ref()
+                .is_some_and(|current| same_prompt(current, &retained)),
+            "the retained offer must win regardless of ID allocation order"
+        );
     });
-}
-
-#[gpui::test]
-fn prompt_skip_acknowledges_only_the_original_retained_event(cx: &mut TestAppContext) {
-    let (core, runtime, _dir) = fixture();
-    core.emit(EventKind::TrackingPrompt(tracking_fixture(4)));
-    let original = retained_prompt(&core);
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
-    workspace.update_in(cx, |workspace, _, cx| {
-        workspace.queue_prompt(original.clone());
-        workspace.dismiss_prompt(cx);
-        assert!(workspace.prompt.is_none());
-    });
-    runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(2)).await });
-    assert!(core.recovery_events().into_iter().all(|event| !matches!(
-        event.kind,
-        EventKind::TrackingPrompt(_) | EventKind::TrackingAsk(_)
-    )));
-    core.emit(EventKind::TrackingAsk(tracking_fixture(5)));
-    let newer = retained_prompt(&core);
-    workspace.update_in(cx, |workspace, _, _| workspace.queue_prompt(newer.clone()));
-    assert!(core.event_is_current(&newer));
-    assert!(!core.event_is_current(&original));
 }
 
 #[gpui::test]
@@ -1241,12 +1400,12 @@ fn stale_prompt_confirm_does_not_ack_a_new_track(cx: &mut TestAppContext) {
     let original = retained_prompt(&core);
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
     workspace.update_in(cx, |workspace, _, _| {
-        workspace.queue_prompt(original.clone())
+        workspace.show_prompt(original.clone())
     });
     core.emit(EventKind::TrackingPrompt(tracking_fixture(5)));
     let newer = retained_prompt(&core);
     workspace.update_in(cx, |workspace, window, cx| {
-        workspace.confirm_prompt(window, cx);
+        workspace.confirm_prompt(workspace.prompt_revision, 4, window, cx);
         assert!(workspace.prompt.is_none());
         assert!(!workspace.prompt_busy);
     });
@@ -1255,13 +1414,32 @@ fn stale_prompt_confirm_does_not_ack_a_new_track(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn successful_prompt_confirm_acknowledges_the_retained_event(cx: &mut TestAppContext) {
-    let (core, runtime, _dir) = fixture();
+    let (initial, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 47,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(initial);
+    let core = Core::from_db(
+        db,
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    );
     core.emit(EventKind::TrackingPrompt(tracking_fixture(4)));
     let event = retained_prompt(&core);
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
     workspace.update_in(cx, |workspace, window, cx| {
-        workspace.queue_prompt(event.clone());
-        workspace.confirm_prompt(window, cx);
+        workspace.show_prompt(event.clone());
+        workspace.confirm_prompt(workspace.prompt_revision, 4, window, cx);
         assert!(workspace.prompt_busy);
     });
     for _ in 0..12 {
@@ -1276,11 +1454,14 @@ fn successful_prompt_confirm_acknowledges_the_retained_event(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn delayed_skip_cannot_ack_identical_reissued_prompt(cx: &mut TestAppContext) {
+fn skip_acknowledges_only_the_displayed_offer_across_reissue(cx: &mut TestAppContext) {
     let (core, runtime, _dir) = fixture();
     core.emit(EventKind::TrackingPrompt(tracking_fixture(4)));
     let first = retained_prompt(&core);
-    let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
+    workspace.update_in(cx, |w, win, cx| w.handle_event(first.clone(), win, cx));
     core.emit(EventKind::NowPlaying(kurisu_core::models::NowPlaying {
         active: false,
         player: String::new(),
@@ -1294,19 +1475,167 @@ fn delayed_skip_cannot_ack_identical_reissued_prompt(cx: &mut TestAppContext) {
     core.emit(EventKind::TrackingPrompt(tracking_fixture(4)));
     let second = retained_prompt(&core);
     assert!(!same_prompt(&first, &second));
-    workspace.update_in(cx, |workspace, _, cx| {
-        workspace.queue_prompt(first);
-        workspace.dismiss_prompt(cx);
+    workspace.update(cx, |w, cx| {
+        w.dismiss_prompt(w.prompt_revision, cx);
+        assert!(w.prompt.is_none());
     });
-    runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(2)).await });
+    settle(cx, &runtime);
     assert!(core.event_is_current(&second));
-    workspace.update_in(cx, |workspace, _, _| workspace.queue_prompt(second.clone()));
-    workspace.read_with(cx, |workspace, _| {
-        assert!(same_prompt(
-            workspace.prompt_event.as_ref().unwrap(),
-            &second
-        ));
+    workspace.update_in(cx, |w, win, cx| {
+        w.handle_event(second.clone(), win, cx);
+        assert!(same_prompt(w.prompt_event.as_ref().unwrap(), &second));
+        w.dismiss_prompt(w.prompt_revision, cx);
+        assert!(w.prompt.is_none());
     });
+    settle(cx, &runtime);
+    assert!(
+        core.recovery_events()
+            .iter()
+            .all(|event| super::prompt_payload(event).is_none())
+    );
+    core.emit(EventKind::TrackingAsk(tracking_fixture(5)));
+    let next = retained_prompt(&core);
+    workspace.update_in(cx, |w, win, cx| w.handle_event(next.clone(), win, cx));
+    assert!(core.event_is_current(&next));
+    assert!(!core.event_is_current(&first));
+}
+
+#[gpui::test]
+fn login_claims_core_intent_before_the_worker_and_cancel_converges(cx: &mut TestAppContext) {
+    let (core, runtime, _dir) = fixture();
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
+    workspace.update_in(cx, |w, window, cx| {
+        let before = core.generation();
+        w.perform_login(false, Some("synthetic-token".into()), window, cx);
+        assert_eq!(core.generation(), before + 1);
+        w.cancel_login(window, cx);
+        assert_eq!(core.generation(), before + 2);
+        core.cancel_login();
+    });
+    settle(cx, &runtime);
+    workspace.read_with(cx, |w, _| {
+        assert!(!w.auth_busy);
+        assert_eq!(w.generation, core.generation());
+    });
+}
+
+#[gpui::test]
+fn tracking_prompt_waits_for_deletion_editor_and_discovery_writes(cx: &mut TestAppContext) {
+    for source in ["delete", "editor", "discovery", "review"] {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            let prompt = tracking_fixture(4);
+            let id = prompt.media_id;
+            w.profile = Some(User {
+                id: 71,
+                ..Default::default()
+            });
+            if source == "delete" {
+                assert!(w.progress.begin_delete(w.generation, id));
+            } else if source == "editor" {
+                w.list.apply_one(
+                    ListEntry {
+                        media_id: id,
+                        status: "CURRENT".into(),
+                        progress: 3,
+                        ..Default::default()
+                    },
+                    now_seconds(),
+                );
+                w.open_editor(id, window, cx);
+                w.editor.as_mut().unwrap().busy = true;
+            } else if source == "review" {
+                let row = ListEntry {
+                    media_id: id,
+                    progress: 3,
+                    ..Default::default()
+                };
+                w.progress.entry(w.generation, &row).requires_review = true;
+            } else {
+                w.editor_adding.insert(id);
+            }
+            core.emit(EventKind::TrackingAsk(prompt));
+            w.show_prompt(retained_prompt(&core));
+            w.confirm_prompt(w.prompt_revision, 4, window, cx);
+            assert!(!w.prompt_busy);
+            assert_eq!(w.active_writes, 0);
+            assert_eq!(w.prompt_progress_pending(id), source != "review");
+            if source == "review" {
+                assert!(w.prompt_error.contains("review your pending episode edit"));
+            } else {
+                assert!(w.prompt_error.is_empty());
+                assert!(w.progress.edit(w.generation, id).is_none());
+            }
+        });
+    }
+}
+
+#[gpui::test]
+fn discovery_status_waits_for_progress_review_and_modal_dismissal(cx: &mut TestAppContext) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
+    workspace.update_in(cx, |w, window, cx| {
+        w.profile = Some(User {
+            id: 71,
+            ..Default::default()
+        });
+        let row = ListEntry {
+            media_id: 9,
+            progress: 4,
+            ..Default::default()
+        };
+        let media = Media {
+            id: 9,
+            ..Default::default()
+        };
+        for route in [Route::Search, Route::Seasons] {
+            w.route = route.clone();
+            w.progress.entry(w.generation, &row).requires_review = true;
+            assert!(w.discovery_status_blocked(9));
+            w.change_discovery_status(media.clone(), "PLANNING", route.clone(), window, cx);
+            w.progress.entry(w.generation, &row).requires_review = false;
+            assert!(!w.discovery_status_blocked(9));
+            w.update = Some(update_fixture());
+            assert!(w.discovery_status_blocked(9));
+            w.change_discovery_status(media.clone(), "PLANNING", route, window, cx);
+            w.add_media(9, "PLANNING", None, window, cx);
+            w.update = None;
+            assert!(!w.editor_adding.contains(&9));
+            assert_eq!(w.active_writes, 0);
+        }
+    });
+}
+
+#[gpui::test]
+fn sync_start_notifies_observers_before_work_completes(cx: &mut TestAppContext) {
+    let (core, runtime, _dir) = fixture();
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    settle(cx, &runtime);
+    workspace.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 71,
+            ..Default::default()
+        });
+        w.list.sync_error = "previous error".into();
+        cx.notify();
+    });
+    let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let notified = observed.clone();
+    let _subscription = cx.update(|_, app| app.observe(&workspace, move |_, _| notified.set(true)));
+    workspace.update_in(cx, |w, window, cx| w.sync_list(window, cx));
+    cx.run_until_parked();
+    workspace.read_with(cx, |w, _| {
+        assert!(w.list.syncing && w.list.sync_error.is_empty());
+    });
+    assert!(observed.get());
 }
 
 #[gpui::test]
@@ -1610,10 +1939,123 @@ fn my_list_header_rows_and_footer_share_one_measured_scroll(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn episode_event_reconciles_open_views_from_the_current_account_cache(cx: &mut TestAppContext) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    let user = User {
+        id: 7,
+        offline: true,
+        ..Default::default()
+    };
+    db.replace_account("synthetic-token", &user).unwrap();
+    let media = Media {
+        id: 9,
+        title_english: Some("Episode total fixture".into()),
+        episodes: Some(12),
+        ..Default::default()
+    };
+    let before = ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 3,
+        media: Some(media.clone()),
+        ..Default::default()
+    };
+    db.upsert_media(&Media {
+        episodes: Some(14),
+        ..media.clone()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        progress: 14,
+        status: "COMPLETED".into(),
+        ..before.clone()
+    })
+    .unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    workspace.update_in(cx, |w, win, cx| {
+        w.profile = Some(user);
+        w.offline = true;
+        w.restoring_session = false;
+        w.list.replace(vec![before.clone()], 0);
+        w.route = Route::Anime(9);
+        w.detail.start(9);
+        w.detail.detail = Some(kurisu_core::models::MediaDetail {
+            media: Media {
+                description: Some("Full synopsis".into()),
+                ..media.clone()
+            },
+            characters: vec![],
+            relations: vec![],
+            staff: vec![],
+            cached_at: None,
+            warning: None,
+            unavailable_sections: vec![],
+        });
+        w.search.results.push(media);
+        w.open_editor(9, win, cx);
+        w.cancel_reads("editor-recs");
+        w.editor.as_mut().unwrap().choose_status("COMPLETED");
+        let inputs = w.editor_inputs.as_ref().unwrap();
+        inputs
+            .progress
+            .update(cx, |input, cx| input.set_value("12", cx));
+        inputs
+            .notes
+            .update(cx, |input, cx| input.set_value("Keep this draft", cx));
+        let mut event = Event {
+            generation: w.generation,
+            account_id: Some(8),
+            prompt_id: None,
+            kind: EventKind::EpisodeUpdated(before),
+        };
+        w.handle_event(event.clone(), win, cx);
+        assert!(!w.list_refresh_queued);
+        event.account_id = Some(7);
+        w.handle_event(event, win, cx);
+        assert!(w.list_refresh_queued);
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(350));
+    // Supersede the first local read before its worker can run.
+    workspace.update_in(cx, |w, win, cx| {
+        w.queue_list_refresh(Some(vec![17]), win, cx)
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(350));
+    settle(cx, &runtime);
+    workspace.read_with(cx, |w, app| {
+        let detail = &w.detail.detail.as_ref().unwrap().media;
+        assert_eq!(detail.episodes, Some(14));
+        assert_eq!(detail.description.as_deref(), Some("Full synopsis"));
+        assert_eq!(w.detail.entry.as_ref().unwrap().progress, 14);
+        assert_eq!(
+            w.entry_for_edit(9).unwrap().media.unwrap().episodes,
+            Some(14)
+        );
+        assert_eq!(w.search.results[0].episodes, Some(14));
+        assert_eq!(w.editor.as_ref().unwrap().total(), Some(14));
+        let inputs = w.editor_inputs.as_ref().unwrap();
+        assert_eq!(inputs.progress.read(app).value(), "14");
+        assert_eq!(inputs.notes.read(app).value(), "Keep this draft");
+        assert!(!w.read_aborts.contains_key("detail"));
+    });
+}
+
+#[gpui::test]
 fn deletion_refresh_clears_selected_detail_entry(cx: &mut TestAppContext) {
     let (core, _runtime, _dir) = fixture();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
-    workspace.update_in(cx, |workspace, _, _| {
+    workspace.update_in(cx, |workspace, _, cx| {
         let entry = ListEntry {
             media_id: 9,
             status: "CURRENT".into(),
@@ -1625,7 +2067,7 @@ fn deletion_refresh_clears_selected_detail_entry(cx: &mut TestAppContext) {
         workspace.detail.entry = Some(entry);
         workspace.detail.entry_available = true;
         workspace.list.apply_scoped(&[9], vec![None], 0);
-        workspace.reconcile_detail_entry();
+        workspace.reconcile_open_entries(None, cx);
         assert!(workspace.detail.entry_available);
         assert!(workspace.detail.entry.is_none());
     });
@@ -1636,7 +2078,7 @@ fn offline_editor_refusal_blocks_close_immediately(cx: &mut TestAppContext) {
     let (core, _runtime, _dir) = fixture();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
     workspace.update_in(cx, |workspace, window, cx| {
-        let mut input = |value: &str, cx: &mut gpui::Context<Workspace>| {
+        let input = |value: &str, cx: &mut gpui::Context<Workspace>| {
             cx.new(|cx| TextInput::new(value, "", window, cx))
         };
         workspace.editor_inputs = Some(EditorInputs {
@@ -1684,7 +2126,7 @@ fn expired_busy_editor_restores_editable_text_inputs(cx: &mut TestAppContext) {
     let (core, _runtime, _dir) = fixture();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
     workspace.update_in(cx, |workspace, window, cx| {
-        let mut input = |value: &str, cx: &mut gpui::Context<Workspace>| {
+        let input = |value: &str, cx: &mut gpui::Context<Workspace>| {
             cx.new(|cx| TextInput::new(value, "", window, cx))
         };
         workspace.editor_inputs = Some(EditorInputs {
@@ -2701,5 +3143,1170 @@ fn profile_format_change_resets_editor_scale_and_clear_submits_zero(cx: &mut Tes
         let patch = workspace.editor.as_ref().unwrap().basic_patch(true);
         assert_eq!(patch.score, Some(0.0));
         assert_eq!(patch.progress, Some(5));
+    });
+}
+
+#[gpui::test]
+fn set_profile_and_reconnect_recover_dropped_tracking_ask_without_resurrecting_dismissed(
+    cx: &mut TestAppContext,
+) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 7,
+            name: "Saved".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_media(&Media {
+        id: 9,
+        episodes: Some(12),
+        ..Default::default()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 3,
+        ..Default::default()
+    })
+    .unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|win, cx| {
+        Workspace::new_with_session_restore(core.clone(), win, cx, false)
+    });
+    workspace.update(cx, |w, _| {
+        w.restoring_session = false;
+        w.profile = Some(User {
+            id: 0,
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+    });
+    settle(cx, &runtime);
+
+    core.emit(EventKind::TrackingAsk(tracking_fixture(4)));
+    let expected = retained_prompt(&core);
+    core.emit(EventKind::UpdateFailed("consumed".into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workspace.read_with(cx, |w, _| w.update_failed != "consumed") {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+    }
+    workspace.update_in(cx, |w, win, cx| {
+        assert!(w.prompt.is_none());
+        w.update_failed.clear();
+        w.set_profile(
+            Some(User {
+                id: 7,
+                name: "Saved".into(),
+                offline: true,
+                ..Default::default()
+            }),
+            win,
+            cx,
+        );
+        assert!(w.prompt_event.is_none(), "prompt recovery must be deferred");
+    });
+    settle(cx, &runtime);
+    workspace.update_in(cx, |w, win, cx| {
+        assert_eq!(w.route, Route::Now);
+        assert!(same_prompt(w.prompt_event.as_ref().unwrap(), &expected));
+        w.dismiss_prompt(w.prompt_revision, cx);
+        assert!(w.prompt.is_none());
+        w.restore_session(win, cx);
+        assert!(w.prompt.is_none());
+    });
+    settle(cx, &runtime);
+    assert!(workspace.read_with(cx, |w, _| w.prompt.is_none()));
+    cx.update(|win, _| win.remove_window());
+    cx.run_until_parked();
+    drop((workspace, db, core, runtime));
+}
+
+#[gpui::test]
+fn dismissed_tracking_ask_lag_replay_does_not_navigate_or_resurrect_while_ack_is_pending(
+    cx: &mut TestAppContext,
+) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 7,
+            name: "Saved".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_media(&Media {
+        id: 9,
+        episodes: Some(12),
+        ..Default::default()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 3,
+        ..Default::default()
+    })
+    .unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|win, cx| {
+        Workspace::new_with_session_restore(core.clone(), win, cx, false)
+    });
+    workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.set_profile(
+            Some(User {
+                id: 7,
+                name: "Saved".into(),
+                offline: true,
+                ..Default::default()
+            }),
+            win,
+            cx,
+        );
+    });
+    settle(cx, &runtime);
+    assert_eq!(
+        workspace.read_with(cx, |w, _| w.route.clone()),
+        Route::MyList
+    );
+
+    core.emit(EventKind::TrackingAsk(tracking_fixture(4)));
+    let expected = retained_prompt(&core);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workspace.read_with(cx, |w, _| w.prompt.is_none()) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+    }
+    assert_eq!(workspace.read_with(cx, |w, _| w.route.clone()), Route::Now);
+
+    for ep in 0..300 {
+        core.emit(EventKind::WatchHistoryUpdated(ep));
+    }
+    cx.run_until_parked();
+    runtime.block_on(async { tokio::task::yield_now().await });
+
+    workspace.update_in(cx, |w, win, cx| {
+        w.dismiss_prompt(w.prompt_revision, cx);
+        w.navigate(Route::MyList, win, cx);
+        assert_eq!(w.route, Route::MyList);
+        assert!(w.prompt.is_none());
+    });
+    assert!(
+        core.event_is_current(&expected),
+        "acknowledgement must still be pending in flight"
+    );
+
+    cx.run_until_parked();
+    assert!(
+        core.event_is_current(&expected),
+        "lagged replay must run while acknowledgement is still in flight"
+    );
+    workspace.read_with(cx, |w, _| {
+        assert_eq!(
+            w.route,
+            Route::MyList,
+            "lagged replay of already-dismissed TrackingAsk navigated back to Now"
+        );
+        assert!(w.prompt.is_none());
+    });
+
+    while core.event_is_current(&expected) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
+    cx.update(|win, _| win.remove_window());
+    cx.run_until_parked();
+    drop((workspace, db, core, runtime));
+}
+
+#[gpui::test]
+fn library_add_folder_and_watching_update_button_respect_busy_and_close_fences(
+    cx: &mut TestAppContext,
+) {
+    let (core, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 7,
+            name: "Saved".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_media(&Media {
+        id: 9,
+        title_english: Some("Steins;Gate".into()),
+        episodes: Some(24),
+        ..Default::default()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    drop(core);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let folder = dir.0.join("anime");
+    std::fs::create_dir(&folder).unwrap();
+    let (workspace, cx) =
+        cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    settle(cx, &runtime);
+
+    workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.set_profile(
+            Some(User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            }),
+            win,
+            cx,
+        );
+        w.auth_busy = true;
+        w.add_library_folder(folder.to_string_lossy().into_owned(), win, cx);
+        assert_eq!(
+            w.active_writes, 0,
+            "add_library_folder admitted write during auth_busy"
+        );
+        w.auth_busy = false;
+        w.update_busy = true;
+        w.add_library_folder(folder.to_string_lossy().into_owned(), win, cx);
+        assert_eq!(
+            w.active_writes, 0,
+            "add_library_folder admitted write during update_busy"
+        );
+        w.update_busy = false;
+
+        w.now_playing = Some(kurisu_core::models::NowPlaying {
+            active: true,
+            player: "mpv".into(),
+            title: "Steins;Gate".into(),
+            matched: Some("Steins;Gate".into()),
+            media_id: Some(9),
+            episode: Some(3),
+            position_us: 0,
+            length_us: 1_000_000,
+        });
+        w.route = Route::Now;
+        w.enter_watching(win, cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !workspace.read_with(cx, |w, _| w.list.loaded) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
+    for _ in 0..8 {
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
+    cx.simulate_accessibility_activation();
+    cx.run_until_parked();
+    let open_tree = cx.take_accessibility_tree_update().unwrap();
+    let (_, open_btn) = open_tree
+        .nodes
+        .iter()
+        .find(|(_, node)| {
+            node.role() == gpui::Role::Button && node.label() == Some("Update to Ep 3")
+        })
+        .expect("watching update button before close");
+    assert!(!open_btn.is_disabled());
+
+    workspace.update_in(cx, |w, win, cx| {
+        w.request_close(CloseIntent::Quit, win, cx);
+        assert!(w.close_ready);
+    });
+    cx.run_until_parked();
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    assert!(
+        tree.nodes
+            .iter()
+            .all(|(_, node)| node.label() != Some("Update to Ep 3") || node.is_hidden()),
+        "watching update button stayed accessible during close"
+    );
+    cx.update(|win, _| win.remove_window());
+    cx.run_until_parked();
+    drop((workspace, runtime));
+}
+
+#[gpui::test]
+fn recovery_prompts_defer_during_close_ready_and_replay_on_resume(cx: &mut TestAppContext) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 7,
+            name: "Saved".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_media(&Media {
+        id: 9,
+        episodes: Some(12),
+        ..Default::default()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 3,
+        ..Default::default()
+    })
+    .unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    core.emit(EventKind::TrackingAsk(tracking_fixture(4)));
+    let expected = retained_prompt(&core);
+    let (workspace, cx) = cx.add_window_view(|win, cx| {
+        Workspace::new_with_session_restore(core.clone(), win, cx, false)
+    });
+    workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.profile = Some(User {
+            id: 7,
+            name: "Saved".into(),
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        w.request_close(CloseIntent::Window, win, cx);
+        assert!(w.close_ready);
+        w.set_profile(
+            Some(User {
+                id: 7,
+                name: "Saved".into(),
+                offline: false,
+                ..Default::default()
+            }),
+            win,
+            cx,
+        );
+    });
+    settle(cx, &runtime);
+    workspace.read_with(cx, |w, _| {
+        assert!(w.close_ready);
+        assert!(w.prompt.is_none());
+        assert!(w.prompt_event.is_none());
+    });
+    workspace.update_in(cx, |w, win, cx| {
+        w.resume_after_close_visibility(true, win, cx);
+    });
+    settle(cx, &runtime);
+    workspace.read_with(cx, |w, _| {
+        assert_eq!(w.route, Route::Now);
+        assert!(same_prompt(
+            w.prompt_event
+                .as_ref()
+                .expect("deferred recovery prompt was not replayed on resume"),
+            &expected
+        ));
+    });
+    cx.update(|win, _| win.remove_window());
+    cx.run_until_parked();
+    drop((workspace, db, core, runtime));
+}
+
+#[gpui::test]
+fn post_quit_events_do_not_spawn_reads_on_watching_route(cx: &mut TestAppContext) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 7,
+            name: "Saved".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_media(&Media {
+        id: 9,
+        title_english: Some("Steins;Gate".into()),
+        episodes: Some(24),
+        ..Default::default()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|win, cx| {
+        Workspace::new_with_session_restore(core.clone(), win, cx, false)
+    });
+    workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.set_profile(
+            Some(User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            }),
+            win,
+            cx,
+        );
+        w.route = Route::Now;
+        w.enter_watching(win, cx);
+    });
+    settle(cx, &runtime);
+    workspace.update_in(cx, |w, _, _| {
+        w.cancel_reads_for_quit();
+        assert!(
+            w.event_stop.lock().unwrap().is_none(),
+            "cancel_reads_for_quit left event subscription running"
+        );
+    });
+    let updated = ListEntry {
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 3,
+        ..Default::default()
+    };
+    core.emit(EventKind::EpisodeUpdated(updated.clone()));
+    core.emit(EventKind::NowPlaying(kurisu_core::models::NowPlaying {
+        active: true,
+        player: "mpv".into(),
+        title: "Steins;Gate".into(),
+        matched: Some("Steins;Gate".into()),
+        media_id: Some(9),
+        episode: Some(4),
+        position_us: 0,
+        length_us: 1_000_000,
+    }));
+    workspace.update_in(cx, |w, win, cx| {
+        w.handle_event(
+            Event {
+                generation: w.generation,
+                account_id: Some(7),
+                prompt_id: None,
+                kind: EventKind::EpisodeUpdated(updated),
+            },
+            win,
+            cx,
+        );
+    });
+    cx.executor().advance_clock(Duration::from_millis(350));
+    settle(cx, &runtime);
+    workspace.read_with(cx, |w, _| {
+        assert!(w.read_aborts.is_empty());
+        assert!(w.read_lifetime.lock().unwrap().is_empty());
+        assert!(w.event_stop.lock().unwrap().is_none());
+    });
+    cx.update(|win, _| win.remove_window());
+    cx.run_until_parked();
+    drop((workspace, db, core, runtime));
+}
+
+#[gpui::test]
+fn active_barrier_save_failure_exposes_discard_barrier_even_with_inactive_drafts(
+    cx: &mut TestAppContext,
+) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx.add_window_view(|win, cx| Workspace::new(core, win, cx));
+    workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.profile = Some(User {
+            id: 47,
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        let mut draft = ProgressEdit::new(2, Some(12));
+        draft.pending = 3;
+        draft.requires_review = true;
+        draft.error = Some("unsaved".into());
+        w.progress_drafts.insert(48, [(9, draft)].into());
+        w.query_error = "controlled query failure".into();
+        w.request_close(CloseIntent::Quit, win, cx);
+    });
+    cx.update(|win, app| win.draw(app).clear(app));
+    assert!(
+        cx.debug_bounds("discard-barrier").is_some(),
+        "Close BarrierError hid Close without saving behind inactive account drafts"
+    );
+    let cancel = cx.debug_bounds("cancel-failed-barrier").unwrap();
+    cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+
+    workspace.update_in(cx, |w, win, cx| {
+        w.query_error = "controlled query failure".into();
+        w.start_barrier(BarrierAction::Logout, win, cx);
+    });
+    cx.update(|win, app| win.draw(app).clear(app));
+    assert!(
+        cx.debug_bounds("discard-barrier").is_some(),
+        "Logout BarrierError hid Continue without saving behind inactive account drafts"
+    );
+    let cancel = cx.debug_bounds("cancel-failed-barrier").unwrap();
+    cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+
+    workspace.update_in(cx, |w, win, cx| {
+        w.query_error.clear();
+        w.request_close(CloseIntent::Quit, win, cx);
+        assert!(
+            w.barrier_error
+                .contains("Unsaved drafts belong to another account")
+        );
+    });
+    cx.update(|win, app| win.draw(app).clear(app));
+    assert!(cx.debug_bounds("discard-barrier").is_none());
+}
+
+#[gpui::test]
+fn discard_barrier_clears_failed_progress_behind_inflight_closes_dirty_editor_and_drops_pending_prefs(
+    cx: &mut TestAppContext,
+) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx.add_window_view(|win, cx| Workspace::new(core.clone(), win, cx));
+    workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.profile = Some(User {
+            id: 47,
+            score_format: Some("POINT_100".into()),
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        let show_a = ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            progress: 2,
+            media: Some(Media {
+                id: 1,
+                episodes: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let show_b = ListEntry {
+            media_id: 2,
+            status: "CURRENT".into(),
+            progress: 4,
+            media: Some(Media {
+                id: 2,
+                episodes: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        w.list.replace(vec![show_a.clone(), show_b.clone()], 0);
+        let edit_a = w.progress.entry(w.generation, &show_a);
+        assert!(edit_a.step(1, Instant::now()));
+        assert_eq!(edit_a.begin_save(), Some((3, 2)));
+        w.active_writes = 1;
+        let edit_b = w.progress.entry(w.generation, &show_b);
+        assert!(edit_b.step(1, Instant::now()));
+        assert_eq!(edit_b.begin_save(), Some((5, 4)));
+        edit_b.finish_save(Err("offline".into()));
+
+        w.request_close(CloseIntent::Window, win, cx);
+        assert!(w.barrier_error.contains("offline"));
+        w.discard_barrier(win, cx);
+        assert!(
+            w.barrier_error.is_empty(),
+            "discard_barrier left failed progress error while sibling was in flight"
+        );
+        assert!(w.progress.edit(w.generation, 2).is_none());
+        assert!(!w.close_ready);
+
+        w.active_writes = 0;
+        w.progress
+            .edit_mut(w.generation, 1)
+            .unwrap()
+            .finish_save(Ok(3));
+        w.check_barrier(win, cx);
+        assert!(w.close_ready);
+
+        w.resume_after_close_visibility(true, win, cx);
+        w.open_editor(1, win, cx);
+        w.editor.as_mut().unwrap().edit_progress(7);
+        w.editor_inputs
+            .as_ref()
+            .unwrap()
+            .progress
+            .update(cx, |input, cx| input.set_value("7", cx));
+        w.stage_query(Some("unsubmitted".into()));
+        w.query_error = "query failed".into();
+        let pref = w.preference_writes.entry("kurisu.list.sort").or_default();
+        pref.pending = Some(QueuedPreference {
+            value: Some("score".into()),
+            account: Some(47),
+        });
+
+        w.request_close(CloseIntent::Window, win, cx);
+        assert!(w.barrier_error.contains("query failed"));
+        w.discard_barrier(win, cx);
+        assert!(
+            w.editor.is_none(),
+            "discard_barrier did not close clean-error dirty editor"
+        );
+        assert!(w.query_pending.is_none());
+        assert!(!w.preference_has_work());
+        assert_eq!(w.active_writes, 0);
+        assert!(w.close_ready);
+    });
+}
+
+#[cfg(feature = "fixture-runtime")]
+#[gpui::test]
+fn hidden_resume_after_close_skips_cover_prefetch_and_list_sync_on_replayed_list(
+    cx: &mut TestAppContext,
+) {
+    const CHILD: &str = "KURISU_HIDDEN_RESUME_LIST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "screens::workspace_tests::hidden_resume_after_close_skips_cover_prefetch_and_list_sync_on_replayed_list",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("KURISU_FIXTURE_GRAPHQL", "http://127.0.0.1:9/graphql")
+            .status()
+            .unwrap();
+        assert!(status.success(), "hidden resume child failed");
+        return;
+    }
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.replace_account(
+        "synthetic-token",
+        &User {
+            id: 7,
+            name: "Saved".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_media(&Media {
+        id: 11,
+        title_english: Some("Steins;Gate".into()),
+        episodes: Some(24),
+        cover_medium: Some("http://127.0.0.1:9/cover.jpg".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    db.upsert_entry(&ListEntry {
+        media_id: 11,
+        status: "CURRENT".into(),
+        progress: 4,
+        ..Default::default()
+    })
+    .unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) =
+        cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !workspace.read_with(cx, |w, _| w.preferences_loaded) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
+    let sync_before = workspace.update_in(cx, |w, win, cx| {
+        w.restoring_session = false;
+        w.profile = Some(User {
+            id: 7,
+            name: "Saved".into(),
+            offline: false,
+            ..Default::default()
+        });
+        w.offline = false;
+        w.last_sync_attempt = None;
+        assert!(w.sync_due());
+        w.cover_regions.clear();
+        w.cover_tickets.clear();
+        w.close_ready = true;
+        w.queue_list_refresh(None, win, cx);
+        assert!(w.list_refresh_deferred);
+        let sync_before = w.sync_request;
+        w.resume_after_close_visibility(false, win, cx);
+        sync_before
+    });
+    while !workspace.read_with(cx, |w, _| w.list.loaded) {
+        assert!(Instant::now() < deadline);
+        settle(cx, &runtime);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    }
+    workspace.read_with(cx, |w, _| {
+        assert_eq!(w.list.len(), 1);
+        assert!(
+            w.cover_tickets.is_empty(),
+            "hidden resume_after_close_visibility prefetched covers"
+        );
+        assert!(
+            w.last_sync_attempt.is_none() && w.sync_request == sync_before,
+            "hidden resume_after_close_visibility started list sync"
+        );
+    });
+    cx.update(|win, _| win.remove_window());
+    cx.run_until_parked();
+    drop((workspace, db, runtime));
+}
+
+#[gpui::test]
+fn bucket_b_stale_recovery_keeps_new_live_prompt(cx: &mut TestAppContext) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    let user = User {
+        id: 7,
+        ..Default::default()
+    };
+    db.replace_account("synthetic-token", &user).unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx.add_window_view(|win, cx| {
+        Workspace::new_with_session_restore(core.clone(), win, cx, false)
+    });
+    let (older, worker) = workspace.update_in(cx, |w, win, cx| {
+        w.stop_event_subscription();
+        w.profile = Some(user);
+        w.route = Route::Settings;
+        core.emit(EventKind::TrackingAsk(tracking_fixture(4)));
+        let older = retained_prompt(&core);
+        w.refresh_recovery_prompts(win, cx);
+        (older, w.read_aborts["recovery-prompts"][0].clone())
+    });
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+    core.emit(EventKind::TrackingPrompt(tracking_fixture(5)));
+    let newer = retained_prompt(&core);
+    assert!(newer.prompt_id > older.prompt_id);
+    workspace.update_in(cx, |w, win, cx| w.handle_event(newer.clone(), win, cx));
+    cx.run_until_parked();
+    workspace.update_in(cx, |w, win, cx| {
+        assert_eq!(
+            w.prompt_event.as_ref().and_then(|e| e.prompt_id),
+            newer.prompt_id,
+            "stale recovery erased the live prompt"
+        );
+        assert_eq!(w.route, Route::Settings);
+        w.prompt = None;
+        w.prompt_event = None;
+        w.handle_event(older, win, cx);
+        assert_eq!(w.route, Route::Settings, "stale ask took over the route");
+    });
+}
+
+#[gpui::test]
+fn bucket_b_completed_editor_caps_progress_input(cx: &mut TestAppContext) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) =
+        cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    workspace.update_in(cx, |w, win, cx| {
+        w.list.replace(vec![completed_fixture()], 0);
+        w.open_editor(9, win, cx);
+        let input = w.editor_inputs.as_ref().unwrap().progress.clone();
+        input.update(cx, |input, cx| {
+            input.replace_text_in_range(Some(0..2), "13", win, cx)
+        });
+    });
+    workspace.read_with(cx, |w, cx| {
+        let editor = w.editor.as_ref().unwrap();
+        assert_eq!(editor.status, "COMPLETED");
+        assert_eq!(
+            editor.progress, 12,
+            "Completed editor exceeded its episode total"
+        );
+        assert_eq!(
+            w.editor_inputs.as_ref().unwrap().progress.read(cx).value(),
+            "12"
+        );
+    });
+}
+
+fn completed_fixture() -> ListEntry {
+    ListEntry {
+        media_id: 9,
+        status: "COMPLETED".into(),
+        progress: 12,
+        media: Some(Media {
+            id: 9,
+            episodes: Some(12),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
+fn cancel_failed_close_save_restores_editor_input(tc: &mut TestAppContext) {
+    let (core, runtime, _dir) = fixture();
+    let (view, cx) = tc.add_window_view(|win, cx| Workspace::new(core, win, cx));
+    settle(cx, &runtime);
+    view.update_in(cx, |w, win, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        w.list.replace(
+            vec![ListEntry {
+                media_id: 9,
+                progress: 2,
+                status: "CURRENT".into(),
+                ..Default::default()
+            }],
+            0,
+        );
+        w.open_editor(9, win, cx);
+        w.editor_inputs
+            .as_ref()
+            .unwrap()
+            .progress
+            .update(cx, |field, cx| {
+                field.replace_text_in_range(Some(0..1), "3", win, cx);
+            });
+        w.request_close(CloseIntent::Window, win, cx);
+        assert_eq!(w.active_writes, 1);
+    });
+    settle(cx, &runtime);
+    view.update_in(cx, |w, win, cx| {
+        assert!(w.barrier_error.contains("Could not save entry"));
+        w.cancel_barrier(win, cx);
+        w.editor_inputs
+            .as_ref()
+            .unwrap()
+            .progress
+            .update(cx, |field, cx| {
+                assert_eq!(field.value(), "3");
+                field.replace_text_in_range(Some(0..1), "4", win, cx);
+                assert_eq!(field.value(), "4");
+            });
+    });
+}
+
+#[gpui::test]
+fn scoped_list_read_cannot_change_workspace_after_quit(tc: &mut TestAppContext) {
+    use super::{PendingEditor, PendingEditorWait};
+
+    let (core, runtime, _dir) = fixture();
+    let (view, cx) =
+        tc.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    view.update_in(cx, |w, win, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        });
+        w.pending_editor = Some(PendingEditor {
+            id: 9,
+            route: w.route.clone(),
+            wait: PendingEditorWait::Refresh,
+            auto_open: true,
+        });
+        w.refresh_scoped(vec![9], 7, win, cx);
+        w.request_close(CloseIntent::Quit, win, cx);
+        assert!(w.stopping);
+    });
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert!(w.list.error.is_empty());
+        assert!(matches!(
+            w.pending_editor.as_ref().unwrap().wait,
+            PendingEditorWait::Refresh
+        ));
+    });
+}
+
+#[gpui::test]
+fn detail_and_pending_completions_leave_stopping_workspace_alone(tc: &mut TestAppContext) {
+    let (core, runtime, _dir) = fixture();
+    let (view, cx) =
+        tc.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    let request = view.update_in(cx, |w, win, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        });
+        w.route = Route::Anime(9);
+        w.load_detail(9, win, cx);
+        w.pending_error = "Pending state before quit".into();
+        w.refresh_pending(win, cx);
+        w.request_close(CloseIntent::Quit, win, cx);
+        assert!(w.stopping);
+        let request = w.detail.request();
+        w.load_detail(9, win, cx);
+        w.refresh_pending(win, cx);
+        assert!(!w.read_aborts.contains_key("detail") && !w.read_aborts.contains_key("pending"));
+        request
+    });
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert_eq!(w.detail.request(), request);
+        assert!(w.detail.detail_error.is_empty());
+        assert!(w.detail.entry_error.is_empty());
+        assert!(w.detail.recommendation_error.is_empty());
+        assert_eq!(w.pending_error, "Pending state before quit");
+    });
+}
+
+#[gpui::test]
+fn quit_aborted_secondary_screen_reads_do_not_populate_errors(tc: &mut TestAppContext) {
+    let (core, runtime, _dir) = fixture();
+    let (view, cx) =
+        tc.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    view.update_in(cx, |w, win, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: false,
+            ..Default::default()
+        });
+        w.offline = false;
+        w.enter_calendar(win, cx);
+        w.enter_seasons(win, cx);
+        w.search.resume = Some(("Steins".into(), false));
+        w.enter_search(win, cx);
+        w.enter_stats(win, cx);
+        w.enter_notifications(win, cx);
+        for group in [
+            "calendar-preference",
+            "calendar",
+            "seasons",
+            "search",
+            "stats",
+            "notifications-page",
+        ] {
+            assert!(
+                w.read_aborts.contains_key(group),
+                "expected active read group {group}"
+            );
+        }
+        w.cancel_reads_for_quit();
+        assert!(w.stopping && !w.writes_fenced());
+        assert!(w.read_aborts.is_empty());
+    });
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert!(
+            w.calendar.error.is_empty(),
+            "calendar: {}",
+            w.calendar.error
+        );
+        assert!(!w.calendar.preference_loaded);
+        assert!(!w.calendar.loaded_once);
+        assert!(w.seasons.error.is_empty(), "seasons: {}", w.seasons.error);
+        assert!(w.search.error.is_empty(), "search: {}", w.search.error);
+        assert!(w.stats.error.is_empty(), "stats: {}", w.stats.error);
+        assert!(
+            w.notifications.error.is_empty(),
+            "notifications: {}",
+            w.notifications.error
+        );
+    });
+    view.update_in(cx, |w, win, cx| {
+        w.calendar.preference_loading = false;
+        w.calendar.loading = false;
+        w.calendar.offset = 2;
+        w.seasons.loading = false;
+        w.seasons.selected_year = "invalid".into();
+        let season_before = (w.seasons.season.clone(), w.seasons.year);
+        w.search.searching = false;
+        w.stats.loading = false;
+        w.notifications.loading = false;
+        w.notifications.unread = Some(3);
+        w.enter_calendar(win, cx);
+        w.shift_calendar(1, win, cx);
+        w.reset_calendar_today(win, cx);
+        w.enter_seasons(win, cx);
+        w.shift_season(1, win, cx);
+        w.jump_season(win, cx);
+        w.search.resume = Some(("Steins".into(), false));
+        w.enter_search(win, cx);
+        w.enter_stats(win, cx);
+        w.enter_notifications(win, cx);
+        w.mark_notifications_read(win, cx);
+        let year_input = w.seasons.year_input.clone().unwrap();
+        let title_input = w.seasons.title_input.clone().unwrap();
+        let search_input = w.search.input.clone().unwrap();
+        year_input.update(cx, |input, cx| {
+            input.set_value("2030", cx);
+            cx.emit(crate::components::input::TextInputEvent::Changed(
+                "2030".into(),
+            ));
+        });
+        title_input.update(cx, |input, cx| {
+            input.set_value("gate", cx);
+            cx.emit(crate::components::input::TextInputEvent::Changed(
+                "gate".into(),
+            ));
+        });
+        search_input.update(cx, |input, cx| {
+            input.set_value("clannad", cx);
+            cx.emit(crate::components::input::TextInputEvent::Changed(
+                "clannad".into(),
+            ));
+        });
+        assert!(!w.calendar.preference_loading);
+        assert!(!w.calendar.loading);
+        assert_eq!(w.calendar.offset, 2);
+        assert!(!w.seasons.loading);
+        assert_eq!((w.seasons.season.clone(), w.seasons.year), season_before);
+        assert!(w.seasons.error.is_empty());
+        assert!(!w.search.searching);
+        assert_eq!(w.search.resume, Some(("Steins".into(), false)));
+        assert!(!w.stats.loading);
+        assert!(!w.notifications.loading);
+        assert!(!w.notifications.marking);
+        assert_eq!(w.active_writes, 0);
+        assert!(w.read_aborts.is_empty());
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |w, _| {
+        assert_eq!(w.seasons.selected_year, "invalid");
+        assert!(w.seasons.title_filter.is_empty());
+        assert!(w.search.query.is_empty());
+    });
+}
+
+#[gpui::test]
+fn editor_status_choices_and_alerts_are_available_inside_modal(tc: &mut TestAppContext) {
+    use gpui::accesskit::{Action, ActionRequest, TreeId};
+
+    let (core, _runtime, _dir) = fixture();
+    let (view, cx) =
+        tc.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    view.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        });
+        w.list.replace(
+            vec![ListEntry {
+                media_id: 9,
+                progress: 2,
+                status: "CURRENT".into(),
+                media: Some(Media {
+                    id: 9,
+                    episodes: Some(12),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            0,
+        );
+        w.global_error = "Could not open the sample file".into();
+        w.set_tray_error(Some("Could not hide Kurisu".into()), cx);
+    });
+    cx.simulate_accessibility_activation();
+    cx.run_until_parked();
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    assert!(tree.nodes.iter().any(|(_, node)| {
+        node.label() == Some("Could not hide Kurisu")
+            && node.role() == gpui::Role::Alert
+            && !node.is_hidden()
+    }));
+    view.update_in(cx, |w, win, cx| w.open_editor(9, win, cx));
+    cx.update(|win, app| win.draw(app).clear(app));
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    let click = |cx: &gpui::VisualTestContext, tree: &gpui::accesskit::TreeUpdate, label| {
+        let (id, node) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .unwrap();
+        assert!(
+            !node.is_hidden() && node.supports_action(Action::Click),
+            "{label}"
+        );
+        cx.simulate_accessibility_action(ActionRequest {
+            action: Action::Click,
+            target_tree: TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        });
+    };
+    for label in ["Could not open the sample file", "Could not hide Kurisu"] {
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label() == Some(label) && node.role() == gpui::Role::Alert && !node.is_hidden()
+        }));
+    }
+    click(cx, &tree, "Dismiss");
+    view.read_with(cx, |w, _| {
+        assert!(w.global_error.is_empty() && w.editor.is_some())
+    });
+    let status = cx.debug_bounds("editor-status").unwrap();
+    cx.simulate_click(status.center(), gpui::Modifiers::default());
+    cx.update(|win, app| win.draw(app).clear(app));
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    click(cx, &tree, "Completed");
+    view.read_with(cx, |w, _| {
+        let editor = w.editor.as_ref().unwrap();
+        assert_eq!(editor.status, "COMPLETED");
+        assert_eq!(editor.progress, 12);
     });
 }

@@ -129,11 +129,18 @@ def validate_version(value):
 
 
 def latest_stable(releases):
+    items = [
+        item
+        for entry in releases
+        for item in (entry if isinstance(entry, list) else [entry])
+    ]
     versions = []
-    for release in releases:
-        if release.get("isDraft") is not False or release.get("isPrerelease") is not False:
+    for release in items:
+        draft = release.get("draft") if "draft" in release else release.get("isDraft")
+        prerelease = release.get("prerelease") if "prerelease" in release else release.get("isPrerelease")
+        if draft is not False or prerelease is not False:
             continue
-        tag = release.get("tagName", "")
+        tag = release.get("tag_name") if "tag_name" in release else release.get("tagName", "")
         if not isinstance(tag, str):
             continue
         try:
@@ -150,9 +157,9 @@ def resolve_version(explicit, offline):
         return validate_version(explicit)
     if offline:
         raise ValueError("Offline builds require --build-version or KURISU_BUILD_VERSION")
+    repository = os.environ.get("KURISU_RELEASE_REPOSITORY") or REPOSITORY
     response = subprocess.run(
-        ["gh", "release", "list", "-R", REPOSITORY, "--limit", "100", "--json",
-         "tagName,isDraft,isPrerelease"],
+        ["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases?per_page=100"],
         check=True, capture_output=True, encoding="utf-8", timeout=60,
     )
     return latest_stable(json.loads(response.stdout))

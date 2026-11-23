@@ -129,7 +129,7 @@ impl TextInput {
     pub fn new(
         value: impl Into<String>,
         placeholder: impl Into<String>,
-        _window: &mut Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let content: String = value.into();
@@ -189,6 +189,9 @@ impl TextInput {
         cx.notify();
     }
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.disabled == disabled {
+            return;
+        }
         self.disabled = disabled;
         self.focus_handle = self.focus_handle.clone().tab_stop(!disabled);
         cx.notify();
@@ -249,6 +252,9 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -257,10 +263,15 @@ impl TextInput {
             }
             self.select_to(prev, window, cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        let range = self.range_to_utf16(&self.selected_range);
+        self.marked_range = None;
+        self.replace_text_in_range(Some(range), "", window, cx)
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -269,7 +280,9 @@ impl TextInput {
             }
             self.select_to(next, window, cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        let range = self.range_to_utf16(&self.selected_range);
+        self.marked_range = None;
+        self.replace_text_in_range(Some(range), "", window, cx)
     }
 
     fn on_mouse_down(
@@ -341,7 +354,9 @@ impl TextInput {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
-            self.replace_text_in_range(None, "", window, cx)
+            let range = self.range_to_utf16(&self.selected_range);
+            self.marked_range = None;
+            self.replace_text_in_range(Some(range), "", window, cx)
         }
     }
 
@@ -489,6 +504,9 @@ impl TextInput {
         for (index, line) in self.last_lines.iter().enumerate() {
             let height = line.size(self.last_line_height).height;
             if position.y < top + height || index + 1 == self.last_lines.len() {
+                if position.y >= top + height {
+                    return Some(start + line.len());
+                }
                 let local = point(position.x - bounds.left(), position.y - top);
                 let offset = line
                     .closest_index_for_position(local, self.last_line_height)
@@ -1279,6 +1297,12 @@ mod tests {
             let previous = input.selected_range.clone();
             input.set_accessible_selection(&selection, NodeId(1), window, cx);
             assert_eq!(input.selected_range, previous);
+            input.selected_range = 1..1;
+            input.marked_range = Some(0..2);
+            input.backspace(&Backspace, window, cx);
+            input.delete(&Delete, window, cx);
+            assert_eq!(input.selected_range, 1..1);
+            assert_eq!(input.marked_range, Some(0..2));
             let mut node = Node::new(input.accessible_role());
             input.accessible_text().write_parent(&mut node, NodeId(1));
             assert!(node.is_disabled());

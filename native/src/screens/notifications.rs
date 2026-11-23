@@ -22,10 +22,10 @@ pub(super) struct NotificationsState {
     items: Arc<Vec<Notification>>,
     widget: Option<ListState>,
     loaded: bool,
-    loading: bool,
-    marking: bool,
-    error: String,
-    unread: Option<i64>,
+    pub(super) loading: bool,
+    pub(super) marking: bool,
+    pub(super) error: String,
+    pub(super) unread: Option<i64>,
     page: i64,
     has_more: bool,
     request: u64,
@@ -142,7 +142,12 @@ impl Workspace {
     }
 
     fn load_notifications(&mut self, more: bool, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() || self.notifications.loading || self.notifications.marking {
+        if self.stopping
+            || self.writes_fenced()
+            || self.profile.is_none()
+            || self.notifications.loading
+            || self.notifications.marking
+        {
             return;
         }
         if self.offline {
@@ -152,6 +157,7 @@ impl Workspace {
         }
         self.notifications.loading = true;
         self.notifications.error.clear();
+        cx.notify();
         self.notifications.request = self.notifications.request.wrapping_add(1);
         let request = self.notifications.request;
         let generation = self.generation;
@@ -164,7 +170,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.notifications.request != request
                 {
@@ -189,8 +196,9 @@ impl Workspace {
         .detach();
     }
 
-    fn mark_notifications_read(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none()
+    pub(super) fn mark_notifications_read(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced()
+            || self.profile.is_none()
             || self.offline
             || self.notifications.loading
             || self.notifications.marking
@@ -201,6 +209,7 @@ impl Workspace {
         self.notifications.marking = true;
         self.notifications.error.clear();
         self.active_writes += 1;
+        cx.notify();
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
@@ -229,6 +238,9 @@ impl Workspace {
     }
 
     fn open_notification(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() || self.modal_open() {
+            return;
+        }
         let Some(item) = self.notifications.items.iter().find(|item| item.id == id) else {
             return;
         };
@@ -242,10 +254,15 @@ impl Workspace {
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = core
-                .spawn(async move { NativePlatform.open_url(&url) })
+                .spawn(async move {
+                    tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
+                        .await
+                        .map_err(|error| error.to_string())?
+                })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation == generation
+                if !this.stopping
+                    && this.generation == generation
                     && this.profile.as_ref().map(|user| user.id) == account
                     && let Err(error) = joined(result)
                 {
@@ -584,7 +601,7 @@ fn notification_url(item: &Notification) -> String {
         return format!("https://anilist.co/forum/thread/{id}");
     }
     if let Some(name) = &item.user_name
-        && let Ok(mut url) = Url::parse("https://anilist.co/user/")
+        && let Ok(mut url) = Url::parse("https://anilist.co/user")
     {
         if let Ok(mut path) = url.path_segments_mut() {
             path.push(name);
@@ -759,5 +776,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(notification_url(&item), "https://anilist.co/forum/thread/7");
+        let following = Notification {
+            kind: "FOLLOWING".into(),
+            user_name: Some("Alice".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            notification_url(&following),
+            "https://anilist.co/user/Alice"
+        );
     }
 }

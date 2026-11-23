@@ -88,27 +88,48 @@ pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
     Ok(feeds)
 }
 
+fn host_ip(parsed: &reqwest::Url) -> Option<std::net::IpAddr> {
+    parsed
+        .host_str()?
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .ok()
+}
+
+fn is_loopback_host(parsed: &reqwest::Url) -> bool {
+    parsed.host_str() == Some("localhost") || host_ip(parsed).is_some_and(|ip| ip.is_loopback())
+}
+
+fn is_local_redirect_target(parsed: &reqwest::Url) -> bool {
+    let host = parsed.host_str().unwrap_or("").trim_end_matches('.');
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host_ip(parsed).is_some_and(|ip| {
+            let ip = ip.to_canonical();
+            ip.is_loopback() || ip.is_unspecified()
+        })
+}
+
 fn validate_feed_url(parsed: &reqwest::Url) -> Result<()> {
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(anyhow!("feed URL must start with http:// or https://"));
     }
     // Allow plaintext HTTP only for a local feed reader.
-    if parsed.scheme() == "http" {
-        let host = parsed
-            .host_str()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let loopback = host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false);
-        if !loopback {
-            return Err(anyhow!(
-                "plain http feeds are only allowed for addresses on this machine, use https"
-            ));
-        }
+    if parsed.scheme() == "http" && !is_loopback_host(parsed) {
+        return Err(anyhow!(
+            "plain http feeds are only allowed for addresses on this machine, use https"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redirect(previous: &[reqwest::Url], next: &reqwest::Url) -> Result<()> {
+    validate_feed_url(next)?;
+    if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
+        return Err(anyhow!("https feed cannot redirect to plain http"));
+    }
+    if previous.iter().any(|url| !is_loopback_host(url)) && is_local_redirect_target(next) {
+        return Err(anyhow!("remote feed cannot redirect to a local address"));
     }
     Ok(())
 }
@@ -147,7 +168,7 @@ fn http_client() -> Result<reqwest::Client> {
         .user_agent("Kurisu")
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if let Err(error) = validate_feed_url(attempt.url()) {
+            if let Err(error) = validate_redirect(attempt.previous(), attempt.url()) {
                 attempt.error(error.to_string())
             } else {
                 reqwest::redirect::Policy::limited(3).redirect(attempt)
@@ -572,15 +593,18 @@ pub fn details_url(item: &RawItem) -> Option<String> {
         };
         if url.scheme() == "https"
             && matches!(url.host_str(), Some("nyaa.si" | "www.nyaa.si"))
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
             && url.username().is_empty()
             && url.password().is_none()
         {
             let path = url.path().trim_end_matches('/');
-            if path
+            if let Some(id) = path
                 .strip_prefix("/view/")
-                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
             {
-                return Some(url.to_string());
+                return Some(format!("https://nyaa.si/view/{id}"));
             }
             if let Some(id) = path
                 .strip_prefix("/download/")
@@ -1916,5 +1940,99 @@ mod tests {
             body
         )
         .unwrap();
+    }
+
+    #[test]
+    fn redirect_policy_blocks_https_downgrade_and_loopback_targets() {
+        let remote = reqwest::Url::parse("https://nyaa.si/?page=rss").unwrap();
+        let tls_local = reqwest::Url::parse("https://localhost/rss").unwrap();
+        let tls_remote = reqwest::Url::parse("https://www.nyaa.si/?page=rss").unwrap();
+        for blocked in [
+            "http://nyaa.si/?page=rss",
+            "http://127.0.0.1:8080/rss",
+            "https://localhost/rss",
+            "https://localhost./rss",
+            "https://sub.localhost/rss",
+            "https://[::ffff:127.0.0.1]/rss",
+            "https://0.0.0.0/rss",
+            "https://[::]/rss",
+        ] {
+            let target = reqwest::Url::parse(blocked).unwrap();
+            assert!(
+                validate_redirect(std::slice::from_ref(&remote), &target).is_err(),
+                "{blocked}"
+            );
+        }
+        assert!(validate_redirect(
+            std::slice::from_ref(&tls_local),
+            &reqwest::Url::parse("http://localhost/rss").unwrap()
+        )
+        .is_err());
+        assert!(validate_redirect(&[remote], &tls_remote).is_ok());
+
+        let dirty = RawItem {
+            title: "Show - 01".into(),
+            link: "https://nyaa.si:443/view/123?x=1#frag".into(),
+            guid: "https://nyaa.si/view/123?x=1".into(),
+            info_hash: None,
+            size: None,
+            seeders: None,
+            leechers: None,
+            category_id: None,
+            category: None,
+            trusted: None,
+            remake: None,
+            published: None,
+        };
+        assert_eq!(details_url(&dirty), None);
+        for (link, guid) in [
+            (
+                "https://nyaa.si:8443/view/123",
+                "https://www.nyaa.si:8443/view/123",
+            ),
+            (
+                "https://nyaa.si/view/123?x=1",
+                "https://www.nyaa.si/view/123?x=1",
+            ),
+            (
+                "https://nyaa.si/view/123#frag",
+                "https://www.nyaa.si/view/123#frag",
+            ),
+            ("https://nyaa.si/view/123?", "https://nyaa.si/view/123#"),
+            (
+                "https://user@nyaa.si/view/123",
+                "https://:pass@nyaa.si/view/123",
+            ),
+            (
+                "https://nyaa.si/view/123/extra",
+                "https://nyaa.si/download/123.torrent?x=1",
+            ),
+            ("http://nyaa.si/view/123", "https://nyaa.si./view/123"),
+            (
+                "https://evil-nyaa.si/view/123",
+                "https://nyaa.si.evil.example/view/123",
+            ),
+        ] {
+            let rejected = RawItem {
+                link: link.into(),
+                guid: guid.into(),
+                ..dirty.clone()
+            };
+            assert_eq!(details_url(&rejected), None, "{link} / {guid}");
+        }
+        for guid in [
+            "https://www.nyaa.si/view/123/",
+            "https://nyaa.si:443/view/123",
+        ] {
+            let clean = RawItem {
+                guid: guid.into(),
+                ..dirty.clone()
+            };
+            assert_eq!(
+                details_url(&clean).as_deref(),
+                Some("https://nyaa.si/view/123"),
+                "{guid}"
+            );
+        }
     }
 }

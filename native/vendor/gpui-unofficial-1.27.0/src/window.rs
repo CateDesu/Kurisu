@@ -1,4 +1,4 @@
-// Modified for Kurisu: expose retained-window visibility.
+// Modified for Kurisu: expose retained-window visibility and update accessibility dispatch.
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(debug_assertions)]
@@ -61,7 +61,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
     },
     thread::AccessError,
     time::Duration,
@@ -1026,6 +1026,7 @@ pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
     parent_node: DispatchNodeId,
+    a11y_parent: Option<accesskit::NodeId>,
     element_id_stack: ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
@@ -1711,7 +1712,7 @@ impl Window {
         }
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;
-        let a11y_active_flag = Arc::new(AtomicBool::new(false));
+        let a11y_activation = Arc::new(AtomicU64::new(0));
 
         #[cfg(not(target_family = "wasm"))]
         if !accessibility_force_disabled {
@@ -1728,26 +1729,31 @@ impl Window {
             let (activation_sender, activation_receiver) = async_channel::unbounded::<()>();
             let (deactivation_sender, deactivation_receiver) = async_channel::unbounded::<()>();
             let (action_sender, action_receiver) =
-                async_channel::unbounded::<accesskit::ActionRequest>();
+                async_channel::unbounded::<(u64, accesskit::ActionRequest)>();
 
             platform_window.a11y_init(crate::A11yCallbacks {
                 activation: {
-                    let active_flag = a11y_active_flag.clone();
+                    let activation = a11y_activation.clone();
                     Box::new(move || {
                         log::info!("Accessibility activated");
-                        active_flag.store(true, SeqCst);
+                        A11y::record_activation(&activation, true);
                         activation_sender.send_blocking(()).log_err();
                         Some(initial_tree.clone())
                     })
                 },
-                action: Box::new(move |request| {
-                    action_sender.send_blocking(request).log_err();
-                }),
+                action: {
+                    let activation = a11y_activation.clone();
+                    Box::new(move |request| {
+                        if let Some(activation) = A11y::published_activation(&activation) {
+                            action_sender.send_blocking((activation, request)).log_err();
+                        }
+                    })
+                },
                 deactivation: {
-                    let active_flag = a11y_active_flag.clone();
+                    let activation = a11y_activation.clone();
                     Box::new(move || {
                         log::info!("Accessibility deactivated");
-                        active_flag.store(false, SeqCst);
+                        A11y::record_activation(&activation, false);
                         deactivation_sender.send_blocking(()).log_err();
                     })
                 },
@@ -1783,10 +1789,10 @@ impl Window {
             let mut async_cx = cx.to_async();
             cx.foreground_executor()
                 .spawn(async move {
-                    while let Ok(request) = action_receiver.recv().await {
+                    while let Ok((activation, request)) = action_receiver.recv().await {
                         handle
                             .update(&mut async_cx, |_, window, cx| {
-                                window.handle_a11y_action(request, cx);
+                                window.handle_a11y_action(activation, request, cx);
                             })
                             .log_err();
                     }
@@ -2263,7 +2269,7 @@ impl Window {
             #[cfg(feature = "profiler")]
             debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay::new(),
             a11y: A11y::new(
-                a11y_active_flag,
+                a11y_activation,
                 accessibility_force_disabled,
                 initial_window_title,
             ),
@@ -3717,7 +3723,7 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
-        self.a11y.sync_active_flag();
+        self.a11y.sync_activation();
         if self.a11y.is_active() {
             self.a11y.begin_frame();
         }
@@ -3816,14 +3822,7 @@ impl Window {
                 paint: Instant::now().duration_since(paint_start),
             });
 
-        // a11y may have been activated/deactivated halfway through the frame
-        let a11y_active_start_of_frame = self.a11y.is_active();
-        self.a11y.sync_active_flag();
-        let a11y_active_end_of_frame = self.a11y.is_active();
-
-        let should_send_a11y_update = a11y_active_start_of_frame && a11y_active_end_of_frame;
-
-        if a11y_active_start_of_frame {
+        if self.a11y.is_active() {
             // Harvest frame metadata for the debug dump while the live window
             // and frame are still in scope.
             let frame_info = crate::window::a11y::debug::FrameDebugInfo {
@@ -3834,12 +3833,13 @@ impl Window {
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);
 
-            if should_send_a11y_update {
+            if self.a11y.frame_activation_is_current() {
                 log::debug!(
                     "Sending a11y tree update: {} nodes",
                     tree_update.nodes.len()
                 );
                 self.platform_window.a11y_tree_update(tree_update);
+                self.a11y.mark_published();
             }
         }
     }
@@ -3942,7 +3942,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    a11y_parent,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3951,6 +3959,7 @@ impl Window {
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
+                        deferred_draw.a11y_parent,
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
@@ -3960,6 +3969,9 @@ impl Window {
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
+                let a11y_parent = a11y_parent
+                    .filter(|_| self.a11y.is_active())
+                    .and_then(|id| self.a11y.nodes.begin_deferred_parent(id));
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
@@ -3971,6 +3983,9 @@ impl Window {
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
+                }
+                if let Some(parent) = a11y_parent {
+                    self.a11y.nodes.end_deferred_parent(parent);
                 }
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
@@ -4078,6 +4093,7 @@ impl Window {
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    a11y_parent: deferred_draw.a11y_parent,
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
@@ -4557,7 +4573,13 @@ impl Window {
     ) {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
+        let a11y_parent = if self.a11y.is_active() {
+            self.a11y.nodes.current_parent()
+        } else {
+            None
+        };
         self.next_frame.deferred_draws.push(DeferredDraw {
+            a11y_parent,
             current_view: self.current_view(),
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
@@ -7118,7 +7140,24 @@ impl Window {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+    fn handle_a11y_action(
+        &mut self,
+        activation: u64,
+        request: accesskit::ActionRequest,
+        cx: &mut App,
+    ) {
+        if !self.a11y.is_current_publication(activation) {
+            return;
+        }
+        if self.invalidator.is_dirty() {
+            self.draw(cx).clear(cx);
+        }
+        if !self.a11y.is_current_publication(activation)
+            || !self.a11y.allows_action_target(request.target_node)
+        {
+            return;
+        }
+
         // Take listeners out temporarily so the closures can borrow Window
         // mutably, then restore them afterward.
         if let Some(mut listeners) = self.a11y.action_listeners.remove(&request.target_node) {

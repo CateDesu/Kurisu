@@ -11,7 +11,7 @@ on:
     inputs:
       source-ref:
         type: string
-        default: ''
+        required: true
       build-version:
         type: string
         default: ''
@@ -19,11 +19,18 @@ on:
     paths:
       - 'core/**'
       - 'native/**'
+      - 'LICENSE'
+      - '.node-version'
       - '.github/workflows/native-candidate.yml'
+      - '.github/workflows/native-release.yml'
+      - '.github/release-transition.*'
+      - '.github/prune-native-releases*.mjs'
+      - '.github/test-native-installer.ps1'
 
 env:
   CARGO_BUILD_JOBS: 3
   KURISU_BUILD_VERSION: ${{ inputs.build-version }}
+  KURISU_RELEASE_REPOSITORY: ${{ vars.KURISU_RELEASE_REPOSITORY || 'CateDesu/Kurisu' }}
 
 permissions:
   contents: read
@@ -33,7 +40,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  resolve-source:
+    runs-on: ubuntu-22.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Require explicit source commit for release calls
+        if: ${{ !startsWith(github.workflow_ref, format('{0}/.github/workflows/native-candidate.yml@', github.repository)) }}
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source-ref }}
+        run: |
+          if [[ ! "$SOURCE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Release workflow call requires a full source-ref commit" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+
+      - name: Record checked-out commit
+        id: source
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve-source
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source-ref || github.ref }}
+          ref: ${{ needs.resolve-source.outputs.commit }}
 
       - uses: actions/setup-python@v5
         with:
@@ -102,16 +134,6 @@ jobs:
       - name: Native Clippy
         run: cargo clippy --locked --manifest-path native/Cargo.toml --features fixture-runtime --all-targets -- -D warnings
 
-      - name: Build Windows bridge candidate
-        if: runner.os == 'Windows' && hashFiles('src-tauri/Cargo.toml') != ''
-        shell: pwsh
-        run: |
-          $env:KURISU_BUILD_VERSION = (Get-Content .github/release-transition.json | ConvertFrom-Json).bridgeTag.TrimStart('v')
-          npm ci
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx tauri build --bundles nsis
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Build Linux candidate
         if: runner.os == 'Linux'
         run: python native/build.py
@@ -123,11 +145,6 @@ jobs:
         run: python native/build.py --installer
         env:
           GH_TOKEN: ${{ github.token }}
-
-      - name: Verify Windows installer in disposable runner
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: .github/test-native-installer.ps1
 
       - name: Inspect Linux runtime dependencies
         if: runner.os == 'Linux'
@@ -149,3 +166,33 @@ jobs:
             native/target/release/bundle/Kurisu-Native_*.exe.sha256
             native/target/release/bundle/Kurisu_*_linux-x64.tar.gz
             native/target/release/bundle/Kurisu_*_linux-x64.tar.gz.sha256
+
+  verify-windows-installer:
+    needs: [resolve-source, build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kurisu-native-Windows
+          path: native/target/release
+
+      - name: Verify Windows installer in disposable runner
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = (Get-Content .github/release-transition.json | ConvertFrom-Json).bridgeTag
+          $bridgeDirectory = Join-Path $env:RUNNER_TEMP 'kurisu-bridge-installer'
+          gh release download $tag --repo $env:KURISU_RELEASE_REPOSITORY --dir $bridgeDirectory --pattern '*_x64-setup.exe' --pattern '*_x64-setup.exe.sha256'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bridge = @(Get-ChildItem -LiteralPath $bridgeDirectory -File -Filter '*_x64-setup.exe')
+          if ($bridge.Count -ne 1) { throw 'Expected one published bridge installer' }
+          .github/test-native-installer.ps1 -BridgeInstaller $bridge[0].FullName

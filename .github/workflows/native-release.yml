@@ -27,10 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ver: ${{ steps.plan.outputs.ver }}
+      commit: ${{ steps.plan.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -44,7 +45,7 @@ jobs:
     needs: plan
     uses: ./.github/workflows/native-candidate.yml
     with:
-      source-ref: ${{ inputs.tag }}
+      source-ref: ${{ needs.plan.outputs.commit }}
       build-version: ${{ needs.plan.outputs.ver }}
 
   publish:
@@ -56,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.plan.outputs.commit }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -74,8 +75,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
         run: node .github/release-transition.mjs publish native "$RELEASE_TAG" release-assets
-      - name: Keep the latest native release and all Tauri releases
+      - name: Keep the latest native release and all legacy releases
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}

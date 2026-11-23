@@ -1,4 +1,3 @@
-# Configure the DISCORD_WEBHOOK Actions secret with the channel webhook URL.
 name: Discord notify
 
 on:

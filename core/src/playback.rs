@@ -18,6 +18,10 @@ use crate::recognize::basename;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_imports))]
 use crate::recognize::match_title;
 
+#[cfg(test)]
+#[path = "playback_config_tests.rs"]
+mod config_tests;
+
 const TICK: Duration = Duration::from_secs(5);
 const AUTO_ASK_DELAY: Duration = Duration::from_secs(15);
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -37,7 +41,7 @@ const BROWSER_PLAYERS: &[&str] = &[
     "browser",
     "kdeconnect",
     "playerctld",
-    // Firefox registers opaque Windows IDs that a name filter cannot recognize.
+    // Windows can report Firefox without its name.
     "308046b0af4a39cb", // Firefox default install
     "e7cf176e110c211b", // Firefox alternate install
     "spotify",
@@ -529,17 +533,26 @@ async fn tick(
     track.was_playing = info.playing;
     track.last_tick = Instant::now();
 
-    let cfg = read_config(app);
-    let entry = info
+    let cfg = match read_config(app) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            app.update_discord(None);
+            return Err(anyhow::anyhow!(error));
+        }
+    };
+    let entry_result = info
         .media_id
         .filter(|_| cfg.discord_enabled || info.episode.is_some())
-        .and_then(|media_id| state.db.get_entry(media_id).ok().flatten());
+        .map(|media_id| state.db.get_entry(media_id));
+    let entry = entry_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|entry| entry.as_ref());
 
     let desired = if cfg.discord_enabled {
         match (info.matched_title.as_ref(), info.media_id) {
             (Some(title), Some(_)) => {
                 let (cover_url, total_episodes) = entry
-                    .as_ref()
                     .and_then(|e| e.media.as_ref())
                     .map(|m| {
                         (
@@ -571,9 +584,12 @@ async fn tick(
     let Some(episode) = info.episode else {
         return Ok(());
     };
-    let progress = entry.as_ref().map_or(0, |e| e.progress);
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    let progress = entry.progress;
 
-    // Auto ask is independent of mode and consumes the prompt to avoid asking twice.
+    // Auto ask runs in every mode and suppresses any later timed prompt for this track.
     if cfg.auto_ask
         && info.playing
         && episode > progress
@@ -1100,8 +1116,8 @@ fn read_now(app: &Core, cache: &mut RecognitionCache) -> anyhow::Result<Option<T
     Ok(preferred_source(sources))
 }
 
-fn read_config(app: &Core) -> TrackingConfig {
-    TrackingConfig::load(&app.state().db)
+fn read_config(app: &Core) -> Result<TrackingConfig, String> {
+    TrackingConfig::try_load(&app.state().db)
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -1381,13 +1397,16 @@ mod tests {
             }
         }
 
-        let remote =
-            |progress| json!({"id":22,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
-        let (api, mut requests) = anilist::mock_api(vec![
-            (200, json!({"data":{"Media":{"mediaListEntry":remote(3)}}})),
+        let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
+        let (mut api, mut requests) = anilist::mock_api(vec![
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"mediaListEntry":remote(3)}}}),
+            ),
             (200, json!({"data":{"SaveMediaListEntry":remote(5)}})),
         ])
         .await;
+        api.record_viewer(7);
         let db = Db::open(Path::new(":memory:")).unwrap();
         db.replace_account(
             "test-session",
@@ -1639,24 +1658,33 @@ mod tests {
 
     #[tokio::test]
     async fn service_shutdown_waits_for_started_blocking_probe() {
+        use std::sync::atomic::AtomicBool;
         let work = PlaybackWork::default();
         let worker = work.clone();
         let probe_work = work.clone();
         let (cancel, mut receiver) = tokio::sync::watch::channel(false);
         let (entered, started) = tokio::sync::oneshot::channel();
+        let (watcher_done, watcher_exited) = tokio::sync::oneshot::channel();
+        let probe_exited = Arc::new(AtomicBool::new(false));
+        let exited = probe_exited.clone();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let handle = tokio::spawn(async move {
             join_or_cancel(&worker, &mut receiver, async move {
                 let probe = probe_work.spawn_blocking(move || {
                     let _ = entered.send(());
                     let _ = released.recv_timeout(Duration::from_secs(10));
+                    exited.store(true, Ordering::Release);
                 });
                 let _ = probe.await;
             })
             .await;
+            let _ = watcher_done.send(());
         });
-        started.await.unwrap();
-        let shutdown = tokio::spawn(
+        tokio::time::timeout(Duration::from_secs(3), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut shutdown = tokio::spawn(async move {
             crate::Services {
                 tasks: Vec::new(),
                 playback: Some(PlaybackTask {
@@ -1666,15 +1694,32 @@ mod tests {
                 }),
                 started: None,
             }
-            .shutdown(),
-        );
-        tokio::task::yield_now().await;
-        assert!(!shutdown.is_finished());
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .shutdown()
+            .await;
+            probe_exited.load(Ordering::Acquire)
+        });
+        tokio::time::timeout(Duration::from_secs(3), watcher_exited)
             .await
             .unwrap()
             .unwrap();
+        let early = tokio::time::timeout(Duration::from_millis(80), &mut shutdown).await;
+        release.send(()).unwrap();
+        let returned_early = early.is_ok();
+        let probe_exited_at_shutdown = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => tokio::time::timeout(Duration::from_secs(3), shutdown)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        assert!(
+            !returned_early,
+            "shutdown returned while the blocking probe was held"
+        );
+        assert!(
+            probe_exited_at_shutdown,
+            "shutdown must follow the probe's exit"
+        );
     }
 
     #[tokio::test]
@@ -2304,6 +2349,24 @@ mod tests {
             playing_episode(&matchers[0], "Some Show - Episode 13", "ep25.mkv", binding),
             None
         );
+        assert_eq!(
+            playing_episode(&matchers[0], "Some Show E13 and E14", "ep13.mkv", binding),
+            Some(1)
+        );
+        for binding in [None, binding] {
+            for filename in [
+                "Some Show E13 and E14.mkv",
+                "Some Show S01.E05 S02.E05.mkv",
+                "Some Show Season 1 - 2 Batch.mkv",
+                "Some Show Seasons 1, 2.mkv",
+            ] {
+                assert_eq!(
+                    playing_episode(&matchers[0], "Some Show - Episode 13", filename, binding),
+                    None,
+                    "{filename}"
+                );
+            }
+        }
     }
 
     struct BindingFolder(std::path::PathBuf);

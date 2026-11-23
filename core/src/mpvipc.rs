@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::time::Duration;
 
-/// Bound the whole exchange, including peers that trickle incomplete replies.
+/// Unix checks this deadline between reads. Windows also applies it to pipe I/O.
 const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 const MAX_REPLY_BYTES: usize = 1024 * 1024;
 
@@ -16,13 +16,15 @@ const IDX_TITLE: usize = 3;
 const IDX_FILENAME: usize = 4;
 const IDX_DURATION: usize = 5;
 const IDX_POSITION: usize = 6;
-const PROPS: [(&str, usize); 6] = [
+const IDX_WORKING_DIR: usize = 7;
+const PROPS: [(&str, usize); 7] = [
     ("pause", IDX_PAUSE),
     ("path", IDX_PATH),
     ("media-title", IDX_TITLE),
     ("filename", IDX_FILENAME),
     ("duration", IDX_DURATION),
     ("time-pos", IDX_POSITION),
+    ("working-directory", IDX_WORKING_DIR),
 ];
 
 pub(crate) struct MpvSnapshot {
@@ -191,7 +193,13 @@ fn query<R: BufRead, W: Write>(
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        let line = read_reply(&mut reader, deadline)?;
+        let Some(line) = read_reply(&mut reader, deadline) else {
+            // Allow sockets that answer the six core playback properties before closing.
+            if (IDX_PAUSE..=IDX_POSITION).all(|id| received[id]) {
+                return build_snapshot(&vals);
+            }
+            return None;
+        };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
@@ -257,10 +265,22 @@ fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
             .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
             .map(|s| (s * 1_000_000.0).round() as i64)
     };
+    let working_dir = str_at(IDX_WORKING_DIR);
+    let resolved_path = if !path.contains("://")
+        && !std::path::Path::new(path).is_absolute()
+        && !working_dir.is_empty()
+    {
+        std::path::Path::new(&working_dir)
+            .join(path)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path.to_string()
+    };
     let position = secs_to_us(IDX_POSITION);
     Some(MpvSnapshot {
         playing: !paused,
-        path: path.to_string(),
+        path: resolved_path,
         media_title: str_at(IDX_TITLE),
         filename: str_at(IDX_FILENAME),
         duration_us: position.and_then(|_| secs_to_us(IDX_DURATION)).unwrap_or(0),
@@ -913,5 +933,27 @@ mod tests {
         assert!(snap.playing);
         assert!(snap.path.ends_with("t.wav"));
         assert_eq!(snap.duration_us, 5_000_000);
+    }
+
+    #[test]
+    fn relative_path_resolves_against_working_directory() {
+        let mut vals = [None, None, None, None, None, None, None, None];
+        vals[IDX_PAUSE] = Some(serde_json::json!(false));
+        vals[IDX_PATH] = Some(serde_json::json!("Show - 03.mkv"));
+        vals[IDX_TITLE] = Some(serde_json::json!("Show - 03.mkv"));
+        vals[IDX_FILENAME] = Some(serde_json::json!("Show - 03.mkv"));
+        vals[IDX_DURATION] = Some(serde_json::json!(1440.0));
+        vals[IDX_POSITION] = Some(serde_json::json!(60.0));
+        vals[IDX_WORKING_DIR] = Some(serde_json::json!("/media/anime"));
+        let snap = build_snapshot(&vals).unwrap();
+        assert_eq!(
+            snap.path,
+            std::path::Path::new("/media/anime")
+                .join("Show - 03.mkv")
+                .to_string_lossy()
+        );
+        vals[IDX_PATH] = Some(serde_json::json!("https://example.com/stream.m3u8"));
+        let stream = build_snapshot(&vals).unwrap();
+        assert_eq!(stream.path, "https://example.com/stream.m3u8");
     }
 }

@@ -401,15 +401,18 @@ def transfer(source: Path, preferences: Path, backup: Path, destination: Path) -
             original = _snapshot(source, files, snapshot, prepared_backup)
         except sqlite3.DatabaseError as error:
             raise TransferError("Source database could not be validated") from error
+        backup_digest = _fingerprints([prepared_backup])[str(prepared_backup)]
         try:
             os.link(prepared_backup, backup)
         except FileExistsError as error:
             raise TransferError("Backup destination appeared during transfer") from error
-        backup_digest = _fingerprints([backup])
         stage = Path(tempfile.mkdtemp(prefix=".kurisu-native-transfer-", dir=destination.parent))
         try:
-            _populate_native(backup, stage, values)
-            if backup_digest != _fingerprints([backup]):
+            try:
+                _populate_native(prepared_backup, stage, values)
+            except sqlite3.DatabaseError as error:
+                raise TransferError("Native database could not be prepared") from error
+            if backup_digest != _fingerprints([backup])[str(backup)]:
                 raise TransferError("Backup changed during transfer")
             if original != _fingerprints(_source_files(source)):
                 raise TransferError("Source changed during transfer")

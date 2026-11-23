@@ -17,16 +17,19 @@ pub fn install() -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn install_in(directory: &std::path::Path, dependencies: &str) -> std::io::Result<()> {
-    install_in_with(directory, dependencies, |_| {})
+    install_in_with(directory, dependencies, std::time::SystemTime::now, |_| {})
 }
 
 #[cfg(target_os = "linux")]
 fn install_in_with(
     directory: &std::path::Path,
     dependencies: &str,
+    now: impl Fn() -> std::time::SystemTime,
     mut before_publish: impl FnMut(&std::path::Path),
 ) -> std::io::Result<()> {
     use std::io::{ErrorKind, Write};
+
+    const MAX_STAGING_RETRIES: usize = 64;
 
     for (name, text) in [
         ("kurisu.LICENSE", LICENSE),
@@ -38,12 +41,25 @@ fn install_in_with(
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let nonce = std::time::SystemTime::now()
+        let nonce = now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(std::io::Error::other)?
             .as_nanos();
-        let staging = directory.join(format!(".kurisu-notices-{}-{nonce}", std::process::id()));
-        let mut file = std::fs::File::create_new(&staging)?;
+        let staging_name = format!(".kurisu-notices-{}-{nonce}", std::process::id());
+        let mut staging = directory.join(&staging_name);
+        let mut attempt = 0;
+        let mut file = loop {
+            match std::fs::File::create_new(&staging) {
+                Err(error)
+                    if error.kind() == ErrorKind::AlreadyExists
+                        && attempt < MAX_STAGING_RETRIES =>
+                {
+                    attempt += 1;
+                    staging = directory.join(format!("{staging_name}-{attempt}"));
+                }
+                result => break result?,
+            }
+        };
         let result = (|| {
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
@@ -85,7 +101,7 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -179,7 +195,7 @@ mod tests {
 
         let directory = TestDirectory::new();
         let mut originals = Vec::new();
-        install_in_with(&directory.0, "bundled dependency texts", |destination| {
+        let before_publish = |destination: &std::path::Path| {
             assert!(!destination.exists());
             let text = format!("concurrent user text for {}", destination.display());
             let metadata = std::thread::scope(|scope| {
@@ -195,7 +211,13 @@ mod tests {
                     .unwrap()
             });
             originals.push((destination.to_path_buf(), text, metadata));
-        })
+        };
+        install_in_with(
+            &directory.0,
+            "bundled dependency texts",
+            std::time::SystemTime::now,
+            before_publish,
+        )
         .unwrap();
         assert_eq!(originals.len(), 2);
         for (path, text, original) in originals {
@@ -205,6 +227,45 @@ mod tests {
             assert_eq!(preserved.ino(), original.ino());
         }
         assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn retries_occupied_staging_names_without_touching_them() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = TestDirectory::new();
+        let prefix = format!(".kurisu-notices-{}-0", std::process::id());
+        let occupied = ["", "-1"].map(|suffix| {
+            let path = directory.0.join(format!("{prefix}{suffix}"));
+            std::fs::write(&path, "another writer's text").unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            (path, inode)
+        });
+
+        install_in_with(
+            &directory.0,
+            "complete dependency texts",
+            || std::time::UNIX_EPOCH,
+            |_| {},
+        )
+        .expect("occupied staging names should not prevent companion publication");
+
+        for (path, inode) in occupied {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "another writer's text"
+            );
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+        }
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("kurisu.LICENSE")).unwrap(),
+            LICENSE
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("kurisu.THIRD_PARTY_NOTICES.txt")).unwrap(),
+            "complete dependency texts"
+        );
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 4);
     }
 
     #[test]

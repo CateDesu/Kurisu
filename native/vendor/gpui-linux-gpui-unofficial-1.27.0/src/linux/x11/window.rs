@@ -517,6 +517,7 @@ impl X11WindowState {
                 xproto::EventMask::EXPOSURE
                     | xproto::EventMask::STRUCTURE_NOTIFY
                     | xproto::EventMask::FOCUS_CHANGE
+                    | xproto::EventMask::KEYMAP_STATE
                     | xproto::EventMask::KEY_PRESS
                     | xproto::EventMask::KEY_RELEASE
                     | xproto::EventMask::PROPERTY_CHANGE

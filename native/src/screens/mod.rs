@@ -18,17 +18,19 @@ mod watching;
 #[cfg(test)]
 mod workspace_tests;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListOffset,
-    ListState as GpuiListState, Render, ScrollHandle, Subscription, Window, prelude::*, px,
+    ListState as ListWidgetState, Render, ScrollHandle, Subscription, Window, prelude::*, px,
 };
-use kurisu_core::models::{Media, NowPlaying, PendingChange, TrackingPrompt, UpdateInfo, User};
-use kurisu_core::{Core, Event, EventKind};
+use kurisu_core::models::{
+    ListEntry, Media, NowPlaying, PendingChange, TrackingPrompt, UpdateInfo, User,
+};
+use kurisu_core::{Core, Event, EventKind, valid_account_id};
 
 use crate::components::covers::{CoverCache, CoverTicket};
 use crate::components::input::{TextInput, TextInputEvent};
@@ -77,9 +79,14 @@ const PREFERENCE_KEYS: [&str; 8] = [
 
 #[derive(Default)]
 struct PreferenceWrite {
-    pending: Option<Option<String>>,
+    pending: Option<QueuedPreference>,
     error: Option<String>,
     revision: u64,
+}
+
+struct QueuedPreference {
+    value: Option<String>,
+    account: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -112,9 +119,28 @@ fn joined<T>(result: Result<Result<T, String>, tokio::task::JoinError>) -> Resul
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BarrierAction {
     Close(CloseIntent),
+    LogoutThenClose(CloseIntent),
     Logout,
     Install,
     Login,
+}
+
+enum ListReadScope {
+    Full,
+    Scoped(Vec<i64>),
+}
+
+enum PendingEditorWait {
+    Progress,
+    Refresh,
+    RefreshFailed(String),
+}
+
+struct PendingEditor {
+    id: i64,
+    route: Route,
+    wait: PendingEditorWait,
+    auto_open: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +155,7 @@ pub enum ModalLayer {
     LibraryRemove,
     LibraryUnlink,
     LibraryBind,
+    TorrentRemove,
 }
 
 #[derive(Clone)]
@@ -257,7 +284,7 @@ pub struct Workspace {
     editor_subscriptions: Vec<Subscription>,
     list: ListState,
     visible_ids: Arc<Vec<i64>>,
-    list_widget: GpuiListState,
+    list_widget: ListWidgetState,
     list_cover_revision: u64,
     list_cover_reconciled: u64,
     list_cover_refresh_scheduled: bool,
@@ -274,8 +301,12 @@ pub struct Workspace {
     read_lifetime: Arc<std::sync::Mutex<HashMap<&'static str, Vec<tokio::task::AbortHandle>>>>,
     event_stop: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     list_epoch: u64,
+    // A sync keeps the local read scope until it can replace or replay it.
+    list_read: Option<ListReadScope>,
     list_scope: Option<HashSet<i64>>,
     list_refresh_queued: bool,
+    list_refresh_deferred: bool,
+    list_completed_while_closing: bool,
     list_refresh_ticket: u64,
     last_sync_attempt: Option<Instant>,
     list_sync_flash: Option<u64>,
@@ -286,27 +317,28 @@ pub struct Workspace {
     preference_active: Option<&'static str>,
     preference_alert_dismissed: bool,
     query_request: u64,
-    query_pending: Option<Option<String>>,
+    query_pending: Option<QueuedPreference>,
     query_write_active: bool,
     query_error: String,
     scroll_memory: HashMap<Route, MyListAnchor>,
     progress: ProgressRegistry,
     progress_drafts: HashMap<i64, HashMap<i64, ProgressEdit>>,
     progress_timers: HashMap<(u64, i64), u64>,
-    pending_editor: Option<(i64, Route)>,
+    pending_editor: Option<PendingEditor>,
     editor: Option<EditorState>,
     editor_delete_confirmation: u64,
     editor_drafts: HashMap<i64, EditorDraft>,
     library_drafts: HashMap<i64, library::LibraryDraft>,
+    library_bind_id: u64,
     editor_status_open: bool,
     editor_inputs: Option<EditorInputs>,
+    fenced_editor_inputs: Option<[String; 10]>,
     editor_recs: Vec<Media>,
     editor_recs_error: String,
     editor_adding: HashSet<i64>,
     added_recommendations: HashSet<i64>,
     editor_details_loading: bool,
     editor_details_open: bool,
-    delete_waiting: bool,
     detail: DetailState,
     detail_scroll: HashMap<i64, ScrollHandle>,
     library_files: LibraryFiles,
@@ -315,11 +347,16 @@ pub struct Workspace {
     pending_error: String,
     pending_busy: bool,
     pending_expanded: bool,
+    pending_refresh_deferred: bool,
+    recovery_prompts_deferred: bool,
+    recovery_prompts_loading: bool,
     pending_request: u64,
     now_playing: Option<NowPlaying>,
     prompt: Option<TrackingPrompt>,
     prompt_event: Option<Event>,
-    prompt_queue: VecDeque<Event>,
+    cached_prompt_target: Option<i64>,
+    prompt_revision: u64,
+    dismissed_prompt: Option<(u64, Option<i64>, u64)>,
     prompt_busy: bool,
     prompt_error: String,
     update: Option<UpdateInfo>,
@@ -328,10 +365,17 @@ pub struct Workspace {
     dismissed_update: String,
     update_busy: bool,
     active_writes: usize,
+    #[cfg(test)]
+    torrent_open_result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    stopping: bool,
     barrier: Option<BarrierAction>,
+    barrier_blocked_by_inactive_drafts: bool,
+    close_ready: bool,
+    route_entry_deferred: bool,
     barrier_error: String,
     logout_confirming: bool,
     global_error: String,
+    tray_error: Option<String>,
     modal_focus: ModalFocus,
 }
 
@@ -347,6 +391,15 @@ impl Drop for Workspace {
 
 impl Workspace {
     pub fn new(core: Core, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_session_restore(core, window, cx, true)
+    }
+
+    fn new_with_session_restore(
+        core: Core,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        restore_session: bool,
+    ) -> Self {
         let generation = core.generation();
         let token = cx.new(|cx| {
             let mut input = TextInput::new("", "AniList access token", window, cx);
@@ -359,6 +412,12 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&list_query, window, |this, _, event, window, cx| {
                 if let TextInputEvent::Changed(value) = event {
+                    if this.edits_fenced() {
+                        let current = this.list.query.clone();
+                        this.list_query
+                            .update(cx, |input, cx| input.set_value(current, cx));
+                        return;
+                    }
                     this.list.set_query(value.clone(), now_seconds());
                     this.stage_query(Some(value.clone()));
                     let request = this.query_request;
@@ -383,7 +442,7 @@ impl Workspace {
                 }
             }),
         ];
-        let list_widget = GpuiListState::new(MyListSlot::count(0), ListAlignment::Top, px(800.));
+        let list_widget = ListWidgetState::new(MyListSlot::count(0), ListAlignment::Top, px(800.));
         let weak = cx.weak_entity();
         list_widget.set_scroll_handler(move |event, window, app| {
             let list_range = event.visible_range.clone();
@@ -465,8 +524,11 @@ impl Workspace {
             read_lifetime: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stop: Arc::new(std::sync::Mutex::new(None)),
             list_epoch: 0,
+            list_read: None,
             list_scope: None,
             list_refresh_queued: false,
+            list_refresh_deferred: false,
+            list_completed_while_closing: false,
             list_refresh_ticket: 0,
             last_sync_attempt: None,
             list_sync_flash: None,
@@ -489,15 +551,16 @@ impl Workspace {
             editor_delete_confirmation: 0,
             editor_drafts: HashMap::new(),
             library_drafts: HashMap::new(),
+            library_bind_id: 0,
             editor_status_open: false,
             editor_inputs: None,
+            fenced_editor_inputs: None,
             editor_recs: Vec::new(),
             editor_recs_error: String::new(),
             editor_adding: HashSet::new(),
             added_recommendations: HashSet::new(),
             editor_details_loading: false,
             editor_details_open: false,
-            delete_waiting: false,
             detail: DetailState::default(),
             detail_scroll: HashMap::new(),
             library_files: LibraryFiles::default(),
@@ -506,11 +569,16 @@ impl Workspace {
             pending_error: String::new(),
             pending_busy: false,
             pending_expanded: false,
+            pending_refresh_deferred: false,
+            recovery_prompts_deferred: false,
+            recovery_prompts_loading: false,
             pending_request: 0,
             now_playing: None,
             prompt: None,
             prompt_event: None,
-            prompt_queue: VecDeque::new(),
+            cached_prompt_target: None,
+            prompt_revision: 0,
+            dismissed_prompt: None,
             prompt_busy: false,
             prompt_error: String::new(),
             update: None,
@@ -519,10 +587,17 @@ impl Workspace {
             dismissed_update: String::new(),
             update_busy: false,
             active_writes: 0,
+            #[cfg(test)]
+            torrent_open_result: None,
+            stopping: false,
             barrier: None,
+            barrier_blocked_by_inactive_drafts: false,
+            close_ready: false,
+            route_entry_deferred: false,
             barrier_error: String::new(),
             logout_confirming: false,
             global_error: String::new(),
+            tray_error: None,
             modal_focus: ModalFocus {
                 root: cx.focus_handle(),
                 start: cx.focus_handle().tab_stop(true),
@@ -554,7 +629,9 @@ impl Workspace {
                 }
             }));
         workspace.subscribe_events(window, cx);
-        workspace.restore_session(window, cx);
+        if restore_session {
+            workspace.restore_session(window, cx);
+        }
         workspace.load_preferences(window, cx);
         workspace.load_update_notice(window, cx);
         workspace.poll_covers(window, cx);
@@ -590,12 +667,48 @@ impl Workspace {
         self.offline
     }
 
+    pub(super) fn writes_fenced(&self) -> bool {
+        self.close_ready || self.barrier.is_some()
+    }
+
+    pub(super) fn edits_fenced(&self) -> bool {
+        self.stopping || self.writes_fenced() || self.auth_busy || self.update_busy
+    }
+
+    pub(crate) fn set_tray_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        if self.tray_error != error {
+            self.tray_error = error;
+            cx.notify();
+        }
+    }
+
+    #[cfg(all(test, feature = "fixture-runtime"))]
+    pub(crate) fn has_tray_error(&self) -> bool {
+        self.tray_error.is_some()
+    }
+
+    pub(crate) fn cancel_reads_for_quit(&mut self) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        if self.auth_abort.is_none() {
+            self.core.cancel_login();
+        }
+        self.stop_pending_auth();
+        self.auth_request = self.auth_request.wrapping_add(1);
+        self.stop_event_subscription();
+        self.cancel_all_reads();
+    }
+
     pub fn modal_open(&self) -> bool {
         self.active_modal().is_some()
     }
 
     pub fn active_modal(&self) -> Option<ModalLayer> {
-        if self.barrier.is_some() && !self.barrier_error.is_empty() {
+        if self.close_ready {
+            Some(ModalLayer::Barrier)
+        } else if self.barrier.is_some() && !self.barrier_error.is_empty() {
             Some(ModalLayer::BarrierError)
         } else if self.barrier.is_some() {
             Some(ModalLayer::Barrier)
@@ -609,6 +722,8 @@ impl Workspace {
             Some(ModalLayer::Logout)
         } else if self.editor.is_some() {
             Some(ModalLayer::Editor)
+        } else if self.torrent_remove_open() {
+            Some(ModalLayer::TorrentRemove)
         } else {
             self.library_modal_layer()
         }
@@ -618,7 +733,14 @@ impl Workspace {
         self.modal_focus.clone()
     }
 
+    pub(crate) fn active_prompt_revision(&self) -> Option<u64> {
+        (self.active_modal() == Some(ModalLayer::Prompt)).then_some(self.prompt_revision)
+    }
+
     pub fn focus_active_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.modal_focus.root.is_focused(window) && self.modal_focus.contains(window, cx) {
+            return;
+        }
         if self.active_modal() == Some(ModalLayer::Editor)
             && let Some(inputs) = &self.editor_inputs
         {
@@ -636,7 +758,7 @@ impl Workspace {
     }
 
     pub fn navigate(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal_open() || route == self.route {
+        if self.stopping || self.modal_open() || route == self.route {
             return;
         }
         self.remember_scroll();
@@ -645,7 +767,7 @@ impl Workspace {
     }
 
     pub fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal_open() {
+        if self.stopping || self.modal_open() {
             return;
         }
         if let Some(route) = self.back_stack.pop() {
@@ -657,7 +779,7 @@ impl Workspace {
         if self
             .pending_editor
             .as_ref()
-            .is_some_and(|(_, origin)| *origin != route)
+            .is_some_and(|pending| pending.route != route)
         {
             self.pending_editor = None;
         }
@@ -674,13 +796,7 @@ impl Workspace {
         }
         self.route = route.clone();
         self.retain_cover_route();
-        if matches!(route, Route::Anime(_)) {
-            self.ensure_library_fresh(window, cx);
-        }
         self.enter_active_route(window, cx);
-        if let Route::Anime(id) = route {
-            self.load_detail(id, window, cx);
-        }
         if route == Route::MyList {
             self.mark_list_cover_refresh();
             self.refresh_airing_order(now_seconds());
@@ -724,18 +840,23 @@ impl Workspace {
     }
 
     fn enter_active_route(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.route_entry_deferred = self.edits_fenced();
+        if self.route_entry_deferred {
+            return;
+        }
         if self.profile.is_none() && self.route != Route::Settings {
             return;
         }
         match self.route {
+            Route::Anime(id) => {
+                self.ensure_library_fresh(window, cx);
+                self.load_detail(id, window, cx);
+            }
             Route::Now => self.enter_watching(window, cx),
             Route::Library => self.enter_library(window, cx),
             Route::Stats => self.enter_stats(window, cx),
             Route::Settings => self.enter_settings(window, cx),
-            Route::Torrents => {
-                self.enter_torrents(window, cx);
-                self.load_torrent_entries(window, cx);
-            }
+            Route::Torrents => self.enter_torrents(window, cx),
             Route::Notifications => self.enter_notifications(window, cx),
             Route::Search => self.enter_search(window, cx),
             Route::Seasons => self.enter_seasons(window, cx),
@@ -874,6 +995,12 @@ impl Workspace {
     }
 
     fn replace_reads(&mut self, group: &'static str, handles: Vec<tokio::task::AbortHandle>) {
+        if self.stopping {
+            for handle in handles {
+                handle.abort();
+            }
+            return;
+        }
         self.read_lifetime
             .lock()
             .unwrap()
@@ -895,12 +1022,14 @@ impl Workspace {
     }
 
     fn cancel_all_reads(&mut self) {
+        self.recovery_prompts_loading = false;
         self.read_lifetime.lock().unwrap().clear();
         for (_, handles) in self.read_aborts.drain() {
             for handle in handles {
                 handle.abort();
             }
         }
+        self.torrents.abort_choices();
     }
 
     fn stop_event_subscription(&mut self) {
@@ -932,7 +1061,11 @@ impl Workspace {
                             continue;
                         }
                         if this
-                            .update_in(cx, |this, window, cx| this.handle_event(event, window, cx))
+                            .update_in(cx, |this, window, cx| {
+                                if !this.stopping {
+                                    this.handle_event(event, window, cx);
+                                }
+                            })
                             .is_err()
                         {
                             break;
@@ -941,13 +1074,26 @@ impl Workspace {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let worker = core.clone();
                         let recovered = core
-                            .spawn(async move { worker.recovery_events() })
+                            .spawn(async move {
+                                worker
+                                    .recovery_events()
+                                    .into_iter()
+                                    .map(|event| {
+                                        let current = worker.event_is_current(&event);
+                                        (event, current)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
                             .await
                             .unwrap_or_default();
                         if this
                             .update_in(cx, |this, window, cx| {
+                                if this.stopping {
+                                    return;
+                                }
                                 let session_changed = recovered
                                     .iter()
+                                    .map(|(event, _)| event)
                                     .find(|event| {
                                         !matches!(
                                             &event.kind,
@@ -960,8 +1106,8 @@ impl Workspace {
                                             || event.account_id
                                                 != this.profile.as_ref().map(|user| user.id)
                                     });
-                                for event in recovered {
-                                    if this.core.event_is_current(&event) {
+                                for (event, current) in recovered {
+                                    if current {
                                         this.handle_event(event, window, cx);
                                     }
                                 }
@@ -991,7 +1137,65 @@ impl Workspace {
         .detach();
     }
 
+    fn refresh_recovery_prompts(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.profile.is_none() {
+            return;
+        }
+        if self.close_ready {
+            self.recovery_prompts_deferred = true;
+            return;
+        }
+        self.recovery_prompts_deferred = false;
+        let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
+        let core = self.core.clone();
+        let worker = core.clone();
+        let job = core.spawn(async move {
+            worker
+                .recovery_events()
+                .into_iter()
+                .filter(|event| prompt_payload(event).is_some() && worker.event_is_current(event))
+                .collect::<Vec<_>>()
+        });
+        let job_id = job.id();
+        self.recovery_prompts_loading = true;
+        self.replace_reads("recovery-prompts", vec![job.abort_handle()]);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this
+                    .read_aborts
+                    .get("recovery-prompts")
+                    .is_none_or(|handles| handles[0].id() != job_id)
+                {
+                    return;
+                }
+                this.cancel_reads("recovery-prompts");
+                this.recovery_prompts_loading = false;
+                if this.stopping
+                    || this.generation != generation
+                    || this.profile.as_ref().map(|user| user.id) != account
+                {
+                    return;
+                }
+                if this.close_ready {
+                    this.recovery_prompts_deferred = true;
+                    return;
+                }
+                if let Ok(events) = result {
+                    for event in events {
+                        this.handle_event(event, window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stopping {
+            return;
+        }
         let kind = match event.kind.clone() {
             EventKind::UpdateAvailable(update) => {
                 self.show_update(update);
@@ -1022,6 +1226,9 @@ impl Workspace {
         {
             return;
         }
+        if prompt_payload(&event).is_some() && !self.core.event_is_current(&event) {
+            return;
+        }
         match kind {
             EventKind::EpisodeUpdated(entry) => {
                 self.queue_list_refresh(Some(vec![entry.media_id]), window, cx);
@@ -1030,10 +1237,6 @@ impl Workspace {
                 }
                 if self.route == Route::Library {
                     self.refresh_library_entries(window, cx);
-                }
-                if self.detail.media_id == Some(entry.media_id) {
-                    self.detail.entry = Some(entry);
-                    self.detail.entry_available = true;
                 }
             }
             EventKind::PendingChanged(scope) => {
@@ -1046,10 +1249,16 @@ impl Workspace {
                     self.refresh_library_entries(window, cx);
                 }
             }
-            EventKind::TrackingPrompt(_) => self.queue_prompt(event),
-            EventKind::TrackingAsk(_) => {
-                self.navigate(Route::Now, window, cx);
-                self.queue_prompt(event);
+            EventKind::TrackingPrompt(_) | EventKind::TrackingAsk(_) => {
+                let can_navigate = matches!(kind, EventKind::TrackingAsk(_)) && !self.modal_open();
+                if self.show_prompt(event) {
+                    if can_navigate && self.route != Route::Now {
+                        self.remember_scroll();
+                        self.back_stack.push(self.route.clone());
+                        self.switch_route(Route::Now, window, cx);
+                    }
+                    self.resume_overdue_progress(window, cx);
+                }
             }
             EventKind::UpdateAvailable(_) | EventKind::UpdateFailed(_) | EventKind::AuthExpired => {
                 unreachable!()
@@ -1073,7 +1282,6 @@ impl Workspace {
         {
             self.prompt = None;
             self.prompt_event = None;
-            self.prompt_queue.clear();
             self.prompt_busy = false;
             self.prompt_error.clear();
         }
@@ -1089,15 +1297,17 @@ impl Workspace {
             let worker = core.clone();
             let logged_in = core.spawn(async move { worker.is_logged_in().await }).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if !state::expiration_verification_matches(
-                    generation,
-                    intent,
-                    account,
-                    this.generation,
-                    this.auth_intent,
-                    this.profile.as_ref().map(|user| user.id),
-                    this.auth_busy,
-                ) {
+                if this.stopping
+                    || !state::expiration_verification_matches(
+                        generation,
+                        intent,
+                        account,
+                        this.generation,
+                        this.auth_intent,
+                        this.profile.as_ref().map(|user| user.id),
+                        this.auth_busy,
+                    )
+                {
                     return;
                 }
                 match logged_in {
@@ -1110,39 +1320,47 @@ impl Workspace {
         .detach();
     }
 
-    fn queue_prompt(&mut self, event: Event) {
+    fn show_prompt(&mut self, event: Event) -> bool {
         let prompt = match &event.kind {
             EventKind::TrackingPrompt(prompt) | EventKind::TrackingAsk(prompt) => prompt.clone(),
-            _ => return,
+            _ => return false,
         };
-        if self
+        if event.prompt_id.is_some_and(|id| {
+            self.dismissed_prompt == Some((event.generation, event.account_id, id))
+        }) || self
             .prompt_event
             .as_ref()
             .is_some_and(|current| same_prompt(current, &event))
-            || self
-                .prompt_queue
-                .iter()
-                .any(|queued| same_prompt(queued, &event))
         {
-            return;
+            return false;
         }
-        self.prompt_queue.clear();
+        self.cached_prompt_target = self.core.cached_tracking_target(&prompt);
         self.prompt = Some(prompt);
         self.prompt_event = Some(event);
+        self.prompt_revision = self.prompt_revision.wrapping_add(1);
         self.prompt_busy = false;
         self.prompt_error.clear();
+        true
     }
 
-    fn dismiss_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.prompt_busy {
-            return;
+    fn prompt_action_allowed(&self, revision: u64) -> bool {
+        !self.edits_fenced() && !self.prompt_busy && self.active_prompt_revision() == Some(revision)
+    }
+
+    fn dismiss_prompt(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if self.prompt_action_allowed(revision) {
+            self.finish_prompt(cx);
         }
+    }
+
+    fn finish_prompt(&mut self, cx: &mut Context<Self>) {
         if let Some(event) = self.prompt_event.take() {
+            if let Some(id) = event.prompt_id {
+                self.dismissed_prompt = Some((event.generation, event.account_id, id));
+            }
             self.ack_prompt_event(event);
         }
-        let next = self.prompt_queue.pop_front();
-        self.prompt = next.as_ref().and_then(prompt_payload).cloned();
-        self.prompt_event = next;
+        self.prompt = None;
         self.prompt_error.clear();
         cx.notify();
     }
@@ -1154,25 +1372,38 @@ impl Workspace {
     }
 
     fn restore_session(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.auth_request += 1;
+        if self.stopping || self.auth_busy {
+            return;
+        }
+        self.auth_request = self.auth_request.wrapping_add(1);
         let request = self.auth_request;
         let core = self.core.clone();
         let generation = self.generation;
+        let core_generation = core.generation();
+        let remote_busy = core.remote_write_active();
+        let account = self.profile.as_ref().map(|user| user.id);
         let intent = self.auth_intent;
+        let worker = core.clone();
+        let job = core.spawn(async move {
+            let previous_account = worker.saved_account_id().await;
+            worker
+                .current_user()
+                .await
+                .map(|user| (previous_account, user))
+        });
+        self.replace_reads("restore-session", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
-            let worker = core.clone();
-            let result = joined(
-                core.spawn(async move {
-                    let previous_account = worker.saved_account_id().await;
-                    worker
-                        .current_user()
-                        .await
-                        .map(|user| (previous_account, user))
-                })
-                .await,
-            );
+            let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if !this.auth_refresh_current(generation, intent, request) {
+                if this.stopping
+                    || this.auth_busy
+                    || !this.auth_refresh_current(generation, intent, request)
+                    || this.profile.as_ref().map(|user| user.id) != account
+                {
+                    return;
+                }
+                if this.core.generation() != core_generation {
+                    this.restore_session(window, cx);
                     return;
                 }
                 this.restoring_session = false;
@@ -1181,13 +1412,75 @@ impl Workspace {
                         if this.last_account.is_none() && this.profile.is_none() {
                             this.last_account = previous_account;
                         }
-                        this.set_profile(user, window, cx);
+                        this.set_profile_at(user, core_generation, window, cx);
+                        if remote_busy
+                            && !this.stopping
+                            && !this.auth_busy
+                            && this.generation == core_generation
+                            && this.core.generation() == core_generation
+                            && this.auth_intent == intent
+                            && let Some(restored_account) =
+                                this.profile.as_ref().map(|user| user.id)
+                        {
+                            this.watch_remote_settlement(
+                                core_generation,
+                                intent,
+                                restored_account,
+                                window,
+                                cx,
+                            );
+                        }
                     }
                     Err(error) => {
                         this.auth_error = error;
                         cx.emit(WorkspaceEvent::StateChanged);
                         cx.notify();
                     }
+                }
+                if this.generation == generation
+                    && this.profile.as_ref().map(|user| user.id) == account
+                {
+                    this.resume_fenced_reads(window.is_visible(), window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    // Superseded remote writes still settle SQLite without emitting events.
+    fn watch_remote_settlement(
+        &mut self,
+        generation: u64,
+        intent: u64,
+        account: i64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let core = self.core.clone();
+        let worker = core.clone();
+        let job = core.spawn(async move { worker.wait_for_remote_settlement(generation).await });
+        self.replace_reads("remote-settlement", vec![job.abort_handle()]);
+        cx.spawn_in(window, async move |this, cx| {
+            if !job.await.unwrap_or(false) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.stopping
+                    || this.auth_busy
+                    || this.generation != generation
+                    || this.core.generation() != generation
+                    || this.auth_intent != intent
+                    || this.profile.as_ref().map(|user| user.id) != Some(account)
+                {
+                    return;
+                }
+                this.queue_list_refresh(None, window, cx);
+                this.refresh_pending(window, cx);
+                if this.route == Route::Now {
+                    this.refresh_watching_list(window, cx);
+                }
+                if this.route == Route::Library {
+                    this.refresh_library_entries(window, cx);
                 }
             });
         })
@@ -1216,12 +1509,16 @@ impl Workspace {
     }
 
     fn visible_freshness(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         let now = now_seconds();
         let clock_due = now.saturating_sub(self.clock_at) >= CLOCK_INTERVAL_SECONDS;
         let plan = freshness_plan(window.is_visible(), &self.route, self.offline, clock_due);
         if !plan.run {
             return;
         }
+        self.resume_overdue_progress(window, cx);
         let airing_changed = self.route == Route::MyList && self.refresh_airing_order(now);
         if clock_due {
             self.clock_at = now;
@@ -1249,7 +1546,13 @@ impl Workspace {
     }
 
     fn reconnect_account(&mut self, manual: bool, window: &Window, cx: &mut Context<Self>) {
-        if !self.offline || self.reconnect_busy || self.auth_busy {
+        if self.stopping
+            || self.writes_fenced()
+            || !self.offline
+            || self.reconnect_busy
+            || self.auth_busy
+            || self.update_busy
+        {
             return;
         }
         if !manual
@@ -1263,6 +1566,7 @@ impl Workspace {
             return;
         };
         self.reconnect_busy = true;
+        self.active_writes += 1;
         self.last_reconnect_attempt = Some(Instant::now());
         self.reconnect_request += 1;
         self.auth_request += 1;
@@ -1277,11 +1581,16 @@ impl Workspace {
                     .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
+                this.active_writes = this.active_writes.saturating_sub(1);
+                if this.stopping {
+                    return;
+                }
                 if this.generation != generation
                     || this.auth_intent != intent
                     || this.reconnect_request != request
                     || this.profile.as_ref().map(|user| user.id) != Some(account)
                 {
+                    this.check_barrier(window, cx);
                     return;
                 }
                 this.reconnect_busy = false;
@@ -1299,6 +1608,12 @@ impl Workspace {
                     Err(error) if manual => this.auth_error = error,
                     Err(_) => {}
                 }
+                this.check_barrier(window, cx);
+                if this.generation == generation
+                    && this.profile.as_ref().map(|user| user.id) == Some(account)
+                {
+                    this.resume_fenced_reads(window.is_visible(), window, cx);
+                }
                 cx.notify();
             });
         })
@@ -1307,20 +1622,39 @@ impl Workspace {
     }
 
     fn set_profile(&mut self, user: Option<User>, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_profile_at(user, self.core.generation(), window, cx);
+    }
+
+    fn set_profile_at(
+        &mut self,
+        user: Option<User>,
+        new_generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.restoring_session = false;
-        let new_generation = self.core.generation();
         let new_id = user.as_ref().map(|user| user.id);
         let old_id = self.profile.as_ref().map(|user| user.id);
+        let list_owner = new_id.filter(|id| valid_account_id(*id));
         let switched_account =
-            new_id.is_some() && self.last_account.is_some() && new_id != self.last_account;
+            list_owner.is_some() && self.last_account.is_some() && list_owner != self.last_account;
         let changed = new_generation != self.generation || new_id != old_id;
         let recovered = self.offline && user.as_ref().is_some_and(|user| !user.offline);
+        let draft_owner = old_id.filter(|id| valid_account_id(*id)).or_else(|| {
+            (old_id.is_some()
+                && recovered
+                && new_generation == self.generation
+                && !switched_account)
+                .then_some(list_owner)
+                .flatten()
+        });
+        let mut restored_drafts = false;
         if changed {
             self.auth_request += 1;
             self.reconnect_request += 1;
             self.reconnect_busy = false;
             self.last_reconnect_attempt = None;
-            if let Some(account) = old_id {
+            if let Some(account) = draft_owner {
                 if let Some(draft) = self.take_library_draft(cx) {
                     self.library_drafts.insert(account, draft);
                 }
@@ -1330,14 +1664,8 @@ impl Workspace {
                 {
                     editor.error = error;
                 }
-                let score_available = !self.offline
-                    || self
-                        .profile
-                        .as_ref()
-                        .and_then(|user| user.score_format.as_ref())
-                        .is_some();
                 if let Some(mut editor) = self.editor.take()
-                    && (editor.is_dirty(score_available) || editor.busy || !editor.error.is_empty())
+                    && (self.editor_is_dirty(&editor) || editor.busy || !editor.error.is_empty())
                 {
                     editor.busy = false;
                     editor.confirming_delete = false;
@@ -1373,13 +1701,14 @@ impl Workspace {
             self.cancel_all_reads();
             self.watching = Default::default();
             self.library_screen = Default::default();
-            if let Some(account) = new_id
+            if let Some(account) = list_owner
                 && let Some(draft) = self.library_drafts.remove(&account)
             {
+                restored_drafts = true;
                 self.restore_library_draft(draft);
             }
             self.stats = Default::default();
-            self.settings = Default::default();
+            self.settings.reset_account();
             self.torrents.reset_account();
             self.notifications = Default::default();
             self.search = Default::default();
@@ -1395,9 +1724,10 @@ impl Workspace {
                 .flatten();
             self.list.clear_account();
             self.list.synced_at = synced_at;
-            if let Some(account) = new_id
+            if let Some(account) = list_owner
                 && let Some(drafts) = self.progress_drafts.remove(&account)
             {
+                restored_drafts = true;
                 self.progress.restore_generation(new_generation, drafts);
                 self.list.step_error = self
                     .progress
@@ -1408,9 +1738,14 @@ impl Workspace {
             self.list_epoch += 1;
             self.list_request += 1;
             self.sync_request += 1;
+            self.list_read = None;
             self.list_scope = None;
             self.list_refresh_queued = false;
+            self.list_refresh_deferred = false;
+            self.list_completed_while_closing = false;
             self.list_refresh_ticket += 1;
+            self.pending_refresh_deferred = false;
+            self.recovery_prompts_deferred = false;
             self.pending_request += 1;
             self.pending.clear();
             self.pending_busy = false;
@@ -1424,6 +1759,7 @@ impl Workspace {
             self.editor_details_loading = false;
             self.editor_details_open = false;
             self.editor_inputs = None;
+            self.fenced_editor_inputs = None;
             self.editor_subscriptions.clear();
             self.detail = DetailState::default();
             self.detail_scroll.clear();
@@ -1431,7 +1767,6 @@ impl Workspace {
             self.library_request += 1;
             self.prompt = None;
             self.prompt_event = None;
-            self.prompt_queue.clear();
             self.prompt_busy = false;
             self.prompt_error.clear();
             self.now_playing = None;
@@ -1462,16 +1797,21 @@ impl Workspace {
             self.queue_list_refresh(None, window, cx);
         }
         if changed
-            && let Some(account) = new_id
+            && let Some(account) = list_owner
             && let Some(draft) = self.editor_drafts.remove(&account)
         {
+            restored_drafts = true;
             self.editor = Some(draft.editor);
             self.editor_inputs = draft.inputs;
             self.editor_subscriptions = draft.subscriptions;
             self.editor_details_open = draft.details_open;
             self.editor_recs = draft.recommendations;
+            self.requeue_editor_covers();
             let busy = self.editor.as_ref().is_some_and(|editor| editor.busy);
-            self.set_editor_inputs_disabled(busy, cx);
+            self.set_editor_inputs_disabled(busy || self.edits_fenced(), cx);
+            if self.edits_fenced() {
+                self.capture_fenced_editor_inputs(cx);
+            }
         }
         if let Some(editor) = self.editor.as_mut() {
             let format = self
@@ -1482,9 +1822,13 @@ impl Workspace {
                 && let Some(inputs) = self.editor_inputs.as_ref()
             {
                 inputs.score.update(cx, |input, cx| input.set_value("", cx));
+                self.sync_fenced_editor_inputs(cx);
             }
         }
-        self.set_editor_inputs_disabled(self.editor.as_ref().is_some_and(|editor| editor.busy), cx);
+        self.set_editor_inputs_disabled(
+            self.editor.as_ref().is_some_and(|editor| editor.busy) || self.edits_fenced(),
+            cx,
+        );
         if switched_account {
             self.preference_reset += 1;
             self.last_sync_attempt = None;
@@ -1493,14 +1837,17 @@ impl Workspace {
             self.list.synced_at = None;
             self.list_query
                 .update(cx, |input, cx| input.set_value("", cx));
-            self.stage_query(None);
+            self.stage_query_inner(None);
             self.save_query(window, cx);
             for key in ["kurisu.list.filter", "kurisu.list.synced"] {
-                self.persist_preference(key, None, window, cx);
+                self.queue_preference(key, None, window, cx);
             }
         }
-        if let Some(id) = new_id {
+        if let Some(id) = list_owner {
             self.last_account = Some(id);
+        }
+        if self.profile.is_none() {
+            self.recovery_prompts_deferred = false;
         }
         if (changed || recovered) && self.profile.is_some() {
             self.load_list(window, cx);
@@ -1509,6 +1856,21 @@ impl Workspace {
         }
         if changed {
             self.enter_active_route(window, cx);
+        }
+        if (changed || recovered) && self.profile.is_some() {
+            self.refresh_recovery_prompts(window, cx);
+        }
+        let closing_with_restored_drafts = restored_drafts
+            && matches!(
+                self.barrier,
+                Some(BarrierAction::Close(_) | BarrierAction::Install)
+            );
+        if closing_with_restored_drafts
+            || self.barrier_blocked_by_inactive_drafts && !self.has_inactive_drafts()
+        {
+            self.cancel_barrier(window, cx);
+        } else if self.barrier.is_some() {
+            self.check_barrier(window, cx);
         }
         cx.emit(WorkspaceEvent::StateChanged);
         cx.notify();
@@ -1597,8 +1959,21 @@ impl Workspace {
     }
 
     fn stage_query(&mut self, value: Option<String>) {
+        if self.edits_fenced() {
+            return;
+        }
+        self.stage_query_inner(value);
+    }
+
+    fn stage_query_inner(&mut self, value: Option<String>) {
+        if self.close_ready {
+            return;
+        }
         self.query_request += 1;
-        self.query_pending = Some(value);
+        self.query_pending = Some(QueuedPreference {
+            value,
+            account: self.profile.as_ref().map(|user| user.id),
+        });
         self.query_error.clear();
     }
 
@@ -1606,7 +1981,7 @@ impl Workspace {
         if self.query_write_active || !self.query_error.is_empty() {
             return;
         }
-        let Some(value) = self.query_pending.take() else {
+        let Some(edit) = self.query_pending.take() else {
             return;
         };
         self.query_write_active = true;
@@ -1614,11 +1989,14 @@ impl Workspace {
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
-            let saved = value.clone();
+            let saved = edit.value.clone();
+            let account = edit.account;
             let result = joined(
-                core.spawn(
-                    async move { worker.set_preference("kurisu.list.q".into(), saved).await },
-                )
+                core.spawn(async move {
+                    worker
+                        .set_workspace_preference("kurisu.list.q".into(), saved, account)
+                        .await
+                })
                 .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1627,7 +2005,7 @@ impl Workspace {
                 if let Err(error) = result
                     && this.query_pending.is_none()
                 {
-                    this.query_pending = Some(value);
+                    this.query_pending = Some(edit);
                     this.query_error = error;
                 }
                 // Only one query write runs, so a reset or newer edit settles last.
@@ -1685,10 +2063,29 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.edits_fenced() {
+            return;
+        }
+        self.queue_preference(key, value, window, cx);
+    }
+
+    fn queue_preference(
+        &mut self,
+        key: &'static str,
+        value: Option<String>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.close_ready {
+            return;
+        }
         assert!(PREFERENCE_KEYS.contains(&key));
         let write = self.preference_writes.entry(key).or_default();
         write.revision = write.revision.wrapping_add(1);
-        write.pending = Some(value);
+        write.pending = Some(QueuedPreference {
+            value,
+            account: self.profile.as_ref().map(|user| user.id),
+        });
         write.error = None;
         self.preference_alert_dismissed = false;
         self.save_preferences(window, cx);
@@ -1706,7 +2103,7 @@ impl Workspace {
         }) else {
             return;
         };
-        let value = self
+        let edit = self
             .preference_writes
             .get_mut(key)
             .unwrap()
@@ -1717,10 +2114,15 @@ impl Workspace {
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
-            let saved = value.clone();
+            let saved = edit.value.clone();
+            let account = edit.account;
             let result = joined(
-                core.spawn(async move { worker.set_preference(key.into(), saved).await })
-                    .await,
+                core.spawn(async move {
+                    worker
+                        .set_workspace_preference(key.into(), saved, account)
+                        .await
+                })
+                .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.preference_active != Some(key) {
@@ -1731,7 +2133,7 @@ impl Workspace {
                 if let Err(error) = result
                     && write.pending.is_none()
                 {
-                    write.pending = Some(value);
+                    write.pending = Some(edit);
                     write.error = Some(error);
                     this.preference_alert_dismissed = false;
                 }
@@ -1744,6 +2146,13 @@ impl Workspace {
     }
 
     fn retry_preferences(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() || self.modal_open() {
+            return;
+        }
+        self.retry_preferences_inner(window, cx);
+    }
+
+    fn retry_preferences_inner(&mut self, window: &Window, cx: &mut Context<Self>) {
         for write in self.preference_writes.values_mut() {
             write.error = None;
         }
@@ -1754,6 +2163,9 @@ impl Workspace {
     }
 
     fn select_filter(&mut self, status: &str, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() {
+            return;
+        }
         self.sort_open = false;
         self.list.set_filter(status, now_seconds());
         self.reset_list_widget();
@@ -1762,6 +2174,9 @@ impl Workspace {
     }
 
     fn select_sort(&mut self, sort: SortKey, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() {
+            return;
+        }
         self.list.set_sort(sort, now_seconds());
         self.sort_open = false;
         self.reset_list_widget();
@@ -1776,6 +2191,9 @@ impl Workspace {
     }
 
     fn flip_sort(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() {
+            return;
+        }
         self.list.set_desc(!self.list.desc, now_seconds());
         self.reset_list_widget();
         self.persist_preference(
@@ -1788,14 +2206,34 @@ impl Workspace {
     }
 
     fn load_list(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() {
+        self.load_list_with_visibility(window.is_visible(), window, cx);
+    }
+
+    fn load_list_with_visibility(
+        &mut self,
+        visible: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stopping || self.profile.is_none() {
             return;
         }
+        if self.close_ready {
+            self.list_refresh_deferred = true;
+            return;
+        }
+        self.list_read = Some(ListReadScope::Full);
+        if self.list.syncing {
+            return;
+        }
+        self.list_completed_while_closing = false;
         self.list_request += 1;
         let request = self.list_request;
         let generation = self.generation;
         let epoch = self.list_epoch;
         self.list.loading = true;
+        self.list.error.clear();
+        cx.notify();
         let core = self.core.clone();
         let worker = core.clone();
         let job = core.spawn(async move { worker.local_entries().await });
@@ -1803,19 +2241,25 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.generation || request != this.list_request {
-                    return;
-                }
-                if epoch != this.list_epoch {
-                    this.load_list(window, cx);
+                if this.stopping || generation != this.generation || request != this.list_request {
                     return;
                 }
                 this.list.loading = false;
+                if epoch != this.list_epoch {
+                    if this.close_ready {
+                        this.list_refresh_deferred = true;
+                        cx.notify();
+                    } else if !this.list_refresh_queued {
+                        this.load_list_with_visibility(visible && window.is_visible(), window, cx);
+                    }
+                    return;
+                }
+                this.list_read = None;
                 match result {
                     Ok(entries) => {
                         this.list.replace(entries, now_seconds());
                         this.progress.reconcile_entries(generation, &this.list);
-                        this.reconcile_detail_entry();
+                        this.reconcile_open_entries(None, cx);
                         this.list.step_error = this
                             .progress
                             .first_error(generation)
@@ -1823,16 +2267,21 @@ impl Workspace {
                             .into();
                         this.reset_list_widget();
                         this.discovery_list_changed();
-                        this.prefetch_covers(0..32, window, cx);
                         this.list.error.clear();
-                        if let Some((id, _)) = &this.pending_editor {
-                            this.open_pending_editor(*id, window, cx);
-                        }
-                        if this.preferences_loaded && !this.offline && this.sync_due() {
-                            this.sync_list(window, cx);
+                        this.finish_pending_editor_refresh(None, None, window, cx);
+                        if this.close_ready {
+                            this.list_completed_while_closing = true;
+                        } else if visible && window.is_visible() {
+                            this.prefetch_covers(0..32, window, cx);
+                            if this.preferences_loaded && !this.offline && this.sync_due() {
+                                this.sync_list(window, cx);
+                            }
                         }
                     }
-                    Err(error) => this.list.error = error,
+                    Err(error) => {
+                        this.finish_pending_editor_refresh(None, Some(&error), window, cx);
+                        this.list.error = error;
+                    }
                 }
                 cx.notify();
             });
@@ -1856,9 +2305,12 @@ impl Workspace {
     }
 
     fn mark_list_synced(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.close_ready || self.auth_busy {
+            return;
+        }
         let at = now_seconds();
         self.list.synced_at = Some(at);
-        self.persist_preference("kurisu.list.synced", Some(at.to_string()), window, cx);
+        self.queue_preference("kurisu.list.synced", Some(at.to_string()), window, cx);
         let request = self.sync_request;
         let generation = self.generation;
         self.list_sync_flash = Some(request);
@@ -1875,14 +2327,22 @@ impl Workspace {
     }
 
     fn sync_list(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() || self.offline || self.list.syncing {
+        if self.writes_fenced()
+            || self.auth_busy
+            || self.update_busy
+            || self.profile.is_none()
+            || self.offline
+            || self.list.syncing
+        {
             return;
         }
         self.last_sync_attempt = Some(Instant::now());
         self.list.syncing = true;
+        self.active_writes += 1;
         self.cancel_reads("list");
         self.list.loading = false;
-        self.list.error.clear();
+        self.list.sync_error.clear();
+        cx.notify();
         self.list_request += 1;
         self.sync_request += 1;
         let request = self.sync_request;
@@ -1893,23 +2353,30 @@ impl Workspace {
             let worker = core.clone();
             let result = joined(core.spawn(async move { worker.sync_my_list().await }).await);
             let _ = this.update_in(cx, |this, window, cx| {
+                this.active_writes = this.active_writes.saturating_sub(1);
                 if !this.sync_result_current(generation, request) {
+                    this.check_barrier(window, cx);
                     return;
                 }
                 this.list.syncing = false;
+                let cancelled_read = this.list_read.take();
                 this.refresh_pending(window, cx);
+                if let Err(error) = &result {
+                    this.list.sync_error = error.clone();
+                }
                 if epoch != this.list_epoch {
                     if result.is_ok() {
                         this.mark_list_synced(window, cx);
                     }
                     this.load_list(window, cx);
+                    this.check_barrier(window, cx);
                     return;
                 }
                 match result {
                     Ok(entries) => {
                         this.list.replace(entries, now_seconds());
                         this.progress.reconcile_entries(generation, &this.list);
-                        this.reconcile_detail_entry();
+                        this.reconcile_open_entries(None, cx);
                         this.list.step_error = this
                             .progress
                             .first_error(generation)
@@ -1919,12 +2386,20 @@ impl Workspace {
                         this.reset_list_widget();
                         this.discovery_list_changed();
                         this.prefetch_covers(0..32, window, cx);
-                        if let Some((id, _)) = &this.pending_editor {
-                            this.open_pending_editor(*id, window, cx);
-                        }
+                        this.list.error.clear();
+                        this.finish_pending_editor_refresh(None, None, window, cx);
                     }
-                    Err(error) => this.list.error = error,
+                    Err(_) => match cancelled_read {
+                        Some(ListReadScope::Full) => this.load_list(window, cx),
+                        Some(ListReadScope::Scoped(ids)) => {
+                            if let Some(account) = this.profile.as_ref().map(|user| user.id) {
+                                this.refresh_scoped(ids, account, window, cx);
+                            }
+                        }
+                        None => {}
+                    },
                 }
+                this.check_barrier(window, cx);
                 cx.notify();
             });
         })
@@ -1937,6 +2412,15 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stopping {
+            return;
+        }
+        if self.close_ready {
+            self.list_epoch += 1;
+            self.list_scope = None;
+            self.list_refresh_deferred = true;
+            return;
+        }
         if self.route == Route::Torrents {
             self.load_torrent_entries(window, cx);
         }
@@ -1961,14 +2445,21 @@ impl Workspace {
                 .timer(Duration::from_millis(300))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.generation != generation || this.list_refresh_ticket != ticket {
+                if this.stopping
+                    || this.generation != generation
+                    || this.list_refresh_ticket != ticket
+                {
                     return;
                 }
                 this.list_refresh_queued = false;
-                let scope = this.list_scope.take();
-                if let (Some(ids), Some(account)) =
-                    (scope, this.profile.as_ref().map(|user| user.id))
-                    && this.list.loaded
+                if this.close_ready {
+                    this.list_refresh_deferred = true;
+                    return;
+                }
+                if let (Some(ids), Some(account)) = (
+                    this.list_scope.take(),
+                    this.profile.as_ref().map(|user| user.id),
+                ) && this.list.loaded
                     && !ids.is_empty()
                 {
                     this.refresh_scoped(ids.into_iter().collect(), account, window, cx);
@@ -1982,11 +2473,35 @@ impl Workspace {
 
     fn refresh_scoped(
         &mut self,
-        ids: Vec<i64>,
+        mut ids: Vec<i64>,
         account: i64,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stopping || self.profile.is_none() {
+            return;
+        }
+        if self.close_ready {
+            self.list_epoch += 1;
+            self.list_scope = None;
+            self.list_refresh_deferred = true;
+            return;
+        }
+        match &self.list_read {
+            Some(ListReadScope::Full) => {
+                self.load_list(window, cx);
+                return;
+            }
+            Some(ListReadScope::Scoped(previous)) => {
+                let mut seen: HashSet<_> = ids.iter().copied().collect();
+                ids.extend(previous.iter().copied().filter(|id| seen.insert(*id)));
+            }
+            None => {}
+        }
+        self.list_read = Some(ListReadScope::Scoped(ids.clone()));
+        if self.list.syncing {
+            return;
+        }
         self.list_request += 1;
         let request = self.list_request;
         let generation = self.generation;
@@ -1999,18 +2514,18 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.generation || request != this.list_request {
+                if this.stopping || generation != this.generation || request != this.list_request {
                     return;
                 }
                 if epoch != this.list_epoch {
-                    this.queue_list_refresh(None, window, cx);
                     return;
                 }
+                this.list_read = None;
                 match result {
                     Ok(values) => {
                         let change = this.list.apply_scoped(&ids, values, now_seconds());
                         this.progress.reconcile_entries(generation, &this.list);
-                        this.reconcile_detail_entry();
+                        this.reconcile_open_entries(Some(&ids), cx);
                         this.list.step_error = this
                             .progress
                             .first_error(generation)
@@ -2019,15 +2534,15 @@ impl Workspace {
                         this.apply_list_change(change);
                         this.discovery_list_changed();
                         this.list.error.clear();
-                        if let Some((id, _)) = this
-                            .pending_editor
-                            .as_ref()
-                            .filter(|(waiting, _)| ids.contains(waiting))
-                        {
-                            this.open_pending_editor(*id, window, cx);
+                        this.finish_pending_editor_refresh(Some(&ids), None, window, cx);
+                        if this.close_ready {
+                            this.list_completed_while_closing = true;
                         }
                     }
-                    Err(error) => this.list.error = error,
+                    Err(error) => {
+                        this.finish_pending_editor_refresh(Some(&ids), Some(&error), window, cx);
+                        this.list.error = error;
+                    }
                 }
                 cx.notify();
             });
@@ -2035,19 +2550,114 @@ impl Workspace {
         .detach();
     }
 
-    fn reconcile_detail_entry(&mut self) {
-        if !self.list.loaded {
+    fn finish_pending_editor_refresh(
+        &mut self,
+        scope: Option<&[i64]>,
+        error: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let can_open = !self.edits_fenced() && !self.modal_open();
+        let Some(pending) = self.pending_editor.as_mut().filter(|pending| {
+            pending.route == self.route && scope.is_none_or(|ids| ids.contains(&pending.id))
+        }) else {
             return;
-        }
-        if let Some(id) = self.detail.media_id {
-            self.detail.entry = self.list.entry(id).cloned();
-            self.detail.entry_available = true;
-            self.detail.entry_error.clear();
+        };
+        if let Some(error) = error {
+            if !matches!(pending.wait, PendingEditorWait::Progress) {
+                pending.wait = PendingEditorWait::RefreshFailed(error.into());
+            }
+        } else {
+            pending.wait = PendingEditorWait::Progress;
+            pending.auto_open &= can_open;
+            let id = pending.id;
+            if !self.close_ready {
+                self.open_pending_editor(id, window, cx);
+            }
         }
     }
 
-    fn step_progress(&mut self, id: i64, delta: i64, window: &Window, cx: &mut Context<Self>) {
-        if self.barrier.is_some() || self.update_busy || self.auth_busy {
+    fn reconcile_open_entries(&mut self, scope: Option<&[i64]>, cx: &mut Context<Self>) {
+        let includes = |id: &i64| scope.is_none_or(|ids| ids.contains(id));
+        if let Some(prompt) = self.prompt.as_ref().filter(|p| includes(&p.media_id)) {
+            self.cached_prompt_target = self.core.cached_tracking_target(prompt);
+        }
+        if self.list.loaded {
+            self.added_recommendations
+                .retain(|id| !includes(id) || self.list.entry(*id).is_some());
+        }
+        for media in self
+            .search
+            .results
+            .iter_mut()
+            .chain(&mut self.seasons.media)
+            .chain(self.calendar.items.iter_mut().map(|item| &mut item.media))
+        {
+            if includes(&media.id)
+                && let Some(total) = self
+                    .list
+                    .entry(media.id)
+                    .and_then(|entry| entry.media.as_ref()?.episodes)
+            {
+                media.episodes = Some(total);
+            }
+        }
+        if let Some(id) = self.detail.media_id.filter(includes) {
+            let entry = self.list.entry(id);
+            if let Some(total) = entry.and_then(|entry| entry.media.as_ref()?.episodes)
+                && let Some(detail) = self.detail.detail.as_mut()
+            {
+                detail.media.episodes = Some(total);
+            }
+            self.detail.reconcile_entry(entry.cloned());
+        }
+        if let Some(editor) = self
+            .editor
+            .as_mut()
+            .filter(|editor| includes(&editor.media_id))
+            && let Some(entry) = self.list.entry(editor.media_id)
+        {
+            let previous = editor.progress;
+            let input_current = self.editor_inputs.as_ref().is_none_or(|inputs| {
+                inputs.progress.read(cx).value().trim().parse::<i64>() == Ok(previous)
+            });
+            editor.refresh_episode_total(entry, input_current);
+            if editor.progress != previous
+                && let Some(inputs) = &self.editor_inputs
+            {
+                inputs.progress.update(cx, |input, cx| {
+                    input.set_value(editor.progress.to_string(), cx)
+                });
+                self.sync_fenced_editor_inputs(cx);
+            }
+        }
+    }
+
+    fn list_or_detail_entry(&self, id: i64) -> Option<&ListEntry> {
+        self.list.entry(id).or_else(|| {
+            self.detail
+                .entry
+                .as_ref()
+                .filter(|entry| entry.media_id == id)
+        })
+    }
+
+    fn entry_for_edit(&self, id: i64) -> Option<ListEntry> {
+        let mut entry = self.list_or_detail_entry(id)?.clone();
+        if (self.route == Route::Anime(id) || entry.media.is_none())
+            && let Some(detail) = self
+                .detail
+                .detail
+                .as_ref()
+                .filter(|detail| detail.media.id == id)
+        {
+            entry.media = Some(detail.media.clone());
+        }
+        Some(entry)
+    }
+
+    fn step_progress(&mut self, id: i64, delta: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() || self.modal_open() || self.progress.busy(self.generation, id) {
             return;
         }
         if self
@@ -2057,29 +2667,26 @@ impl Workspace {
         {
             return;
         }
-        let Some(mut entry) = self
-            .list
-            .entry(id)
-            .or_else(|| {
-                self.detail
-                    .entry
-                    .as_ref()
-                    .filter(|entry| entry.media_id == id)
-            })
-            .cloned()
-        else {
+        let Some(entry) = self.entry_for_edit(id) else {
             return;
         };
-        if entry.media.is_none() {
-            entry.media = self
-                .detail
-                .detail
-                .as_ref()
-                .filter(|detail| detail.media.id == id)
-                .map(|detail| detail.media.clone());
-        }
         let edit = self.progress.entry(self.generation, &entry);
         if !edit.step(delta, Instant::now()) {
+            self.update_step_error();
+            cx.notify();
+            return;
+        }
+        let reopens_completed = edit.reopens_completed(&entry);
+        let due = edit.due.filter(|_| edit.dirty());
+        self.update_step_error();
+        let Some(due) = due else {
+            self.open_pending_editor(id, window, cx);
+            cx.notify();
+            return;
+        };
+        if reopens_completed {
+            self.save_progress(id, window, cx);
+            cx.notify();
             return;
         }
         let key = (self.generation, id);
@@ -2087,15 +2694,24 @@ impl Workspace {
         *seq += 1;
         let current = *seq;
         let generation = self.generation;
-        let due = edit.due.unwrap();
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor()
                 .timer(due.saturating_duration_since(Instant::now()))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.generation == generation && this.progress_timers.get(&key) == Some(&current)
+                if !this.stopping
+                    && this.generation == generation
+                    && this.progress_timers.get(&key) == Some(&current)
                 {
-                    this.save_progress(id, window, cx);
+                    if !this.edits_fenced() && this.modal_allows_progress_save(id) {
+                        this.save_progress(id, window, cx);
+                    } else if let Some(pending) = this
+                        .pending_editor
+                        .as_mut()
+                        .filter(|pending| pending.id == id)
+                    {
+                        pending.auto_open = false;
+                    }
                 }
             });
         })
@@ -2103,8 +2719,28 @@ impl Workspace {
         cx.notify();
     }
 
+    fn modal_allows_progress_save(&self, id: i64) -> bool {
+        match self.active_modal() {
+            None => true,
+            Some(ModalLayer::Prompt) => self.prompt.as_ref().is_some_and(|p| p.media_id == id),
+            _ => false,
+        }
+    }
+
+    pub(super) fn resume_overdue_progress(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() || self.profile.is_none() {
+            return;
+        }
+        for id in self.progress.due(self.generation, Instant::now()) {
+            if self.modal_allows_progress_save(id) {
+                self.save_progress(id, window, cx);
+            }
+        }
+    }
+
     fn save_progress(&mut self, id: i64, window: &Window, cx: &mut Context<Self>) {
         let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
         let entry_revision = self.list.revision();
         let Some((value, expected)) = self
             .progress
@@ -2113,6 +2749,8 @@ impl Workspace {
         else {
             return;
         };
+        self.update_step_error();
+        cx.notify();
         self.active_writes += 1;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -2123,7 +2761,9 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
-                if generation != this.generation {
+                if generation != this.generation
+                    || account != this.profile.as_ref().map(|user| user.id)
+                {
                     this.check_barrier(window, cx);
                     return;
                 }
@@ -2131,19 +2771,18 @@ impl Workspace {
                     .as_ref()
                     .map(|entry| entry.progress)
                     .map_err(Clone::clone);
-                let superseded = result.is_ok() && this.list.revision() != entry_revision;
+                let superseded = this.list.revision() != entry_revision;
                 if let Some(edit) = this.progress.edit_mut(generation, id) {
                     match outcome {
                         Ok(progress) if superseded => edit.finish_superseded_save(value, progress),
                         outcome => edit.finish_save(outcome),
                     }
                 }
+                if superseded && this.list.loaded {
+                    this.progress.reconcile_entries(generation, &this.list);
+                }
                 if let Ok(entry) = result {
                     if superseded {
-                        if this.list.loaded {
-                            this.progress.reconcile_entries(generation, &this.list);
-                            this.reconcile_detail_entry();
-                        }
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                         // An unchanged baseline may belong to an earlier read of this entry.
                         if this.list.loaded
@@ -2152,30 +2791,27 @@ impl Workspace {
                                 .entry(id)
                                 .is_none_or(|entry| entry.progress != expected)
                         {
-                            this.open_pending_editor(id, window, cx);
+                            this.finish_pending_editor_refresh(Some(&[id]), None, window, cx);
+                        } else {
+                            let auto_open = !this.edits_fenced() && !this.modal_open();
+                            if let Some(pending) = this
+                                .pending_editor
+                                .as_mut()
+                                .filter(|pending| pending.id == id)
+                            {
+                                pending.wait = PendingEditorWait::Refresh;
+                                pending.auto_open &= auto_open;
+                            }
                         }
                     } else {
-                        let change = this.list.apply_one(entry.clone(), now_seconds());
+                        let change = this.list.apply_one(entry, now_seconds());
                         this.apply_list_change(change);
                         this.discovery_list_changed();
-                        if this.detail.media_id == Some(id) {
-                            this.detail.entry = Some(entry);
-                            this.detail.entry_available = true;
-                        }
-                        this.open_pending_editor(id, window, cx);
+                        this.reconcile_open_entries(Some(&[id]), cx);
+                        this.finish_pending_editor_refresh(Some(&[id]), None, window, cx);
                     }
                 }
-                this.list.step_error = this
-                    .progress
-                    .first_error(generation)
-                    .unwrap_or_default()
-                    .into();
-                if this.delete_waiting
-                    && this.editor.as_ref().is_some_and(|edit| edit.media_id == id)
-                {
-                    this.delete_waiting = false;
-                    this.perform_delete(window, cx);
-                }
+                this.update_step_error();
                 this.check_barrier(window, cx);
                 cx.notify();
             });
@@ -2190,7 +2826,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.list.loaded {
+        if self.edits_fenced() || self.modal_open() || !self.list.loaded {
+            return;
+        }
+        if self.progress.busy(self.generation, id) {
             return;
         }
         let latest = self.list.entry(id).map(|entry| entry.progress);
@@ -2219,7 +2858,12 @@ impl Workspace {
             .first_error(self.generation)
             .unwrap_or_default()
             .into();
-        if keep_local {
+        if keep_local
+            && self
+                .progress
+                .edit(self.generation, id)
+                .is_some_and(|edit| edit.dirty())
+        {
             self.save_progress(id, window, cx);
         } else {
             self.open_pending_editor(id, window, cx);
@@ -2229,26 +2873,45 @@ impl Workspace {
     }
 
     fn retry_progress_errors(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.can_retry_progress_errors() {
+            return;
+        }
         for id in self.progress.dirty_ids(self.generation) {
             if self.progress.retry_error(self.generation, id) {
                 self.save_progress(id, window, cx);
             }
         }
+        self.update_step_error();
+        cx.notify();
+    }
+
+    fn can_retry_progress_errors(&self) -> bool {
+        !self.edits_fenced()
+            && !self.modal_open()
+            && self.progress.has_retryable_error(self.generation)
+    }
+
+    fn update_step_error(&mut self) {
         self.list.step_error = self
             .progress
             .first_error(self.generation)
             .unwrap_or_default()
             .into();
-        cx.notify();
     }
 
     fn load_detail(&mut self, id: i64, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         self.cancel_reads("detail-entry");
         self.cancel_reads("detail-recommendations");
         self.reset_detail_cover_region();
         let request = self.detail.start(id);
+        cx.notify();
+        let detail_entry_revision = self.detail.entry_revision;
         let entry_revision = self.list.revision();
         let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
         let worker = core.clone();
         let detail_job = core.spawn(async move { worker.get_media_detail(id).await });
@@ -2265,9 +2928,11 @@ impl Workspace {
             ],
         );
         cx.spawn_in(window, async move |this, cx| {
-            let result = joined(detail_job.await);
+            let mut result = joined(detail_job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.generation
+                if this.stopping
+                    || generation != this.generation
+                    || this.profile.as_ref().map(|user| user.id) != account
                     || this.route != Route::Anime(id)
                     || !this.detail.current(id, request)
                 {
@@ -2302,6 +2967,17 @@ impl Workspace {
                         }
                     }
                 }
+                if let Ok(detail) = &mut result
+                    && let Some(entry) = this.list.entry(id)
+                    && let Some(total) = entry.media.as_ref().and_then(|media| media.episodes)
+                    && detail.media.episodes != Some(total)
+                {
+                    // Resolve overlapping detail and list reads from the local cache.
+                    if this.list.revision() != entry_revision {
+                        detail.media.episodes = Some(total);
+                    }
+                    this.queue_list_refresh(Some(vec![id]), window, cx);
+                }
                 this.detail.finish_detail(id, request, result);
                 cx.notify();
             });
@@ -2310,10 +2986,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(entry_job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
-                if generation != this.generation
-                    || this.route != Route::Anime(id)
-                    || !this.detail.current(id, request)
-                    || (this.list.loaded && this.list.revision() != entry_revision)
+                if this.profile.as_ref().map(|user| user.id) != account
+                    || !this.detail_entry_current(id, request, generation, detail_entry_revision)
                 {
                     return;
                 }
@@ -2325,7 +2999,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(recs_job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.generation
+                if this.stopping
+                    || generation != this.generation
+                    || this.profile.as_ref().map(|user| user.id) != account
                     || this.route != Route::Anime(id)
                     || !this.detail.current(id, request)
                 {
@@ -2346,25 +3022,37 @@ impl Workspace {
         .detach();
     }
 
+    fn media_write_blocked(&self, id: i64) -> bool {
+        self.profile.is_none()
+            || self.edits_fenced()
+            || self.editor_adding.contains(&id)
+            || self.progress.blocks_add(self.generation, id)
+    }
+
+    fn add_media_blocked(&self, id: i64, origin: Option<ModalLayer>) -> bool {
+        self.media_write_blocked(id)
+            || self.added_recommendations.contains(&id)
+            || self.active_modal() != origin
+            || self.editor.as_ref().is_some_and(|editor| editor.busy)
+    }
+
     fn add_media(
         &mut self,
         id: i64,
         status: &'static str,
+        origin: Option<ModalLayer>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.profile.is_none()
-            || self.editor_adding.contains(&id)
-            || self.added_recommendations.contains(&id)
-            || self.barrier.is_some()
-            || self.auth_busy
-            || self.update_busy
-        {
+        if self.add_media_blocked(id, origin) {
             return;
         }
         self.editor_adding.insert(id);
         self.active_writes += 1;
+        cx.notify();
         let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
+        let revision = self.list.revision();
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
@@ -2383,7 +3071,12 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
-                if generation != this.generation {
+                if this.stopping {
+                    return;
+                }
+                if generation != this.generation
+                    || account != this.profile.as_ref().map(|user| user.id)
+                {
                     this.check_barrier(window, cx);
                     return;
                 }
@@ -2391,12 +3084,11 @@ impl Workspace {
                 match result {
                     Ok(entry) => {
                         this.added_recommendations.insert(id);
-                        let change = this.list.apply_one(entry.clone(), now_seconds());
-                        this.apply_list_change(change);
-                        this.discovery_list_changed();
-                        if this.detail.media_id == Some(id) {
-                            this.detail.entry = Some(entry);
-                            this.detail.entry_available = true;
+                        if this.list.revision() == revision {
+                            let change = this.list.apply_one(entry, now_seconds());
+                            this.apply_list_change(change);
+                            this.discovery_list_changed();
+                            this.reconcile_open_entries(Some(&[id]), cx);
                         }
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
@@ -2410,40 +3102,76 @@ impl Workspace {
     }
 
     fn refresh_pending(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() {
+        let Some(account) = self.profile.as_ref().map(|user| user.id) else {
+            return;
+        };
+        if self.stopping {
+            return;
+        }
+        if self.close_ready || self.auth_busy {
+            self.pending_refresh_deferred = true;
             return;
         }
         self.pending_request += 1;
         let request = self.pending_request;
         let generation = self.generation;
+        let intent = self.auth_intent;
         let core = self.core.clone();
         let worker = core.clone();
         let job = core.spawn(async move {
-            let pending = worker.get_pending_changes().await;
+            let pending = match worker.get_pending_changes_for(generation, account).await {
+                Ok(Some(items)) => Ok(items),
+                Ok(None) => return None,
+                Err(error) => Err(error),
+            };
+            if worker.generation() != generation {
+                return None;
+            }
             let user = worker.current_user().await;
-            (pending, user)
+            Some((pending, user))
         });
         self.replace_reads("pending", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.generation || request != this.pending_request {
+                if this.stopping
+                    || generation != this.generation
+                    || Some(account) != this.profile.as_ref().map(|user| user.id)
+                    || request != this.pending_request
+                {
+                    return;
+                }
+                if this.auth_busy {
+                    this.pending_refresh_deferred = true;
+                    return;
+                }
+                if intent != this.auth_intent || generation != this.core.generation() {
                     return;
                 }
                 let (result, user) = match result {
-                    Ok(value) => value,
+                    Ok(Some(value)) => value,
+                    Ok(None) => return,
                     Err(error) => {
                         this.pending_error = error.to_string();
                         return;
                     }
                 };
-                if let Ok(Some(user)) = user
-                    && this
-                        .profile
-                        .as_ref()
-                        .is_some_and(|profile| profile.id == user.id)
-                {
-                    this.set_profile(Some(user), window, cx);
+                if matches!(&user, Ok(user) if user.as_ref().map(|user| user.id) != Some(account)) {
+                    return;
+                }
+                if let Ok(Some(user)) = user {
+                    if this.close_ready {
+                        if this.profile.as_ref().is_some_and(|profile| {
+                            profile.offline != user.offline
+                                || profile.score_format != user.score_format
+                                || profile.name != user.name
+                                || profile.avatar != user.avatar
+                        }) {
+                            this.pending_refresh_deferred = true;
+                        }
+                    } else {
+                        this.set_profile_at(Some(user), generation, window, cx);
+                    }
                 }
                 match result {
                     Ok(items) => {
@@ -2458,12 +3186,17 @@ impl Workspace {
         .detach();
     }
 
+    fn pending_actions_disabled(&self) -> bool {
+        self.pending_busy || self.edits_fenced() || self.modal_open() || self.profile.is_none()
+    }
+
     fn retry_pending(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.pending_busy || self.barrier.is_some() {
+        if self.pending_actions_disabled() {
             return;
         }
         self.pending_busy = true;
         self.active_writes += 1;
+        cx.notify();
         let generation = self.generation;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -2474,6 +3207,9 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
+                if this.stopping {
+                    return;
+                }
                 if generation != this.generation {
                     this.check_barrier(window, cx);
                     return;
@@ -2501,11 +3237,16 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_busy || self.barrier.is_some() {
+        if self.pending_actions_disabled()
+            || !self.pending.iter().any(|item| {
+                item.media_id == id && item.conflict && (!keep_local || !item.missing_media)
+            })
+        {
             return;
         }
         self.pending_busy = true;
         self.active_writes += 1;
+        cx.notify();
         let generation = self.generation;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -2516,6 +3257,9 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
+                if this.stopping {
+                    return;
+                }
                 if generation != this.generation {
                     this.check_barrier(window, cx);
                     return;
@@ -2527,60 +3271,92 @@ impl Workspace {
                 this.refresh_pending(window, cx);
                 this.queue_list_refresh(Some(vec![id]), window, cx);
                 this.check_barrier(window, cx);
+                cx.notify();
             });
         })
         .detach();
     }
 
-    fn confirm_prompt(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn prompt_current_progress(&self, prompt: &TrackingPrompt) -> Option<i64> {
+        self.list
+            .entry(prompt.media_id)
+            .map(|entry| entry.progress)
+            .or_else(|| (!self.list.loaded).then_some(prompt.progress))
+    }
+
+    fn prompt_target(&self, prompt: &TrackingPrompt) -> Option<i64> {
+        let current = self.prompt_current_progress(prompt)?;
+        let target = self.cached_prompt_target.unwrap_or_else(|| {
+            self.list
+                .entry(prompt.media_id)
+                .and_then(|entry| entry.media.as_ref()?.episodes)
+                .filter(|total| *total > 0)
+                .map_or(prompt.episode, |total| prompt.episode.min(total))
+        });
+        (prompt.episode > prompt.progress && target > current).then_some(target)
+    }
+
+    fn prompt_progress_pending(&self, id: i64) -> bool {
+        self.editor_adding.contains(&id)
+            || self.progress.busy(self.generation, id)
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.media_id == id && editor.busy)
+            || self
+                .progress
+                .edit(self.generation, id)
+                .is_some_and(|edit| edit.dirty() && edit.due.is_some())
+    }
+
+    fn confirm_prompt(
+        &mut self,
+        revision: u64,
+        target: i64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.prompt_action_allowed(revision) {
+            return;
+        }
         let Some(event) = self.prompt_event.clone() else {
             return;
         };
         let Some(prompt) = prompt_payload(&event).cloned() else {
             return;
         };
-        if self.prompt_busy || self.barrier.is_some() {
-            return;
-        }
         if !self.core.event_is_current(&event) {
             self.prompt = None;
             self.prompt_event = None;
-            self.prompt_queue.clear();
+            cx.notify();
+            return;
+        }
+        let media_id = prompt.media_id;
+        if self.prompt_progress_pending(media_id) || self.prompt_target(&prompt) != Some(target) {
+            return;
+        }
+        if self.progress.blocks_add(self.generation, media_id) {
+            self.prompt_error = "Finish or review your pending episode edit first.".into();
             cx.notify();
             return;
         }
         self.prompt_busy = true;
         self.prompt_error.clear();
         self.active_writes += 1;
+        cx.notify();
         let generation = self.generation;
         let core = self.core.clone();
-        let media_id = prompt.media_id;
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
             let event_for_ui = event.clone();
             let result = joined(
-                core.spawn(async move {
-                    if !worker.event_is_current(&event) {
-                        return Err("Playback prompt is no longer current.".into());
-                    }
-                    let fresh = worker.get_entry(prompt.media_id).await?;
-                    if !worker.event_is_current(&event) {
-                        return Err("Playback prompt is no longer current.".into());
-                    }
-                    if let Some(entry) = fresh
-                        && entry.progress < prompt.episode
-                    {
-                        worker
-                            .set_progress(prompt.media_id, prompt.episode, Some(entry.progress))
-                            .await?;
-                    }
-                    Ok(())
-                })
-                .await,
+                core.spawn(async move { worker.confirm_tracking_prompt(event, target).await })
+                    .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
                 if generation != this.generation
+                    || revision != this.prompt_revision
                     || this
                         .prompt_event
                         .as_ref()
@@ -2594,12 +3370,10 @@ impl Workspace {
                 }
                 this.prompt_busy = false;
                 match result {
-                    Ok(()) => {
-                        this.dismiss_prompt(cx);
-                        this.queue_list_refresh(Some(vec![media_id]), window, cx);
-                    }
+                    Ok(()) => this.finish_prompt(cx),
                     Err(error) => this.prompt_error = error,
                 }
+                this.queue_list_refresh(Some(vec![media_id]), window, cx);
                 this.check_barrier(window, cx);
                 cx.notify();
             });
@@ -2655,11 +3429,81 @@ impl Workspace {
     }
 
     pub fn request_logout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.auth_busy || self.modal_open() {
+        if self.edits_fenced() || self.modal_open() || self.profile.is_none() {
             return;
         }
         self.logout_confirming = true;
         cx.notify();
+    }
+
+    fn capture_fenced_inputs(&mut self, cx: &gpui::App) {
+        self.capture_fenced_editor_inputs(cx);
+        self.settings.capture_fenced_inputs(cx);
+        self.library_screen.capture_fenced_inputs(cx);
+    }
+
+    fn clear_fenced_inputs_if_idle(&mut self, cx: &mut Context<Self>) {
+        if !self.edits_fenced() {
+            self.fenced_editor_inputs = None;
+            self.set_editor_inputs_disabled(
+                self.editor.as_ref().is_some_and(|editor| editor.busy),
+                cx,
+            );
+            self.settings.clear_fenced_inputs(cx);
+            self.library_screen.clear_fenced_inputs();
+        }
+    }
+
+    fn resume_route_reads(
+        &mut self,
+        replay_list: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entered = self.route_entry_deferred;
+        if entered {
+            self.enter_active_route(window, cx);
+        }
+        if self.profile.is_none() {
+            return;
+        }
+        if !entered {
+            match self.route {
+                Route::Torrents => {
+                    if replay_list || self.torrents.entries_reload_pending {
+                        self.torrents.entries_reload_pending = false;
+                        self.load_torrent_entries(window, cx);
+                    }
+                    self.ensure_torrent_feed_loaded(window, cx);
+                    self.reload_expanded_torrent_choices(window, cx);
+                }
+                Route::Calendar if !self.calendar.loaded_once && !self.calendar.loading => {
+                    self.enter_calendar(window, cx);
+                }
+                Route::Library => {
+                    self.resume_library_binding(window, cx);
+                    self.refresh_library_history(window, cx);
+                }
+                Route::Now => {
+                    self.refresh_watching_list(window, cx);
+                    self.refresh_watching_playback(window, cx);
+                }
+                Route::Seasons if !self.seasons.loaded_once && !self.seasons.loading => {
+                    self.enter_seasons(window, cx);
+                }
+                _ => {}
+            }
+        } else if replay_list && self.route == Route::Torrents && !self.torrents.entries_loading {
+            self.torrents.entries_reload_pending = false;
+            self.load_torrent_entries(window, cx);
+        }
+        if self.library_screen.refresh_after_scan
+            || (self.route == Route::Library
+                && (!self.library_screen.scan_loaded
+                    || self.list.revision() != self.library_screen.list_revision))
+        {
+            self.ensure_library_fresh(window, cx);
+        }
     }
 
     pub fn request_close(
@@ -2668,30 +3512,122 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.barrier = Some(BarrierAction::Close(intent));
+        if self.close_ready {
+            if intent == CloseIntent::Quit {
+                self.cancel_reads_for_quit();
+            }
+            cx.emit(WorkspaceEvent::ReadyToClose(intent));
+            return;
+        }
+        self.capture_fenced_inputs(cx);
+        self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier = Some(match self.barrier {
+            Some(BarrierAction::Logout | BarrierAction::LogoutThenClose(_)) => {
+                BarrierAction::LogoutThenClose(intent)
+            }
+            _ => BarrierAction::Close(intent),
+        });
+        self.queued_login = None;
         self.barrier_error.clear();
         self.check_barrier(window, cx);
     }
 
-    fn start_barrier(&mut self, action: BarrierAction, window: &Window, cx: &mut Context<Self>) {
-        if action == BarrierAction::Install && (self.restart_pending || self.update_busy) {
+    pub fn resume_after_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resume_after_close_visibility(window.is_visible(), window, cx);
+    }
+
+    pub(crate) fn resume_after_close_visibility(
+        &mut self,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_ready = std::mem::replace(&mut self.close_ready, false);
+        self.clear_fenced_inputs_if_idle(cx);
+        if let Some(pending) = &mut self.pending_editor {
+            pending.auto_open &= !was_ready;
+        }
+        if was_ready {
+            self.resume_fenced_reads(visible, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn resume_fenced_reads(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() {
             return;
         }
+        let replay_list = std::mem::take(&mut self.list_refresh_deferred);
+        let completed_list = std::mem::take(&mut self.list_completed_while_closing);
+        let replay_pending = std::mem::take(&mut self.pending_refresh_deferred);
+        let replay_prompts = std::mem::take(&mut self.recovery_prompts_deferred);
+        self.resume_route_reads(replay_list, window, cx);
+        if replay_list && self.profile.is_some() {
+            self.list_refresh_ticket += 1;
+            self.list_refresh_queued = false;
+            self.list_scope = None;
+            if let Some(pending) = &mut self.pending_editor
+                && completed_list
+                && matches!(pending.wait, PendingEditorWait::Progress)
+                && !self.progress.blocks_add(self.generation, pending.id)
+            {
+                pending.wait = PendingEditorWait::Refresh;
+            }
+            self.load_list_with_visibility(visible, window, cx);
+        } else if completed_list && self.list.loaded {
+            if let Some(pending) = &self.pending_editor {
+                self.open_pending_editor(pending.id, window, cx);
+            }
+            if visible && window.is_visible() {
+                self.prefetch_covers(0..32, window, cx);
+                if self.preferences_loaded && !self.offline && self.sync_due() {
+                    self.sync_list(window, cx);
+                }
+            }
+        }
+        if replay_pending && self.profile.is_some() {
+            self.refresh_pending(window, cx);
+        }
+        if replay_prompts && self.profile.is_some() {
+            self.refresh_recovery_prompts(window, cx);
+        }
+        self.resume_overdue_progress(window, cx);
+        cx.notify();
+    }
+
+    fn start_barrier(&mut self, action: BarrierAction, window: &Window, cx: &mut Context<Self>) {
+        if self.writes_fenced()
+            || action == BarrierAction::Install && (self.restart_pending || self.update_busy)
+        {
+            return;
+        }
+        self.capture_fenced_inputs(cx);
+        self.barrier_blocked_by_inactive_drafts = false;
         self.barrier = Some(action);
         self.barrier_error.clear();
         self.check_barrier(window, cx);
     }
 
-    fn cancel_barrier(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.barrier.take(), Some(BarrierAction::Close(_))) {
+    fn cancel_barrier(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.barrier.take(),
+            Some(BarrierAction::Close(_) | BarrierAction::LogoutThenClose(_))
+        ) {
             cx.emit(WorkspaceEvent::CloseCancelled);
         }
+        self.barrier_blocked_by_inactive_drafts = false;
+        self.clear_fenced_inputs_if_idle(cx);
         self.queued_login = None;
         self.barrier_error.clear();
+        if let Some(pending) = &mut self.pending_editor {
+            pending.auto_open = false;
+        }
+        self.resume_fenced_reads(window.is_visible(), window, cx);
         cx.notify();
     }
 
     fn check_barrier(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.barrier_blocked_by_inactive_drafts = false;
         let Some(action) = self.barrier else {
             return;
         };
@@ -2710,14 +3646,26 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if let Some(error) = self.settings.tracking_save_error() {
+            self.barrier_error =
+                format!("Could not save playback tracking: {error}. Kurisu is still open.");
+            cx.notify();
+            return;
+        }
+        if let Some((label, error)) = self.settings.app_setting_save_error() {
+            self.barrier_error = format!("Could not save {label}: {error}. Kurisu is still open.");
+            cx.notify();
+            return;
+        }
         if matches!(action, BarrierAction::Close(_) | BarrierAction::Install)
             && self.has_inactive_drafts()
         {
+            self.barrier_blocked_by_inactive_drafts = true;
             self.barrier_error = "Unsaved drafts belong to another account. Sign in to that account to review them, or discard them to continue.".into();
             cx.notify();
             return;
         }
-        if let Some(error) = self.progress.first_error(self.generation) {
+        if let Some(error) = self.progress.first_settled_error(self.generation) {
             self.barrier_error = format!("Could not save progress: {error}. Kurisu is still open.");
             cx.notify();
             return;
@@ -2753,16 +3701,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let score_available = !self.offline
-            || self
-                .profile
-                .as_ref()
-                .and_then(|user| user.score_format.as_ref())
-                .is_some();
         if self
             .editor
             .as_ref()
-            .is_some_and(|editor| editor.is_dirty(score_available))
+            .is_some_and(|editor| self.editor_is_dirty(editor))
         {
             self.save_editor(window, cx);
             if let Some(error) = self
@@ -2780,16 +3722,61 @@ impl Workspace {
         self.barrier_error.clear();
         self.barrier = None;
         match action {
-            BarrierAction::Close(intent) => cx.emit(WorkspaceEvent::ReadyToClose(intent)),
-            BarrierAction::Logout => self.perform_logout(window, cx),
-            BarrierAction::Install => self.perform_install(window, cx),
+            BarrierAction::Close(intent) => {
+                self.close_ready = true;
+                if intent == CloseIntent::Quit {
+                    self.cancel_reads_for_quit();
+                } else {
+                    self.cancel_login(window, cx);
+                }
+                cx.emit(WorkspaceEvent::ReadyToClose(intent));
+            }
+            BarrierAction::LogoutThenClose(intent) => {
+                self.barrier = Some(BarrierAction::Close(intent));
+                self.perform_logout(window, cx);
+            }
+            BarrierAction::Logout => {
+                self.perform_logout(window, cx);
+                self.clear_fenced_inputs_if_idle(cx);
+            }
+            BarrierAction::Install => {
+                self.perform_install(window, cx);
+                self.clear_fenced_inputs_if_idle(cx);
+            }
             BarrierAction::Login => {
                 if let Some((oauth, token)) = self.queued_login.take() {
                     self.perform_login(oauth, token, window, cx);
                 }
+                self.clear_fenced_inputs_if_idle(cx);
             }
         }
         cx.notify();
+    }
+
+    fn discard_barrier(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.barrier.is_none() {
+            return;
+        }
+        self.barrier_blocked_by_inactive_drafts = false;
+        self.query_pending = None;
+        self.query_error.clear();
+        for write in self.preference_writes.values_mut() {
+            write.pending = None;
+            write.error = None;
+        }
+        self.settings.discard_failed_saves();
+        self.progress.discard_generation(self.generation);
+        self.pending_editor = None;
+        self.list.step_error = self
+            .progress
+            .first_error(self.generation)
+            .unwrap_or_default()
+            .into();
+        if self.editor.as_ref().is_some_and(|editor| !editor.busy) {
+            self.close_editor(cx);
+        }
+        self.barrier_error.clear();
+        self.check_barrier(window, cx);
     }
 
     fn retry_barrier(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -2805,7 +3792,9 @@ impl Workspace {
         if let Some(editor) = self.editor.as_mut() {
             editor.error.clear();
         }
-        self.retry_preferences(window, cx);
+        self.retry_tracking_settings(window, cx);
+        self.retry_app_settings(window, cx);
+        self.retry_preferences_inner(window, cx);
     }
 
     fn has_inactive_drafts(&self) -> bool {
@@ -2824,6 +3813,10 @@ impl Workspace {
     }
 
     fn discard_inactive_drafts(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.barrier_blocked_by_inactive_drafts {
+            return;
+        }
+        self.barrier_blocked_by_inactive_drafts = false;
         let active = self.profile.as_ref().map(|user| user.id);
         self.progress_drafts
             .retain(|account, _| Some(*account) == active);
@@ -2850,7 +3843,10 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.auth_busy && !self.auth_retry_available() {
+        if self.close_ready
+            || self.barrier.is_some()
+            || self.auth_busy && !self.auth_retry_available()
+        {
             return;
         }
         if self.editor.is_some()
@@ -2859,21 +3855,17 @@ impl Workspace {
         {
             editor.error = error;
         }
-        let score_available = !self.offline
-            || self
-                .profile
-                .as_ref()
-                .and_then(|user| user.score_format.as_ref())
-                .is_some();
         if self.query_pending.is_some()
             || !self.query_error.is_empty()
             || self.preference_has_work()
             || self.preference_error().is_some()
+            || self.settings.tracking_save_error().is_some()
+            || self.settings.app_setting_save_error().is_some()
             || self.active_writes > 0
             || self.progress.has_in_flight(self.generation)
             || !self.progress.dirty_ids(self.generation).is_empty()
             || self.editor.as_ref().is_some_and(|editor| {
-                editor.busy || !editor.error.is_empty() || editor.is_dirty(score_available)
+                editor.busy || !editor.error.is_empty() || self.editor_is_dirty(editor)
             })
         {
             self.queued_login = Some((oauth, token));
@@ -2890,10 +3882,16 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stopping {
+            return;
+        }
+        let core_intent = self.core.begin_login_intent();
         if let Some(previous) = self.auth_abort.take() {
-            self.core.cancel_login();
             previous.abort();
         }
+        self.capture_fenced_inputs(cx);
+        self.cancel_reads("restore-session");
+        self.cancel_reads("remote-settlement");
         self.restoring_session = false;
         self.auth_busy = true;
         self.auth_oauth = oauth;
@@ -2902,12 +3900,18 @@ impl Workspace {
         let intent = self.auth_intent;
         let core = self.core.clone();
         let worker = core.clone();
+        let last_account = self.last_account;
+        let token = if oauth {
+            None
+        } else {
+            Some(token.unwrap_or_default())
+        };
         let job = core.spawn(async move {
-            if oauth {
-                worker.login_oauth().await
-            } else {
-                worker.login_with_token(token.unwrap_or_default()).await
-            }
+            let previous_account = worker.saved_account_id().await;
+            let user = worker
+                .login_for_intent(core_intent, token, last_account.or(previous_account))
+                .await?;
+            Ok((previous_account, user))
         });
         self.auth_abort = Some(job.abort_handle());
         cx.emit(WorkspaceEvent::StateChanged);
@@ -2915,16 +3919,25 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.auth_intent != intent {
+                if this.stopping || this.auth_intent != intent {
                     return;
                 }
                 this.auth_abort = None;
                 this.auth_busy = false;
                 this.auth_oauth = false;
+                this.clear_fenced_inputs_if_idle(cx);
                 match result {
-                    Ok(user) => {
+                    Ok((previous_account, user)) => {
+                        let same_account = this.generation == this.core.generation()
+                            && this.profile.as_ref().map(|profile| profile.id) == Some(user.id);
+                        if this.last_account.is_none() && this.profile.is_none() {
+                            this.last_account = previous_account;
+                        }
                         this.token.update(cx, |input, cx| input.set_value("", cx));
                         this.set_profile(Some(user), window, cx);
+                        if same_account {
+                            this.resume_fenced_reads(window.is_visible(), window, cx);
+                        }
                     }
                     Err(error) => {
                         this.auth_error = error;
@@ -2962,33 +3975,46 @@ impl Workspace {
         self.auth_busy = false;
         self.auth_oauth = false;
         self.auth_error.clear();
+        self.clear_fenced_inputs_if_idle(cx);
         self.restore_session(window, cx);
         cx.notify();
     }
 
     fn perform_logout(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.capture_fenced_inputs(cx);
+        self.cancel_reads("restore-session");
+        self.cancel_reads("remote-settlement");
         self.auth_busy = true;
+        self.active_writes += 1;
         self.auth_intent += 1;
         let intent = self.auth_intent;
-        let generation = self.generation;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
             let result = joined(core.spawn(async move { worker.logout().await }).await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if intent != this.auth_intent {
+                this.active_writes -= 1;
+                if this.stopping || intent != this.auth_intent {
+                    this.check_barrier(window, cx);
                     return;
                 }
+                if let Err(error) = &result
+                    && this.barrier.is_some()
+                {
+                    this.global_error =
+                        format!("Could not finish signing out: {error}. Kurisu is still open.");
+                    this.cancel_barrier(window, cx);
+                }
                 this.auth_busy = false;
+                this.clear_fenced_inputs_if_idle(cx);
                 match result {
                     Ok(()) => this.set_profile(None, window, cx),
                     Err(error) => {
                         this.auth_error = error;
-                        if generation == this.generation {
-                            this.restore_session(window, cx);
-                        }
+                        this.restore_session(window, cx);
                     }
                 }
+                this.check_barrier(window, cx);
                 cx.notify();
             });
         })
@@ -2996,11 +4022,13 @@ impl Workspace {
     }
 
     fn perform_install(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.update_busy || self.restart_pending {
+        if self.close_ready || self.update_busy || self.restart_pending {
             return;
         }
+        self.capture_fenced_inputs(cx);
         self.update_busy = true;
         self.update_failed.clear();
+        self.active_writes += 1;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
@@ -3008,15 +4036,35 @@ impl Workspace {
                 core.spawn(async move { worker.install_update().await })
                     .await,
             );
-            let _ = this.update_in(cx, |this, _window, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.active_writes = this.active_writes.saturating_sub(1);
                 this.update_busy = false;
+                this.clear_fenced_inputs_if_idle(cx);
                 match result {
-                    Err(error) => this.update_failed = error,
+                    Err(error) => {
+                        this.update_failed = error;
+                        this.check_barrier(window, cx);
+                        this.resume_fenced_reads(window.is_visible(), window, cx);
+                    }
                     Ok(outcome) if outcome == "restarting" => {
                         this.note_restart_pending();
-                        cx.emit(WorkspaceEvent::UpdateInstallerStarted);
+                        if matches!(
+                            this.barrier,
+                            Some(
+                                BarrierAction::Close(CloseIntent::Quit)
+                                    | BarrierAction::LogoutThenClose(CloseIntent::Quit)
+                            )
+                        ) {
+                            this.check_barrier(window, cx);
+                        } else {
+                            cx.emit(WorkspaceEvent::UpdateInstallerStarted);
+                        }
                     }
-                    Ok(_) => this.note_restart_pending(),
+                    Ok(_) => {
+                        this.note_restart_pending();
+                        this.check_barrier(window, cx);
+                        this.resume_fenced_reads(window.is_visible(), window, cx);
+                    }
                 }
                 cx.notify();
             });

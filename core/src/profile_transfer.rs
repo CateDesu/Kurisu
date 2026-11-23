@@ -694,7 +694,7 @@ fn publish_directory(stage: &Path, destination: &Path) -> Result<()> {
 }
 
 /// Copies a stopped legacy profile. Never opens the source with SQLite.
-/// The caller must stop both programs and keep them stopped until this returns.
+/// Keep the legacy profile stopped and the native profile unopened during the copy.
 pub fn transfer(request: &TransferRequest) -> Result<TransferOutcome> {
     let TransferRequest {
         source_db: source,

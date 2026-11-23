@@ -1,3 +1,4 @@
+// Modified for Kurisu: scope modal actions, retain deferred parents, and track published activation.
 //! Accessibility support, provided by [AccessKit][accesskit].
 //!
 //! There are user-facing guide-level docs [here](crate::_accessibility).
@@ -109,11 +110,15 @@ use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 /// The fixed AccessKit node ID used for the root of every window's a11y tree.
 pub(crate) const ROOT_NODE_ID: NodeId = NodeId(0);
+
+const ACTIVE: u64 = 1;
+const PUBLISHED: u64 = 2;
+const ACTIVATION_FLAGS: u64 = ACTIVE | PUBLISHED;
 
 /// A listener for an accessibility action on a specific node.
 pub(crate) type A11yActionListener =
@@ -128,27 +133,17 @@ pub(crate) struct A11y {
     ///
     /// [forcibly disabled]: crate::Application::new_inaccessible
     force_disabled: bool,
-    /// Whether a11y features have been requested by the system.
+    /// The low bits track whether this activation is active and published.
     ///
     /// Updated by AccessKit using callbacks provided to the adapter. Can change
     /// halfway through a frame.
-    active_flag: Arc<AtomicBool>,
-    /// Whether a11y features are active for *this specific frame*.
-    ///
-    /// At the start of each frame, we load [`Self::active_flag`] (using
-    /// [`Self::sync_active_flag`]) and use this to determine whether we
-    /// should construct a [`TreeUpdate`] for this frame. It's important that
-    /// this value is stable within a frame, because the builder API exposed by
-    /// this type maintains a stack of nodes and each must be pushed and popped
-    /// exactly once.
-    ///
-    /// At the end of the frame, we re-call [`Self::sync_active_flag`] to
-    /// determine whether we should actually send the finished [`TreeUpdate`].
-    active_this_frame: bool,
+    activation: Arc<AtomicU64>,
+    frame_activation: u64,
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    modal_targets: Option<FxHashSet<NodeId>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -165,18 +160,19 @@ pub(crate) struct A11y {
 
 impl A11y {
     pub(crate) fn new(
-        active_flag: Arc<AtomicBool>,
+        activation: Arc<AtomicU64>,
         force_disabled: bool,
         window_title: Option<SharedString>,
     ) -> Self {
         Self {
             force_disabled,
-            active_flag,
-            active_this_frame: false,
+            activation,
+            frame_activation: 0,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
+            modal_targets: None,
             window_title,
             last_focus_without_node: None,
             debug: debug::A11yDebug::default(),
@@ -205,12 +201,37 @@ impl A11y {
         self.window_title = Some(title.into());
     }
 
-    /// Ensures that [`Self::is_active`] returns up to date information.
-    ///
-    /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
-    /// for more commentary.
-    pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = self.is_enabled() && self.active_flag.load(Ordering::SeqCst);
+    pub(crate) fn record_activation(activation: &AtomicU64, active: bool) {
+        let _ = activation.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            let generation = (current & !ACTIVATION_FLAGS).wrapping_add(ACTIVATION_FLAGS + 1);
+            Some(generation | u64::from(active))
+        });
+    }
+
+    pub(crate) fn published_activation(activation: &AtomicU64) -> Option<u64> {
+        let current = activation.load(Ordering::SeqCst);
+        (current & ACTIVATION_FLAGS == ACTIVATION_FLAGS).then_some(current)
+    }
+
+    pub(crate) fn sync_activation(&mut self) {
+        self.frame_activation = self.activation.load(Ordering::SeqCst) & !PUBLISHED;
+    }
+
+    pub(crate) fn frame_activation_is_current(&self) -> bool {
+        self.frame_activation == self.activation.load(Ordering::SeqCst) & !PUBLISHED
+    }
+
+    pub(crate) fn mark_published(&self) {
+        let _ = self.activation.compare_exchange(
+            self.frame_activation,
+            self.frame_activation | PUBLISHED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(crate) fn is_current_publication(&self, activation: u64) -> bool {
+        Self::published_activation(&self.activation) == Some(activation)
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -218,7 +239,7 @@ impl A11y {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.active_this_frame
+        self.is_enabled() && self.frame_activation & ACTIVE != 0
     }
 
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
@@ -281,7 +302,8 @@ impl A11y {
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
-        let update = self.nodes.finalize();
+        let mut update = self.nodes.finalize();
+        self.modal_targets = scope_to_modal(&mut update);
         self.debug.capture(
             &update,
             self.nodes.focus,
@@ -294,9 +316,45 @@ impl A11y {
         update
     }
 
+    pub(crate) fn allows_action_target(&self, id: NodeId) -> bool {
+        self.is_active()
+            && self
+                .modal_targets
+                .as_ref()
+                .is_none_or(|targets| targets.contains(&id))
+    }
+
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
     }
+}
+
+fn scope_to_modal(update: &mut TreeUpdate) -> Option<FxHashSet<NodeId>> {
+    let modal = update
+        .nodes
+        .iter()
+        .rfind(|(_, node)| node.is_modal())
+        .map(|(id, _)| *id)?;
+    let mut targets = FxHashSet::default();
+    targets.insert(modal);
+    // The builder emits parents after their children.
+    for (id, node) in update.nodes.iter().rev() {
+        if targets.contains(id) {
+            targets.extend(node.children().iter().copied());
+        }
+    }
+    let mut branch = modal;
+    for (id, node) in &mut update.nodes {
+        if node.children().contains(&branch) {
+            branch = *id;
+        } else if *id != ROOT_NODE_ID && !targets.contains(id) {
+            node.set_hidden();
+        }
+    }
+    if !targets.contains(&update.focus) {
+        update.focus = modal;
+    }
+    Some(targets)
 }
 
 /// Builder API for synthetic children. See the docs for
@@ -454,6 +512,33 @@ impl A11yNodeBuilder {
         }
         self.all_nodes.push((id, node));
         true
+    }
+
+    pub(crate) fn current_parent(&self) -> Option<NodeId> {
+        self.ids_stack.last().copied()
+    }
+
+    pub(crate) fn begin_deferred_parent(&mut self, id: NodeId) -> Option<(usize, usize)> {
+        debug_assert_eq!(self.ids_stack.as_slice(), &[ROOT_NODE_ID]);
+        let index = self
+            .all_nodes
+            .iter()
+            .rposition(|(node_id, _)| *node_id == id)?;
+        self.ids_stack.push(id);
+        self.nodes_stack
+            .push(accesskit::Node::new(accesskit::Role::Unknown));
+        Some((index, self.all_nodes.len()))
+    }
+
+    pub(crate) fn end_deferred_parent(&mut self, (index, start): (usize, usize)) {
+        self.ids_stack.pop();
+        let children = self.nodes_stack.pop().unwrap();
+        for &child in children.children() {
+            self.all_nodes[index].1.push_child(child);
+        }
+        // Keep children before their parents for modal scoping.
+        let added = self.all_nodes.len() - start;
+        self.all_nodes[index..].rotate_right(added);
     }
 
     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
@@ -640,7 +725,7 @@ mod tests {
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
     use crate::FocusId;
     use accesskit::{NodeId, Role};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{Arc, atomic::AtomicU64};
 
     fn test_node() -> accesskit::Node {
         accesskit::Node::new(Role::GenericContainer)
@@ -653,7 +738,7 @@ mod tests {
     }
 
     fn new_a11y() -> A11y {
-        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
+        let mut a11y = A11y::new(Arc::new(AtomicU64::new(1)), false, None);
         a11y.begin_frame();
         a11y
     }
@@ -662,8 +747,12 @@ mod tests {
     fn accessibility_enabled_is_independent_of_activation() {
         for force_disabled in [false, true] {
             for active in [false, true] {
-                let mut a11y = A11y::new(Arc::new(AtomicBool::new(active)), force_disabled, None);
-                a11y.sync_active_flag();
+                let mut a11y = A11y::new(
+                    Arc::new(AtomicU64::new(u64::from(active))),
+                    force_disabled,
+                    None,
+                );
+                a11y.sync_activation();
 
                 assert_eq!(a11y.is_enabled(), !force_disabled);
                 assert_eq!(a11y.is_active(), !force_disabled && active);

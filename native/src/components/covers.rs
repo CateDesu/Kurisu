@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Cursor, Read},
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -61,6 +61,8 @@ pub struct CoverCache {
     workers: usize,
     send: mpsc::SyncSender<Work>,
     recv: mpsc::Receiver<Complete>,
+    unstarted: Option<(mpsc::Receiver<Work>, mpsc::SyncSender<Complete>)>,
+    remote_client: Arc<OnceLock<Option<Client>>>,
     completed: Arc<Notify>,
     wanted: VecDeque<CoverTicket>,
     active: HashSet<CoverTicket>,
@@ -80,18 +82,47 @@ impl CoverCache {
         let workers = workers.clamp(1, 4);
         let (send, work_recv) = mpsc::sync_channel::<Work>(workers * 2);
         let (complete_send, recv) = mpsc::sync_channel::<Complete>(workers * 2);
-        let completed = Arc::new(Notify::new());
+        Self {
+            max_bytes: max_bytes.max(1),
+            max_entries: (max_bytes / 8192).clamp(128, 4096),
+            workers,
+            send,
+            recv,
+            unstarted: Some((work_recv, complete_send)),
+            remote_client: Arc::new(OnceLock::new()),
+            completed: Arc::new(Notify::new()),
+            wanted: VecDeque::new(),
+            active: HashSet::new(),
+            visible: HashSet::new(),
+            running: HashSet::new(),
+            entries: HashMap::new(),
+            disposed: Vec::new(),
+            total_bytes: 0,
+            clock: 0,
+            revision: 0,
+            #[cfg(test)]
+            ownership_updates: 0,
+        }
+    }
+
+    fn start_workers(&mut self) {
+        let Some((work_recv, complete_send)) = self.unstarted.take() else {
+            return;
+        };
         let work_recv = Arc::new(Mutex::new(work_recv));
-        for _ in 0..workers {
+        for _ in 0..self.workers {
             let work_recv = work_recv.clone();
             let complete_send = complete_send.clone();
-            let completed = completed.clone();
+            let completed = self.completed.clone();
+            let remote_client = self.remote_client.clone();
             thread::spawn(move || {
-                let client = remote_client();
                 loop {
-                    let work = { work_recv.lock().unwrap().recv() };
+                    let work = {
+                        let Ok(guard) = work_recv.lock() else { break };
+                        guard.recv()
+                    };
                     let Ok(work) = work else { break };
-                    let (image, bytes) = load_thumbnail(&work.ticket, client.as_ref());
+                    let (image, bytes) = load_thumbnail(&work.ticket, &remote_client);
                     if complete_send
                         .send(Complete {
                             ticket: work.ticket,
@@ -105,25 +136,6 @@ impl CoverCache {
                     completed.notify_one();
                 }
             });
-        }
-        Self {
-            max_bytes: max_bytes.max(1),
-            max_entries: (max_bytes / 8192).clamp(128, 4096),
-            workers,
-            send,
-            recv,
-            completed,
-            wanted: VecDeque::new(),
-            active: HashSet::new(),
-            visible: HashSet::new(),
-            running: HashSet::new(),
-            entries: HashMap::new(),
-            disposed: Vec::new(),
-            total_bytes: 0,
-            clock: 0,
-            revision: 0,
-            #[cfg(test)]
-            ownership_updates: 0,
         }
     }
 
@@ -268,6 +280,7 @@ impl CoverCache {
             if self.entries.contains_key(&ticket) || self.running.contains(&ticket) {
                 continue;
             }
+            self.start_workers();
             match self.send.try_send(Work {
                 ticket: ticket.clone(),
             }) {
@@ -346,7 +359,7 @@ fn remote_client() -> Option<Client> {
 
 fn load_thumbnail(
     ticket: &CoverTicket,
-    client: Option<&Client>,
+    client: &OnceLock<Option<Client>>,
 ) -> (Option<Arc<RenderImage>>, usize) {
     let bytes = match &ticket.source {
         CoverSource::Local(path) => {
@@ -370,7 +383,7 @@ fn load_thumbnail(
             if !permitted_url(&url) {
                 return (None, 0);
             }
-            let Some(client) = client else {
+            let Some(client) = client.get_or_init(remote_client).as_ref() else {
                 return (None, 0);
             };
             let Ok(response) = client
@@ -484,6 +497,7 @@ mod tests {
         let (send, work) = mpsc::sync_channel(workers * 2);
         let (complete, recv) = mpsc::sync_channel(workers * 2);
         let mut cache = CoverCache::new(max_bytes, workers);
+        cache.unstarted = None;
         cache.send = send;
         cache.recv = recv;
         (cache, work, complete)
@@ -877,5 +891,155 @@ mod tests {
         assert!(cache.running.contains(&active) || cache.wanted.contains(&active));
         assert!(cache.entries.contains_key(&inactive));
         assert!(!cache.active.contains(&inactive));
+    }
+
+    #[test]
+    fn workers_and_remote_client_stay_lazy_until_needed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cache = CoverCache::new(8, 2);
+        assert!(cache.unstarted.is_some());
+        assert!(cache.remote_client.get().is_none());
+
+        let completed = cache.completion_signal();
+        let local = cache.request(CoverSource::Local("missing-local".into()), 1, 1, 1., true);
+        let rejected = request(&mut cache, "http://example.invalid/cover.png", true);
+        cache.retain_visible(&[local, rejected]);
+        assert!(cache.unstarted.is_none());
+        let mut ready_count = 0;
+        while ready_count < 2 {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), completed.notified())
+                    .await
+                    .unwrap();
+            });
+            ready_count += cache.poll().len();
+        }
+        assert!(cache.remote_client.get().is_none());
+    }
+
+    #[test]
+    fn test_app_context_drop_releases_retained_visual_context_and_view() {
+        use gpui::{Context, IntoElement, Render, TestAppContext, Window, div};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        {
+            let mut cx = TestAppContext::single();
+            let (_view, vcx) = cx.add_window_view(|_, _| Probe(dropped.clone()));
+            vcx.run_until_parked();
+        }
+        assert!(dropped.load(Ordering::Acquire));
+
+        let panic_dropped = Arc::new(AtomicBool::new(false));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cx = TestAppContext::single();
+            let (_view, vcx) = cx.add_window_view(|_, _| Probe(panic_dropped.clone()));
+            vcx.run_until_parked();
+            panic!("simulated test failure");
+        }));
+        assert!(unwound.is_err());
+        assert!(panic_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_app_context_quit_finishes_callbacks_before_shutdown_on_reentry() {
+        use gpui::{
+            AnyWindowHandle, AppContext, Context, IntoElement, Render, TestAppContext,
+            VisualTestContext, Window, WindowOptions, div,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        let shutdown_ran = Arc::new(AtomicBool::new(false));
+        let second_before_shutdown = Arc::new(AtomicBool::new(false));
+        {
+            let mut cx = TestAppContext::single();
+            let shutdown_flag = shutdown_ran.clone();
+            cx.update(|app| {
+                app.on_app_quit(move |_| {
+                    shutdown_flag.store(true, Ordering::Release);
+                    async {}
+                })
+                .detach();
+            });
+            let nested = cx.clone();
+            cx.on_quit(move || nested.quit());
+            let shutdown_check = shutdown_ran.clone();
+            let second_flag = second_before_shutdown.clone();
+            cx.on_quit(move || {
+                assert!(
+                    !shutdown_check.load(Ordering::Acquire),
+                    "app shut down before remaining on_quit callbacks ran"
+                );
+                second_flag.store(true, Ordering::Release);
+            });
+            cx.quit();
+        }
+        assert!(second_before_shutdown.load(Ordering::Acquire));
+        assert!(shutdown_ran.load(Ordering::Acquire));
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let visual_shutdown_ran = Arc::new(AtomicBool::new(false));
+        let after_visual_drop = Arc::new(AtomicBool::new(false));
+        {
+            let cx = TestAppContext::single();
+            let shutdown_flag = visual_shutdown_ran.clone();
+            let dropped_flag = dropped.clone();
+            let window: AnyWindowHandle = cx
+                .update(|app| {
+                    app.on_app_quit(move |_| {
+                        shutdown_flag.store(true, Ordering::Release);
+                        async {}
+                    })
+                    .detach();
+                    app.open_window(WindowOptions::default(), |_, app| {
+                        app.new(|_| Probe(dropped_flag))
+                    })
+                    .unwrap()
+                })
+                .into();
+            let vcx = VisualTestContext::from_window(window, &cx);
+            drop(cx);
+            let vcx = vcx.into_mut();
+            let shutdown_check = visual_shutdown_ran.clone();
+            let after_flag = after_visual_drop.clone();
+            vcx.on_quit(move || {
+                assert!(
+                    !shutdown_check.load(Ordering::Acquire),
+                    "app shut down during visual context drop before remaining on_quit callbacks ran"
+                );
+                after_flag.store(true, Ordering::Release);
+            });
+            vcx.quit();
+        }
+        assert!(after_visual_drop.load(Ordering::Acquire));
+        assert!(visual_shutdown_ran.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
     }
 }

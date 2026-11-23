@@ -10,7 +10,7 @@ use serde_json::Value;
 const REPO: &str = "CateDesu/Kurisu";
 const USER_AGENT: &str = "Kurisu";
 
-/// Keep the failure marker until acknowledged.
+/// Taking the saved failure notice attempts to remove this marker.
 pub const FAILED_MARKER: &str = ".kurisu-update-failed";
 
 pub const FAILED_MESSAGE: &str = "The last update failed to install cleanly, so the previous version was kept. Nothing was lost — you can retry the update from Settings.";
@@ -629,7 +629,7 @@ pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std
 
 #[cfg(target_os = "linux")]
 pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if UPDATE_APPLIED.load(Ordering::SeqCst) {
         return Err("an update was already installed; restart Kurisu to finish it".to_string());
     }
@@ -647,6 +647,13 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     let dir = exe.parent().ok_or("cannot locate install dir")?;
     let _installation = lock_install_dir(dir)
         .map_err(|error| format!("could not lock the installation: {error}"))?;
+    // Another profile can update this installation while this process is running.
+    let (running, installed) = std::fs::metadata("/proc/self/exe")
+        .and_then(|running| std::fs::metadata(&exe).map(|installed| (running, installed)))
+        .map_err(|error| format!("could not identify the installed executable: {error}"))?;
+    if (running.dev(), running.ino()) != (installed.dev(), installed.ino()) {
+        return Err("the installed executable has changed; restart Kurisu before updating".into());
+    }
     let name = exe
         .file_name()
         .and_then(|n| n.to_str())
@@ -1039,6 +1046,22 @@ mod tests {
             .to_string_lossy()
             .starts_with(".kurisu-new-")));
         std::fs::remove_dir(&backup).unwrap();
+
+        let other_update = dir.join("other-update");
+        std::fs::write(&other_update, b"already installed by the other profile").unwrap();
+        std::fs::hard_link(&exe, &backup).unwrap();
+        std::fs::rename(other_update, &exe).unwrap();
+        let installed = std::fs::metadata(&exe).unwrap();
+        let error = apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).unwrap_err();
+        assert!(error.contains("restart Kurisu"), "{error}");
+        assert_eq!(std::fs::metadata(&exe).unwrap().ino(), installed.ino());
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"already installed by the other profile"
+        );
+        assert_eq!(std::fs::metadata(&backup).unwrap().ino(), original.ino());
+        assert!(!update_applied());
+        std::fs::rename(&backup, &exe).unwrap();
 
         apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), replacement);

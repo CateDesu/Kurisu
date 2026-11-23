@@ -147,20 +147,20 @@ pub(super) struct TorrentsState {
     results: Vec<TorrentItem>,
     rows: Arc<Vec<TorrentDisplayRow>>,
     widget: Option<ListState>,
-    search_input: Option<Entity<TextInput>>,
+    pub(super) search_input: Option<Entity<TextInput>>,
     feed_input: Option<Entity<TextInput>>,
     show_inputs: HashMap<&'static str, Entity<TextInput>>,
     show_filters: HashMap<&'static str, String>,
     subscriptions: Vec<Subscription>,
     loaded: bool,
-    loading: bool,
+    pub(super) loading: bool,
     refreshed: Option<Instant>,
     entries_loaded: bool,
-    entries_loading: bool,
-    entries_reload_pending: bool,
+    pub(super) entries_loading: bool,
+    pub(super) entries_reload_pending: bool,
     feeds_loaded: bool,
-    feeds_loading: bool,
-    searching: bool,
+    pub(super) feeds_loading: bool,
+    pub(super) searching: bool,
     searched: bool,
     adding_feed: bool,
     removing_feed: Option<String>,
@@ -185,7 +185,7 @@ pub(super) struct TorrentsState {
     request: u64,
     entries_request: u64,
     feeds_request: u64,
-    search_request: u64,
+    pub(super) search_request: u64,
     prefs_request: u64,
     choice_request: u64,
 }
@@ -256,6 +256,15 @@ impl Drop for TorrentsState {
 }
 
 impl TorrentsState {
+    pub(super) fn abort_choices(&mut self) {
+        for choice in self.choices.values_mut() {
+            if let Some(abort) = choice.abort.take() {
+                abort.abort();
+            }
+            choice.loading = false;
+        }
+    }
+
     pub(super) fn reset_account(&mut self) {
         let mut next = Self::default();
         std::mem::swap(&mut next.new_only, &mut self.new_only);
@@ -297,8 +306,18 @@ impl Workspace {
                 let input = cx.new(|cx| TextInput::new("", "Filter shows…", window, cx));
                 self.torrents.subscriptions.push(cx.subscribe(
                     &input,
-                    move |this, _, event, cx| {
+                    move |this, input, event, cx| {
                         if let TextInputEvent::Changed(value) = event {
+                            if this.writes_fenced() {
+                                let current = this
+                                    .torrents
+                                    .show_filters
+                                    .get(status)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                input.update(cx, |input, cx| input.set_value(current, cx));
+                                return;
+                            }
                             this.torrents.show_filters.insert(status, value.clone());
                             this.rebuild_torrent_rows();
                             cx.notify();
@@ -320,15 +339,16 @@ impl Workspace {
         if !self.torrents.prefs_loaded {
             self.load_torrent_preferences(window, cx);
         }
-        if !self.torrents.entries_loaded && !self.torrents.entries_loading {
+        if (!self.torrents.entries_loaded || self.torrents.entries_reload_pending)
+            && !self.torrents.entries_loading
+        {
             self.load_torrent_entries(window, cx);
         }
         if !self.torrents.feeds_loaded && !self.torrents.feeds_loading {
             self.load_torrent_feeds(window, cx);
         }
-        if !self.torrents.loaded && !self.torrents.loading {
-            self.refresh_torrent_feed(false, window, cx);
-        }
+        self.ensure_torrent_feed_loaded(window, cx);
+        self.reload_expanded_torrent_choices(window, cx);
         self.refresh_torrents_covers();
     }
 
@@ -362,6 +382,9 @@ impl Workspace {
     }
 
     fn load_torrent_preferences(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         let new_revision = self.preference_revision("kurisu.torrents.new");
         let statuses_revision = self.preference_revision("kurisu.torrents.statuses");
         let filters_revision = self.preference_revision("kurisu.torrents.filters");
@@ -437,16 +460,30 @@ impl Workspace {
     }
 
     fn torrent_scope_matches(&self, generation: u64, account: Option<i64>) -> bool {
-        self.generation == generation && self.profile.as_ref().map(|user| user.id) == account
+        !self.stopping
+            && self.generation == generation
+            && self.profile.as_ref().map(|user| user.id) == account
     }
 
     pub(super) fn load_torrent_entries(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping {
+            return;
+        }
+        if self.writes_fenced() {
+            self.torrents.entries_reload_pending = true;
+            if self.close_ready {
+                self.list_refresh_deferred = true;
+            }
+            return;
+        }
         if self.torrents.entries_loading {
             self.torrents.entries_reload_pending = true;
             return;
         }
+        self.torrents.entries_reload_pending = false;
         self.torrents.entries_loading = true;
         self.torrents.entries_error.clear();
+        cx.notify();
         self.torrents.entries_request = self.torrents.entries_request.wrapping_add(1);
         let request = self.torrents.entries_request;
         let generation = self.generation;
@@ -458,7 +495,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, window, cx| {
-                if !this.torrent_scope_matches(generation, account)
+                if this.stopping
+                    || !this.torrent_scope_matches(generation, account)
                     || this.torrents.entries_request != request
                 {
                     return;
@@ -469,16 +507,19 @@ impl Workspace {
                         this.torrents.entries = entries;
                         this.torrents.entries_loaded = true;
                         this.rebuild_torrent_rows();
-                        let open: Vec<_> = this.torrents.expanded_shows.iter().copied().collect();
-                        for id in open {
-                            this.load_show_choices(id, false, window, cx);
-                        }
+                        this.reload_expanded_torrent_choices(window, cx);
                     }
                     Err(error) => this.torrents.entries_error = error,
                 }
                 if this.torrents.entries_reload_pending {
-                    this.torrents.entries_reload_pending = false;
-                    this.load_torrent_entries(window, cx);
+                    if this.writes_fenced() {
+                        if this.close_ready {
+                            this.list_refresh_deferred = true;
+                        }
+                    } else {
+                        this.torrents.entries_reload_pending = false;
+                        this.load_torrent_entries(window, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -487,11 +528,12 @@ impl Workspace {
     }
 
     fn load_torrent_feeds(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.torrents.feeds_loading {
+        if self.stopping || self.writes_fenced() || self.torrents.feeds_loading {
             return;
         }
         self.torrents.feeds_loading = true;
         self.torrents.feeds_error.clear();
+        cx.notify();
         self.torrents.feeds_request = self.torrents.feeds_request.wrapping_add(1);
         let request = self.torrents.feeds_request;
         let generation = self.generation;
@@ -522,12 +564,19 @@ impl Workspace {
         .detach();
     }
 
+    pub(super) fn ensure_torrent_feed_loaded(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.torrents.loaded {
+            self.refresh_torrent_feed(false, window, cx);
+        }
+    }
+
     fn refresh_torrent_feed(&mut self, flash: bool, window: &Window, cx: &mut Context<Self>) {
-        if self.torrents.loading {
+        if self.stopping || self.writes_fenced() || self.torrents.loading {
             return;
         }
         self.torrents.loading = true;
         self.torrents.error.clear();
+        cx.notify();
         self.torrents.request = self.torrents.request.wrapping_add(1);
         let request = self.torrents.request;
         let generation = self.generation;
@@ -570,10 +619,7 @@ impl Workspace {
                             this.torrents.refreshed = Some(Instant::now());
                         }
                         this.rebuild_torrent_rows();
-                        let open: Vec<_> = this.torrents.expanded_shows.iter().copied().collect();
-                        for id in open {
-                            this.load_show_choices(id, false, window, cx);
-                        }
+                        this.reload_expanded_torrent_choices(window, cx);
                     }
                     Err(error) => this.torrents.error = error,
                 }
@@ -808,7 +854,12 @@ impl Workspace {
             .chars()
             .take(200)
             .collect::<String>();
-        if query.is_empty() || self.profile.is_none() || self.torrents.searching {
+        if self.stopping
+            || self.writes_fenced()
+            || query.is_empty()
+            || self.profile.is_none()
+            || self.torrents.searching
+        {
             return;
         }
         self.torrents.submitted_query = query.clone();
@@ -866,6 +917,9 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.edits_fenced() {
+            return;
+        }
         if let Some(category) = category {
             self.torrents.category = category;
         }
@@ -889,11 +943,22 @@ impl Workspace {
             }
         }
         self.torrents.choices.clear();
-        let open: Vec<_> = self.torrents.expanded_shows.iter().copied().collect();
-        for id in open {
+        self.reload_expanded_torrent_choices(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn reload_expanded_torrent_choices(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
+        let expanded: Vec<_> = self.torrents.expanded_shows.iter().copied().collect();
+        for id in expanded {
             self.load_show_choices(id, false, window, cx);
         }
-        cx.notify();
     }
 
     fn load_show_choices(
@@ -903,6 +968,9 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         let Some(entry) = self
             .torrents
             .entries
@@ -954,6 +1022,7 @@ impl Workspace {
         });
         state.abort = Some(job.abort_handle());
         self.rebuild_torrent_rows();
+        cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _, cx| {
@@ -1141,8 +1210,27 @@ fn append_choice_rows(
 }
 
 impl Workspace {
+    fn accept_written_torrent_feeds(&mut self, feeds: Vec<String>) {
+        self.torrents.feeds_request = self.torrents.feeds_request.wrapping_add(1);
+        self.torrents.feeds_loading = false;
+        self.cancel_reads("torrents-feeds");
+        self.torrents.feeds = feeds;
+        self.torrents.feeds_loaded = true;
+        self.torrents.feeds_error.clear();
+    }
+
+    fn restart_torrent_feed(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.torrents.loaded = false;
+        if self.torrents.loading {
+            self.torrents.request = self.torrents.request.wrapping_add(1);
+            self.cancel_reads("torrents-feed-items");
+            self.torrents.loading = false;
+        }
+        self.refresh_torrent_feed(false, window, cx);
+    }
+
     fn add_torrent_feed(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.torrents.adding_feed || self.profile.is_none() {
+        if self.torrent_feed_controls_disabled() {
             return;
         }
         let Some(input) = &self.torrents.feed_input else {
@@ -1166,21 +1254,24 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
+                let mut refreshed = false;
                 if this.torrent_scope_matches(generation, account) {
                     this.torrents.adding_feed = false;
                     match result {
                         Ok(feeds) => {
-                            this.torrents.feeds = feeds;
-                            this.torrents.feeds_loaded = true;
+                            this.accept_written_torrent_feeds(feeds);
                             if let Some(input) = &this.torrents.feed_input {
                                 input.update(cx, |input, cx| input.set_value("", cx));
                             }
-                            this.refresh_torrent_feed(false, window, cx);
+                            refreshed = true;
                         }
                         Err(error) => this.torrents.error = error,
                     }
                 }
                 this.check_barrier(window, cx);
+                if refreshed {
+                    this.restart_torrent_feed(window, cx);
+                }
                 cx.notify();
             });
         })
@@ -1188,8 +1279,46 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(super) fn torrent_remove_open(&self) -> bool {
+        self.route == Route::Torrents && self.torrents.removing_feed.is_some()
+    }
+
+    fn torrent_feed_controls_disabled(&self) -> bool {
+        self.edits_fenced()
+            || self.modal_open()
+            || self.profile.is_none()
+            || self.torrents.adding_feed
+            || self.torrents.removing
+    }
+
+    fn ask_remove_torrent_feed(&mut self, target: &str, window: &Window, cx: &mut Context<Self>) {
+        if self.torrent_feed_controls_disabled()
+            || self.route != Route::Torrents
+            || !self.torrents.feeds.iter().any(|feed| feed == target)
+        {
+            return;
+        }
+        self.torrents.removing_feed = Some(target.into());
+        cx.notify();
+        cx.defer_in(window, |this, window, cx| {
+            if this.active_modal() == Some(super::ModalLayer::TorrentRemove)
+                && !this.modal_focus.contains(window, cx)
+            {
+                this.modal_focus.hold(window, cx);
+            }
+        });
+    }
+
+    fn can_remove_torrent_feed(&self) -> bool {
+        !self.edits_fenced()
+            && self.profile.is_some()
+            && self.active_modal() == Some(super::ModalLayer::TorrentRemove)
+            && !self.torrents.adding_feed
+            && !self.torrents.removing
+    }
+
     fn remove_torrent_feed(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.torrents.removing {
+        if !self.can_remove_torrent_feed() {
             return;
         }
         let Some(url) = self.torrents.removing_feed.clone() else {
@@ -1209,19 +1338,22 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
+                let mut refreshed = false;
                 if this.torrent_scope_matches(generation, account) {
                     this.torrents.removing = false;
                     this.torrents.removing_feed = None;
                     match result {
                         Ok(feeds) => {
-                            this.torrents.feeds = feeds;
-                            this.torrents.feeds_loaded = true;
-                            this.refresh_torrent_feed(false, window, cx);
+                            this.accept_written_torrent_feeds(feeds);
+                            refreshed = true;
                         }
                         Err(error) => this.torrents.error = error,
                     }
                 }
                 this.check_barrier(window, cx);
+                if refreshed {
+                    this.restart_torrent_feed(window, cx);
+                }
                 cx.notify();
             });
         })
@@ -1236,16 +1368,37 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stopping || self.edits_fenced() || self.modal_open() {
+            return;
+        }
+        let counted = item.is_some();
+        if counted {
+            self.active_writes += 1;
+        }
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
+        #[cfg(test)]
+        let controlled = self.torrent_open_result.take();
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(
-                core.spawn(async move { NativePlatform.open_url(&url) })
-                    .await,
+                core.spawn(async move {
+                    #[cfg(test)]
+                    if let Some(controlled) = controlled {
+                        return controlled.await.map_err(|error| error.to_string())?;
+                    }
+                    tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
+                        .await
+                        .map_err(|error| error.to_string())?
+                })
+                .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
+                if counted {
+                    this.active_writes = this.active_writes.saturating_sub(1);
+                }
                 if !this.torrent_scope_matches(generation, account) {
+                    this.check_barrier(window, cx);
                     return;
                 }
                 match result {
@@ -1256,6 +1409,7 @@ impl Workspace {
                     }
                     Err(error) => this.torrents.error = format!("Could not open link: {error}"),
                 }
+                this.check_barrier(window, cx);
                 cx.notify();
             });
         })
@@ -1337,7 +1491,7 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.torrents.prefs_loaded {
+        if self.edits_fenced() || !self.torrents.prefs_loaded {
             return;
         }
         if !self.torrents.expanded_statuses.insert(status) {
@@ -1372,6 +1526,9 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let feed_controls_disabled = self.torrent_feed_controls_disabled();
+        let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
         if self.modal_open() {
             self.torrents.category_menu = false;
             self.torrents.release_menu = false;
@@ -1396,15 +1553,11 @@ impl Workspace {
             .p(px(28.))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape"
-                    && (this.torrents.category_menu
-                        || this.torrents.release_menu
-                        || this.torrents.removing_feed.is_some())
+                    && !this.modal_open()
+                    && (this.torrents.category_menu || this.torrents.release_menu)
                 {
                     this.torrents.category_menu = false;
                     this.torrents.release_menu = false;
-                    if !this.torrents.removing {
-                        this.torrents.removing_feed = None;
-                    }
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1461,10 +1614,6 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .id("torrent-feeds-heading")
-                            .role(Role::Heading)
-                            .aria_level(2)
-                            .aria_label("Feeds")
                             .flex()
                             .gap(px(6.))
                             .child(
@@ -1507,27 +1656,35 @@ impl Workspace {
                             .mb(px(8.))
                             .child(
                                 div()
-                                    .id("torrent-feed-toggle")
-                                    .role(Role::Button)
+                                    .id("torrent-feeds-heading")
+                                    .role(Role::Heading)
+                                    .aria_level(2)
                                     .aria_label("Feeds")
-                                    .aria_expanded(state.show_feeds)
-                                    .tab_stop(true)
-                                    .focusable()
-                                    .focus_visible(|style| {
-                                        style.border_1().border_color(rgb(ACCENT))
-                                    })
-                                    .cursor_pointer()
-                                    .font(serif_font())
-                                    .text_size(px(20.))
-                                    .child(if state.show_feeds {
-                                        "⌄ Feeds"
-                                    } else {
-                                        "› Feeds"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.torrents.show_feeds = !this.torrents.show_feeds;
-                                        cx.notify();
-                                    })),
+                                    .child(
+                                        div()
+                                            .id("torrent-feed-toggle")
+                                            .role(Role::Button)
+                                            .aria_label("Feeds")
+                                            .aria_expanded(state.show_feeds)
+                                            .tab_stop(true)
+                                            .focusable()
+                                            .focus_visible(|style| {
+                                                style.border_1().border_color(rgb(ACCENT))
+                                            })
+                                            .cursor_pointer()
+                                            .font(serif_font())
+                                            .text_size(px(20.))
+                                            .child(if state.show_feeds {
+                                                "⌄ Feeds"
+                                            } else {
+                                                "› Feeds"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.torrents.show_feeds =
+                                                    !this.torrents.show_feeds;
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
                             .child(div().flex_1().h(px(1.)).bg(rgb(EDGE))),
                     )
@@ -1553,7 +1710,7 @@ impl Workspace {
                                     } else {
                                         "+ Add feed"
                                     },
-                                    state.adding_feed,
+                                    feed_controls_disabled,
                                 )
                                 .on_click(cx.listener(
                                     |this, _, window, cx| this.add_torrent_feed(window, cx),
@@ -1612,12 +1769,19 @@ impl Workspace {
                         .bg(rgb(PANEL))
                         .child(div().flex_1().min_w_0().truncate().child(url.clone()))
                         .child(
-                            button(format!("torrent-remove-feed-{index}"), "Remove", false)
-                                .aria_label(format!("Remove feed {url}"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.torrents.removing_feed = Some(target.clone());
-                                    cx.notify();
-                                })),
+                            button(
+                                format!("torrent-remove-feed-{index}"),
+                                "Remove",
+                                feed_controls_disabled,
+                            )
+                            .aria_label(format!("Remove feed {url}"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    if this.torrent_scope_matches(generation, account) {
+                                        this.ask_remove_torrent_feed(&target, window, cx);
+                                    }
+                                },
+                            )),
                         ),
                 );
             }
@@ -1789,7 +1953,7 @@ impl Workspace {
                     )
                     .child("New feed releases only")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if !this.torrents.prefs_loaded {
+                        if this.edits_fenced() || !this.torrents.prefs_loaded {
                             return;
                         }
                         this.torrents.new_only = !this.torrents.new_only;
@@ -1869,11 +2033,15 @@ impl Workspace {
             ));
         }
         page = page.child(tips);
-        for error in [&state.error, &state.entries_error, &state.feeds_error] {
+        for (id, error) in [
+            ("torrent-error-feed", &state.error),
+            ("torrent-error-entries", &state.entries_error),
+            ("torrent-error-feeds", &state.feeds_error),
+        ] {
             if !error.is_empty() {
                 page = page.child(
                     div()
-                        .id("torrent-error")
+                        .id(id)
                         .role(Role::Alert)
                         .mb(px(8.))
                         .p(px(8.))
@@ -1981,48 +2149,72 @@ impl Workspace {
                     )),
             );
         }
-        if let Some(url) = &state.removing_feed {
-            page = page.child(
-                div()
-                    .id("torrent-remove-confirm")
-                    .role(Role::Dialog)
-                    .aria_label("Remove feed?")
-                    .p(px(16.))
-                    .border_1()
-                    .border_color(rgb(EDGE))
-                    .bg(rgb(PANEL_2))
-                    .child(format!("Remove feed? {url}"))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .child(
-                                button(
-                                    "torrent-remove-confirm-yes",
-                                    if state.removing {
-                                        "Removing…"
-                                    } else {
-                                        "Remove"
-                                    },
-                                    state.removing,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.remove_torrent_feed(window, cx),
-                                )),
-                            )
-                            .child(
-                                button("torrent-remove-confirm-no", "Cancel", state.removing)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if !this.torrents.removing {
-                                            this.torrents.removing_feed = None;
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
-                    ),
-            );
-        }
         page.into_any()
+    }
+
+    pub(super) fn dismiss_torrent_remove(&mut self, cx: &mut Context<Self>) {
+        if self.active_modal() == Some(super::ModalLayer::TorrentRemove) && !self.torrents.removing
+        {
+            self.torrents.removing_feed = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn render_torrent_remove(&self, cx: &mut Context<Self>) -> AnyElement {
+        let url = self.torrents.removing_feed.as_deref().unwrap_or_default();
+        let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
+        crate::components::dialog("torrent-remove-confirm", "Remove feed?")
+            .w(px(440.))
+            .max_w_full()
+            .max_h_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(crate::components::heading("Remove feed?"))
+            .child(
+                div()
+                    .id("torrent-remove-url")
+                    .min_w_0()
+                    .min_h_0()
+                    .max_h(px(180.))
+                    .overflow_y_scroll()
+                    .whitespace_normal()
+                    .child(url.to_owned()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .gap(px(8.))
+                    .child(
+                        button(
+                            "torrent-remove-confirm-yes",
+                            if self.torrents.removing {
+                                "Removing…"
+                            } else {
+                                "Remove"
+                            },
+                            !self.can_remove_torrent_feed(),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if this.torrent_scope_matches(generation, account) {
+                                    this.remove_torrent_feed(window, cx);
+                                }
+                            },
+                        )),
+                    )
+                    .child(
+                        button(
+                            "torrent-remove-confirm-no",
+                            "Cancel",
+                            self.torrents.removing,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_torrent_remove(cx))),
+                    ),
+            )
+            .into_any()
     }
 }
 
@@ -2500,6 +2692,58 @@ fn torrent_time_ago(timestamp: i64) -> String {
 }
 
 #[cfg(test)]
+impl Workspace {
+    pub(crate) fn test_open_torrent(
+        &mut self,
+        item: Option<TorrentItem>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> tokio::sync::oneshot::Sender<Result<(), String>> {
+        let (release, result) = tokio::sync::oneshot::channel();
+        assert!(self.torrent_open_result.replace(result).is_none());
+        self.open_torrent_url(item, "https://example.invalid/release".into(), window, cx);
+        self.torrent_open_result.take();
+        release
+    }
+
+    pub(crate) fn test_torrent_owner(&mut self, generation: u64, account: i64) {
+        self.generation = generation;
+        self.profile = Some(kurisu_core::User {
+            id: account,
+            offline: true,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn test_feed_input(&self) -> Entity<TextInput> {
+        self.torrents.feed_input.clone().unwrap()
+    }
+
+    pub(crate) fn test_torrent_error(&self) -> &str {
+        &self.torrents.error
+    }
+
+    pub(crate) fn test_cancel_torrent_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_barrier(window, cx);
+    }
+
+    pub(crate) fn test_remove_torrent_feed(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let previous = self
+            .torrents
+            .removing_feed
+            .replace("https://example.invalid/feed".into());
+        self.remove_torrent_feed(window, cx);
+        if !self.torrents.removing {
+            self.torrents.removing_feed = previous;
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
@@ -2525,6 +2769,16 @@ mod tests {
         if let Some(feeds) = feeds {
             db.set_setting("rss_feeds", feeds).unwrap();
         }
+        if !entries.is_empty() {
+            db.replace_account(
+                "test-token",
+                &kurisu_core::User {
+                    id: 991_001,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
         for entry in entries {
             db.upsert_entry(entry).unwrap();
         }
@@ -2545,6 +2799,194 @@ mod tests {
     fn settle(runtime: &tokio::runtime::Runtime, cx: &mut TestAppContext) {
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(2)).await });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn direct_read_starts_notify_before_completion(tc: &mut TestAppContext) {
+        let (core, _runtime) = fixture(&[], Some("[]"));
+        let (view, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        view.update(cx, |w, _| {
+            w.profile = Some(kurisu_core::User {
+                id: 991_001,
+                ..Default::default()
+            });
+            w.list.error = "Previous list read failed".into();
+        });
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let notified = observed.clone();
+        let _subscription = cx.update(|_, app| app.observe(&view, move |_, _| notified.set(true)));
+        let starts = [
+            Workspace::load_list as fn(&mut Workspace, &Window, &mut Context<Workspace>),
+            |w, window, cx| w.load_detail(9, window, cx),
+            Workspace::load_torrent_entries,
+            Workspace::load_torrent_feeds,
+            |w, window, cx| w.refresh_torrent_feed(true, window, cx),
+        ];
+        for start in starts {
+            view.update_in(cx, |w, window, cx| start(w, window, cx));
+            assert!(observed.replace(false));
+        }
+        view.read_with(cx, |w, _| {
+            assert!(w.list.loading && w.detail.loading);
+            assert!(w.torrents.entries_loading && w.torrents.feeds_loading && w.torrents.loading);
+            assert!(w.list.error.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn feeds_heading_contains_an_operable_disclosure(tc: &mut TestAppContext) {
+        let (core, _runtime) = fixture(&[], Some("[]"));
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 991_001,
+                ..Default::default()
+            });
+            w.restoring_session = false;
+            w.route = Route::Torrents;
+            w.enter_torrents(window, cx);
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (_, heading) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Heading && node.label() == Some("Feeds"))
+            .expect("Feeds heading");
+        assert_eq!(heading.level(), Some(2));
+        let (id, button) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Button && node.label() == Some("Feeds"))
+            .expect("Feeds disclosure");
+        assert!(heading.children().contains(id));
+        assert!(button.supports_action(gpui::AccessibleAction::Click));
+        assert_eq!(button.is_expanded(), Some(false));
+
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Click,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        });
+        cx.run_until_parked();
+        let expanded = cx.take_accessibility_tree_update().unwrap();
+        assert!(
+            expanded
+                .nodes
+                .iter()
+                .any(|(node_id, node)| { node_id == id && node.is_expanded() == Some(true) })
+        );
+        assert!(expanded.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Region && node.label() == Some("Saved feeds")
+        }));
+
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        });
+        cx.run_until_parked();
+        let keystroke = gpui::Keystroke::parse("space").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        assert!(!workspace.read_with(cx, |w, _| w.torrents.show_feeds));
+    }
+
+    #[gpui::test]
+    fn removing_last_feed_during_close_refreshes_releases_on_restore(tc: &mut TestAppContext) {
+        let url = "http://127.0.0.1:9/feed";
+        let (core, runtime) = fixture(&[], Some(&format!(r#"["{url}"]"#)));
+        let (view, cx) = tc.add_window_view(|win, cx| {
+            Workspace::new_with_session_restore(core.clone(), win, cx, false)
+        });
+        view.update_in(cx, |w, win, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            });
+            w.offline = true;
+            w.route = Route::Torrents;
+            w.torrents.loaded = true;
+            w.torrents.feeds = vec![url.into()];
+            w.torrents.items = vec![TorrentItem {
+                title: "Removed feed release".into(),
+                ..Default::default()
+            }];
+            w.torrents.removing_feed = Some(url.into());
+            w.remove_torrent_feed(win, cx);
+            assert_eq!(w.active_writes, 1);
+            w.request_close(super::super::CloseIntent::Window, win, cx);
+        });
+        cx.run_until_parked();
+        settle(&runtime, cx);
+        assert!(runtime.block_on(core.get_rss_feeds()).unwrap().is_empty());
+        view.update_in(cx, |w, win, cx| {
+            assert!(w.close_ready && w.torrents.feeds.is_empty());
+            w.resume_after_close(win, cx);
+        });
+        settle(&runtime, cx);
+        view.read_with(cx, |w, _| {
+            assert!(w.torrents.loaded && w.torrents.items.is_empty())
+        });
+    }
+
+    #[gpui::test]
+    fn bucket_b_expanded_choices_restart_after_tray_restore(cx: &mut TestAppContext) {
+        let entry = ListEntry {
+            media_id: 9,
+            status: "CURRENT".into(),
+            ..Default::default()
+        };
+        let (core, runtime) = fixture(std::slice::from_ref(&entry), Some("[]"));
+        let (workspace, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        workspace.update_in(cx, |w, win, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 991_001,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Torrents;
+            w.torrents.entries = vec![entry];
+            w.toggle_show_choices(9, win, cx);
+            assert!(w.torrents.choices[&9].loading);
+            w.refresh_torrent_feed(false, win, cx);
+            w.request_close(super::super::CloseIntent::Window, win, cx);
+            assert!(w.close_ready);
+        });
+        settle(&runtime, cx);
+        workspace.update_in(cx, |w, win, cx| {
+            assert!(w.torrents.loaded);
+            assert!(w.torrents.expanded_shows.contains(&9));
+            assert!(w.torrents.choices.is_empty());
+            w.resume_after_close_visibility(true, win, cx);
+            assert!(
+                w.torrents
+                    .choices
+                    .get(&9)
+                    .is_some_and(|choice| choice.loading),
+                "expanded show choices did not restart after tray restore"
+            );
+        });
+        settle(&runtime, cx);
+        workspace.read_with(cx, |w, _| {
+            let choice = &w.torrents.choices[&9];
+            assert!(!choice.loading);
+            assert!(choice.error.contains("details are not cached"));
+        });
     }
 
     #[gpui::test]
@@ -2640,7 +3082,10 @@ mod tests {
                 .preference_writes
                 .entry("kurisu.torrents.new")
                 .or_default();
-            write.pending = Some(Some("1".into()));
+            write.pending = Some(crate::screens::QueuedPreference {
+                value: Some("1".into()),
+                account: Some(47),
+            });
             write.error = Some("storage failure".into());
             cx.notify();
         });
@@ -2858,7 +3303,9 @@ mod tests {
             })
             .collect();
         let (core, runtime) = fixture(&entries, Some("[]"));
-        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
         workspace.update_in(cx, |workspace, _, _| {
             workspace.auth_intent += 1;
             workspace.profile = Some(kurisu_core::User {
@@ -3071,5 +3518,296 @@ mod tests {
             }
         )));
         assert_eq!(rows.iter().filter(|row| matches!(row, TorrentDisplayRow::ChoiceSection { title, .. } if title == "Recent feed releases")).count(), 1);
+    }
+
+    #[gpui::test]
+    fn torrent_calendar_and_list_preferences_respect_all_edit_fences(cx: &mut TestAppContext) {
+        let (core, _runtime) = fixture(&[], Some("[]"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.offline = true;
+            w.torrents.prefs_loaded = true;
+            w.calendar.preference_loaded = true;
+            let item = TorrentItem {
+                guid: "controlled-guid".into(),
+                link: "https://example.invalid/item.torrent".into(),
+                ..Default::default()
+            };
+            w.auth_busy = true;
+            let auth_opener = w.test_open_torrent(Some(item.clone()), window, cx);
+            assert!(
+                auth_opener.is_closed() && w.active_writes == 0,
+                "open_torrent_url admitted write during auth_busy"
+            );
+            w.auth_busy = false;
+            w.update_busy = true;
+            let update_opener = w.test_open_torrent(Some(item), window, cx);
+            assert!(
+                update_opener.is_closed() && w.active_writes == 0,
+                "open_torrent_url admitted write during update_busy"
+            );
+
+            w.select_filter("COMPLETED", window, cx);
+            assert_eq!(w.list.filter, "CURRENT");
+            w.select_sort(crate::screens::state::SortKey::Score, window, cx);
+            assert_eq!(w.list.sort, crate::screens::state::SortKey::Title);
+            w.flip_sort(window, cx);
+            assert!(!w.list.desc);
+            w.list_query.update(cx, |input, cx| {
+                input.set_value("mutated", cx);
+                cx.emit(TextInputEvent::Changed("mutated".into()));
+            });
+            w.stage_query(Some("mutated".into()));
+            w.persist_preference("kurisu.list.filter", Some("COMPLETED".into()), window, cx);
+            w.set_calendar_filter(false, window, cx);
+            assert!(w.calendar.watching_only);
+            w.change_torrent_filters(Some("1_2".into()), Some("2".into()), window, cx);
+            assert_eq!(w.torrents.category, "1_0");
+            assert_eq!(w.torrents.release, "0");
+            w.toggle_torrent_status("PLANNING", window, cx);
+            assert!(!w.torrents.expanded_statuses.contains("PLANNING"));
+            assert!(w.query_pending.is_none());
+            assert!(!w.preference_has_work());
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, app| {
+            assert_eq!(w.list.query, "");
+            assert_eq!(w.list_query.read(app).value(), "");
+        });
+        workspace.update_in(cx, |w, _, cx| {
+            w.update_busy = false;
+            cx.notify();
+        });
+    }
+
+    #[gpui::test]
+    fn fenced_torrent_entries_completion_preserves_pending_reload_until_unfence(
+        cx: &mut TestAppContext,
+    ) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kurisu-torrents-fenced-entries-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&root.join("kurisu.db")).unwrap();
+        db.set_setting("rss_feeds", "[]").unwrap();
+        db.replace_account(
+            "test-token",
+            &kurisu_core::User {
+                id: 47,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let core = Core::open(
+            root.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        )
+        .unwrap();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let first_read = workspace.update_in(cx, |w, window, cx| {
+            w.restoring_session = false;
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.offline = true;
+            w.route = Route::Torrents;
+            w.load_torrent_entries(window, cx);
+            assert!(w.torrents.entries_loading);
+            w.read_aborts["torrents-entries"][0].clone()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !first_read.is_finished() {
+            assert!(Instant::now() < deadline);
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+        }
+        db.upsert_entry(&ListEntry {
+            media_id: 2,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            w.load_torrent_entries(window, cx);
+            assert!(w.torrents.entries_reload_pending);
+            w.request_close(super::super::CloseIntent::Window, window, cx);
+            assert!(w.close_ready);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert!(!w.torrents.entries_loading);
+            assert_eq!(w.torrents.entries.len(), 1);
+            assert!(
+                w.torrents.entries_reload_pending,
+                "fenced torrent completion dropped entries_reload_pending"
+            );
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.resume_after_close_visibility(true, window, cx);
+        });
+        while workspace.read_with(cx, |w, _| w.torrents.entries_loading) {
+            assert!(Instant::now() < deadline);
+            settle(&runtime, cx);
+        }
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.torrents.entries.len(), 2);
+            assert!(!w.torrents.entries_reload_pending);
+        });
+
+        let second_read = workspace.update_in(cx, |w, window, cx| {
+            w.load_torrent_entries(window, cx);
+            assert!(w.torrents.entries_loading);
+            w.read_aborts["torrents-entries"][0].clone()
+        });
+        while !second_read.is_finished() {
+            assert!(Instant::now() < deadline);
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+        }
+        db.upsert_entry(&ListEntry {
+            media_id: 3,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            w.load_torrent_entries(window, cx);
+            assert!(w.torrents.entries_reload_pending);
+            w.query_error = "hold barrier".into();
+            w.request_close(super::super::CloseIntent::Window, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert!(
+                !w.torrents.entries_loading,
+                "fenced torrent completion started a new read during barrier"
+            );
+            assert_eq!(w.torrents.entries.len(), 2);
+            assert!(w.torrents.entries_reload_pending);
+        });
+        workspace.update_in(cx, |w, _, _| w.query_error.clear());
+        cx.update(|win, app| win.draw(app).clear(app));
+        let cancel = cx.debug_bounds("cancel-failed-barrier").unwrap();
+        cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+        while workspace.read_with(cx, |w, _| w.torrents.entries_loading) {
+            assert!(Instant::now() < deadline);
+            settle(&runtime, cx);
+        }
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.torrents.entries.len(), 3);
+            assert!(!w.torrents.entries_reload_pending);
+        });
+        cx.update(|win, _| win.remove_window());
+        drop(workspace);
+        drop(db);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod modal_regressions {
+    use super::super::workspace_tests::fixture;
+    use super::*;
+    use gpui::accesskit::{Action, ActionRequest, TreeId};
+    use kurisu_core::User;
+
+    #[gpui::test]
+    fn torrent_remove_escape_works_from_pending_banner_focus(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            });
+            w.offline = true;
+            w.route = Route::Torrents;
+            w.pending_error = "Sync status fixture".into();
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Retry sync"))
+            .unwrap();
+        cx.simulate_accessibility_action(ActionRequest {
+            action: Action::Focus,
+            target_tree: TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        });
+        view.update_in(cx, |w, win, cx| {
+            let feed = format!("https://example.invalid/{}", "long-feed".repeat(27));
+            w.torrents.feeds = vec![feed.clone()];
+            w.ask_remove_torrent_feed(&feed, win, cx);
+            w.auth_busy = true;
+            w.remove_torrent_feed(win, cx);
+            assert_eq!(w.active_writes, 0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        assert!(tree.nodes.iter().any(|(_, node)| node.is_modal()));
+        let dialog = tree
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == gpui::Role::Dialog && node.label() == Some("Remove feed?"))
+                    .then(|| node.bounds().unwrap())
+            })
+            .unwrap();
+        let scale = cx.update(|win, _| f64::from(win.scale_factor()));
+        assert!(
+            dialog.width() <= 440. * scale && dialog.height() > 150. * scale,
+            "{dialog:?}"
+        );
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label() == Some("Remove") && !node.is_hidden() && node.is_disabled()
+        }));
+        view.update_in(cx, |w, win, cx| {
+            w.torrents.removing = true;
+            w.escape_active_modal(win, cx);
+            assert!(w.torrents.removing_feed.is_some());
+            w.torrents.removing = false;
+        });
+        cx.simulate_keystrokes("escape");
+        view.update_in(cx, |w, win, cx| {
+            assert!(w.torrents.removing_feed.is_none());
+            w.auth_busy = false;
+            w.profile = None;
+            w.torrents.removing_feed = Some("https://example.invalid/feed".into());
+            w.remove_torrent_feed(win, cx);
+            assert_eq!(w.active_writes, 0);
+        });
     }
 }

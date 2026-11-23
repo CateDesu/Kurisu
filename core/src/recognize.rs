@@ -1,53 +1,92 @@
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use regex::Regex;
 
 use crate::db::Db;
 
-static RE_BRACKETS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\[\(【][^\]\)】]*[\]\)】]").unwrap());
-static RE_RES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(1080|720|480|360|2160|1440|4320)p?\b|\b\d{3,4}p\d{2,3}\b|\b[48]k\b|\b(bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc10|hevc|x265|x264|h[\s.]*26[456]|avc|av1|vp9|vp0|vvc|xvid|divx|mpeg-?2|aac|eac3|ddp?\d|opus|flac|10bit|hi10|yuv420)\b").unwrap()
+static RE_BRACKETS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]|\((?:[^()]|\([^()]*\))*\)|【(?:[^【】]|【[^【】]*】)*】",
+    )
+    .unwrap()
 });
+static RE_EMPTY_BRACKETS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\s*\]|\(\s*\)|【\s*】").unwrap());
+static RE_FORMAT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:(?:360|480|576|720|1080|1440|2160|4320)p|\d{3,4}p\d{2,3}|[48]k|bd|bdrip|blu-?ray|blueray|webrip|web-?dl|dvdrip|hevc(?:10(?:bit)?)?|x265|x264|h[\s.-]*26[456]|avc|av1|vp9|vp0|vvc|xvid|divx|uncensored|mpeg-?2|(?:aac|e-?ac-?3|ac-?3|ddp?|opus|flac|dts(?:-?hd)?|truehd|l?pcm)(?:[ ._-]?[0-9]\.[0-9])?|ddp?\d|(?:8|10|12|16|24|32)[ .-]?bit|hi10p?|yuv(?:420|422|444)(?:p(?:\d{1,2}(?:le|be)?)?)?|\d{3,4}[x×]\d{3,4}p?|\d{1,3}(?:\.\d{1,4})?[ ._-]*fps|[1-9]\.\d[ ._-]*ch|\d{1,4}(?:\.\d{1,3})?[ ._-]*(?:[kmgt]i?b))\b").unwrap()
+});
+static RE_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^\p{L}\p{N}])(?P<date>([12][0-9]{3})([-._])([0-9]{2})([-._])([0-9]{2}))(?:$|[^\p{L}\p{N}])").unwrap()
+});
+pub(crate) static PACK_WORDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:batch|pack|complete(?:d)?(?:[ .-]+series)?|collection)\b").unwrap()
+});
+static RE_RES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(1080|720|576|480|360|2160|1440|4320)\b").unwrap());
 // Require a separator before E05 to preserve Steins;Gate.
 static RE_EP_TAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*[-_·]?\s*(?:[sS]\d{1,2}[eE]|ep(?:isode)?\.?|[-_·\s][eE]|#)?\s*0*[1-9]\d{0,3}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
+    Regex::new(r"(?i)\s*[-_·–—]?\s*(?:s\d{1,2}[.\s_]*e|ep(?:isode)?\.?|[-_·–—.\s]e|#)?\s*0*[1-9]\d{0,3}(?:v\d+)?\s*(?:end|final)?\s*$").unwrap()
 });
 static RE_EP_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:v\d+)?").unwrap());
 static RE_NTH_SEASON: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?P<n>\d{1,2})(?:st|nd|rd|th) season\b").unwrap());
+    LazyLock::new(|| Regex::new(r"\b(?P<n>\d{1,2})(?:st|nd|rd|th)(?:[\s._]+|-)season\b").unwrap());
 static RE_SEASON_N: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bseason (?P<n>\d{1,2})\b").unwrap());
-static RE_CHANNEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d\.\d\b").unwrap());
+    LazyLock::new(|| Regex::new(r"\bseason(?:[\s._]+|-)(?P<n>\d{1,2})\b").unwrap());
+static RE_CHANNEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:2\.0|5\.1|7\.1)\b").unwrap());
+static RE_NATIVE_SEASON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"第(?P<number>[0-9]{1,2})期|(?P<roman>[ⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫⅱⅲⅳⅴⅵⅶⅷⅸⅹⅺⅻ])").unwrap()
+});
 static RE_SEASON_EP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)[sS](\d{1,2})\s*[eE]\d{1,3}").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bs(\d{1,2})[.\s_]*(?:e\d{1,4}(?:v\d+)?)+\b").unwrap());
 static RE_SEASON_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)[sS]\d{1,2}\s*([eE])").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)s\d{1,2}[.\s_]*(e)").unwrap());
 static RE_SEASON_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)[sS]\d{1,2}\b").unwrap());
 static RE_SEASON_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bs(\d{1,2})\b").unwrap());
 static RE_REV_TAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+v\d+\s*$").unwrap());
+static RE_SUBTITLE_SEPARATOR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+[-–—|]\s+").unwrap());
+pub(crate) static RELEASE_WORDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:dual[ ._-]+audio|multi[ ._-]+(?:audio|subs?)|english[ ._-]+sub(?:bed|s)?|end|final)\b").unwrap()
+});
 static RE_SEASON_WORDS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:season[\s._-]+\d{1,2}|\d{1,2}(?:st|nd|rd|th)[\s._-]+season)\b").unwrap()
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}])(?P<words>season(?:[\s._]+|-)(?P<number>[0-9]{1,2})|[0-9]{1,2}(?:st|nd|rd|th)(?:[\s._]+|-)season)(?:$|[^\p{L}\p{N}])").unwrap()
+});
+static RE_SEASON_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}])(?P<range>(?:season(?P<plural>s)?(?:[\s._]+|-)|(?P<short>s))(?P<first>[0-9]{1,2})(?P<separator>[\s_]*[-~–—+&,][\s_]*)(?:(?P<second_season>s|seasons?[\s._-]+))?(?P<last>[0-9]{1,4})(?:v[0-9]+)?(?P<more>(?:[\s_]*[-~–—,][\s_]*[0-9]{1,4})*))(?:$|[^\p{L}\p{N}])").unwrap()
 });
 static RE_EXPLICIT_EP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:\bs\d{1,2}\s*e|\bep(?:isode)?[.\s_-]*|\be[.\s_-]*|#)\s*(\d{1,4})(?:v\d+)?(?:$|[^\w])").unwrap()
+    Regex::new(r"(?i)(?:\bs(?P<season>\d{1,2})[.\s_]*e|\bep(?:isode)?[.\s_-]*|\be[.\s_-]*|#)\s*(?P<episode>\d{1,4})(?:v\d+)?(?P<more>(?:e\d{1,4}(?:v\d+)?)+)?(?:$|[^\w])").unwrap()
 });
 static RE_LEADING_EP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^[\s._:·-]*(\d{1,4})(?:v\d+)?(?:$|[\s._-])").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)^[\s._:·–—-]*(\d{1,4})(?:v\d+)?(?:$|[\s._–—-])").unwrap());
+static RE_DASHED_EP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[\s._])(?P<dash>[-·–—])[\s._]*(\d{1,4})(?:v\d+)?\b").unwrap()
+});
+static RE_BRACKET_SEASON_EP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[\[(【]\s*(?P<marker>(?:season[\s._-]+[0-9]{1,2}|[0-9]{1,2}(?:st|nd|rd|th)[\s._-]+season)[\s_]+[-–—])[\s_]+(?P<number>[0-9]{2,4})(?:v[0-9]+)?\s*[\])】]").unwrap()
+});
 static RE_BRACKET_EP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)[\[(【]\s*(?:(?:ep(?:isode)?\.?|e)\s*)?(\d{1,4})(?:v\d+)?\s*[\])】]").unwrap()
+    Regex::new(r"(?i)[\[(【]\s*(?P<marker>(?:(?:season[\s._-]+[0-9]{1,2}|[0-9]{1,2}(?:st|nd|rd|th)[\s._-]+season)[\s._]+(?:[-–—][\s._]+)?)?(?:ep(?:isode)?[.\s_-]*|e[.\s_-]*|#)|s[0-9]{1,2}[.\s_]*e)?\s*(?P<number>\d{1,4})(?:v\d+)?(?P<more>(?:e\d{1,4}(?:v\d+)?)+)?\s*[\])】]").unwrap()
 });
 static RE_EP_RANGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}.])(?P<marker>s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<start>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–]\s*(?:s[0-9]{1,2}e|ep(?:isode)?[.\s_-]*|e|#)?(?P<end>[0-9]{1,4})(?:v[0-9]+)?(?:$|[^\p{L}\p{N}.])").unwrap()
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}])(?P<range>(?P<marker>(?:s(?P<season>[0-9]{1,2})[.\s_]*)?e[.\s_-]*|ep(?:isode)?[.\s_-]*|#)?(?P<start>[0-9]{1,4})(?:v[0-9]+)?\s*[-~–—]\s*(?P<end_marker>s(?P<end_season>[0-9]{1,2})[.\s_]*e|ep(?:isode)?[.\s_-]*|e[.\s_-]*|#)?(?P<end>[0-9]{1,4})(?P<fraction>\.(?:5|25|75))?(?:v[0-9]+)?)(?:$|[^\p{L}\p{N}])").unwrap()
 });
-static RE_HALF_EPISODE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}.])(?:s[0-9]{1,2}\s*e|ep(?:isode)?[.\s_-]*|e[.\s_-]*|#)?[0-9]{1,4}\.5(?:v[0-9]+)?(?:$|[^\p{L}\p{N}.])").unwrap()
+static RE_CROSS_SEASON_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bs([0-9]{1,2})[.\s_]*e[0-9]{1,4}(?:v[0-9]+)?\s*[-~–—]\s*s([0-9]{1,2})[.\s_]*e[0-9]{1,4}(?:v[0-9]+)?\b").unwrap()
+});
+static RE_FRACTIONAL_EPISODE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^\p{L}\p{N}])(?P<fraction>(?:s[0-9]{1,2}[.\s_]*e|ep(?:isode)?[.\s_-]*|e[.\s_-]*|#)?(?P<number>[0-9]{1,4})\.(?:5|25|75)(?:v[0-9]+)?)(?:$|[^\p{L}\p{N}])").unwrap()
+});
+pub(crate) static RE_EXTRAS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?P<marker>trailer|preview|sample|pvs?|ovas?|oads?|sp|op|ed|ost|ncops?|nceds?|creditless|extras?|specials?|cms?|menus?)[0-9]*(?:\s*v[0-9]+)?\b").unwrap()
 });
 
-const NOISE_NUMBERS: [i64; 7] = [360, 480, 720, 1080, 1440, 2160, 4320];
+const NOISE_NUMBERS: [i64; 8] = [360, 480, 576, 720, 1080, 1440, 2160, 4320];
 
 const MAX_SEASON: u32 = 50;
 
@@ -70,8 +109,10 @@ pub(crate) struct Matcher {
     format: Option<String>,
     norms: Vec<String>,
     norm_seasons: Vec<Option<u32>>,
+    explicit_season: Option<u32>,
     status_rank: u8,
     title_patterns: OnceLock<Vec<Regex>>,
+    season_patterns: OnceLock<Vec<(u32, String, Regex)>>,
     // Include rows whose titles cannot produce a matcher.
     source: Option<Arc<Vec<MatcherInput>>>,
 }
@@ -92,24 +133,275 @@ impl Matcher {
             variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
             variants
                 .into_iter()
-                .filter_map(|variant| {
-                    let words = variant
-                        .split(|c: char| !c.is_alphanumeric())
-                        .filter(|word| !word.is_empty())
-                        .map(regex::escape)
-                        .collect::<Vec<_>>();
-                    if words.is_empty() {
-                        return None;
-                    }
-                    Regex::new(&format!(
-                        r"(?i)(?:^|[^\p{{L}}\p{{N}}]){}(?:$|[^\p{{L}}\p{{N}}])",
-                        words.join(r"[^\p{L}\p{N}]+")
-                    ))
-                    .ok()
+                .filter_map(|variant| title_pattern(&fold_digits(variant)))
+                .collect()
+        })
+    }
+
+    pub(crate) fn release_title_span(&self, release: &str) -> Option<Range<usize>> {
+        self.release_title_chain(release).map(|(span, _)| span)
+    }
+
+    pub(crate) fn release_title_span_in(&self, release: &str, body: &str) -> Option<Range<usize>> {
+        let offset = release.len() - body.len();
+        self.release_title_span(release)
+            .and_then(|span| Some(span.start.checked_sub(offset)?..span.end - offset))
+    }
+
+    pub(crate) fn collapse_known_aliases(&self, release: &str) -> String {
+        let mut title = release.to_owned();
+        if let Some((span, first_end)) = self.release_title_chain(release) {
+            title.replace_range(first_end..span.end, &" ".repeat(span.end - first_end));
+        }
+        title
+    }
+
+    fn release_title_chain(&self, release: &str) -> Option<(Range<usize>, usize)> {
+        let body = strip_release_groups(release, std::slice::from_ref(self));
+        let offset = release.len() - body.len();
+        let mut cut = release_alias_cut(body, 0);
+        let mut spans = self.release_alias_spans(body).into_iter();
+        let mut title = spans
+            .find(|span| {
+                alias_before_episode(span, cut, self.alias_spelling(body, span).is_literal())
+            })
+            .or_else(|| {
+                let title_end = self.literal_release_title_end(body, cut);
+                let cut = cut.max(title_end);
+                self.season_alias_spans(body, release_season(body, &release[..offset], title_end))
+                    .into_iter()
+                    .find(|span| span.end <= cut && season_alias_suffix(body, span))
+            })?;
+        let first_end = title.end + offset;
+        if title.end > cut {
+            cut = release_alias_cut(body, title.end);
+        }
+        for next in spans {
+            if next.start < title.end {
+                continue;
+            }
+            if next.start >= cut {
+                break;
+            }
+            if !alias_before_episode(&next, cut, self.alias_spelling(body, &next).is_literal()) {
+                continue;
+            }
+            if !matches!(
+                body[title.end..next.start].trim(),
+                "/" | "|" | "｜" | "／" | ":" | "："
+            ) {
+                break;
+            }
+            title.end = next.end;
+            if title.end > cut {
+                cut = release_alias_cut(body, title.end);
+            }
+        }
+        Some((title.start + offset..title.end + offset, first_end))
+    }
+
+    pub(crate) fn release_alias_spans(&self, release: &str) -> Vec<Range<usize>> {
+        Self::pattern_spans(self.title_patterns(), release)
+    }
+
+    fn could_contain_alias(&self, normalized: &str) -> bool {
+        self.norms.iter().any(|norm| {
+            let word = norm.split(' ').next().unwrap_or_default();
+            normalized.starts_with(word)
+                || (!word.is_ascii()
+                    && native_season(word).is_some_and(|(marker, _)| {
+                        marker.start > 0 && normalized.starts_with(&word[..marker.start])
+                    }))
+        })
+    }
+
+    fn release_alias_evidence(&self, raw: &str, cut: usize, season: Option<u32>) -> AliasEvidence {
+        let mut exact = 0;
+        let mut direct = 0;
+        for span in self.release_alias_spans(raw) {
+            let spelling = self.alias_spelling(raw, &span);
+            if !alias_before_episode(&span, cut, spelling.is_literal()) {
+                continue;
+            }
+            if spelling == AliasSpelling::Exact {
+                exact = exact.max(span.len());
+            }
+            if direct == 0
+                && (spelling.is_literal()
+                    || (release_alias_cut(&raw[span.clone()], 0) == span.len()
+                        && !has_marked_episode_tail(&raw[span.clone()])))
+                && release_alias_suffix(raw, &span)
+            {
+                direct = span.len();
+            }
+        }
+        let stem = self
+            .season_alias_spans(raw, season)
+            .into_iter()
+            .find(|span| span.end <= cut && season_alias_suffix(raw, span))
+            .map_or(0, |span| span.len());
+        AliasEvidence {
+            direct,
+            stem,
+            exact,
+        }
+    }
+
+    pub(crate) fn has_release_alias(&self, release: &str) -> bool {
+        let body = strip_release_groups(release, std::slice::from_ref(self));
+        self.release_title_span_in(release, body)
+            .is_some_and(|span| release_alias_suffix(body, &span))
+    }
+
+    pub(crate) fn has_scoped_release_alias(&self, release: &str) -> bool {
+        let body = strip_release_groups(release, std::slice::from_ref(self));
+        self.release_title_span_in(release, body)
+            .is_some_and(|span| season_alias_suffix(body, &span))
+    }
+
+    fn literal_release_title_end(&self, release: &str, cut: usize) -> usize {
+        if cut == release.len()
+            || !self.variants.iter().any(|variant| {
+                let variant = fold_digits(variant);
+                release_alias_cut(&variant, 0) < variant.len()
+            })
+        {
+            return 0;
+        }
+        self.release_alias_spans(release)
+            .into_iter()
+            .filter(|span| self.alias_spelling(release, span).is_literal())
+            .chain(
+                self.season_patterns()
+                    .iter()
+                    .flat_map(|(_, alias, pattern)| {
+                        Self::pattern_spans(std::iter::once(pattern), release)
+                            .into_iter()
+                            .filter(move |span| alias_spelling(release, span, alias).is_literal())
+                    }),
+            )
+            .filter(|span| {
+                span.start < cut && span.end > cut && starts_release_alias(release, span)
+            })
+            .map(|span| span.end)
+            .max()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn release_season(&self, body: &str, groups: &str) -> Option<u32> {
+        let end = self.literal_release_title_end(body, release_alias_cut(body, 0));
+        release_season(body, groups, end)
+    }
+
+    fn season_alias_spans(&self, release: &str, season: Option<u32>) -> Vec<Range<usize>> {
+        let Some(season) = season else {
+            return Vec::new();
+        };
+        if self
+            .explicit_season
+            .map_or(!self.norm_seasons.contains(&Some(season)), |n| n != season)
+        {
+            return Vec::new();
+        }
+        Self::pattern_spans(
+            self.season_patterns()
+                .iter()
+                .filter_map(|(number, _, pattern)| (*number == season).then_some(pattern)),
+            release,
+        )
+    }
+
+    fn season_patterns(&self) -> &[(u32, String, Regex)] {
+        self.season_patterns.get_or_init(|| {
+            self.variants
+                .iter()
+                .zip(&self.norm_seasons)
+                .filter_map(|(variant, ordinal)| Some((variant, (*ordinal)?)))
+                .flat_map(|(variant, ordinal)| {
+                    season_aliases(&fold_digits(variant))
+                        .into_iter()
+                        .filter_map(move |alias| {
+                            Some((ordinal, alias.trim().to_owned(), title_pattern(&alias)?))
+                        })
                 })
                 .collect()
         })
     }
+
+    fn pattern_spans<'a>(
+        patterns: impl IntoIterator<Item = &'a Regex>,
+        release: &str,
+    ) -> Vec<Range<usize>> {
+        let mut spans = patterns
+            .into_iter()
+            .flat_map(|pattern| {
+                let mut from = 0;
+                std::iter::from_fn(move || {
+                    let alias = pattern.captures_at(release, from)?.name("title")?;
+                    from = alias.end();
+                    Some(alias.range())
+                })
+            })
+            .collect::<Vec<_>>();
+        spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+        spans
+    }
+
+    pub(crate) fn alias_spelling(&self, raw: &str, span: &Range<usize>) -> AliasSpelling {
+        self.variants
+            .iter()
+            .map(|variant| alias_spelling(raw, span, &fold_digits(variant.trim())))
+            .max()
+            .unwrap_or(AliasSpelling::Normalized)
+    }
+
+    pub(crate) fn is_season_pack(&self, release: &str) -> bool {
+        season_pack_range(release, || {
+            let body = strip_release_groups(release, std::slice::from_ref(self));
+            (self.release_title_span(release), release.len() - body.len())
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AliasSpelling {
+    Normalized,
+    Scene,
+    Exact,
+}
+
+impl AliasSpelling {
+    pub(crate) fn is_literal(self) -> bool {
+        self != Self::Normalized
+    }
+}
+
+fn alias_spelling(raw: &str, span: &Range<usize>, alias: &str) -> AliasSpelling {
+    let boundary = |c: char| release_separator(c) || "[]()【】/|｜／:：#".contains(c);
+    if !raw[..span.start].chars().next_back().is_none_or(boundary)
+        || !raw[span.end..].chars().next().is_none_or(boundary)
+    {
+        return AliasSpelling::Normalized;
+    }
+    let text = &raw[span.clone()];
+    if text.eq_ignore_ascii_case(alias)
+        || (!alias.is_ascii() && text.to_lowercase() == alias.to_lowercase())
+    {
+        return AliasSpelling::Exact;
+    }
+    if text.contains(['.', '_']) && alias.contains(char::is_whitespace) {
+        let mut release = text.chars().flat_map(char::to_lowercase);
+        if alias.chars().flat_map(char::to_lowercase).all(|ch| {
+            release.next().is_some_and(|actual| {
+                actual == ch || ch.is_whitespace() && matches!(actual, '.' | '_')
+            })
+        }) && release.next().is_none()
+            && release_alias_cut(alias, 0) < alias.len()
+        {
+            return AliasSpelling::Scene;
+        }
+    }
+    AliasSpelling::Normalized
 }
 
 fn status_rank(status: &str) -> u8 {
@@ -237,7 +529,7 @@ fn normalize_matcher_inputs(inputs: Vec<MatcherInput>) -> Vec<Matcher> {
         for v in input.titles.iter().flatten() {
             if !v.trim().is_empty() {
                 // List title numbers belong to the name. Only releases lose episode suffixes.
-                let n = norm_title(v);
+                let n = catalog_title_norm(v);
                 if !n.is_empty() {
                     variants.push(v.to_string());
                     norms.push(n);
@@ -247,6 +539,12 @@ fn normalize_matcher_inputs(inputs: Vec<MatcherInput>) -> Vec<Matcher> {
         if norms.is_empty() {
             continue;
         }
+        let norm_seasons = variants
+            .iter()
+            .zip(&norms)
+            .map(|(variant, norm)| catalog_season_ordinal(variant, norm))
+            .collect();
+        let explicit_season = variants.iter().find_map(|variant| catalog_season(variant));
         out.push(Matcher {
             media_id: input.media_id,
             display: input
@@ -259,14 +557,51 @@ fn normalize_matcher_inputs(inputs: Vec<MatcherInput>) -> Vec<Matcher> {
             variants,
             episodes: input.episodes,
             format: input.format.clone(),
-            norm_seasons: norms.iter().map(|norm| norm_season_ordinal(norm)).collect(),
+            norm_seasons,
+            explicit_season,
             norms,
             status_rank: input.status_rank,
             title_patterns: OnceLock::new(),
+            season_patterns: OnceLock::new(),
             source: Some(inputs.clone()),
         });
     }
     out
+}
+
+fn title_pattern(variant: &str) -> Option<Regex> {
+    let mut previous = "";
+    let words = variant
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let token = if previous.eq_ignore_ascii_case("part")
+                && word
+                    .parse::<u32>()
+                    .is_ok_and(|n| (1..=MAX_SEASON).contains(&n))
+            {
+                format!("0*{}", canon_ordinal(word))
+            } else {
+                regex::escape(word)
+            };
+            previous = word;
+            token
+        })
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return None;
+    }
+    Regex::new(&format!(
+        r"(?i)(?:^|[^\p{{L}}\p{{N}}])(?P<title>{}|{})(?:$|[^\p{{L}}\p{{N}}])",
+        variant
+            .trim()
+            .split(' ')
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join(r"[ ._]"),
+        words.join(r"[^\p{L}\p{N}]+")
+    ))
+    .ok()
 }
 
 /// Some true means a prefix match. Some false means an interior or suffix match.
@@ -314,18 +649,51 @@ fn norm_match_tier(norm: &str, cand: &str) -> Option<u8> {
     }
 }
 
+pub(crate) fn release_norm_matches(candidate: &str, catalog: &str) -> bool {
+    candidate == catalog
+        || candidate.strip_suffix(" 1") == Some(catalog)
+        || candidate
+            .rsplit_once(' ')
+            .is_some_and(|(stem, year)| stem == catalog && year.parse().is_ok_and(looks_like_year))
+        || catalog.rsplit_once(" part ").is_some_and(|(stem, part)| {
+            part_number(part).is_some_and(|part| {
+                candidate
+                    .rsplit_once(' ')
+                    .is_some_and(|(base, suffix)| base == stem && suffix.parse::<u32>() == Ok(part))
+            })
+        })
+        || same_numbered_part(candidate, catalog)
+        || native_season(catalog).is_some_and(|(marker, season)| {
+            let mut stem = catalog.to_string();
+            stem.replace_range(marker, " ");
+            let stem = normalize(&stem);
+            candidate.rsplit_once(' ').is_some_and(|(base, number)| {
+                (base == stem || base == catalog) && number.parse::<u32>() == Ok(season)
+            })
+        })
+}
+
+fn same_numbered_part(candidate: &str, catalog: &str) -> bool {
+    candidate
+        .rsplit_once(" part ")
+        .zip(catalog.rsplit_once(" part "))
+        .is_some_and(|((base, first), (stem, second))| {
+            base == stem && part_number(first).is_some_and(|n| Some(n) == part_number(second))
+        })
+}
+
 fn parse_season_marker(raw: &str) -> Option<u32> {
     RE_SEASON_EP
-        .captures(raw)
+        .captures(&raw.replace('_', " "))
         .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
         .filter(|&n| (1..=MAX_SEASON).contains(&n))
 }
 
 fn parse_season_word(raw: &str) -> Option<u32> {
-    let lower = raw.to_lowercase();
-    let n = RE_SEASON_N
+    let lower = raw.to_lowercase().replace('_', " ");
+    let n = RE_NTH_SEASON
         .captures(&lower)
-        .or_else(|| RE_NTH_SEASON.captures(&lower))?
+        .or_else(|| RE_SEASON_N.captures(&lower))?
         .name("n")?;
     n.as_str()
         .parse::<u32>()
@@ -335,21 +703,213 @@ fn parse_season_word(raw: &str) -> Option<u32> {
 
 fn parse_season_token(raw: &str) -> Option<u32> {
     RE_SEASON_TOKEN
-        .captures(raw)
+        .captures(&raw.replace('_', " "))
         .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
         .filter(|&n| (1..=MAX_SEASON).contains(&n))
+}
+
+pub(crate) fn catalog_season(title: &str) -> Option<u32> {
+    let title = fold_digits(title);
+    parse_season_word(&title)
+        .or_else(|| parse_season_token(&title))
+        .or_else(|| native_season(&title).map(|(_, number)| number))
+        .or_else(|| {
+            normalize(&title)
+                .rsplit_once(" part ")
+                .and_then(|(_, part)| part_number(part))
+        })
+}
+
+fn part_number(part: &str) -> Option<u32> {
+    part.parse::<u32>()
+        .ok()
+        .filter(|n| (1..=MAX_SEASON).contains(n))
+        .or_else(|| roman_to_u32(part))
+}
+
+fn native_season(title: &str) -> Option<(Range<usize>, u32)> {
+    let marker = RE_NATIVE_SEASON.captures(title)?;
+    let number = if let Some(number) = marker.name("number") {
+        number.as_str().parse().ok()?
+    } else {
+        let roman = marker.name("roman")?.as_str().to_lowercase();
+        "ⅱⅲⅳⅴⅵⅶⅷⅸⅹⅺⅻ".chars().position(|c| roman.starts_with(c))? as u32 + 2
+    };
+    (1..=MAX_SEASON)
+        .contains(&number)
+        .then(|| (marker.get(0).unwrap().range(), number))
+}
+
+fn season_aliases(title: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(words) = RE_SEASON_WORDS
+        .captures(title)
+        .and_then(|c| c.name("words"))
+        .or_else(|| RE_SEASON_TOKEN.find(title))
+    {
+        let mut alias = title.to_owned();
+        alias.replace_range(words.range(), " ");
+        aliases.push(alias);
+    }
+    if let Some((marker, _)) = native_season(title) {
+        let mut alias = title.to_owned();
+        alias.replace_range(marker.clone(), " ");
+        aliases.push(alias);
+        // Attached numerals can precede a translated subtitle.
+        if !title[marker.clone()].starts_with('第') {
+            aliases.push(title[..marker.start].to_owned());
+            aliases.push(title[..marker.end].to_owned());
+        }
+    }
+    if aliases.is_empty() {
+        if let Some((stem, suffix)) = title.rsplit_once(' ') {
+            if part_number(&suffix.to_ascii_lowercase()).is_some() {
+                let stem = stem
+                    .strip_suffix(" Part")
+                    .or_else(|| stem.strip_suffix(" part"))
+                    .unwrap_or(stem);
+                aliases.push(stem.trim_end_matches([':', '：', ' ']).to_owned());
+            }
+        }
+    }
+    aliases
+}
+
+fn release_season(body: &str, groups: &str, title_end: usize) -> Option<u32> {
+    let (scene, named, token) = body_season_markers(body, title_end);
+    scene
+        .or(named)
+        .or(token)
+        .or_else(|| native_release_season(body, title_end))
+        .or_else(|| leading_release_tags(groups, None).season)
+}
+
+fn body_season_markers(body: &str, title_end: usize) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let normalized = body.replace('_', " ");
+    let mut markers = Cow::Borrowed(normalized.as_str());
+    for tag in RE_BRACKETS.find_iter(&normalized) {
+        if tag.start() == 0 || tag.end() <= title_end {
+            continue;
+        }
+        let inner = tag
+            .as_str()
+            .trim_matches(['[', ']', '(', ')', '【', '】'])
+            .trim();
+        let first_season = [
+            RE_SEASON_WORDS
+                .captures(inner)
+                .and_then(|c| c.name("words")),
+            RE_SEASON_TOKEN.find(inner),
+            RE_SEASON_EP.find(inner),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|m| m.start())
+        .min();
+        if let Some(start) = first_season.filter(|start| *start > 0) {
+            let prefix = mask_tag_words(&mask_release_format(&inner[..start], true));
+            let prefix = PACK_WORDS.replace_all(&prefix, " ");
+            if prefix.chars().any(char::is_alphabetic) {
+                // A season inside a release group's name does not identify the show.
+                markers
+                    .to_mut()
+                    .replace_range(tag.range(), &" ".repeat(tag.len()));
+            }
+        }
+    }
+    let end = marked_episode_bounds(&markers[title_end..])
+        .map_or(markers.len(), |(_, end)| title_end + end);
+    let (context, tail) = markers.split_at(end);
+    let scene = parse_season_marker(context);
+    let named = parse_season_word(context);
+    let token = parse_season_token(context);
+    let trailing_tag = (scene.is_none() && named.is_none() && token.is_none() && !tail.is_empty())
+        .then(|| leading_release_tags(tail, None).season)
+        .flatten();
+    (scene, named.or(trailing_tag), token)
+}
+
+fn native_release_season(body: &str, title_end: usize) -> Option<u32> {
+    let prefix = marked_release_prefix_after(body, title_end).unwrap_or(body);
+    native_season(prefix).map(|(_, number)| number)
+}
+
+fn starts_release_alias(body: &str, span: &Range<usize>) -> bool {
+    body[..span.start]
+        .trim_matches(release_separator)
+        .chars()
+        .all(|c| matches!(c, '[' | '(' | '【'))
+}
+
+fn season_alias_suffix(body: &str, span: &Range<usize>) -> bool {
+    release_alias_suffix(body, span)
+        || (starts_release_alias(body, span)
+            && marked_release_prefix(&body[span.end..].replace('_', " ")).is_some_and(|prefix| {
+                if normalize(prefix).starts_with("final season") {
+                    return false;
+                }
+                let prefix = mask_season_words(prefix, None);
+                let prefix = RE_NATIVE_SEASON.replace_all(&prefix, " ");
+                let prefix = RE_SEASON_TOKEN.replace_all(&prefix, " ");
+                let prefix = mask_release_format(&prefix, true);
+                let prefix = RELEASE_WORDS.replace_all(&prefix, " ");
+                RE_EMPTY_BRACKETS
+                    .replace_all(&prefix, " ")
+                    .trim_matches(release_separator)
+                    .is_empty()
+            }))
+}
+
+fn release_alias_suffix(body: &str, span: &Range<usize>) -> bool {
+    if !starts_release_alias(body, span) {
+        return false;
+    }
+    let tail = mask_dates(&strip_ext(&body[span.end..])).replace('_', " ");
+    let tail = mask_release_format(&tail, true);
+    let tail = mask_brackets(&tail);
+    if normalize(&tail).starts_with("final season ")
+        || marked_release_prefix(&tail).is_some_and(|prefix| {
+            prefix
+                .trim_matches(release_separator)
+                .parse::<u32>()
+                .is_ok_and(|number| (1..=MAX_SEASON).contains(&number))
+        })
+    {
+        return false;
+    }
+    let tail = mask_season_words(&tail, None);
+    let tail = RE_NATIVE_SEASON.replace_all(&tail, " ");
+    let tail = RE_SEASON_BARE.replace_all(&tail, " ");
+    let tail = PACK_WORDS.replace_all(&tail, " ");
+    let tail = RELEASE_WORDS.replace_all(&tail, " ");
+    let tail = RE_EXPLICIT_EP.replace_all(&tail, " ");
+    let tail = RE_REV_TAIL.replace(&tail, " ");
+    // A remaining numeric field can be an episode, range, revision or year.
+    normalize(&tail).split_whitespace().all(|word| {
+        let (number, revision) = word.split_once('v').unwrap_or((word, "0"));
+        number.parse::<u32>().is_ok() && revision.parse::<u32>().is_ok()
+    })
+}
+
+fn catalog_season_ordinal(variant: &str, norm: &str) -> Option<u32> {
+    let ordinal = norm_season_ordinal(norm);
+    catalog_season(variant).or(ordinal)
 }
 
 fn norm_season_ordinal(norm: &str) -> Option<u32> {
     #[cfg(test)]
     ORDINAL_PARSES.set(ORDINAL_PARSES.get() + 1);
     let words: Vec<&str> = norm.split_whitespace().collect();
-    for w in &words {
-        if let Some(n) = roman_to_u32(w) {
-            return Some(n);
-        }
+    if let Some(ordinal) = norm
+        .rsplit_once(" part ")
+        .and_then(|(_, part)| part_number(part))
+    {
+        return Some(ordinal);
     }
-    if words.len() == 2 && words[0] == "no" {
+    if let Some(ordinal) = words.last().and_then(|word| roman_to_u32(word)) {
+        return Some(ordinal);
+    }
+    if words.len() >= 2 && words[words.len() - 2] == "no" {
         return None;
     }
     words.last().and_then(|w| {
@@ -385,136 +945,369 @@ fn roman_to_u32(s: &str) -> Option<u32> {
             'm' => 1000,
             _ => return None,
         };
-        total = if v < prev { total - v } else { total + v };
+        total = if v < prev {
+            total.checked_sub(v)?
+        } else {
+            total + v
+        };
         prev = v;
     }
     (1..=30).contains(&total).then_some(total)
 }
 
+#[derive(Default, PartialEq, Eq, PartialOrd, Ord)]
+struct AliasEvidence {
+    direct: usize,
+    stem: usize,
+    exact: usize,
+}
+
+impl AliasEvidence {
+    fn length(&self) -> usize {
+        self.direct.max(self.stem)
+    }
+}
+
 type TiebreakKey = (
     bool,
     u8,
+    usize,
+    usize,
     std::cmp::Reverse<u8>,
     usize,
     std::cmp::Reverse<i64>,
 );
 
-fn strip_corner_release_groups<'a>(mut title: &'a str, matchers: &[Matcher]) -> &'a str {
-    loop {
+pub(crate) fn strip_release_groups<'a>(mut title: &'a str, matchers: &[Matcher]) -> &'a str {
+    while let Some(tag) = RE_BRACKETS
+        .find(title.trim_start())
+        .filter(|tag| tag.start() == 0)
+    {
         let trimmed = title.trim_start();
-        if trimmed.starts_with(['[', '(']) {
-            let Some(group) = RE_BRACKETS.find(trimmed).filter(|group| group.start() == 0) else {
-                break;
-            };
-            let remainder = trimmed[group.end()..].trim_start();
-            if !remainder.starts_with(['【', '[', '(']) {
+        let body = trimmed[tag.end()..].trim_start_matches(|c: char| c.is_whitespace() || c == '_');
+        if strip_ext(body).trim().is_empty() {
+            break;
+        }
+        let tag_norm = normalize(tag.as_str());
+        let body_norm = normalize(body);
+        let prefix = trimmed.to_lowercase();
+        let release_suffix = body.starts_with(['-', '·', '[', '(', '#', '【'])
+            || marked_release_prefix(body).is_some_and(|prefix| prefix.is_empty())
+            || parse_season_word(body).is_some_and(|_| {
+                body.get(..6)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("season"))
+            })
+            || leading_episode(body).is_some();
+        let mut main = body;
+        while let Some(padding) = RE_BRACKETS.find(main).filter(|tag| tag.start() == 0) {
+            if !normalize(&mask_release_format(padding.as_str(), true)).is_empty() {
                 break;
             }
-            title = remainder;
-            continue;
+            main =
+                main[padding.end()..].trim_start_matches(|c: char| c.is_whitespace() || c == '_');
         }
-        let Some(rest) = trimmed.strip_prefix('【') else {
-            break;
-        };
-        let Some(end) = rest.find('】') else {
-            break;
-        };
-        // A shared bracket label alone does not identify a catalog title.
-        let lower = title.trim_start().to_lowercase();
-        if matchers.iter().any(|matched| {
-            matched.variants.iter().any(|variant| {
-                let variant = variant.trim_start().to_lowercase();
-                variant.starts_with('【')
-                    && lower.strip_prefix(&variant).is_some_and(|tail| {
-                        tail.chars().next().is_none_or(|c| !c.is_alphanumeric())
-                    })
+        let repeats_title =
+            main.len() != body.len() && contains_tokens(&normalize(main), &tag_norm) == Some(true);
+        if !repeats_title
+            && (release_suffix || contains_tokens(&body_norm, &tag_norm) != Some(true))
+            && matchers.iter().any(|matched| {
+                matched.variants.iter().any(|variant| {
+                    let variant = variant.trim().to_lowercase();
+                    let same_bracketed_name = RE_BRACKETS.find(&variant).is_some_and(|bracket| {
+                        bracket.start() == 0 && normalize(bracket.as_str()) == tag_norm
+                    });
+                    (variant.starts_with(['[', '(', '【'])
+                        && prefix.strip_prefix(&variant).is_some_and(|tail| {
+                            tail.chars().next().is_none_or(|c| !c.is_alphanumeric())
+                        }))
+                        || ((tag.as_str().starts_with('【') || release_suffix)
+                            && matched.norms.iter().any(|norm| norm == &tag_norm))
+                        || (release_suffix && same_bracketed_name)
+                })
             })
-        }) {
+        {
             break;
         }
-        let remainder = rest[end + '】'.len_utf8()..].trim_start();
-        if strip_ext(remainder).trim().is_empty() {
-            break;
-        }
-        title = remainder;
+        title = body;
     }
     title
 }
 
-/// Seasons must agree. Unnumbered releases cannot imply a numbered sequel.
+fn marked_episode_bounds(s: &str) -> Option<(usize, usize)> {
+    let explicit = RE_EXPLICIT_EP.find(s).map(|m| (m.start(), m.end()));
+    let dashed = dashed_episode(s).map(|(dash, number)| (dash, number.end()));
+    let bracket = bracket_episode_match(s).map(|tag| (tag.span.start(), tag.span.end()));
+    explicit.into_iter().chain(dashed).chain(bracket).min()
+}
+
+pub(crate) fn release_alias_cut(s: &str, title_end: usize) -> usize {
+    let tail = &s[title_end..];
+    let bounds = if tail.contains('_') {
+        marked_episode_bounds(&tail.replace('_', " "))
+    } else {
+        marked_episode_bounds(tail)
+    };
+    bounds
+        .map(|(start, _)| title_end + start)
+        .filter(|&start| !s[..start].trim_matches(release_separator).is_empty())
+        .unwrap_or(s.len())
+}
+
+pub(crate) fn alias_before_episode(span: &Range<usize>, cut: usize, exact: bool) -> bool {
+    span.start < cut && (span.end <= cut || exact)
+}
+
+pub(crate) fn marked_release_prefix(s: &str) -> Option<&str> {
+    marked_release_prefix_after(s, 0)
+}
+
+fn marked_release_prefix_after(s: &str, title_end: usize) -> Option<&str> {
+    let (start, _) = marked_episode_bounds(&s[title_end..])?;
+    Some(s[..title_end + start].trim_end_matches(release_separator))
+}
+
+/// Match the release season against any title variant. Unnumbered releases default to season one.
 pub(crate) fn match_title<'a>(
     matchers: &'a [Matcher],
     title: &str,
     url: &str,
 ) -> Option<&'a Matcher> {
     let base = basename(url);
-    let title = strip_corner_release_groups(title, matchers);
-    let base = strip_corner_release_groups(&base, matchers);
-    let candidates = [
-        (clean_title(title), None, 0),
-        (clean_title(base), None, 0),
-        (norm_title(title), Some(title), 5),
-        (norm_title(base), Some(base), 5),
-        (clean_title_inner(title, false), None, 4),
-        (clean_title_inner(base, false), None, 4),
+    let folded_title = fold_digits(title);
+    let folded_base = fold_digits(&base);
+    let title = strip_release_groups(&folded_title, matchers);
+    let base = strip_release_groups(&folded_base, matchers);
+    let marked_title = has_marked_episode_tail(title);
+    let marked_base = has_marked_episode_tail(base);
+    let (clean, title_with_season_word) = release_title_norms(title);
+    let (clean_base, base_with_season_word) = release_title_norms(base);
+    let title_markers = title.replace('_', " ");
+    let base_markers = base.replace('_', " ");
+    let display_norm = normalize(title);
+    let path_norm = normalize(base);
+    let literal_title_end = |raw: &str, norm: &str| {
+        let cut = release_alias_cut(raw, 0);
+        matchers
+            .iter()
+            .filter(|m| cut < raw.len() && m.could_contain_alias(norm))
+            .map(|m| m.literal_release_title_end(raw, cut))
+            .max()
+            .unwrap_or_default()
+    };
+    let title_end = literal_title_end(title, &display_norm);
+    let base_end = literal_title_end(base, &path_norm);
+    let title_prefix = marked_release_prefix_after(&title_markers, title_end).unwrap_or_default();
+    let base_prefix = marked_release_prefix_after(&base_markers, base_end).unwrap_or_default();
+    let title_alias = catalog_title_norm(title_prefix);
+    let base_alias = catalog_title_norm(base_prefix);
+    let (title_scene, title_named, title_token) = body_season_markers(title, title_end);
+    let (base_scene, base_named, base_token) = body_season_markers(base, base_end);
+    let cand_season = title_scene.or(base_scene);
+    let season_ord = cand_season
+        .or(title_named)
+        .or(base_named)
+        .or(title_token)
+        .or(base_token);
+    let native =
+        native_release_season(title, title_end).or_else(|| native_release_season(base, base_end));
+    if [
         (
-            clean_title_inner(&title.replace(['【', '】'], " "), false),
+            title,
+            title_end,
+            title_scene.or(title_named).or(title_token),
+        ),
+        (base, base_end, base_scene.or(base_named).or(base_token)),
+    ]
+    .into_iter()
+    .any(|(release, title_end, season)| {
+        native_release_season(release, title_end)
+            .zip(season)
+            .is_some_and(|(native, season)| native != season)
+    }) {
+        return None;
+    }
+    let season_ord = season_ord
+        .or(native)
+        .or_else(|| {
+            leading_release_tags(&folded_title[..folded_title.len() - title.len()], None).season
+        })
+        .or_else(|| {
+            leading_release_tags(&folded_base[..folded_base.len() - base.len()], None).season
+        });
+    let title_cut = release_alias_cut(title, title_end);
+    let base_cut = release_alias_cut(base, base_end);
+    let title_norm = norm_title(title);
+    let base_norm = norm_title(base);
+    let bare_title_norms = [
+        (!marked_title).then_some(&title_norm),
+        (!marked_base).then_some(&base_norm),
+    ];
+    let exact_unmarked_title = season_ord.is_none()
+        && bare_title_norms
+            .iter()
+            .flatten()
+            .any(|norm| matchers.iter().any(|m| m.norms.contains(norm)));
+    let evidence: Vec<_> = matchers
+        .iter()
+        .map(|m| {
+            let mut candidates = [
+                (title, &display_norm, title_cut),
+                (base, &path_norm, base_cut),
+            ]
+            .into_iter()
+            .filter(|(_, norm, _)| m.could_contain_alias(norm))
+            .peekable();
+            let literal = season_ord.is_some()
+                && candidates.peek().is_some()
+                && literal_numbered_title(matchers, m);
+            let alias = candidates
+                .map(|(raw, _, cut)| m.release_alias_evidence(raw, cut, season_ord))
+                .fold(AliasEvidence::default(), |best, candidate| AliasEvidence {
+                    exact: best.exact.max(candidate.exact),
+                    ..best.max(candidate)
+                });
+            // A scene marker can corroborate a shortened Roman ordinal title.
+            let roman_stem = alias.direct == 0
+                && alias.stem > 0
+                && m.norms.iter().any(|norm| {
+                    norm.rsplit_once(' ')
+                        .is_some_and(|(_, suffix)| roman_to_u32(suffix) == season_ord)
+                });
+            (m, alias, literal && !roman_stem)
+        })
+        .collect();
+    let conflicting_alias = evidence
+        .iter()
+        .filter_map(|(m, alias, literal)| {
+            let season = season_ord?;
+            (alias.direct > 0
+                && (m.explicit_season.is_some() || m.norm_seasons.iter().any(Option::is_some))
+                && !matches_catalog_season(m, season, *literal))
+            .then_some(alias.direct)
+        })
+        .max()
+        .unwrap_or_default();
+    let bare_owned = |m: &Matcher| {
+        bare_title_norms
+            .iter()
+            .flatten()
+            .any(|norm| m.norms.contains(norm))
+    };
+    let candidates = [
+        (title_alias, None, 6, false),
+        (base_alias, None, 6, false),
+        (marked_prefix_norm(title_prefix), None, 0, false),
+        (marked_prefix_norm(base_prefix), None, 0, false),
+        (pack_title_norm(title), None, 4, false),
+        (plural_season_pack_norm(title), None, 0, false),
+        (pack_title_norm(base), None, 4, false),
+        (plural_season_pack_norm(base), None, 0, false),
+        (clean, None, 0, false),
+        (clean_base, None, 0, false),
+        (catalog_title_norm(title), Some(title), 5, false),
+        (catalog_title_norm(base), Some(base), 5, false),
+        (title_norm.clone(), Some(title), 5, false),
+        (base_norm.clone(), Some(base), 5, false),
+        (clean_title_inner(title, false).0, None, 4, false),
+        (clean_title_inner(base, false).0, None, 4, false),
+        (
+            clean_title_inner(&title.replace(['【', '】'], " "), false).0,
             None,
             if title.trim_start().starts_with('【') {
                 5
             } else {
                 3
             },
+            false,
         ),
         (
-            clean_title_inner(&base.replace(['【', '】'], " "), false),
+            clean_title_inner(&base.replace(['【', '】'], " "), false).0,
             None,
             if base.trim_start().starts_with('【') {
                 5
             } else {
                 3
             },
+            false,
         ),
+        (title_with_season_word.unwrap_or_default(), None, 4, true),
+        (base_with_season_word.unwrap_or_default(), None, 4, true),
+        (literal_season_range_norm(title), None, 4, true),
+        (literal_season_range_norm(base), None, 4, true),
     ];
-    let cand_season = parse_season_marker(title).or_else(|| parse_season_marker(&basename(url)));
     let mut best: Option<(TiebreakKey, &Matcher)> = None;
-    let season_ord = cand_season
-        .or_else(|| parse_season_word(title))
-        .or_else(|| parse_season_word(&basename(url)))
-        .or_else(|| parse_season_token(title))
-        .or_else(|| parse_season_token(&basename(url)));
-    for (cand, raw_title, exact_tier) in candidates {
+    for (m, alias, literal) in &evidence {
+        if alias.length() == 0
+            || (exact_unmarked_title && !bare_owned(m))
+            || alias.length() < conflicting_alias
+            || season_ord.is_some_and(|season| !matches_catalog_season(m, season, *literal))
+        {
+            continue;
+        }
+        let season_match = cand_season.is_some_and(|cs| m.norm_seasons.contains(&Some(cs)));
+        let key = (
+            season_match,
+            7,
+            alias.length(),
+            alias.exact,
+            std::cmp::Reverse(m.status_rank),
+            0,
+            std::cmp::Reverse(m.media_id),
+        );
+        if best.as_ref().is_none_or(|(bk, _)| key > *bk) {
+            best = Some((key, m));
+        }
+    }
+    let format_prefixes = [
+        if title_prefix.is_empty() && !marked_title {
+            &title_markers
+        } else {
+            title_prefix
+        },
+        if base_prefix.is_empty() && !marked_base {
+            &base_markers
+        } else {
+            base_prefix
+        },
+    ]
+    .into_iter()
+    .flat_map(format_prefix_norms)
+    .map(|prefix| (prefix, None, 6, false));
+    for (cand, raw_title, exact_tier, season_word_is_literal) in
+        candidates.into_iter().chain(format_prefixes)
+    {
         let exact_only = exact_tier > 0;
         if cand.is_empty() {
             continue;
         }
-        let cand_ord = season_ord.or_else(|| norm_season_ordinal(&cand));
-        for m in matchers {
+        let cand_ord = if season_word_is_literal {
+            cand_season
+        } else {
+            season_ord
+        }
+        .or_else(|| norm_season_ordinal(&cand));
+        for (m, alias, literal) in &evidence {
+            if alias.length() < conflicting_alias {
+                continue;
+            }
             if exact_only && !m.norms.iter().any(|n| n == &cand) {
                 continue;
             }
             if let Some(raw) = raw_title {
-                let text = strip_ext(raw);
-                let marked_episode = RE_EP_TAIL.find(&text).is_some_and(|tail| {
-                    tail.as_str().trim_start().starts_with(['-', '_', '·'])
-                        || RE_EXPLICIT_EP.is_match(tail.as_str())
-                });
-                if marked_episode
-                    && parse_season_marker(raw).is_none()
-                    && !m
-                        .variants
-                        .iter()
-                        .any(|v| raw.to_lowercase().contains(&v.to_lowercase()))
-                {
+                let marked_episode = if raw == title {
+                    marked_title
+                } else {
+                    marked_base
+                };
+                if marked_episode && parse_season_marker(raw).is_none() && alias.exact == 0 {
                     continue;
                 }
             }
             let expected_season = cand_ord.unwrap_or(1);
-            if !m
-                .norm_seasons
-                .iter()
-                .any(|ord| *ord == Some(expected_season) || (expected_season == 1 && ord.is_none()))
-            {
+            let exact_alias = m.norms.iter().any(|norm| norm == &cand);
+            let matches_season = matches_catalog_season(m, expected_season, *literal)
+                || (m.explicit_season.is_some() && season_ord.is_none() && exact_alias);
+            if !matches_season {
                 continue;
             }
             if let Some((tier, nlen)) = m
@@ -525,15 +1318,34 @@ pub(crate) fn match_title<'a>(
                         // Preserve title numbers before status breaks ties.
                         (n == &cand).then_some((exact_tier, n.len()))
                     } else {
-                        norm_match_tier(n, &cand).map(|t| (t, n.len()))
+                        let tier = norm_match_tier(n, &cand)
+                            .or_else(|| release_norm_matches(&cand, n).then_some(3));
+                        tier.map(|t| (t, n.len()))
                     }
                 })
                 .max()
             {
                 let season_match = cand_season.is_some_and(|cs| m.norm_seasons.contains(&Some(cs)));
+                let exact = if tier == 1 && alias.exact == 0 {
+                    [(title, title_cut), (base, base_cut)]
+                        .into_iter()
+                        .flat_map(|(raw, cut)| {
+                            m.release_alias_spans(raw).into_iter().filter(move |span| {
+                                span.start < cut
+                                    && m.alias_spelling(raw, span) == AliasSpelling::Exact
+                            })
+                        })
+                        .map(|span| span.len())
+                        .max()
+                        .unwrap_or_default()
+                } else {
+                    alias.exact
+                };
                 let key = (
                     season_match,
                     tier,
+                    exact,
+                    0,
                     std::cmp::Reverse(m.status_rank),
                     nlen,
                     std::cmp::Reverse(m.media_id),
@@ -547,52 +1359,233 @@ pub(crate) fn match_title<'a>(
     best.map(|(_, m)| m)
 }
 
-pub(crate) fn clean_title(s: &str) -> String {
+fn matches_catalog_season(matched: &Matcher, expected: u32, literal: bool) -> bool {
+    if let Some(explicit) = matched.explicit_season {
+        return explicit == expected;
+    }
+    matched.norm_seasons.iter().any(|ord| {
+        if literal {
+            expected == 1
+        } else {
+            ord.unwrap_or(1) == expected
+        }
+    })
+}
+
+fn literal_numbered_title(matchers: &[Matcher], matched: &Matcher) -> bool {
+    let mut stems = matched
+        .norms
+        .iter()
+        .zip(&matched.variants)
+        .zip(&matched.norm_seasons)
+        .filter_map(|((norm, variant), ordinal)| {
+            let (stem, suffix) = norm.rsplit_once(' ')?;
+            let terminal_ordinal = suffix.parse().ok().or_else(|| roman_to_u32(suffix));
+            (terminal_ordinal.is_some()
+                && terminal_ordinal == *ordinal
+                && catalog_season(variant).is_none())
+            .then_some(stem)
+        })
+        .peekable();
+    stems.peek().is_some()
+        && !stems.any(|stem| {
+            matchers.iter().any(|other| {
+                matched.media_id != other.media_id && other.norms.iter().any(|n| n == stem)
+            })
+        })
+}
+
+#[cfg(test)]
+fn clean_title(s: &str) -> String {
+    release_title_norms(s).0
+}
+
+/// The alternate needs a catalog title that ends in the literal word Season.
+pub(crate) fn release_title_norms(s: &str) -> (String, Option<String>) {
     clean_title_inner(s, true)
 }
 
-fn clean_title_inner(s: &str, strip_channels: bool) -> String {
-    let s = strip_ext(s);
-    let s = RE_BRACKETS.replace_all(&s, " ");
-    // Strip channels before episode tails to avoid reading AAC2.0 as episode zero.
-    let s = if strip_channels {
-        RE_CHANNEL.replace_all(&s, " ")
-    } else {
-        s
-    };
-    let s = RE_RES.replace_all(&s, " ");
-    let release =
-        s.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-' | '·'));
-    let stripped = strip_episode_tail(release);
+fn clean_release_text(s: &str, strip_channels: bool) -> String {
+    let s = mask_dates(&strip_ext(s)).replace('_', " ");
+    let s = RE_BRACKETS.replace_all(&s, |c: &regex::Captures| {
+        let inner = &c[0];
+        if let Some(words) = RE_SEASON_WORDS
+            .captures(inner)
+            .and_then(|c| c.name("words"))
+        {
+            format!(" {} ", words.as_str())
+        } else if let Some(season) = RE_SEASON_EP.captures(inner).and_then(|c| c.get(1)) {
+            format!(" S{} ", season.as_str())
+        } else if let Some(token) = RE_SEASON_TOKEN.find(inner) {
+            format!(" {} ", token.as_str())
+        } else {
+            " ".to_string()
+        }
+    });
+    let s = mask_release_format(&s, strip_channels);
+    RE_RES.replace_all(&s, " ").into_owned()
+}
+
+fn clean_title_inner(s: &str, strip_channels: bool) -> (String, Option<String>) {
+    let s = clean_release_text(s, strip_channels);
+    let release = s.trim_end_matches(release_separator);
+    let (stripped, alternate) = strip_episode_tail(release);
     // Preserve numeric titles when stripping would leave nothing.
-    let normed = normalize(&stripped);
+    let normed = normalize(stripped);
     let out = if normed.is_empty() {
         normalize(&s)
     } else {
         normed
     };
-    season_ordinals(&out)
+    (
+        season_ordinals(&out),
+        alternate.map(|s| season_ordinals(&normalize(s))),
+    )
 }
 
-/// A number after season is an ordinal. Check outside the regex, which lacks lookbehind.
-fn strip_episode_tail(s: &str) -> Cow<'_, str> {
-    match RE_EP_TAIL.find(s) {
-        Some(m) if preceded_by_season(s, m.start()) => Cow::Borrowed(s),
-        _ => RE_EP_TAIL.replace(s, ""),
+pub(crate) fn marked_prefix_norm(prefix: &str) -> String {
+    let norm = season_ordinals(&normalize(&clean_release_text(prefix, true)));
+    if let Some((stem, year)) = norm.rsplit_once(' ') {
+        if year.parse().is_ok_and(looks_like_year) {
+            return stem.to_string();
+        }
+    }
+    norm
+}
+
+pub(crate) fn format_prefix_norms(s: &str) -> impl Iterator<Item = String> + '_ {
+    RE_FORMAT
+        .find_iter(s)
+        .filter(|tag| tag.start() > 0 && marked_prefix_norm(&s[tag.start()..]).is_empty())
+        .map(|tag| catalog_title_norm(&s[..tag.start()]))
+}
+
+fn plural_season_pack_norm(raw: &str) -> String {
+    let text = RE_BRACKETS.replace_all(raw, " ").replace('_', " ");
+    if let Some(range) = RE_SEASON_RANGE
+        .captures(&text)
+        .filter(|range| range.name("plural").is_some() && valid_season_range(range, ""))
+    {
+        let prefix = &text[..range.name("range").unwrap().start()];
+        return format!(
+            "{} {}",
+            catalog_title_norm(prefix),
+            canon_ordinal(&range["first"])
+        );
+    }
+    String::new()
+}
+
+fn pack_title_norm(raw: &str) -> String {
+    let text = strip_ext(raw).replace('_', " ");
+    let text = RE_BRACKETS.replace_all(&text, " ");
+    if !PACK_WORDS.is_match(&text) {
+        return String::new();
+    }
+    let text = mask_release_format(&text, true);
+    let text = PACK_WORDS.replace_all(&text, " ");
+    let trimmed = text.trim_end_matches(release_separator);
+    season_ordinals(&normalize(trimmed))
+}
+
+fn literal_season_range_norm(raw: &str) -> String {
+    if !raw
+        .as_bytes()
+        .windows(6)
+        .any(|word| word.eq_ignore_ascii_case(b"season"))
+    {
+        return String::new();
+    }
+    let normalized = mask_release_format(&raw.replace('_', " "), true);
+    let Some(span) = episode_ranges(&normalized)
+        .next()
+        .and_then(|range| range.name("range"))
+    else {
+        return String::new();
+    };
+    let prefix = normalized[..span.start()].trim_end_matches(release_separator);
+    let norm = release_title_norms(prefix).0;
+    if norm.ends_with(" season") {
+        norm
+    } else {
+        String::new()
     }
 }
 
-fn preceded_by_season(s: &str, start: usize) -> bool {
-    s[..start]
-        .split_whitespace()
-        .next_back()
-        .is_some_and(|w| w.eq_ignore_ascii_case("season"))
+fn has_marked_episode_tail(raw: &str) -> bool {
+    let text = strip_ext(raw).replace('_', " ");
+    let text = RE_BRACKETS.replace_all(&text, " ");
+    let text = mask_release_format(&text, false);
+    let text = RE_RES.replace_all(&text, " ");
+    let text = text.trim_end_matches(release_separator);
+    RE_EP_TAIL.find(text).is_some_and(|tail| {
+        episode_separator(tail.as_str(), preceded_by_season(&text[..tail.start()]))
+            || RE_EXPLICIT_EP.is_match(tail.as_str())
+    })
+}
+
+fn release_separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '.' | '_' | '-' | '·' | '–' | '—')
+}
+
+fn preceded_by_season(prefix: &str) -> bool {
+    prefix
+        .split(release_separator)
+        .rfind(|word| !word.is_empty())
+        .is_some_and(|word| word.eq_ignore_ascii_case("season"))
+}
+
+fn episode_separator(tail: &str, follows_season: bool) -> bool {
+    let marker = tail.trim_start();
+    marker.starts_with('·')
+        || marker.strip_prefix(['-', '–', '—']).is_some_and(|rest| {
+            !follows_season || tail != marker || rest.starts_with(char::is_whitespace)
+        })
+}
+
+fn strip_episode_tail(s: &str) -> (&str, Option<&str>) {
+    if let Some((_, fraction)) =
+        fractional_episodes(s).find(|(_, fraction)| fraction.end == s.len())
+    {
+        return (&s[..fraction.start], None);
+    }
+    let Some(tail) = RE_EP_TAIL.find(s) else {
+        return (s, None);
+    };
+    if RE_SEASON_TOKEN
+        .find_iter(s)
+        .any(|token| token.end() == s.len())
+    {
+        return (s, None);
+    }
+    let prefix = &s[..tail.start()];
+    let bare_number = tail
+        .as_str()
+        .trim_start_matches(release_separator)
+        .starts_with(|c: char| c.is_ascii_digit());
+    if bare_number && preceded_by_season(prefix) && !episode_separator(tail.as_str(), true) {
+        let normalized = normalize(prefix);
+        if !RE_NTH_SEASON
+            .find_iter(&normalized)
+            .any(|m| m.end() == normalized.len())
+        {
+            return (s, Some(prefix));
+        }
+    }
+    (prefix, None)
+}
+
+pub(crate) fn catalog_title_norm(s: &str) -> String {
+    let s = strip_ext(&fold_digits(s)).replace(['【', '】', '_'], " ");
+    let s = RE_BRACKETS.replace_all(&s, " ");
+    season_ordinals(&normalize(&s))
 }
 
 pub(crate) fn norm_title(s: &str) -> String {
-    let s = strip_ext(s).replace(['【', '】'], " ");
+    let s = strip_ext(&fold_digits(s)).replace(['【', '】', '_'], " ");
     let s = RE_BRACKETS.replace_all(&s, " ");
-    let res_stripped = RE_RES.replace_all(&s, " ");
+    let format_stripped = mask_release_format(&s, false);
+    let res_stripped = RE_RES.replace_all(&format_stripped, " ");
     // A real title such as Opus can also be a codec name.
     let s = if normalize(&res_stripped).is_empty() {
         s
@@ -622,11 +1615,38 @@ fn season_ordinals(normed: &str) -> String {
     let out = RE_SEASON_N.replace_all(&out, |c: &regex::Captures| {
         canon_ordinal(c.name("n").map_or("", |m| m.as_str())).to_string()
     });
-    RE_SEASON_TOKEN
+    let out = RE_SEASON_TOKEN
         .replace_all(&out, |c: &regex::Captures| {
             canon_ordinal(c.get(1).map_or("", |m| m.as_str())).to_string()
         })
-        .into_owned()
+        .into_owned();
+    if let Some((stem, part)) = out.rsplit_once(" part ") {
+        if part
+            .parse::<u32>()
+            .is_ok_and(|number| (1..=MAX_SEASON).contains(&number))
+        {
+            return format!("{stem} part {}", canon_ordinal(part));
+        }
+    }
+    out
+}
+
+pub(crate) fn fold_digits(s: &str) -> Cow<'_, str> {
+    if s.contains(|c: char| ('０'..='９').contains(&c)) {
+        Cow::Owned(
+            s.chars()
+                .map(|c| {
+                    if ('０'..='９').contains(&c) {
+                        (b'0' + (c as u32 - '０' as u32) as u8) as char
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 fn normalize(s: &str) -> String {
@@ -698,163 +1718,178 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Outer None permits guessing. Inner None means the title matched but no episode followed.
-pub(crate) fn parse_episode_after(playing: &str, variants: &[String]) -> Option<Option<i64>> {
-    let lp = playing.to_lowercase();
-    for v in variants {
-        let lv = v.to_lowercase();
-        if lv.is_empty() {
-            continue;
-        }
-        // Prefer whole titles over title text embedded in episode numbers or metadata.
-        let occurrence = lp.match_indices(&lv).min_by_key(|(start, _)| {
-            let end = *start + lv.len();
-            let embedded = lp[..*start]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric)
-                || lp[end..].chars().next().is_some_and(char::is_alphanumeric);
-            let metadata = RE_BRACKETS
-                .find_iter(&lp)
-                .find(|bracket| bracket.start() <= *start && *start < bracket.end())
-                .map_or(0, |bracket| {
-                    if bracket
-                        .as_str()
-                        .trim_matches(['[', ']', '(', ')', '【', '】'])
-                        .trim()
-                        == lv
-                    {
-                        1
-                    } else {
-                        2
-                    }
-                });
-            (embedded, metadata)
-        });
-        if let Some((start, title)) = occurrence {
-            let mut remainder = lp.clone();
-            remainder.replace_range(start..start + title.len(), " ");
-            return Some(parse_episode_number(&remainder, true));
-        }
-    }
-    None
-}
-
-pub(crate) fn parse_episode_guess(s: &str) -> Option<i64> {
-    parse_last_episode_number(s)
-}
-
-/// Guess only if no raw title variant matched. A title without an episode may be a batch.
+/// A title match suppresses the final numeric fallback. Other candidates can still supply an episode.
 pub(crate) fn resolve_episode(matched: &Matcher, candidates: &[&str]) -> Option<i64> {
     let mut variant_hit = false;
+    let mut fallback = None;
     for cand in candidates {
-        let episode = parse_episode_after(cand, &matched.variants).or_else(|| {
-            let pattern = matched
-                .title_patterns()
-                .iter()
-                .find(|pattern| pattern.is_match(cand))?;
-            Some(parse_episode_number(&pattern.replace(cand, " "), true))
-        });
-        match episode {
-            Some(Some(n)) => return Some(n),
-            Some(None) => variant_hit = true,
-            None => {
-                if matched.norms.contains(&norm_title(cand)) {
-                    if RE_SEASON_EP.is_match(cand) {
-                        if let Some(episode) = parse_episode_guess(cand) {
-                            return Some(episode);
-                        }
-                    }
-                    if let Some(episode) = bracket_episode(cand) {
-                        return Some(episode);
-                    }
-                    variant_hit = true;
-                }
-            }
+        let folded = fold_digits(cand);
+        if matched.is_season_pack(&folded) {
+            variant_hit = true;
+            continue;
         }
+        let cand = strip_release_groups(&folded, std::slice::from_ref(matched));
+        let offset = folded.len() - cand.len();
+        let groups = mask_release_format(&folded[..offset].replace('_', " "), true);
+        let title = matched.release_title_span_in(&folded, cand);
+        let title_removed = title.is_some();
+        let normalized_alias = !title_removed && matched.norms.contains(&norm_title(cand));
+        let (remainder, _) = episode_remainder(cand, title);
+        let masked = mask_brackets(&remainder);
+        let position = episode_position(&masked, title_removed);
+        if has_cross_season_range(&groups, groups.len())
+            || leading_release_extra(&groups, matched.format.as_deref())
+            || leading_fractional_release(&groups)
+            || episode_ranges(&groups)
+                .any(|range| bracketed_range(&groups, range.name("range").unwrap().range()))
+            || has_conflicting_episode_markers(&remainder, cand)
+            || !is_single_episode(&remainder, position, title_removed || normalized_alias)
+        {
+            variant_hit = true;
+            continue;
+        }
+        let episode = if normalized_alias && parse_season_marker(cand).is_none() {
+            bracket_episode_match(&remainder).map(|tag| tag.number)
+        } else {
+            episode_from_remainder(&masked, title_removed)
+        };
+        if let Some(episode) = episode.or_else(|| {
+            if offset == 0 || has_conflicting_episode_markers(&groups, &groups) {
+                return None;
+            }
+            let season = matched.release_season(cand, "").or_else(|| {
+                candidates.iter().find_map(|candidate| {
+                    let folded = fold_digits(candidate);
+                    let body = strip_release_groups(&folded, std::slice::from_ref(matched));
+                    matched.release_season(body, "")
+                })
+            });
+            leading_release_tags(&folded[..offset], season).episode
+        }) {
+            if title_removed || normalized_alias {
+                return Some(episode);
+            }
+            fallback = fallback.or(Some(episode));
+        }
+        variant_hit |= title_removed || normalized_alias;
     }
     if variant_hit {
         None
     } else {
-        candidates.iter().find_map(|c| parse_episode_guess(c))
+        fallback
     }
 }
 
 pub(crate) fn excluded_playback_release(matched: &Matcher, candidate: &str) -> bool {
-    let filename = strip_ext(candidate);
+    let filename = strip_ext(&fold_digits(candidate));
     let candidate = filename.as_str();
-    static EXTRAS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"\b(?P<marker>trailer|preview|sample|pv|ova|oad|sp|op|ed|ost|ncop|nced|creditless|extras?|specials?)[0-9]*\b",
-        )
-        .unwrap()
-    });
     let movie = matched.episodes == Some(1);
-    if !(RE_HALF_EPISODE.is_match(candidate)
-        || RE_EP_RANGE.is_match(candidate)
-        || EXTRAS.is_match(&normalize(candidate)))
-    {
-        return false;
-    }
-    let remainder = matched
-        .title_patterns()
-        .iter()
-        .find(|pattern| pattern.is_match(candidate))
-        .map_or(Cow::Borrowed(candidate), |pattern| {
-            pattern.replace(candidate, " ")
-        });
-    if let Some(fractional) = RE_HALF_EPISODE.find(&remainder) {
-        let episode = RE_EXPLICIT_EP
-            .captures(&remainder)
-            .or_else(|| RE_LEADING_EP.captures(&remainder))
-            .and_then(|captures| captures.get(1));
-        if episode.is_none_or(|episode| episode.start() >= fractional.start()) {
-            return true;
-        }
-    }
-    let unrelated_extra = |raw: &str| {
-        EXTRAS.captures_iter(&normalize(raw)).any(|capture| {
-            !matches!(
-                (matched.format.as_deref(), &capture["marker"]),
-                (Some("OVA"), "ova" | "oad") | (Some("SPECIAL"), "sp" | "special" | "specials")
-            )
-        })
-    };
-    if RE_BRACKETS.find_iter(&remainder).any(|bracket| {
-        let metadata = normalize(bracket.as_str());
-        unrelated_extra(&metadata)
-            && EXTRAS.find(&metadata).is_some_and(|marker| {
-                marker.start() == 0
-                    && metadata[marker.end()..].split_whitespace().all(|word| {
-                        word.parse::<u32>().is_ok()
-                            || RE_RES.is_match(word)
-                            || EXTRAS.is_match(word)
-                    })
-            })
-    }) {
+    if matched.is_season_pack(candidate) {
         return true;
     }
-    let unbracketed = RE_BRACKETS.replace_all(&remainder, " ");
-    let episode = RE_EXPLICIT_EP
-        .captures(&unbracketed)
-        .or_else(|| RE_LEADING_EP.captures(&unbracketed))
-        .and_then(|captures| captures.get(1));
-    let extra_metadata = if movie {
-        remainder.as_ref()
-    } else {
-        &unbracketed[..episode.map_or(unbracketed.len(), |episode| episode.start())]
-    };
-    if unrelated_extra(extra_metadata) {
+    let title = matched.release_title_span(candidate);
+    let (remainder, _) = episode_remainder(candidate, title.clone());
+    let body = strip_release_groups(candidate, std::slice::from_ref(matched));
+    let group_end = candidate.len() - body.len();
+    let source_body = body;
+    let (groups, body) = remainder.split_at(group_end);
+    let release_range = |range| is_release_range(candidate, range, group_end);
+    if has_cross_season_range(&remainder, group_end) {
+        return true;
+    }
+    let episode = episode_position(&mask_brackets(body), true);
+    if starts_with_fractional_episode(body, episode)
+        || has_conflicting_episode_markers(body, source_body)
+        || (episode.is_none() && has_conflicting_episode_markers(groups, &candidate[..group_end]))
+        || leading_fractional_release(groups)
+        || has_release_extra(body, matched.format.as_deref(), movie)
+        || leading_release_extra(groups, matched.format.as_deref())
+    {
         return true;
     }
     if movie {
-        return RE_EP_RANGE.is_match(&remainder);
+        return episode_ranges(&remainder).any(|c| release_range(c.name("range").unwrap().range()))
+            || (episode.is_none()
+                && RE_DATE.captures_iter(candidate).any(|date| {
+                    let span = date.name("date").unwrap().range();
+                    title
+                        .as_ref()
+                        .is_none_or(|title| !title.contains(&span.start))
+                        && !RE_BRACKETS
+                            .find_iter(candidate)
+                            .any(|tag| tag.range().contains(&span.start))
+                        && valid_date(date)
+                }));
     }
-    RE_EP_RANGE.captures_iter(&remainder).any(|range| {
-        let first = range["start"].parse::<i64>().unwrap();
-        let last = range["end"].parse::<i64>().unwrap();
-        first < last && !looks_like_year(first) && !looks_like_year(last)
-    }) && resolve_episode(matched, &[candidate]).is_none()
+    episode_ranges(&remainder).any(|c| release_range(c.name("range").unwrap().range()))
+        && resolve_episode(matched, &[candidate]).is_none()
+}
+
+pub(crate) fn has_release_extra(s: &str, format: Option<&str>, single_feature: bool) -> bool {
+    let s = mask_season_words(s, None);
+    let masked = mask_brackets(&s);
+    let episode = (!single_feature)
+        .then(|| episode_position(&masked, true))
+        .flatten();
+    let end = episode.unwrap_or(masked.len());
+    unrelated_extra(&masked[..end], format)
+        || episode.is_some_and(|start| {
+            // An episode subtitle can contain extra markers as ordinary words.
+            let tail = RELEASE_WORDS.replace_all(&masked[start..], " ");
+            whole_extra_tag(&tail, format)
+                || RE_SUBTITLE_SEPARATOR
+                    .find_iter(tail.trim_end())
+                    .last()
+                    .is_some_and(|separator| whole_extra_tag(&tail[separator.end()..], format))
+        })
+        || RE_BRACKETS.find_iter(&s).any(|bracket| {
+            whole_extra_tag(bracket.as_str(), format)
+                || (single_feature && unrelated_extra(bracket.as_str(), format))
+        })
+}
+
+fn whole_extra_tag(tag: &str, format: Option<&str>) -> bool {
+    let tag = mask_release_format(&tag.replace('_', " "), true);
+    let tag = mask_season_words(&tag, None);
+    let tag = RE_SEASON_TOKEN.replace_all(&tag, " ");
+    let tag = RELEASE_WORDS.replace_all(&tag, " ");
+    let metadata = normalize(&RE_EXPLICIT_EP.replace_all(&tag, " "));
+    unrelated_extra(&metadata, format)
+        && metadata
+            .replace("next episode preview", "preview")
+            .split_whitespace()
+            .all(|word| {
+                word.parse::<u32>().is_ok()
+                    || RE_EXTRAS.is_match(word)
+                    || word.split_once('v').is_some_and(|(number, revision)| {
+                        (number.is_empty() || number.parse::<u32>().is_ok())
+                            && revision.parse::<u32>().is_ok()
+                    })
+            })
+}
+
+pub(crate) fn leading_release_extra(groups: &str, format: Option<&str>) -> bool {
+    RE_BRACKETS
+        .find_iter(groups)
+        .any(|tag| whole_extra_tag(tag.as_str(), format))
+}
+
+pub(crate) fn leading_fractional_release(groups: &str) -> bool {
+    fractional_episodes(groups).any(|(_, span)| bracketed_range(groups, span))
+        || episode_ranges(groups).any(|range| {
+            range.name("fraction").is_some()
+                && bracketed_range(groups, range.name("range").unwrap().range())
+        })
+}
+
+fn unrelated_extra(s: &str, format: Option<&str>) -> bool {
+    RE_EXTRAS.captures_iter(&normalize(s)).any(|capture| {
+        !matches!(
+            (format, &capture["marker"]),
+            (Some("OVA"), "ova" | "ovas" | "oad" | "oads")
+                | (Some("SPECIAL"), "sp" | "special" | "specials")
+        )
+    })
 }
 
 pub(crate) fn resolve_playback_episode(
@@ -876,15 +1911,16 @@ pub(crate) fn resolve_playback_episode(
     }
     (bound
         || candidates.iter().any(|candidate| {
-            matched
-                .norms
-                .contains(&norm_title(strip_corner_release_groups(
+            let folded = fold_digits(candidate);
+            matched.has_release_alias(&folded)
+                || matched.norms.contains(&norm_title(strip_release_groups(
                     candidate,
                     std::slice::from_ref(matched),
                 )))
                 || matched
                     .norms
                     .contains(&norm_title(&RE_BRACKETS.replace_all(candidate, " ")))
+                || matched.norms.contains(&release_title_norms(candidate).0)
         }))
     .then_some(1)
 }
@@ -894,62 +1930,720 @@ fn looks_like_year(n: i64) -> bool {
     (1900..=chrono::Utc::now().year() as i64 + 1).contains(&n)
 }
 
-fn bracket_episode(s: &str) -> Option<i64> {
+#[derive(Default)]
+struct LeadingTag {
+    season: Option<u32>,
+    episode: Option<i64>,
+    pack: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct LeadingTags {
+    season: Option<u32>,
+    episode: Option<i64>,
+    // A recognized pack must agree with the target season.
+    pub(crate) pack_matches: Option<bool>,
+}
+
+pub(crate) fn leading_release_tags(groups: &str, body_season: Option<u32>) -> LeadingTags {
+    if groups.is_empty() {
+        return LeadingTags::default();
+    }
+    let groups = mask_release_format(&groups.replace('_', " "), true);
+    let groups = mask_tag_words(&groups);
+    let mut uncertain_season = false;
+    let tags: Vec<_> = RE_BRACKETS
+        .find_iter(&groups)
+        .map(|tag| {
+            let stripped = PACK_WORDS.replace_all(tag.as_str(), " ");
+            let mut pack = matches!(stripped, Cow::Owned(_));
+            let tag = stripped.as_ref();
+            let inner = tag.trim_matches(['[', ']', '(', ')', '【', '】']).trim();
+            if let Some(episode) =
+                bracket_episode_match(tag).filter(|ep| ep.marked && ep.span.len() == tag.len())
+            {
+                let season = parse_season_marker(inner).or_else(|| parse_season_word(inner));
+                if season.is_none()
+                    && (RE_SEASON_EP.is_match(inner) || RE_SEASON_WORDS.is_match(inner))
+                {
+                    uncertain_season = true;
+                    return LeadingTag::default();
+                }
+                return LeadingTag {
+                    season,
+                    episode: Some(episode.number),
+                    pack,
+                };
+            }
+            let season = if RE_SEASON_WORDS.captures(inner).is_some_and(|c| {
+                c.name("words").is_some_and(|words| {
+                    let tail = inner[words.end()..].trim_matches(release_separator);
+                    words.start() == 0 && (tail.is_empty() || tail.parse().is_ok_and(episode_noise))
+                })
+            }) {
+                parse_season_word(inner)
+            } else if RE_SEASON_TOKEN
+                .find(inner)
+                .is_some_and(|token| token.len() == inner.len())
+            {
+                parse_season_token(inner)
+            } else if episode_ranges(tag).any(|range| {
+                range.name("fraction").is_none()
+                    && bracketed_range(tag, range.name("range").unwrap().range())
+            }) && !has_cross_season_range(tag, tag.len())
+            {
+                pack = true;
+                parse_season_marker(inner)
+                    .or_else(|| parse_season_word(inner))
+                    .or_else(|| parse_season_token(inner))
+            } else if pack && inner.is_empty() {
+                None
+            } else {
+                return LeadingTag::default();
+            };
+            uncertain_season |= season.is_none()
+                && (RE_SEASON_TOKEN.is_match(inner)
+                    || RE_SEASON_EP.is_match(inner)
+                    || RE_SEASON_WORDS.is_match(inner));
+            LeadingTag {
+                season,
+                episode: None,
+                pack,
+            }
+        })
+        .collect();
+    let season = tags.iter().find_map(|tag| tag.season);
+    let target = body_season.or(season);
+    let unscoped_matches = !uncertain_season
+        && tags
+            .iter()
+            .filter_map(|tag| tag.season)
+            .all(|scope| Some(scope) == target);
+    let matches = |tag: &LeadingTag| {
+        tag.season
+            .map_or(unscoped_matches, |scope| Some(scope) == target)
+    };
+    let episode = tags
+        .iter()
+        .filter(|tag| matches(tag))
+        .find_map(|tag| tag.episode);
+    let pack_matches = tags
+        .iter()
+        .filter(|tag| tag.pack)
+        .map(matches)
+        .reduce(|a, b| a && b);
+    LeadingTags {
+        season,
+        episode,
+        pack_matches,
+    }
+}
+
+struct BracketEpisode<'a> {
+    number: i64,
+    span: regex::Match<'a>,
+    marked: bool,
+}
+
+fn bracket_episode_match(s: &str) -> Option<BracketEpisode<'_>> {
     RE_BRACKET_EP
         .captures_iter(s)
-        .filter_map(|c| c.get(1)?.as_str().parse::<i64>().ok())
-        .find(|n| !NOISE_NUMBERS.contains(n) && !looks_like_year(*n))
+        .map(|c| (c, false))
+        .chain(RE_BRACKET_SEASON_EP.captures_iter(s).map(|c| (c, true)))
+        .filter_map(|(c, season_dash)| {
+            let number = c.name("number")?;
+            let number = number.as_str().parse::<i64>().ok()?;
+            let marked = c.name("marker").is_some();
+            if !marked && c.name("more").is_some() {
+                return None;
+            }
+            ((marked && !season_dash) || !episode_noise(number)).then_some(BracketEpisode {
+                number,
+                span: c.get(0)?,
+                marked,
+            })
+        })
+        .min_by_key(|episode| episode.span.start())
 }
 
-fn parse_last_episode_number(s: &str) -> Option<i64> {
-    parse_episode_number(s, false)
+fn episode_noise(number: i64) -> bool {
+    NOISE_NUMBERS.contains(&number) || looks_like_year(number)
 }
 
-fn parse_episode_number(s: &str, title_removed: bool) -> Option<i64> {
+fn mask_tag_words(tag: &str) -> String {
+    let tag = RELEASE_WORDS.replace_all(tag, |c: &regex::Captures| " ".repeat(c[0].len()));
+    RE_EMPTY_BRACKETS
+        .replace_all(&tag, |c: &regex::Captures| " ".repeat(c[0].len()))
+        .into_owned()
+}
+
+fn mask_brackets(s: &str) -> String {
+    RE_BRACKETS
+        .replace_all(s, |c: &regex::Captures| {
+            let bracket = &c[0];
+            if bracket_episode_match(bracket).is_some() {
+                bracket.to_owned()
+            } else {
+                " ".repeat(bracket.len())
+            }
+        })
+        .into_owned()
+}
+
+fn valid_season_range(c: &regex::Captures<'_>, more: &str) -> bool {
+    let numbers = std::iter::once(&c["first"])
+        .chain(std::iter::once(&c["last"]))
+        .chain(
+            more.split(|ch: char| !ch.is_ascii_digit())
+                .filter(|n| !n.is_empty()),
+        );
+    let mut last = 0;
+    for n in numbers.map(|n| n.parse::<u32>().unwrap()) {
+        if n <= last || n > MAX_SEASON {
+            return false;
+        }
+        last = n;
+    }
+    true
+}
+
+fn season_pack_range(
+    s: &str,
+    title_context: impl FnOnce() -> (Option<Range<usize>>, usize),
+) -> bool {
+    let s = mask_dates(s);
+    let mut packs = RE_SEASON_RANGE.captures_iter(&s).filter_map(|c| {
+        let range = c.name("range").unwrap();
+        let more = c.name("more").unwrap();
+        let detached = more
+            .as_str()
+            .find(|ch: char| ch.is_whitespace() || ch == '_');
+        let (end, chain) = detached.map_or((range.end(), more.as_str()), |start| {
+            (more.start() + start, &more.as_str()[..start])
+        });
+        let span = range.start()..end;
+        (valid_season_range(&c, chain)
+            && (explicit_season_range(&c)
+                || compact_season_range(&c, chain)
+                || (c["last"].len() == 1
+                    && (bracketed_range(&s, span.clone()) || follows_with_pack_label(&s[end..])))))
+        .then_some((c, span))
+    });
+    let Some(first) = packs.next() else {
+        return false;
+    };
+    let (title, group_end) = title_context();
+    std::iter::once(first).chain(packs).any(|(c, span)| {
+        is_release_range(&s, span.clone(), group_end)
+            && title.as_ref().is_none_or(|title| {
+                !(literal_season_range(&c, title)
+                    || (title.start <= span.start && title.end >= span.end))
+            })
+    })
+}
+
+fn follows_with_pack_label(suffix: &str) -> bool {
+    let Some(label) = PACK_WORDS.find(suffix) else {
+        return false;
+    };
+    let padding = mask_release_format(&suffix[..label.start()].replace('_', " "), true);
+    RELEASE_WORDS
+        .replace_all(&padding, " ")
+        .chars()
+        .all(|ch| release_separator(ch) || "[]()【】|".contains(ch))
+}
+
+pub(crate) fn preceding_season(prefix: &str) -> Option<u32> {
+    let prefix = prefix.trim_end_matches(release_separator);
+    RE_SEASON_WORDS
+        .captures_iter(prefix)
+        .last()
+        .and_then(|c| c.name("words"))
+        .filter(|words| words.end() == prefix.len())
+        .and_then(|words| parse_season_word(words.as_str()))
+        .or_else(|| {
+            RE_SEASON_TOKEN
+                .find_iter(prefix)
+                .last()
+                .filter(|token| token.end() == prefix.len())
+                .and_then(|token| parse_season_token(token.as_str()))
+        })
+}
+
+fn literal_season_range(c: &regex::Captures<'_>, title: &Range<usize>) -> bool {
+    let start = c.name("range").unwrap().start();
+    c.name("short").is_none()
+        && c.name("plural").is_none()
+        && c.name("second_season").is_none()
+        && title.contains(&start)
+        && title.end <= c.name("first").unwrap().start()
+}
+
+fn explicit_season_range(c: &regex::Captures<'_>) -> bool {
+    c.name("plural").is_some()
+        || c.name("second_season").is_some()
+        || !is_dash(c["separator"].trim_matches(|ch: char| ch.is_whitespace() || ch == '_'))
+}
+
+fn is_dash(s: &str) -> bool {
+    matches!(s, "-" | "–" | "—")
+}
+
+fn compact_season_range(c: &regex::Captures<'_>, more: &str) -> bool {
+    is_dash(&c["separator"])
+        && (c.name("short").is_some()
+            || !more.is_empty()
+            || c["first"].starts_with('0')
+            || c["last"].len() == 1)
+}
+
+fn is_release_range(s: &str, range: Range<usize>, group_end: usize) -> bool {
+    range.end > group_end || bracketed_range(s, range)
+}
+
+pub(crate) fn bracketed_range(s: &str, range: Range<usize>) -> bool {
+    RE_BRACKETS.find_iter(s).any(|bracket| {
+        if bracket.start() >= range.start || bracket.end() <= range.end {
+            return false;
+        }
+        let padding = |text: &str| {
+            let text = text.replace(['_', '[', ']', '(', ')', '【', '】'], " ");
+            let text = mask_release_format(&text, true);
+            let text = mask_season_words(&text, None);
+            let text = RE_SEASON_TOKEN.replace_all(&text, " ");
+            let text = RELEASE_WORDS.replace_all(&text, " ");
+            PACK_WORDS
+                .replace_all(&text, " ")
+                .chars()
+                .all(|c| c.is_whitespace() || matches!(c, '|' | '-' | '·' | '–' | '—'))
+        };
+        let delimiter = bracket.as_str().chars().next().unwrap().len_utf8();
+        padding(&s[bracket.start() + delimiter..range.start])
+            && padding(&s[range.end..bracket.end() - delimiter])
+    })
+}
+
+fn mask_season_words(s: &str, title: Option<&Range<usize>>) -> String {
+    let mut masked = s.to_owned();
+    let mut start = 0;
+    while let Some(phrase) = RE_SEASON_WORDS.captures_at(s, start) {
+        let words = phrase.name("words").unwrap();
+        let literal_season = title.is_some_and(|t| {
+            phrase.name("number").is_some_and(|number| {
+                t.start <= words.start() && words.start() < t.end && t.end <= number.start()
+            })
+        });
+        if !literal_season {
+            masked.replace_range(words.range(), &" ".repeat(words.len()));
+            let after_words = s[words.end()..].trim_start();
+            if s[..words.start()].trim_end().ends_with(['[', '(', '【']) {
+                if let Some(dash) = after_words
+                    .chars()
+                    .next()
+                    .filter(|c| matches!(c, '-' | '–' | '—'))
+                {
+                    let start = s.len() - after_words.len();
+                    let tail = after_words[dash.len_utf8()..].trim_start();
+                    // Retain the explicit episode marker and original byte offsets.
+                    let marker = if starts_with_unmarked_episode(tail) {
+                        "e  "
+                    } else {
+                        "   "
+                    };
+                    masked
+                        .replace_range(start..start + dash.len_utf8(), &marker[..dash.len_utf8()]);
+                }
+            }
+        }
+        start = words.end();
+    }
+    masked
+}
+
+fn starts_with_unmarked_episode(s: &str) -> bool {
+    let end = s.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=4).contains(&end)
+        && s[..end].parse().is_ok_and(|number| !episode_noise(number))
+        && RE_FORMAT.find(s).is_none_or(|tag| tag.start() != 0)
+        && RE_CHANNEL.find(s).is_none_or(|tag| tag.start() != 0)
+        && (s[end..].chars().next().is_none_or(|c| !c.is_alphabetic())
+            || s[end..]
+                .strip_prefix(['v', 'V'])
+                .is_some_and(|revision| revision.starts_with(|c: char| c.is_ascii_digit())))
+}
+
+pub(crate) fn mask_release_format(s: &str, strip_channels: bool) -> String {
+    let mut masked = RE_FORMAT
+        .replace_all(s, |c: &regex::Captures| " ".repeat(c[0].len()))
+        .into_owned();
+    if strip_channels {
+        masked = RE_CHANNEL
+            .replace_all(&masked, |c: &regex::Captures| " ".repeat(c[0].len()))
+            .into_owned();
+    }
+    mask_dates(&masked)
+}
+
+fn valid_date(c: regex::Captures<'_>) -> bool {
+    c[3] == c[5]
+        && chrono::NaiveDate::from_ymd_opt(
+            c[2].parse().unwrap(),
+            c[4].parse().unwrap(),
+            c[6].parse().unwrap(),
+        )
+        .is_some()
+}
+
+pub(crate) fn mask_dates(s: &str) -> String {
+    let mut masked = s.to_string();
+    for date in RE_DATE.captures_iter(s) {
+        let span = date.name("date").unwrap();
+        if valid_date(date) {
+            masked.replace_range(span.range(), &" ".repeat(span.len()));
+        }
+    }
+    masked
+}
+
+fn mask_release_title(s: &str, masked: &mut String, title: Range<usize>) {
+    let tag_opener = RE_BRACKETS
+        .find_iter(s)
+        .find(|tag| title.start <= tag.start() && tag.start() < title.end && title.end < tag.end());
+    let padding = " ".repeat(title.len());
+    masked.replace_range(title, &padding);
+    if let Some(tag) = tag_opener {
+        // Keep the bracket around the episode or extra remaining after the title.
+        let end = tag.start() + tag.as_str().chars().next().unwrap().len_utf8();
+        masked.replace_range(tag.start()..end, &s[tag.start()..end]);
+    }
+}
+
+fn mask_invalid_season_ranges(s: &str, masked: &mut String, title: Option<&Range<usize>>) -> bool {
+    let mut found = false;
+    for c in RE_SEASON_RANGE.captures_iter(s) {
+        if !(compact_season_range(&c, &c["more"]) || explicit_season_range(&c))
+            || title.is_some_and(|title| literal_season_range(&c, title))
+        {
+            continue;
+        }
+        let span = c.name("range").unwrap();
+        let last = c.name("last").unwrap().end();
+        let more = &s[last..span.end()];
+        let has_episode_separator = more.starts_with(|ch: char| ch.is_whitespace() || ch == '_');
+        let end = if has_episode_separator {
+            last
+        } else {
+            span.end()
+        };
+        if !valid_season_range(&c, if has_episode_separator { "" } else { more }) {
+            // A detached episode may follow a malformed compact season label.
+            masked.replace_range(span.start()..end, &" ".repeat(end - span.start()));
+            found = true;
+        }
+    }
+    found
+}
+
+pub(crate) fn episode_remainder(s: &str, title: Option<Range<usize>>) -> (String, bool) {
+    let s = mask_dates(s).replace('_', " ");
+    let mut masked = mask_season_words(&s, title.as_ref());
+    let invalid_season_range = mask_invalid_season_ranges(&s, &mut masked, title.as_ref());
+    if let Some(title) = title {
+        mask_release_title(&s, &mut masked, title);
+    }
+    if let Some((marker, _)) = native_season(&masked) {
+        masked.replace_range(marker.clone(), &" ".repeat(marker.len()));
+    }
+    let masked = mask_release_format(&strip_ext(&masked), true);
+    let masked = RE_BRACKETS
+        .replace_all(&masked, |c: &regex::Captures| mask_tag_words(&c[0]))
+        .into_owned();
+    (masked, invalid_season_range)
+}
+
+fn leading_episode(s: &str) -> Option<(i64, usize)> {
+    let first = RE_LEADING_EP.captures(s)?.get(1)?;
+    let first_number = first.as_str().parse::<i64>().ok()?;
+    if !looks_like_year(first_number) {
+        return Some((first_number, first.start()));
+    }
+    let next = RE_LEADING_EP.captures(&s[first.end()..])?.get(1)?;
+    let number = next.as_str().parse::<i64>().ok()?;
+    (!looks_like_year(number)).then_some((number, first.end() + next.start()))
+}
+
+fn dotted_numeric_prefix(s: &str) -> bool {
+    let Some(prefix) = s.strip_suffix('.') else {
+        return false;
+    };
+    let number = prefix
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    !number.is_empty() && !number.parse().is_ok_and(looks_like_year)
+}
+
+fn dotted_numeric_suffix(s: &str) -> bool {
+    let Some(suffix) = s.strip_prefix('.') else {
+        return false;
+    };
+    let number = suffix
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    !number.is_empty()
+        && !number
+            .parse()
+            .is_ok_and(|n| NOISE_NUMBERS.contains(&n) || looks_like_year(n))
+}
+
+fn fractional_episodes(s: &str) -> impl Iterator<Item = (usize, Range<usize>)> + '_ {
+    let mut from = 0;
+    std::iter::from_fn(move || loop {
+        let capture = RE_FRACTIONAL_EPISODE.captures_at(s, from)?;
+        let fraction = capture.name("fraction").unwrap();
+        let number = capture.name("number").unwrap();
+        from = number.end();
+        if (fraction.start() != number.start()
+            || (!number.as_str().parse().is_ok_and(looks_like_year)
+                && !dotted_numeric_prefix(&s[..fraction.start()])))
+            && !dotted_numeric_suffix(&s[fraction.end()..])
+        {
+            return Some((number.start(), fraction.range()));
+        }
+    })
+}
+
+fn starts_with_fractional_episode(s: &str, episode_start: Option<usize>) -> bool {
+    fractional_episodes(s).any(|(number, range)| {
+        episode_start.is_none_or(|start| start >= number) || bracketed_range(s, range)
+    })
+}
+
+pub(crate) fn has_fractional_episode(s: &str) -> bool {
     let s = strip_ext(s);
-    let s = RE_SEASON_WORDS.replace_all(&s, " ");
-    let explicit = RE_EXPLICIT_EP.captures(&s);
-    let leading = title_removed.then(|| RE_LEADING_EP.captures(&s)).flatten();
-    // A pack has no single episode to track or offer as the next file.
-    if RE_EP_RANGE.captures_iter(&s).any(|c| {
-        let start = c.name("start").unwrap();
-        let first = start.as_str().parse::<i64>().unwrap();
-        let last = c.name("end").unwrap().as_str().parse::<i64>().unwrap();
-        let episode = explicit
-            .as_ref()
-            .or(leading.as_ref())
-            .and_then(|c| c.get(1));
-        episode.is_none_or(|episode| episode.start() == start.start())
-            && (title_removed || c.name("marker").is_some() || start.len() >= 2)
-            && first < last
+    let episode = episode_position(&mask_brackets(&s), true);
+    starts_with_fractional_episode(&s, episode)
+        || release_episode_ranges(&s, episode).any(|range| range.name("fraction").is_some())
+}
+
+pub(crate) fn has_cross_season_range(s: &str, group_end: usize) -> bool {
+    RE_CROSS_SEASON_RANGE.captures_iter(s).any(|c| {
+        canon_ordinal(&c[1]) != canon_ordinal(&c[2])
+            && is_release_range(s, c.get(0).unwrap().range(), group_end)
+    })
+}
+
+pub(crate) fn episode_ranges(s: &str) -> impl Iterator<Item = regex::Captures<'_>> {
+    let mut from = 0;
+    std::iter::from_fn(move || loop {
+        let capture = RE_EP_RANGE.captures_at(s, from)?;
+        let span = capture.name("range").unwrap();
+        let start = capture.name("start").unwrap();
+        let end = capture.name("end").unwrap();
+        let first: i64 = start.as_str().parse().unwrap();
+        let last: i64 = end.as_str().parse().unwrap();
+        let before = &s[..span.start()];
+        let unmarked = capture.name("marker").is_none();
+        let follows_date = unmarked
+            && RE_DATE.captures_iter(&s[..end.end()]).any(|date| {
+                date.name("date").unwrap().range().contains(&start.start()) && valid_date(date)
+            });
+        let trailing_fraction = capture.name("fraction").is_none_or(|_| {
+            let suffix = RE_BRACKETS.replace_all(&s[span.end()..], " ");
+            let suffix = RELEASE_WORDS.replace_all(&suffix, " ");
+            let tail = suffix.trim_matches(release_separator);
+            tail.is_empty()
+                || tail
+                    .parse::<i64>()
+                    .is_ok_and(|n| looks_like_year(n) || NOISE_NUMBERS.contains(&n))
+                || tail.starts_with([']', ')', '】'])
+        });
+        if first < last
+            && trailing_fraction
             && !looks_like_year(first)
             && !looks_like_year(last)
-    }) {
-        return None;
+            && (!unmarked || !dotted_numeric_prefix(before))
+            && !dotted_numeric_suffix(&s[span.end()..])
+            && !follows_date
+        {
+            from = span.end();
+            return Some(capture);
+        }
+        // Retry after the first number so a year prefix cannot hide a following range.
+        from = start.end();
+    })
+}
+
+pub(crate) fn torrent_episode_ranges(s: &str) -> impl Iterator<Item = regex::Captures<'_>> {
+    let episode = episode_position(&mask_brackets(s), true);
+    release_episode_ranges(s, episode)
+}
+
+fn release_episode_ranges(
+    s: &str,
+    episode: Option<usize>,
+) -> impl Iterator<Item = regex::Captures<'_>> {
+    let mut previous_end = None;
+    episode_ranges(s).filter(move |c| {
+        let range = c.name("range").unwrap();
+        let consecutive = previous_end.is_some_and(|end| {
+            s[end..range.start()]
+                .chars()
+                .all(|ch| release_separator(ch) || matches!(ch, ',' | '+' | '&' | '|'))
+        });
+        let accepted = consecutive
+            || episode.is_none_or(|position| position >= c.name("start").unwrap().start())
+            || bracketed_range(s, range.range());
+        if accepted {
+            previous_end = Some(range.end());
+        }
+        accepted
+    })
+}
+
+fn dashed_episode(s: &str) -> Option<(usize, regex::Match<'_>)> {
+    RE_DASHED_EP.captures_iter(s).find_map(|c| {
+        let number = c.get(2)?;
+        (!number.as_str().parse().is_ok_and(looks_like_year))
+            .then(|| (c.name("dash").unwrap().start(), number))
+    })
+}
+
+fn episode_position(s: &str, title_removed: bool) -> Option<usize> {
+    let explicit = RE_EXPLICIT_EP
+        .captures(s)
+        .and_then(|c| c.name("episode"))
+        .map(|m| m.start());
+    let dashed = dashed_episode(s).map(|(_, m)| m.start());
+    let leading = title_removed
+        .then(|| leading_episode(s))
+        .flatten()
+        .map(|(_, start)| start);
+    let bracket = bracket_episode_match(s).map(|tag| tag.span.start());
+    explicit
+        .into_iter()
+        .chain(dashed)
+        .chain(leading)
+        .chain(bracket)
+        .min()
+}
+
+fn is_single_episode(s: &str, episode_start: Option<usize>, strict_ranges: bool) -> bool {
+    // A pack has no single episode to track or offer as the next file.
+    !has_cross_season_range(s, 0)
+        && !starts_with_fractional_episode(s, episode_start)
+        && !release_episode_ranges(s, episode_start)
+            .any(|c| strict_ranges || c.name("marker").is_some() || c["start"].len() >= 2)
+}
+
+pub(crate) fn has_conflicting_episode_markers(s: &str, source: &str) -> bool {
+    let masked = RE_BRACKETS.replace_all(s, |c: &regex::Captures| {
+        let span = c.get(0).unwrap();
+        let tag = mask_tag_words(span.as_str());
+        if let Some(episode) = bracket_episode_match(&tag)
+            .filter(|episode| episode.marked && episode.span.len() == tag.len())
+        {
+            // The episode remainder masks named seasons but keeps the source byte offsets.
+            let raw = &source[span.range()];
+            if let Some(season) = parse_season_word(raw) {
+                let more = RE_EXPLICIT_EP.captures(&tag).and_then(|c| c.name("more"));
+                let scoped = format!(
+                    "[S{season}E{}{}]",
+                    episode.number,
+                    more.map_or("", |m| m.as_str())
+                );
+                return format!("{scoped:<width$}", width = span.len());
+            }
+        }
+        let inner = tag.trim_start_matches(|c: char| c.is_whitespace() || "[(【".contains(c));
+        if RE_EXPLICIT_EP
+            .find(inner)
+            .is_some_and(|marker| marker.start() == 0)
+        {
+            tag
+        } else {
+            " ".repeat(tag.len())
+        }
+    });
+    let mut from = 0;
+    let mut previous_end = None;
+    let mut episode = None;
+    let mut season = None;
+    while let Some(marker) = RE_EXPLICIT_EP.captures_at(&masked, from) {
+        let number = marker.name("episode").unwrap();
+        // Start before the consumed delimiter so adjacent markers are visible.
+        from = number.end();
+        let Ok(number) = number.as_str().parse::<i64>() else {
+            continue;
+        };
+        let start = marker.get(0).unwrap().start();
+        if previous_end.is_some_and(|end| {
+            let between = &masked[end..start];
+            RE_SUBTITLE_SEPARATOR
+                .find(between)
+                .is_some_and(|separator| {
+                    let prefix = between[separator.end()..].trim_end();
+                    !prefix.ends_with(['[', '(', '【']) && prefix.chars().any(char::is_alphabetic)
+                })
+        }) {
+            continue;
+        }
+        if marker.name("more").is_some_and(|more| {
+            more.as_str()[1..].split(['e', 'E']).any(|ep| {
+                ep.split(['v', 'V']).next().and_then(|ep| ep.parse().ok()) != Some(number)
+            })
+        }) {
+            return true;
+        }
+        let scope = marker
+            .name("season")
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .or_else(|| preceding_season(source.get(previous_end.unwrap_or(0)..start)?));
+        previous_end = Some(from);
+        if episode.replace(number).is_some_and(|last| last != number)
+            || scope.is_some_and(|n| season.replace(n).is_some_and(|last| last != n))
+        {
+            return true;
+        }
     }
-    let bracketed = bracket_episode(&s);
-    let s = RE_BRACKETS.replace_all(&s, " ");
-    let s = RE_CHANNEL.replace_all(&s, " ");
+    false
+}
+
+fn episode_from_remainder(masked: &str, title_removed: bool) -> Option<i64> {
+    let bracketed = bracket_episode_match(masked);
+    let dashed = dashed_episode(masked).map(|(_, m)| m);
     if let Some(episode) = RE_EXPLICIT_EP
-        .captures(&s)
-        .and_then(|c| c.get(1)?.as_str().parse::<i64>().ok())
+        .captures(masked)
+        .and_then(|c| c.name("episode"))
+        .filter(|m| {
+            dashed.is_none_or(|dash| m.start() < dash.start())
+                && bracketed
+                    .as_ref()
+                    .is_none_or(|tag| m.start() < tag.span.end())
+        })
+        .and_then(|m| m.as_str().parse().ok())
     {
         return Some(episode);
     }
-    let s = RE_SEASON_PREFIX.replace_all(&s, "$1");
+    let s = RE_SEASON_PREFIX.replace_all(masked, "$1");
     let s = RE_SEASON_BARE.replace_all(&s, " ");
     let s = RE_REV_TAIL.replace(&s, " ");
     if title_removed {
-        if let Some(episode) = RE_LEADING_EP
-            .captures(&s)
-            .and_then(|c| c.get(1)?.as_str().parse::<i64>().ok())
-            .filter(|n| !looks_like_year(*n))
-        {
+        if let Some((episode, _)) = leading_episode(&s) {
             return Some(episode);
         }
     }
-    if bracketed.is_some() {
-        return bracketed;
+    if let Some(episode) = dashed
+        .filter(|m| {
+            bracketed
+                .as_ref()
+                .is_none_or(|tag| m.start() < tag.span.start())
+        })
+        .and_then(|m| m.as_str().parse().ok())
+        .or_else(|| bracketed.map(|tag| tag.number))
+    {
+        return Some(episode);
     }
     // An episode immediately after the title can resemble a resolution, such as One Piece 1080.
     let after_title = RE_EP_NUM.find(&s).and_then(|m| {
@@ -1222,6 +2916,24 @@ mod tests {
                 Some(30),
                 Some(5),
             ),
+            (
+                "[S03E05] Example Saga",
+                "file:///shows/Example.Saga.S02E06.mkv",
+                Some(20),
+                Some(6),
+            ),
+            (
+                "[S03E05] Example Saga",
+                "file:///shows/Example.Saga.S02.mkv",
+                Some(20),
+                None,
+            ),
+            (
+                "[S03E05] Example Saga",
+                "file:///shows/Example.Saga.S01E06.mkv",
+                Some(10),
+                Some(6),
+            ),
             ("Example Saga S04E03", "", None, None),
             ("Example Saga - 03", "", Some(10), Some(3)),
             ("Tie Show - 02", "", Some(54), Some(2)),
@@ -1277,7 +2989,8 @@ mod tests {
                     matcher
                         .norms
                         .iter()
-                        .map(|norm| norm_season_ordinal(norm))
+                        .zip(&matcher.variants)
+                        .map(|(norm, variant)| catalog_season_ordinal(variant, norm))
                         .collect::<Vec<_>>()
                 );
             }
@@ -1711,6 +3424,77 @@ mod tests {
     }
 
     #[test]
+    fn guessing_keeps_episode_digits_separate_from_release_tags() {
+        for release in [
+            "Unknown - 05 DDP2.0",
+            "Unknown.05.DDP2.0",
+            "Unknown - 05 Hi10P AC3",
+            "Unknown - 05 8-bit yuv420p10",
+        ] {
+            assert_eq!(parse_episode_guess(release), Some(5), "{release}");
+        }
+        for release in [
+            "Unknown - 2024 - 12.5 [1080p]",
+            "Unknown 2024 - 12.5 [1080p]",
+            "Unknown 2024-E01-E12",
+            "Unknown 2024-01~12",
+        ] {
+            assert_eq!(parse_episode_guess(release), None, "{release}");
+        }
+    }
+
+    #[test]
+    fn four_digit_scene_episodes_survive_title_normalization() {
+        let matchers = [mk(1, "Some Show"), mk(2, "Some Show Season 2")];
+        for release in [
+            "Some.Show.S02E1015.1080p.mkv",
+            "Some Show [S02E1015] [1080p].mkv",
+        ] {
+            let matched = match_title(&matchers, release, "").unwrap();
+            assert_eq!(matched.media_id, 2, "{release}");
+            assert_eq!(
+                resolve_episode(matched, &[release]),
+                Some(1015),
+                "{release}"
+            );
+        }
+    }
+
+    #[test]
+    fn movie_tags_keep_bonus_markers_after_metadata_is_removed() {
+        let movie = Matcher {
+            episodes: Some(1),
+            ..mk(1, "Some Movie Season 2")
+        };
+        for tag in [
+            "[Season 2 Preview]",
+            "[Season 2 NCOP01]",
+            "[Season 2] [1080p_Sample]",
+            "[Season 2] [NCOP AAC2.0]",
+            "[Season 2] [Menu]",
+            "[Season 2] [CM01]",
+            "[Season 2] Extras 01",
+            "[Season 2] [S01_E02-S02_E01]",
+            "[Season 2] 2024-01-02",
+        ] {
+            let release = format!("[G] Some Movie {tag}.mkv");
+            for bound in [false, true] {
+                assert_eq!(
+                    resolve_playback_episode(&movie, &[&release], bound),
+                    None,
+                    "{release}"
+                );
+            }
+        }
+        let release = "[G] Some Movie [Season 2 (10-bit)] [1080p].mkv";
+        assert_eq!(
+            resolve_playback_episode(&movie, &[release], false),
+            Some(1),
+            "{release}"
+        );
+    }
+
+    #[test]
     fn episode_zero_parses() {
         assert_eq!(parse_episode_guess("Show - 00"), Some(0));
         assert_eq!(parse_episode_guess("Show 0"), Some(0));
@@ -1813,6 +3597,16 @@ mod tests {
         );
     }
 
+    fn parse_episode_guess(release: &str) -> Option<i64> {
+        resolve_episode(&mk(1, "Unmatched fixture title"), &[release])
+    }
+
+    fn parse_episode_after(release: &str, title: &str) -> Option<Option<i64>> {
+        let matcher = mk(1, title);
+        matcher.release_title_span(release)?;
+        Some(resolve_episode(&matcher, &[release]))
+    }
+
     #[test]
     fn title_removal_prefers_titles_over_metadata_and_preserves_fallback() {
         for (title, input, expected) in [
@@ -1832,26 +3626,19 @@ mod tests {
             ("86", "[86] - 86 (1080p)", Some(Some(86))),
             ("86", "Other Show - 03", None),
         ] {
-            assert_eq!(
-                parse_episode_after(input, &[title.into()]),
-                expected,
-                "{input}"
-            );
+            assert_eq!(parse_episode_after(input, title), expected, "{input}");
         }
     }
 
     #[test]
     fn episode_after_title_removal_avoids_title_numbers() {
-        let variants = vec!["91 Days".to_string()];
+        let title = "91 Days";
         assert_eq!(
-            parse_episode_after("[Group] 91 Days - 05 [1080p]", &variants),
+            parse_episode_after("[Group] 91 Days - 05 [1080p]", title),
             Some(Some(5))
         );
-        assert_eq!(
-            parse_episode_after("91 Days [BD 1080p]", &variants),
-            Some(None)
-        );
-        assert_eq!(parse_episode_after("Something Else - 03", &variants), None);
+        assert_eq!(parse_episode_after("91 Days [BD 1080p]", title), Some(None));
+        assert_eq!(parse_episode_after("Something Else - 03", title), None);
     }
 
     #[test]
@@ -1861,11 +3648,13 @@ mod tests {
             display: "91 Days".into(),
             variants: vec!["91 Days".into()],
             norms: vec!["91 days".into()],
+            explicit_season: None,
             norm_seasons: vec![None],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            season_patterns: OnceLock::new(),
             source: None,
         };
         assert_eq!(
@@ -1881,11 +3670,13 @@ mod tests {
             display: "Re:Zero".into(),
             variants: vec!["Re:Zero kara Hajimeru Isekai Seikatsu".into()],
             norms: vec!["re zero kara hajimeru isekai seikatsu".into()],
+            explicit_season: None,
             norm_seasons: vec![None],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            season_patterns: OnceLock::new(),
             source: None,
         };
         assert_eq!(
@@ -1901,11 +3692,13 @@ mod tests {
             display: "Frieren".into(),
             variants: vec!["Sousou no Frieren".into()],
             norms: vec!["sousou no frieren".into()],
+            explicit_season: None,
             norm_seasons: vec![None],
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            season_patterns: OnceLock::new(),
             source: None,
         };
         let matchers = vec![m];
@@ -1937,11 +3730,13 @@ mod tests {
             display: title.into(),
             variants: vec![title.into()],
             norms: vec![norm_title(title)],
-            norm_seasons: vec![norm_season_ordinal(&norm_title(title))],
+            norm_seasons: vec![catalog_season_ordinal(title, &norm_title(title))],
+            explicit_season: catalog_season(title),
             episodes: None,
             format: None,
             status_rank: 0,
             title_patterns: OnceLock::new(),
+            season_patterns: OnceLock::new(),
             source: None,
         }
     }
@@ -1988,6 +3783,63 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_episode_precedes_numeric_episode_titles() {
+        let show = mk(1, "Some Show");
+        for title in ["Countdown 1-2-3", "Only 12.5 Seconds", "1-2-3 Go"] {
+            let release = format!("[Group] Some Show [E03] - {title} [1080p].mkv");
+            assert_eq!(
+                resolve_playback_episode(&show, &[&release], false),
+                Some(3),
+                "{release}"
+            );
+        }
+    }
+
+    #[test]
+    fn episode_fallback_ignores_group_numbers_and_preserves_whole_pack_tags() {
+        let show = mk(1, "Some Show");
+        for group in ["[Fansubs S01-S02]", "[Fansubs 01-24]", "[Group 1.5]"] {
+            let release = format!("{group} 05.mkv");
+            assert_eq!(resolve_episode(&show, &[&release]), Some(5), "{release}");
+            assert_eq!(
+                resolve_playback_episode(&show, &[&release], true),
+                Some(5),
+                "{release}"
+            );
+        }
+        for release in [
+            "[S01-S02] 05.mkv",
+            "[01-12] 05.mkv",
+            "[S01E01-S02E12] 05.mkv",
+            "[05.5] 05.mkv",
+        ] {
+            assert_eq!(resolve_episode(&show, &[release]), None, "{release}");
+            assert_eq!(
+                resolve_playback_episode(&show, &[release], true),
+                None,
+                "{release}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_alias_bracket_episodes_respect_ranges_and_fractions() {
+        let show = mk(1, "Some Show (2024)");
+        for (suffix, expected) in [
+            ("[05] [1080p]", Some(5)),
+            ("[05] - 12.5 Seconds", Some(5)),
+            ("[05] [01-12] [BD]", None),
+            ("[01-12] (2)", None),
+            ("[05] [05.5] [BD]", None),
+            ("[05.5] [05] [BD]", None),
+            ("[05] [S01E01-S02E12] [BD]", None),
+        ] {
+            let release = format!("Some Show {suffix}.mkv");
+            assert_eq!(resolve_episode(&show, &[&release]), expected, "{release}");
+        }
+    }
+
+    #[test]
     fn batch_ranges_do_not_resolve_to_a_single_episode() {
         let show = mk(1, "Some Show");
         for release in [
@@ -1996,6 +3848,7 @@ mod tests {
             "Some Show E01-E12 [1080p]",
             "Some Show S01E01-E12 [1080p]",
             "Some Show [01-12] [1080p]",
+            "Some Show - 01-12 [E03]",
             "Some Show - ٠١-١٢",
         ] {
             assert_eq!(resolve_episode(&show, &[release]), None, "{release}");
@@ -2307,6 +4160,7 @@ mod tests {
                 display: (*en).into(),
                 variants: vec![(*en).into(), rom_by_id[id].into()],
                 norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                explicit_season: None,
                 norm_seasons: vec![
                     norm_season_ordinal(&norm_title(en)),
                     norm_season_ordinal(&norm_title(rom_by_id[id])),
@@ -2315,6 +4169,7 @@ mod tests {
                 format: None,
                 status_rank: status_rank(status),
                 title_patterns: OnceLock::new(),
+                season_patterns: OnceLock::new(),
                 source: None,
             })
             .collect();
@@ -2371,6 +4226,7 @@ mod tests {
                 display: (*en).into(),
                 variants: vec![(*en).into(), rom_by_id[id].into()],
                 norms: vec![norm_title(en), norm_title(rom_by_id[id])],
+                explicit_season: None,
                 norm_seasons: vec![
                     norm_season_ordinal(&norm_title(en)),
                     norm_season_ordinal(&norm_title(rom_by_id[id])),
@@ -2379,6 +4235,7 @@ mod tests {
                 format: None,
                 status_rank: status_rank(status),
                 title_patterns: OnceLock::new(),
+                season_patterns: OnceLock::new(),
                 source: None,
             })
             .collect();
@@ -2398,11 +4255,13 @@ mod tests {
                 display: "Mushoku Tensei: Jobless Reincarnation Season 2".into(),
                 variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 2".into()],
                 norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 2")],
+                explicit_season: None,
                 norm_seasons: vec![Some(2)],
                 episodes: None,
                 format: None,
                 status_rank: status_rank("CURRENT"),
                 title_patterns: OnceLock::new(),
+                season_patterns: OnceLock::new(),
                 source: None,
             },
             Matcher {
@@ -2410,11 +4269,13 @@ mod tests {
                 display: "Mushoku Tensei: Jobless Reincarnation Season 3".into(),
                 variants: vec!["Mushoku Tensei: Jobless Reincarnation Season 3".into()],
                 norms: vec![norm_title("Mushoku Tensei: Jobless Reincarnation Season 3")],
+                explicit_season: None,
                 norm_seasons: vec![Some(3)],
                 episodes: None,
                 format: None,
                 status_rank: status_rank("PAUSED"),
                 title_patterns: OnceLock::new(),
+                season_patterns: OnceLock::new(),
                 source: None,
             },
         ];
@@ -2428,13 +4289,13 @@ mod tests {
 
     #[test]
     fn season_pack_does_not_parse_season_as_episode() {
-        let variants = vec!["Some Show".to_string()];
+        let title = "Some Show";
         assert_eq!(
-            parse_episode_after("Some Show S02 [1080p]", &variants),
+            parse_episode_after("Some Show S02 [1080p]", title),
             Some(None)
         );
         assert_eq!(
-            parse_episode_after("Some Show S02E05 [1080p]", &variants),
+            parse_episode_after("Some Show S02E05 [1080p]", title),
             Some(Some(5))
         );
     }
@@ -2501,6 +4362,114 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_season_words_and_compact_ranges_are_not_episodes() {
+        let show = mk(1, "Some Show");
+        for title in [
+            "Some Show Season 2/2nd Season",
+            "Some Show Season 2 2nd Season",
+            "Some Show Season 1-2",
+            "Some Show Season 01-02",
+            "Some Show Season 1~2",
+            "Some Show Season 1–2",
+            "Some Show Season 1-2-3",
+            "Some Show Seasons 1-2",
+            "Some_Show_Seasons_1_-_2",
+            "Seasons 1-2",
+        ] {
+            assert_eq!(parse_episode_guess(title), None, "{title}");
+            assert_eq!(
+                resolve_playback_episode(&show, &[title], true),
+                None,
+                "{title}"
+            );
+        }
+        let first_season = mk(1, "Some Show Season 1");
+        assert_eq!(
+            resolve_episode(&first_season, &["Some Show Season 1-2"]),
+            None
+        );
+        for title in [
+            "Some Show [Season 2/2nd Season][E05]",
+            "Some Show Season 2 2nd Season S02E05",
+            "Some Show Season 2 - 05",
+            "Some Show Season 2-05",
+        ] {
+            assert_eq!(parse_episode_guess(title), Some(5), "{title}");
+            assert_eq!(
+                resolve_playback_episode(&show, &[title], true),
+                Some(5),
+                "{title}"
+            );
+        }
+        assert_eq!(parse_episode_guess("Some Show Season 2-10"), Some(10));
+    }
+
+    #[test]
+    fn title_owns_season_words_and_keeps_official_numbered_editions() {
+        let matchers = [
+            mk(1, "Some Show"),
+            mk(2, "Some Show Final Season"),
+            mk(3, "Some Show Season 5"),
+            mk(4, "Some Show Final Season 2"),
+            mk(5, "Monster"),
+            mk(6, "Monster Season"),
+            mk(7, "Attack on Titan: Final Season"),
+        ];
+        for (release, id, episode) in [
+            ("Some_Show_Final_Season_05.mkv", 2, Some(5)),
+            ("[A] Some_Show_Final_Season_05 [1080p]", 2, Some(5)),
+            ("Some_Show_Season_05.mkv", 3, None),
+            ("Some Show Final Season 2 [BD]", 4, None),
+            ("Some_Show_Final_Season_2_1080p.mkv", 4, None),
+            ("Some Show Final Season 2 - 06.mkv", 4, Some(6)),
+            ("Monster_Season_05.mkv", 6, Some(5)),
+            ("Monster Season - 05.mkv", 6, Some(5)),
+            ("Attack on Titan Final Season - 05.mkv", 7, Some(5)),
+            ("Some Show Season 1 - 05.mkv", 1, Some(5)),
+        ] {
+            let matched = match_title(&matchers, release, "").expect(release);
+            assert_eq!(matched.media_id, id, "{release}");
+            assert_eq!(resolve_episode(matched, &[release]), episode, "{release}");
+        }
+        assert_eq!(parse_episode_guess("Some_Show_Season_05.mkv"), None);
+        assert!(match_title(&matchers[..1], "Some_Show_Season_05.mkv", "").is_none());
+    }
+
+    #[test]
+    fn year_prefix_does_not_supply_an_episode_to_release_filters() {
+        let show = mk(1, "Some Show");
+        for release in [
+            "Some Show 2024 OVA 01.mkv",
+            "Some Show 2024 01-12 [1080p].mkv",
+            "Some Show 2024 - 01-12 [1080p].mkv",
+            "Some Show 2024 - 05.5 [1080p].mkv",
+            "Some Show 2024 - 12.5 [1080p].mkv",
+            "Some_Show_2024_-_EP05.5_1080p.mkv",
+        ] {
+            assert!(excluded_playback_release(&show, release), "{release}");
+            assert_eq!(
+                resolve_playback_episode(&show, &[release], true),
+                None,
+                "{release}"
+            );
+        }
+        for release in ["Some Show 2024 - 05.5.mkv", "Some Show 2024 - 12.5.mkv"] {
+            assert_eq!(parse_episode_guess(release), None, "{release}");
+            assert_eq!(resolve_episode(&show, &[release]), None, "{release}");
+        }
+        for title in ["Some Show", "Some Show (2024)"] {
+            let show = mk(1, title);
+            for release in ["Some Show 2024 - 05.mkv", "Some_Show_(2024)_-_05.mkv"] {
+                assert_eq!(
+                    resolve_playback_episode(&show, &[release], false),
+                    Some(5),
+                    "{release}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn episode_markers_beat_numbers_in_episode_titles() {
         let show = mk(1, "Some Show");
         for title in [
@@ -2552,6 +4521,30 @@ mod tests {
             let matched = match_title(&matchers, title, "").unwrap();
             assert_eq!(matched.media_id, 1, "{title}");
             assert_eq!(resolve_episode(matched, &[title]), Some(5));
+        }
+    }
+
+    #[test]
+    fn interior_alias_exactness_breaks_normalized_ties() {
+        let matchers = [mk(1, "Re - Zero Kara"), mk(2, "Re: Zero Kara")];
+        for (release, id) in [
+            ("Watashi no Anime / Re: Zero Kara - 05", 2),
+            ("Watashi no Anime / Re - Zero Kara - 05", 1),
+        ] {
+            assert_eq!(
+                match_title(&matchers, release, "").map(|m| m.media_id),
+                Some(id)
+            );
+        }
+    }
+
+    #[test]
+    fn clean_trims_dashes_after_the_episode() {
+        for dash in ['-', '–', '—'] {
+            assert_eq!(
+                clean_title(&format!("Some Show 05 {dash} [1080p]")),
+                "some show"
+            );
         }
     }
 
@@ -2923,5 +4916,58 @@ mod tests {
             std::fs::remove_dir_all(folder).unwrap();
         }
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn bracketed_and_dot_scene_titles_parse_episodes_and_seasons() {
+        let show = Matcher {
+            episodes: Some(12),
+            ..mk(1, "Show")
+        };
+        assert_eq!(
+            resolve_episode(&show, &["[Group] Show - 03 - 1-2-3 Go! [1080p].mkv"]),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_episode(&show, &["[Group] Show - 03 - 12.5 Seconds [1080p].mkv"]),
+            Some(3)
+        );
+        let matchers = vec![
+            Matcher {
+                episodes: Some(12),
+                ..mk(1, "Some Show")
+            },
+            Matcher {
+                episodes: Some(12),
+                ..mk(2, "Some Show Season 2")
+            },
+        ];
+        for file in [
+            "Some.Show.Season.2.E04.1080p.mkv",
+            "Some_Show_2nd_Season_04.mkv",
+        ] {
+            let matched = match_title(&matchers, file, "").unwrap();
+            assert_eq!(matched.media_id, 2, "{file}");
+            assert_eq!(resolve_episode(matched, &[file]), Some(4), "{file}");
+        }
+        for file in [
+            "[Group] Show [BD Season 2] - 04 [1080p].mkv",
+            "[Group] Show (2024 Season 2) - E04 [1080p].mkv",
+            "[Group] Show [Season 2 BD] - 04 (2).mkv",
+        ] {
+            assert_eq!(parse_episode_guess(file), Some(4), "{file}");
+            assert_eq!(
+                resolve_playback_episode(&show, &[file], false),
+                Some(4),
+                "{file}"
+            );
+        }
+        for file in [
+            "K_2nd_Season_04.mkv",
+            "K.2nd.Season.E04.mkv",
+            "K.Season.2.mkv",
+        ] {
+            assert_eq!(clean_title(file), "k 2", "{file}");
+        }
     }
 }

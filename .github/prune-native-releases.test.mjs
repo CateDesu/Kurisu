@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { retentionPlan, pruneNativeReleases } from "./prune-native-releases.mjs";
 import { originalWindowsSelector, transition } from "./release-transition.mjs";
 
@@ -16,7 +18,7 @@ const release = (id, tag, native = true) => ({ id, tag_name: tag, draft: false, 
 const releases = () => [release(1, transition.previousStableTag, false), release(2, transition.bridgeTag, false),
   release(3, "v1.1.0"), release(4, "v1.1.4"), release(5, "v1.1.5")];
 
-test("keep all Tauri releases and newest native while allowing skipped upgrades", () => {
+test("keep all legacy releases and newest native while allowing skipped upgrades", () => {
   const rows = releases();
   rows.push({ ...release(6, "v1.1.3"), draft: true }, { ...release(7, "v1.1.6"), prerelease: true });
   const result = retentionPlan(rows, "v1.1.5");
@@ -34,6 +36,9 @@ test("refuse stale, missing, draft or incomplete replacement releases", () => {
   }
   const rows = releases(); rows.at(-1).assets.pop();
   assert.throws(() => retentionPlan(rows, "v1.1.5"), /required/);
+  const colliding = releases();
+  colliding.at(-1).assets.push({ id: 9999, name: "Extra_x64-setup.exe", state: "uploaded" });
+  assert.throws(() => retentionPlan(colliding, "v1.1.5"), /frozen bridge Windows installer/);
 });
 
 test("refuse a missing bridge and preserve incomplete or unknown old releases", () => {
@@ -59,9 +64,19 @@ function fixture(context, fault = "") {
   const execute = args => {
     commands.push(args);
     if (args.includes("--paginate")) {
+      assert.ok(args.includes("--jq"), "expected --jq projection on paginated release listing");
+      assert.ok(!args.includes("--slurp"), "gh api does not allow --slurp with --jq");
       if (downloaded && fault === "newer") rows = [...rows.filter(row => row.id !== 9), release(9, "v1.1.6")];
       if (downloaded && fault === "changed") rows.at(-1).assets[0].id++;
-      return JSON.stringify([rows.slice(0, 2), rows.slice(2)]);
+      return rows.map(row => JSON.stringify({
+        id: row.id,
+        tag_name: row.tag_name,
+        draft: row.draft,
+        prerelease: row.prerelease,
+        assets: row.assets.map(({ id, name, size, state, digest, updated_at }) => ({
+          id, name, size, state, digest, updated_at,
+        })),
+      })).join("\n");
     }
     if (args[0] === "release" && args[1] === "download") {
       const tag = args[2];
@@ -109,4 +124,89 @@ test("a deletion that does not land stops cleanup", context => {
   const f = fixture(context, "not-deleted");
   assert.throws(() => pruneNativeReleases("v1.1.5", f.directory, f.execute), /did not land/);
   assert.equal(f.commands.filter(args => args.includes("DELETE")).length, 1);
+});
+
+test("pruneNativeReleases honors GITHUB_REPOSITORY and rejects uppercase sidecars", context => {
+  const f = fixture(context);
+  const sidecar = join(f.directory, "kurisu-native.sha256");
+  const original = createHash("sha256").update(Buffer.from("payload kurisu-native")).digest("hex");
+  writeFileSync(sidecar, `${original.toUpperCase()}  kurisu-native\n`);
+  const prev = process.env.GITHUB_REPOSITORY;
+  process.env.GITHUB_REPOSITORY = "ForkOwner/Kurisu";
+  try {
+    assert.throws(() => pruneNativeReleases("v1.1.5", f.directory, args => {
+      const out = f.execute(args);
+      if (args[0] === "release" && args[1] === "download" && args[2] === "v1.1.5") {
+        const destination = args[args.indexOf("--dir") + 1];
+        writeFileSync(join(destination, "kurisu-native.sha256"), `${original.toUpperCase()}  kurisu-native\n`);
+      }
+      return out;
+    }), /Published checksum does not match: kurisu-native/);
+    assert.ok(f.commands[0].includes("repos/ForkOwner/Kurisu/releases?per_page=100"));
+  } finally {
+    if (prev === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = prev;
+  }
+});
+
+test("cli execution handles paginated release listings larger than default spawnSync buffer", {
+  skip: process.platform === "win32",
+}, context => {
+  const f = fixture(context);
+  const bin = join(f.directory, "bin");
+  mkdirSync(bin);
+  const releasesPath = join(f.directory, "huge-releases.json");
+  const padding = "y".repeat(3_500);
+  const manyDrafts = Array.from({ length: 450 }, (_, index) => ({
+    id: 1000 + index,
+    tag_name: `v1.0.0.${index + 100}-${padding}`,
+    draft: true,
+    prerelease: false,
+    assets: [],
+  }));
+  writeFileSync(releasesPath, JSON.stringify([...f.remaining(), ...manyDrafts]));
+  writeFileSync(join(bin, "gh"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+if (args[0] === "api" && args.includes("--paginate")) {
+  if (!args.includes("--jq") || args.includes("--slurp")) process.exit(2);
+  const rows = JSON.parse(fs.readFileSync(process.env.KURISU_HUGE_RELEASES, "utf8"));
+  for (const row of rows) {
+    console.log(JSON.stringify({
+      id: row.id,
+      tag_name: row.tag_name,
+      draft: row.draft,
+      prerelease: row.prerelease,
+      assets: row.assets,
+    }));
+  }
+} else if (args[0] === "release" && args[1] === "download") {
+  const destination = args[args.indexOf("--dir") + 1];
+  for (let index = 0; index < args.length; index++) if (args[index] === "--pattern") {
+    const name = args[index + 1];
+    fs.copyFileSync(path.join(process.env.KURISU_ASSET_DIR, name), path.join(destination, name));
+  }
+} else if (args[0] === "api" && args.includes("DELETE")) {
+  const id = Number(args.at(-1).split("/").at(-1));
+  const rows = JSON.parse(fs.readFileSync(process.env.KURISU_HUGE_RELEASES, "utf8")).filter(row => row.id !== id);
+  fs.writeFileSync(process.env.KURISU_HUGE_RELEASES, JSON.stringify(rows));
+}
+`, { mode: 0o755 });
+  const cli = spawnSync(process.execPath, [
+    fileURLToPath(new URL("prune-native-releases.mjs", import.meta.url)),
+    "v1.1.5",
+    f.directory,
+  ], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      KURISU_HUGE_RELEASES: releasesPath,
+      KURISU_ASSET_DIR: f.directory,
+    },
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  const parsed = JSON.parse(cli.stdout.trim().split("\n").at(-1));
+  assert.deepEqual(parsed.removed, ["v1.1.0", "v1.1.4"]);
 });

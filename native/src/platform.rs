@@ -12,7 +12,7 @@ use std::{
     },
     thread,
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{AssetSource, SharedString};
@@ -355,78 +355,172 @@ pub struct InstanceGuard {
     listener_thread: Option<JoinHandle<()>>,
 }
 
+const INSTANCE_LOCK: &str = ".kurisu-native.lock";
+#[cfg(windows)]
+const INSTANCE_ENDPOINT: &str = ".kurisu-native.endpoint";
+#[cfg(not(windows))]
+const INSTANCE_ENDPOINT: &str = INSTANCE_LOCK;
+const ACTIVATION_WAIT: Duration = Duration::from_secs(1);
+
+fn open_instance_file(path: &Path, writable: bool) -> Result<File, String> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && (link_or_reparse(&meta) || !meta.is_file())
+    {
+        return Err("Profile instance path must be a regular file".into());
+    }
+    let mut options = File::options();
+    options
+        .read(true)
+        .write(writable)
+        .create(writable)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    let meta = file.metadata().map_err(|error| error.to_string())?;
+    if link_or_reparse(&meta) || !meta.is_file() {
+        return Err("Profile instance path must be a regular file".into());
+    }
+    Ok(file)
+}
+
+fn activation_secret() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let a = RandomState::new().hash_one(std::process::id());
+    let b = RandomState::new().hash_one(std::time::SystemTime::now());
+    format!("{a:016x}{b:016x}")
+}
+
+fn read_activation_endpoint(path: &Path) -> Option<(u16, String)> {
+    let mut content = String::new();
+    open_instance_file(&path.join(INSTANCE_ENDPOINT), false)
+        .ok()?
+        .take(128)
+        .read_to_string(&mut content)
+        .ok()?;
+    let line = content.lines().next()?.trim();
+    let (port, secret) = line.split_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    (secret.len() == 32 && secret.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| (port, secret.to_string()))
+}
+
 impl InstanceGuard {
     pub fn acquire(path: &Path) -> Result<Self, String> {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         path.hash(&mut hash);
         let profile_id = format!("{:016x}", hash.finish());
-        let profile_lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.join(".kurisu-native.lock"))
-            .map_err(|error| error.to_string())?;
+        let profile_lock = open_instance_file(&path.join(INSTANCE_LOCK), true)?;
         match profile_lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                for attempt in 0..16 {
-                    if activate_instance(&profile_id, attempt) {
+                let deadline = Instant::now() + ACTIVATION_WAIT;
+                while Instant::now() < deadline {
+                    if let Some((port, secret)) = read_activation_endpoint(path)
+                        && activate_instance_at(port, &profile_id, &secret, deadline).is_some()
+                    {
                         break;
                     }
+                    thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(25)),
+                    );
                 }
                 return Err("This data profile is already open".into());
             }
             Err(TryLockError::Error(error)) => return Err(error.to_string()),
         }
-        for attempt in 0..16u64 {
-            let address = instance_address(&profile_id, attempt);
-            match TcpListener::bind(address) {
-                Ok(listener) => {
-                    listener
-                        .set_nonblocking(true)
-                        .map_err(|error| error.to_string())?;
-                    let activate = Arc::new(AtomicBool::new(false));
-                    let running = Arc::new(AtomicBool::new(true));
-                    let activate_thread = activate.clone();
-                    let running_thread = running.clone();
-                    let identity = profile_id.clone();
-                    let listener_thread = thread::spawn(move || {
-                        while running_thread.load(Ordering::Relaxed) {
-                            match listener.accept() {
-                                Ok((mut stream, _)) => {
-                                    if stream
+        // Tighten legacy lock permissions only after owning the lock and before publishing the secret.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            profile_lock
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+        }
+        let mut guard = Self {
+            profile_id,
+            _profile_lock: profile_lock,
+            activate: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(true)),
+            listener_thread: None,
+        };
+        if let Err(error) = guard.start_activation(path) {
+            log::warn!("Could not enable profile window activation: {error}");
+        }
+        Ok(guard)
+    }
+
+    fn start_activation(&mut self, _path: &Path) -> Result<(), String> {
+        let listener = (0..16)
+            .find_map(|attempt| TcpListener::bind(instance_address(&self.profile_id, attempt)).ok())
+            .ok_or("Could not reserve a window activation port")?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let secret = activation_secret();
+        // Windows prevents other processes from reading the lock file.
+        #[cfg(windows)]
+        let mut endpoint = open_instance_file(&_path.join(INSTANCE_ENDPOINT), true)?;
+        #[cfg(not(windows))]
+        let mut endpoint = &self._profile_lock;
+        endpoint.set_len(0).map_err(|error| error.to_string())?;
+        let record = format!("{port}:{secret}\n");
+        endpoint
+            .write_all(record.as_bytes())
+            .map_err(|error| error.to_string())?;
+
+        let activate = self.activate.clone();
+        let running = self.running.clone();
+        let identity = self.profile_id.clone();
+        let expected_secret = secret.into_bytes();
+        self.listener_thread = Some(
+            thread::Builder::new()
+                .spawn(move || {
+                    while running.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                if stream.set_nonblocking(false).is_ok()
+                                    && stream
+                                        .set_read_timeout(Some(Duration::from_millis(250)))
+                                        .is_ok()
+                                    && stream
                                         .set_write_timeout(Some(Duration::from_millis(250)))
                                         .is_ok()
+                                {
+                                    let mut token = [0u8; 32];
+                                    if stream.read_exact(&mut token).is_ok()
+                                        && token == expected_secret.as_slice()
                                     {
                                         // Publish before acknowledging so later UI input can supersede it.
-                                        activate_thread.store(true, Ordering::Release);
+                                        activate.store(true, Ordering::Release);
                                         let _ = stream.write_all(identity.as_bytes());
                                     }
                                 }
-                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                    thread::sleep(Duration::from_millis(80))
-                                }
-                                Err(_) => break,
                             }
+                            Err(_) => thread::sleep(Duration::from_millis(80)),
                         }
-                    });
-                    return Ok(Self {
-                        profile_id,
-                        _profile_lock: profile_lock,
-                        activate,
-                        running,
-                        listener_thread: Some(listener_thread),
-                    });
-                }
-                Err(_) => {
-                    if activate_instance(&profile_id, attempt) {
-                        return Err("This data profile is already open".into());
                     }
-                }
-            }
-        }
-        Err("Could not reserve a single-instance identity for this data profile".into())
+                })
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(())
     }
 
     pub fn take_activation(&self) -> bool {
@@ -441,14 +535,33 @@ fn instance_address(profile_id: &str, attempt: u64) -> std::net::SocketAddr {
     (std::net::Ipv4Addr::LOCALHOST, port).into()
 }
 
-fn activate_instance(profile_id: &str, attempt: u64) -> bool {
-    let address = instance_address(profile_id, attempt);
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
-        return false;
+fn activate_instance_at(
+    port: u16,
+    profile_id: &str,
+    secret: &str,
+    deadline: Instant,
+) -> Option<()> {
+    let timeout = || {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        (!remaining.is_zero()).then_some(remaining.min(Duration::from_millis(250)))
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, timeout()?).ok()?;
+    stream.set_write_timeout(Some(timeout()?)).ok()?;
+    if stream.write(secret.as_bytes()).ok()? != secret.len() {
+        return None;
+    }
     let mut reply = [0u8; 16];
-    stream.read_exact(&mut reply).is_ok() && reply == profile_id.as_bytes()
+    let mut remaining = &mut reply[..];
+    while !remaining.is_empty() {
+        stream.set_read_timeout(Some(timeout()?)).ok()?;
+        let count = stream.read(remaining).ok()?;
+        if count == 0 {
+            return None;
+        }
+        remaining = &mut remaining[count..];
+    }
+    (reply == profile_id.as_bytes()).then_some(())
 }
 
 impl Drop for InstanceGuard {
@@ -546,7 +659,7 @@ mod tests {
 
     impl Drop for TestProfile {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -580,6 +693,41 @@ mod tests {
         assert!(!first.take_activation());
         assert!(InstanceGuard::acquire(&profile.0).is_err());
         assert!(first.take_activation());
+        assert!(!first.take_activation());
+    }
+
+    #[test]
+    fn duplicate_waits_for_delayed_endpoint_publication() {
+        let profile = TestProfile::new("delayed-endpoint");
+        let first = InstanceGuard::acquire(&profile.0).unwrap();
+        let path = profile.0.join(INSTANCE_ENDPOINT);
+        let (port, secret) = read_activation_endpoint(&profile.0).unwrap();
+        let mut endpoint = open_instance_file(&path, true).unwrap();
+        endpoint.set_len(0).unwrap();
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            writeln!(endpoint, "{port}:{secret}").unwrap();
+        });
+
+        assert_eq!(
+            InstanceGuard::acquire(&profile.0).err().as_deref(),
+            Some("This data profile is already open")
+        );
+        publisher.join().unwrap();
+        assert!(first.take_activation());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_error_keeps_profile_open_and_locked() {
+        let profile = TestProfile::new("endpoint-error");
+        std::fs::create_dir(profile.0.join(INSTANCE_ENDPOINT)).unwrap();
+        let first = InstanceGuard::acquire(&profile.0).unwrap();
+
+        assert_eq!(
+            InstanceGuard::acquire(&profile.0).err().as_deref(),
+            Some("This data profile is already open")
+        );
         assert!(!first.take_activation());
     }
 
@@ -647,5 +795,90 @@ mod tests {
             "GDBus.Error:org.freedesktop.DBus.Error.NoReply"
         ));
         assert!(!file_manager_is_unsupported("Permission denied"));
+    }
+
+    #[test]
+    fn unauthenticated_connection_cannot_activate_instance() {
+        let dir = std::env::temp_dir().join(format!(
+            "kurisu-instance-auth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let guard = InstanceGuard::acquire(&dir).unwrap();
+        let (port, _secret) = read_activation_endpoint(&dir).unwrap();
+        let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250)).unwrap();
+        let _ = stream.write_all(&[b'0'; 32]);
+        let mut reply = [0u8; 16];
+        assert!(stream.read_exact(&mut reply).is_err());
+        thread::sleep(Duration::from_millis(40));
+        assert!(!guard.take_activation());
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_instance_lock_permissions_are_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let profile = TestProfile::new("lock-perms");
+        let lock_path = profile.0.join(INSTANCE_LOCK);
+        std::fs::write(&lock_path, "").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+
+        let guard = InstanceGuard::acquire(&profile.0).unwrap();
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            InstanceGuard::acquire(&profile.0).err().as_deref(),
+            Some("This data profile is already open")
+        );
+        assert!(guard.take_activation());
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_instance_does_not_change_held_lock_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let profile = TestProfile::new("lock-perms-held");
+        let lock_path = profile.0.join(INSTANCE_LOCK);
+        let guard = InstanceGuard::acquire(&profile.0).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            InstanceGuard::acquire(&profile.0).err().as_deref(),
+            Some("This data profile is already open")
+        );
+        assert!(guard.take_activation());
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+        drop(guard);
+
+        let reopened = InstanceGuard::acquire(&profile.0).unwrap();
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        drop(reopened);
     }
 }

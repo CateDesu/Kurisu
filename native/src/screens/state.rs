@@ -159,6 +159,7 @@ pub struct ListState {
     pub loading: bool,
     pub syncing: bool,
     pub error: String,
+    pub sync_error: String,
     pub step_error: String,
     next_airing_boundary: Option<i64>,
     revision: u64,
@@ -188,6 +189,7 @@ impl ListState {
         self.loading = false;
         self.syncing = false;
         self.error.clear();
+        self.sync_error.clear();
         self.step_error.clear();
         self.next_airing_boundary = None;
         self.revision += 1;
@@ -476,6 +478,12 @@ pub struct ProgressEdit {
 }
 
 impl ProgressEdit {
+    const MISSING_ENTRY: &str = "This entry is no longer on your list. Review the saved progress.";
+
+    fn can_retry(&self) -> bool {
+        !self.busy() && !self.requires_review && self.dirty() && self.error.is_some()
+    }
+
     pub fn new(progress: i64, total: Option<i64>) -> Self {
         Self {
             saved: progress,
@@ -492,6 +500,18 @@ impl ProgressEdit {
 
     pub fn dirty(&self) -> bool {
         self.pending != self.saved
+    }
+
+    pub fn busy(&self) -> bool {
+        self.in_flight || self.deleting
+    }
+
+    pub fn reopens_completed(&self, entry: &ListEntry) -> bool {
+        entry.status == "COMPLETED"
+            && self.dirty()
+            && self
+                .total
+                .is_some_and(|total| total > 0 && self.pending < total)
     }
 
     pub fn step(&mut self, delta: i64, now: Instant) -> bool {
@@ -523,13 +543,14 @@ impl ProgressEdit {
             return;
         }
         if self.requires_review {
-            if progress != self.saved {
+            if self.error.as_deref() == Some(Self::MISSING_ENTRY) {
+                self.error = Some("This entry is back on your list. Review before saving.".into());
+                self.due = None;
+            } else if progress != self.saved && self.remote_progress != Some(progress) {
                 self.error = Some("Progress changed on your list. Review before saving.".into());
                 self.due = None;
             }
-            if self.remote_progress.is_some() || progress != self.saved {
-                self.remote_progress = Some(progress);
-            }
+            self.remote_progress = Some(progress);
             return;
         }
         if self.error.is_some() {
@@ -557,8 +578,6 @@ impl ProgressEdit {
             self.requires_review = true;
             self.error = Some("Progress changed on your list. Review before saving.".into());
             self.due = None;
-        } else if self.requires_review {
-            self.remote_progress = Some(progress);
         }
     }
 
@@ -663,9 +682,7 @@ impl ProgressRegistry {
                     continue;
                 }
                 if edit.dirty() || edit.in_flight || edit.error.is_some() || edit.requires_review {
-                    edit.error = Some(
-                        "This entry is no longer on your list. Review the saved progress.".into(),
-                    );
+                    edit.error = Some(ProgressEdit::MISSING_ENTRY.into());
                     edit.requires_review = true;
                     edit.remote_progress = None;
                     edit.due = None;
@@ -710,7 +727,11 @@ impl ProgressRegistry {
         keep_local: bool,
     ) -> bool {
         let key = (generation, id);
-        let Some(edit) = self.edits.get_mut(&key).filter(|edit| edit.requires_review) else {
+        let Some(edit) = self
+            .edits
+            .get_mut(&key)
+            .filter(|edit| edit.requires_review && !edit.busy())
+        else {
             return false;
         };
         if edit.remote_progress != observed || keep_local && observed.is_none() {
@@ -735,11 +756,17 @@ impl ProgressRegistry {
         let Some(edit) = self.edits.get_mut(&(generation, id)) else {
             return false;
         };
-        if edit.requires_review || !edit.dirty() || edit.error.is_none() {
+        if !edit.can_retry() {
             return false;
         }
         edit.error = None;
         true
+    }
+
+    pub fn has_retryable_error(&self, generation: u64) -> bool {
+        self.edits
+            .iter()
+            .any(|(&(owner, _), edit)| owner == generation && edit.can_retry())
     }
 
     pub fn entry(&mut self, generation: u64, entry: &ListEntry) -> &mut ProgressEdit {
@@ -783,26 +810,55 @@ impl ProgressRegistry {
             .collect()
     }
     pub fn has_in_flight(&self, generation: u64) -> bool {
-        self.edits
-            .iter()
-            .any(|(&(g, _), edit)| g == generation && (edit.in_flight || edit.deleting))
+        self.removals.iter().any(|&(g, _)| g == generation)
+            || self
+                .edits
+                .iter()
+                .any(|(&(g, _), edit)| g == generation && edit.busy())
+    }
+
+    pub fn busy(&self, generation: u64, id: i64) -> bool {
+        self.deleting(generation, id)
+            || self.edit(generation, id).is_some_and(|edit| edit.in_flight)
+    }
+
+    pub fn deleting(&self, generation: u64, id: i64) -> bool {
+        self.removals.contains(&(generation, id))
+            || self.edit(generation, id).is_some_and(|edit| edit.deleting)
+    }
+
+    pub fn blocks_add(&self, generation: u64, id: i64) -> bool {
+        self.busy(generation, id)
+            || self
+                .edit(generation, id)
+                .is_some_and(|edit| edit.requires_review || edit.dirty() || edit.error.is_some())
     }
     pub fn first_error(&self, generation: u64) -> Option<&str> {
-        self.edits.iter().find_map(|(&(g, _), edit)| {
-            (g == generation && (edit.dirty() || edit.requires_review))
-                .then(|| {
-                    edit.error.as_deref().or(edit
-                        .requires_review
-                        .then_some("Review saved progress before continuing."))
-                })
-                .flatten()
+        self.errors(generation).next().map(|(_, error)| error)
+    }
+
+    pub fn first_settled_error(&self, generation: u64) -> Option<&str> {
+        self.errors(generation)
+            .find_map(|(edit, error)| (!edit.busy()).then_some(error))
+    }
+
+    fn errors(&self, generation: u64) -> impl Iterator<Item = (&ProgressEdit, &str)> {
+        self.edits.iter().filter_map(move |(&(owner, _), edit)| {
+            if owner != generation || !edit.dirty() && !edit.requires_review {
+                return None;
+            }
+            let error = edit.error.as_deref().or(edit
+                .requires_review
+                .then_some("Review saved progress before continuing."))?;
+            Some((edit, error))
         })
     }
     pub fn begin_delete(&mut self, generation: u64, id: i64) -> bool {
         let key = (generation, id);
-        if !self.removals.insert(key) {
+        if self.busy(generation, id) {
             return false;
         }
+        self.removals.insert(key);
         if let Some(edit) = self.edits.get_mut(&key) {
             edit.deleting = true;
             edit.due = None;
@@ -811,7 +867,9 @@ impl ProgressRegistry {
     }
     pub fn finish_delete(&mut self, generation: u64, id: i64, success: bool) {
         let key = (generation, id);
-        self.removals.remove(&key);
+        if !self.removals.remove(&key) {
+            return;
+        }
         if success {
             self.edits.remove(&key);
         } else if let Some(edit) = self.edits.get_mut(&key) {
@@ -821,6 +879,10 @@ impl ProgressRegistry {
     pub fn clear_generation(&mut self, generation: u64) {
         self.edits.retain(|(g, _), _| *g != generation);
         self.removals.retain(|(g, _)| *g != generation);
+    }
+    pub fn discard_generation(&mut self, generation: u64) {
+        self.edits
+            .retain(|&(owner, _), edit| owner != generation || edit.busy());
     }
 }
 
@@ -882,6 +944,7 @@ pub struct EditorState {
     pub busy: bool,
     pub confirming_delete: bool,
     pub review_progress: Option<i64>,
+    pub details_error: String,
     pub error: String,
 }
 
@@ -910,12 +973,40 @@ impl EditorState {
             busy: false,
             confirming_delete: false,
             review_progress: None,
+            details_error: String::new(),
             error: String::new(),
         }
     }
 
     pub fn total(&self) -> Option<i64> {
         self.media.as_ref().and_then(|m| m.episodes)
+    }
+
+    pub fn refresh_episode_total(&mut self, entry: &ListEntry, progress_input_current: bool) {
+        let Some(media) = entry.media.as_ref() else {
+            return;
+        };
+        let Some(total) = media.episodes else { return };
+        if self.total() == Some(total) {
+            return;
+        }
+        self.media.get_or_insert_with(|| media.clone()).episodes = Some(total);
+        if !progress_input_current {
+            return;
+        }
+        if self.status_chosen && self.status == "COMPLETED" {
+            self.progress = total;
+            self.completion_pending = true;
+        } else if self.progress_edited || self.status_before_completion.is_some() {
+            self.update_progress_status();
+        } else if !self.status_chosen && self.progress == self.snapshot.progress {
+            self.progress = entry.progress;
+            self.snapshot.progress = entry.progress;
+            if self.status == self.snapshot.status {
+                self.status = entry.status.clone();
+                self.snapshot.status = entry.status.clone();
+            }
+        }
     }
 
     pub fn choose_status(&mut self, status: &str) {
@@ -943,16 +1034,47 @@ impl EditorState {
         if self.progress == progress {
             return;
         }
+        // Overshooting can undo completion inferred from a progress edit.
+        let progress = if self.status == "COMPLETED"
+            && self.status_before_completion.is_none()
+            && let Some(total) = self.total().filter(|total| *total > 0)
+        {
+            progress.min(total)
+        } else {
+            progress
+        };
+        if self.progress == progress {
+            return;
+        }
         self.progress = progress;
+        self.update_progress_status();
+    }
+
+    fn update_progress_status(&mut self) {
+        if self.status == "COMPLETED"
+            && self
+                .total()
+                .is_some_and(|total| total > 0 && self.progress < total)
+        {
+            self.status = self
+                .status_before_completion
+                .take()
+                .unwrap_or_else(|| "CURRENT".into());
+            self.status_chosen = false;
+            self.completion_pending = false;
+            return;
+        }
         if self.status_chosen {
             return;
         }
         if self
             .total()
-            .is_some_and(|total| total > 0 && progress == total)
+            .is_some_and(|total| total > 0 && self.progress == total)
         {
             if self.status != "COMPLETED" {
-                self.status_before_completion = Some(self.status.clone());
+                if self.snapshot.status != "COMPLETED" {
+                    self.status_before_completion = Some(self.status.clone());
+                }
                 self.status = "COMPLETED".into();
             }
         } else if let Some(previous) = self.status_before_completion.take() {
@@ -962,6 +1084,9 @@ impl EditorState {
 
     pub fn set_score(&mut self, value: Option<f64>, format: Option<&str>) {
         self.score = value.map(|v| clamp_score(v, format));
+        if self.score.is_some() {
+            self.score_cleared = false;
+        }
     }
 
     pub fn apply_details(&mut self, details: EntryDetails) {
@@ -970,6 +1095,7 @@ impl EditorState {
         self.completed_at = details.completed_at.clone().unwrap_or_default();
         self.custom_lists = details.custom_lists.clone();
         self.details = Some(details);
+        self.details_error.clear();
     }
 
     pub fn accept_details(&mut self, submitted: &Self, details: EntryDetails) {
@@ -990,6 +1116,7 @@ impl EditorState {
             self.custom_lists = details.custom_lists.clone();
         }
         self.details = Some(details);
+        self.details_error.clear();
     }
 
     pub fn score_available(&self) -> bool {
@@ -1026,6 +1153,10 @@ impl EditorState {
                 .then_some(self.score.unwrap_or(0.0)),
             repeat: (self.repeat != self.snapshot.repeat).then_some(self.repeat.max(0)),
         }
+    }
+
+    pub(super) fn chosen_status(&self) -> Option<&str> {
+        self.status_chosen.then_some(self.status.as_str())
     }
 
     pub fn is_dirty(&self, score_available: bool) -> bool {
@@ -1155,6 +1286,7 @@ pub struct DetailState {
     pub description_expanded: bool,
     pub loading: bool,
     request: u64,
+    pub entry_revision: u64,
 }
 
 impl DetailState {
@@ -1179,6 +1311,13 @@ impl DetailState {
     }
     pub fn current(&self, media_id: i64, request: u64) -> bool {
         self.media_id == Some(media_id) && self.request == request
+    }
+
+    pub fn reconcile_entry(&mut self, entry: Option<ListEntry>) {
+        self.entry_revision += 1;
+        self.entry = entry;
+        self.entry_available = true;
+        self.entry_error.clear();
     }
 
     pub fn finish_detail(
@@ -1537,6 +1676,42 @@ mod tests {
         );
         list.apply_scoped(&[1], vec![None], 0);
         assert_eq!(list.visible(), &[2]);
+    }
+
+    #[test]
+    fn new_episode_total_preserves_explicit_progress_and_reconsiders_inferred_completion() {
+        let before = entry(9, "Show", "CURRENT", 3, Some(12));
+        let after = entry(9, "Show", "CURRENT", 3, Some(13));
+        for progress in [8, 12, 13] {
+            let mut editor = EditorState::new(before.clone());
+            editor.edit_progress(progress);
+            editor.refresh_episode_total(&after, true);
+            assert_eq!(editor.progress, progress);
+            assert_eq!(
+                editor.status,
+                if progress == 13 {
+                    "COMPLETED"
+                } else {
+                    "CURRENT"
+                }
+            );
+            assert_eq!(editor.basic_patch(false).progress, Some(progress));
+        }
+        let mut editor = EditorState::new(entry(9, "Show", "COMPLETED", 12, Some(12)));
+        editor.edit_progress(11);
+        editor.edit_progress(12);
+        editor.refresh_episode_total(&after, true);
+        assert_eq!((editor.status.as_str(), editor.progress), ("CURRENT", 12));
+    }
+
+    #[test]
+    fn reentering_existing_progress_preserves_completed_entries_above_total() {
+        for (status, progress) in [("COMPLETED", 13), ("COMPLETED", 12), ("CURRENT", 13)] {
+            let mut editor = EditorState::new(entry(9, "Show", status, progress, Some(12)));
+            editor.edit_progress(progress);
+            assert_eq!(editor.progress, progress);
+            assert!(editor.basic_patch(true).is_empty());
+        }
     }
 
     #[test]
@@ -1990,6 +2165,12 @@ mod tests {
         let mut list = ListState::new();
         list.replace(vec![], 0);
         registry.reconcile_entries(9, &list);
+        assert!(registry.has_in_flight(9));
+        assert!(!registry.resolve_review(9, 4, None, false));
+        assert!(!registry.begin_delete(9, 4));
+        registry.discard_generation(9);
+        assert!(registry.edit(9, 4).unwrap().requires_review);
+        assert!(registry.has_in_flight(9));
         registry
             .edit_mut(9, 4)
             .unwrap()
@@ -1999,10 +2180,41 @@ mod tests {
         assert!(!edit.in_flight && !edit.dirty());
         assert!(edit.requires_review);
         assert!(registry.first_error(9).is_some());
+        assert!(registry.begin_delete(9, 4));
+        assert!(!registry.resolve_review(9, 4, None, false));
+        registry.discard_generation(9);
+        assert!(registry.edit(9, 4).unwrap().requires_review);
+        registry.finish_delete(9, 4, false);
         assert!(!registry.resolve_review(9, 4, None, true));
         assert!(registry.resolve_review(9, 4, None, false));
         assert!(registry.edit(9, 4).is_none());
     }
+    #[test]
+    fn readded_entry_replaces_the_missing_review_message_without_losing_the_draft() {
+        let mut registry = ProgressRegistry::default();
+        let original = entry(4, "A", "CURRENT", 2, Some(12));
+        assert!(registry.entry(9, &original).step(3, Instant::now()));
+        let mut list = ListState::new();
+        list.replace(vec![], 0);
+        registry.reconcile_entries(9, &list);
+        assert_eq!(registry.first_error(9), Some(ProgressEdit::MISSING_ENTRY));
+
+        list.apply_one(original, 0);
+        registry.reconcile_entries(9, &list);
+        let edit = registry.edit(9, 4).unwrap();
+        assert_eq!(
+            (edit.saved, edit.pending, edit.remote_progress),
+            (2, 5, Some(2))
+        );
+        assert!(edit.requires_review);
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("This entry is back on your list. Review before saving.")
+        );
+        assert!(registry.resolve_review(9, 4, Some(2), true));
+        assert_eq!(registry.edit_mut(9, 4).unwrap().begin_save(), Some((5, 2)));
+    }
+
     #[test]
     fn format_change_ack_preserves_invalidated_score() {
         for score in [None, Some(80.0)] {
@@ -2075,5 +2287,53 @@ mod tests {
         editor.score_cleared = true;
         assert_eq!(editor.basic_patch(true).score, Some(0.0));
         assert_eq!(editor.basic_patch(true).progress, Some(5));
+    }
+
+    #[test]
+    fn completed_entry_reopens_when_progress_drops_below_total() {
+        let mut editor = EditorState::new(entry(4, "A", "COMPLETED", 12, Some(12)));
+        editor.edit_progress(5);
+        assert_eq!(editor.status, "CURRENT");
+        let patch = editor.basic_patch(true);
+        assert_eq!(patch.status.as_deref(), Some("CURRENT"));
+        assert_eq!(patch.progress, Some(5));
+
+        editor.edit_progress(12);
+        assert_eq!(editor.status, "COMPLETED");
+        assert!(editor.basic_patch(true).is_empty());
+    }
+
+    #[test]
+    fn completed_dropdown_reopens_when_progress_edited_below_total() {
+        let mut editor = EditorState::new(entry(4, "A", "CURRENT", 3, Some(12)));
+        editor.choose_status("COMPLETED");
+        assert_eq!(editor.status, "COMPLETED");
+        assert_eq!(editor.progress, 12);
+
+        editor.edit_progress(5);
+        assert_eq!(editor.status, "CURRENT");
+        let patch = editor.basic_patch(true);
+        assert_eq!(patch.status, None);
+        assert_eq!(patch.progress, Some(5));
+    }
+
+    #[test]
+    fn progress_review_after_expiry_unblocks_when_remote_progress_is_unchanged() {
+        let mut registry = ProgressRegistry::default();
+        let item = entry(7, "Show", "CURRENT", 3, Some(12));
+        let edit = registry.entry(1, &item);
+        assert!(edit.step(1, Instant::now()));
+        let drafts = registry.take_generation_drafts(1);
+        registry.restore_generation(2, drafts);
+        let mut list = ListState::default();
+        list.replace(vec![item], 0);
+        registry.reconcile_entries(2, &list);
+        let restored = registry.edit(2, 7).unwrap();
+        assert!(restored.requires_review);
+        assert_eq!(restored.remote_progress, Some(3));
+        assert!(registry.resolve_review(2, 7, Some(3), false));
+        let kept = registry.edit(2, 7).unwrap();
+        assert!(!kept.requires_review);
+        assert!(!kept.dirty());
     }
 }

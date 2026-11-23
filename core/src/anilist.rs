@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -19,7 +19,7 @@ const OAUTH_EXCHANGE: &str = "https://kurisu-anilist-exchange.vercel.app/api/exc
 /// Must match the registered OAuth redirect port.
 pub const OAUTH_PORT: u16 = 39417;
 
-pub(crate) fn valid_account_id(id: i64) -> bool {
+pub fn valid_account_id(id: i64) -> bool {
     (1..=i64::from(i32::MAX)).contains(&id)
 }
 
@@ -145,7 +145,7 @@ struct AniCover {
 #[derive(Deserialize)]
 struct AniStudios {
     #[serde(deserialize_with = "Option::deserialize")]
-    nodes: Option<Vec<AniStudioNode>>,
+    nodes: Option<Vec<Option<AniStudioNode>>>,
 }
 #[derive(Deserialize)]
 struct AniStudioNode {
@@ -162,7 +162,7 @@ impl From<AniMedia> for Media {
             title_native: m.title.native,
             cover_medium: m.cover_image.as_ref().and_then(|c| c.medium.clone()),
             cover_large: m.cover_image.and_then(|c| c.large),
-            episodes: m.episodes,
+            episodes: m.episodes.filter(|total| *total > 0),
             format: m.format,
             status: m.status,
             average_score: m.average_score,
@@ -179,6 +179,8 @@ impl From<AniMedia> for Media {
 #[derive(Clone, Deserialize)]
 pub struct SavedEntry {
     pub id: i64,
+    #[serde(rename = "mediaId")]
+    media_id: i64,
     pub status: String,
     pub progress: i64,
     // Null is valid, but an omitted score makes the reply incomplete.
@@ -189,7 +191,21 @@ pub struct SavedEntry {
     pub updated_at: Option<i64>,
 }
 
+// Omitted totals leave the cache alone. An explicit null clears it.
+pub(crate) type ReportedEpisodes = Option<Option<i64>>;
+
+fn reported_episodes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<ReportedEpisodes, D::Error> {
+    Option::<i64>::deserialize(deserializer).map(|total| Some(total.filter(|total| *total > 0)))
+}
+
 impl SavedEntry {
+    fn check_identity(&self, media_id: i64, expected_id: Option<i64>) -> Result<()> {
+        require_media_id(media_id, self.media_id)?;
+        require_entry_id(self.id, expected_id)
+    }
+
     fn retain_score_in_format(&mut self, score_format: Option<&str>) {
         self.score = score_in_format(self.score, score_format);
     }
@@ -213,7 +229,9 @@ struct RateBudget {
 pub struct AniList {
     http: reqwest::Client,
     token: Option<String>,
+    verified_account: Option<i64>,
     rate: Arc<Mutex<RateBudget>>,
+    auth_intent: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
     #[cfg(any(test, feature = "test-support"))]
     endpoint: Option<String>,
 }
@@ -237,19 +255,30 @@ impl AniList {
         AniList {
             http,
             token: None,
+            verified_account: None,
             rate: Arc::new(Mutex::new(RateBudget::default())),
+            auth_intent: None,
             #[cfg(any(test, feature = "test-support"))]
             endpoint,
         }
     }
     pub fn set_token(&mut self, t: Option<String>) {
         self.token = t;
+        self.verified_account = None;
     }
     pub fn has_token(&self) -> bool {
         self.token.is_some()
     }
     pub fn token(&self) -> Option<String> {
         self.token.clone()
+    }
+
+    pub(crate) fn verified_account(&self) -> Option<i64> {
+        self.verified_account
+    }
+
+    pub(crate) fn record_viewer(&mut self, account: i64) {
+        self.verified_account = Some(account);
     }
 
     pub async fn exchange_code(&self, code: &str) -> Result<String> {
@@ -328,7 +357,7 @@ impl AniList {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let wait = reset - now + 1;
+        let wait = reset.saturating_sub(now).saturating_add(1);
         if wait <= 0 || wait > 65 {
             return;
         }
@@ -336,7 +365,52 @@ impl AniList {
         tokio::time::sleep(Duration::from_secs(wait as u64)).await;
     }
 
+    pub(crate) fn for_intent(
+        &self,
+        intent: &tokio::sync::watch::Sender<u64>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            auth_intent: Some((intent.subscribe(), generation)),
+            ..self.clone()
+        }
+    }
+
+    async fn until_replaced<T>(
+        &self,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        if let Some((intent, generation)) = &self.auth_intent {
+            let mut intent = intent.clone();
+            tokio::select! {
+                biased;
+                _ = intent.wait_for(|current| current != generation) => Err(UnsentRequest.into()),
+                result = operation => Ok(result),
+            }
+        } else {
+            Ok(operation.await)
+        }
+    }
+
     async fn gql<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        query: &str,
+        vars: serde_json::Value,
+    ) -> Result<T> {
+        self.until_replaced(self.gql_request(query, vars)).await?
+    }
+
+    // Let dispatched writes finish so callers can distinguish rejection from uncertainty.
+    async fn gql_request<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        query: &str,
+        vars: serde_json::Value,
+    ) -> Result<T> {
+        anyhow::ensure!(self.has_token(), "not authenticated");
+        self.gql_response(query, vars).await
+    }
+
+    async fn gql_response<T: for<'de> serde::Deserialize<'de>>(
         &self,
         query: &str,
         vars: serde_json::Value,
@@ -356,23 +430,21 @@ impl AniList {
         query: &str,
         vars: serde_json::Value,
     ) -> Result<T> {
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| anyhow!("not authenticated"))?;
         let payload = serde_json::json!({ "query": query, "variables": vars });
         let mut retries = 0;
-        self.wait_for_budget().await;
         let (status, body) = loop {
-            let resp = self
+            self.until_replaced(self.wait_for_budget()).await?;
+            let request = self
                 .http
                 .post(self.endpoint())
-                .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
-                .json(&payload)
-                .send()
-                .await?;
+                .json(&payload);
+            let request = match &self.token {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            };
+            let resp = request.send().await?;
             let status = resp.status();
             self.note_rate_headers(resp.headers());
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -381,10 +453,23 @@ impl AniList {
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| {
+                        let reset = resp
+                            .headers()
+                            .get("x-ratelimit-reset")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<i64>().ok())?;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        Some(reset.saturating_sub(now).saturating_add(1).max(1) as u64)
+                    })
                     .unwrap_or(1);
                 if retries < 2 && wait <= 65 {
                     retries += 1;
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    self.until_replaced(tokio::time::sleep(Duration::from_secs(wait)))
+                        .await?;
                     continue;
                 }
                 return Err(ApiError::new(
@@ -402,22 +487,41 @@ impl AniList {
         };
         if let Some(errs) = body.get("errors") {
             let error = errs.get(0);
+            let Some(msg) = error
+                .and_then(|e| e.get("message"))
+                .and_then(|value| value.as_str())
+                .filter(|message| !message.trim().is_empty())
+            else {
+                return Err(ApiError::new(
+                    status,
+                    false,
+                    "AniList returned an unusable error response".into(),
+                )
+                .into());
+            };
             let reported_status = error
                 .and_then(|e| e.get("status"))
                 .and_then(|s| s.as_u64())
                 .and_then(|s| u16::try_from(s).ok())
                 .and_then(|s| reqwest::StatusCode::from_u16(s).ok())
                 .filter(|s| s.is_client_error() || s.is_server_error());
-            let status = if status.is_success() {
+            // A transport 404 can carry a more specific account or service error.
+            let status = if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                 reported_status.unwrap_or(status)
             } else {
                 status
             };
-            let msg = error
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown AniList error");
-            return Err(ApiError::new(status, true, msg.to_string()).into());
+            let mut failure = ApiError::new(status, true, msg.to_string());
+            if failure.not_found()
+                && (errs.as_array().is_some_and(|errors| errors.len() > 1)
+                    || error
+                        .and_then(|error| error.get("path"))
+                        .and_then(|path| path.as_array())
+                        .is_some_and(|path| path.len() > 1))
+            {
+                failure.kind = ApiErrorKind::Partial;
+            }
+            return Err(failure.into());
         }
         if !status.is_success() {
             return Err(ApiError::new(
@@ -623,7 +727,7 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct Page {
-            recommendations: Option<Vec<Rec>>,
+            recommendations: Option<Vec<Option<Rec>>>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -649,6 +753,7 @@ impl AniList {
             .recommendations
             .ok_or_else(|| anyhow!("AniList returned unavailable recommendations"))?
             .into_iter()
+            .flatten()
             .filter_map(|rec| rec.media_recommendation)
             .map(Media::from)
             .collect())
@@ -700,7 +805,7 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct Relations {
-            edges: Option<Vec<RelEdge>>,
+            edges: Option<Vec<Option<RelEdge>>>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -717,18 +822,18 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct CharConn {
-            edges: Option<Vec<CharEdge>>,
+            edges: Option<Vec<Option<CharEdge>>>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct CharEdge {
             role: Option<String>,
             node: Option<NamedNode>,
-            voice_actors: Option<Vec<NamedNode>>,
+            voice_actors: Option<Vec<Option<NamedNode>>>,
         }
         #[derive(Deserialize)]
         struct StaffConn {
-            edges: Option<Vec<StaffEdge>>,
+            edges: Option<Vec<Option<StaffEdge>>>,
         }
         #[derive(Deserialize)]
         struct StaffEdge {
@@ -779,7 +884,9 @@ impl AniList {
                 }
             }
         }";
-        let r: R = self.gql(q, serde_json::json!({ "id": id })).await?;
+        let r: R = self
+            .until_replaced(self.gql_response(q, serde_json::json!({ "id": id })))
+            .await??;
         require_media_id(id, r.media.media.id)?;
         let mut unavailable_sections = Vec::new();
         if r.media
@@ -812,6 +919,7 @@ impl AniList {
             .and_then(|rel| rel.edges)
             .unwrap_or_default()
             .into_iter()
+            .flatten()
             .filter_map(|e| {
                 let node = e.node?;
                 if node.kind.as_deref() != Some("ANIME") {
@@ -829,10 +937,16 @@ impl AniList {
             .and_then(|c| c.edges)
             .unwrap_or_default()
             .into_iter()
+            .flatten()
             .filter_map(|e| {
                 let node = e.node?;
                 let name = node.name.and_then(|n| n.full)?;
-                let va = e.voice_actors.unwrap_or_default().into_iter().next();
+                let va = e
+                    .voice_actors
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flatten()
+                    .next();
                 Some(MediaCharacter {
                     role: e.role,
                     name,
@@ -851,6 +965,7 @@ impl AniList {
             .and_then(|s| s.edges)
             .unwrap_or_default()
             .into_iter()
+            .flatten()
             .filter_map(|e| {
                 let node = e.node?;
                 let name = node.name.and_then(|n| n.full)?;
@@ -874,7 +989,7 @@ impl AniList {
                 .media
                 .studios
                 .and_then(|s| s.nodes)
-                .map(|n| n.into_iter().map(|s| s.name).collect::<Vec<_>>())
+                .map(|n| n.into_iter().flatten().map(|s| s.name).collect::<Vec<_>>())
                 .filter(|s: &Vec<String>| !s.is_empty()),
             ..r.media.media.into()
         };
@@ -1061,7 +1176,7 @@ impl AniList {
         #[serde(rename_all = "camelCase")]
         struct Page {
             page_info: Option<PageInfo>,
-            airing_schedules: Option<Vec<Sched>>,
+            airing_schedules: Option<Vec<Option<Sched>>>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -1082,7 +1197,7 @@ impl AniList {
             #[serde(flatten)]
             media: AniMedia,
         }
-        // AniList uses an exclusive lower bound. Subtract one second for an inclusive start.
+        // Include the start time despite AniList's exclusive lower bound.
         let start_exclusive = start.saturating_sub(1);
         let q = "query ($startExclusive: Int!, $end: Int!, $page: Int!) {
             Page(page: $page, perPage: 50) {
@@ -1116,7 +1231,7 @@ impl AniList {
                 .airing_schedules
                 .ok_or_else(|| anyhow!("AniList returned unavailable airing schedules"))?;
             let got = scheds.len();
-            for s in scheds {
+            for s in scheds.into_iter().flatten() {
                 let Some(m) = s.media else { continue };
                 if m.is_adult == Some(true) {
                     continue;
@@ -1228,6 +1343,10 @@ impl AniList {
                     let e = e.ok_or_else(|| {
                         anyhow!("AniList returned a null entry, refusing to sync a partial list")
                     })?;
+                    require_entry_id(e.id, None)?;
+                    if let Some(media) = &e.media {
+                        require_media_id(e.media_id, media.id)?;
+                    }
                     // Keep null media entries so AniList merges cannot trigger local deletion.
                     out.push(ListEntry {
                         id: Some(e.id),
@@ -1265,6 +1384,28 @@ impl AniList {
         media_id: i64,
         score_format: Option<&str>,
     ) -> Result<Option<SavedEntry>> {
+        self.entry_by_media_id_with_episodes(media_id, score_format)
+            .await
+            .map(|(entry, _)| entry)
+    }
+
+    pub(crate) async fn entry_by_media_id_with_episodes(
+        &self,
+        media_id: i64,
+        score_format: Option<&str>,
+    ) -> Result<(Option<SavedEntry>, ReportedEpisodes)> {
+        let (mut entry, episodes) = self.fetch_entry(media_id, score_format).await?;
+        if let Some(entry) = entry.as_mut() {
+            entry.retain_score_in_format(score_format);
+        }
+        Ok((entry, episodes))
+    }
+
+    async fn fetch_entry(
+        &self,
+        media_id: i64,
+        score_format: Option<&str>,
+    ) -> Result<(Option<SavedEntry>, ReportedEpisodes)> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Media")]
@@ -1272,12 +1413,16 @@ impl AniList {
         }
         #[derive(Deserialize)]
         struct EntryMedia {
+            id: i64,
+            #[serde(default, deserialize_with = "reported_episodes")]
+            episodes: ReportedEpisodes,
             #[serde(rename = "mediaListEntry", deserialize_with = "Option::deserialize")]
             entry: Option<SavedEntry>,
         }
         let q = "query ($mediaId: Int!, $scoreFormat: ScoreFormat) {
             Media(id: $mediaId, type: ANIME) {
-                mediaListEntry { id status progress score(format: $scoreFormat) repeat updatedAt }
+                id episodes
+                mediaListEntry { id mediaId status progress score(format: $scoreFormat) repeat updatedAt }
             }
         }";
         let r: R = self
@@ -1286,97 +1431,92 @@ impl AniList {
                 serde_json::json!({ "mediaId": media_id, "scoreFormat": score_format }),
             )
             .await?;
-        Ok(r.media.entry.map(|mut entry| {
-            entry.retain_score_in_format(score_format);
-            entry
-        }))
+        require_media_id(media_id, r.media.id)?;
+        if let Some(entry) = &r.media.entry {
+            entry.check_identity(media_id, None)?;
+        }
+        Ok((r.media.entry, r.media.episodes))
     }
 
     /// Omitted fields stay unchanged on AniList.
-    pub async fn save_entry(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn save_entry(
         &self,
         media_id: i64,
+        entry_id: Option<i64>,
         status: Option<ListStatus>,
         progress: Option<i64>,
         score: Option<f64>,
         repeat: Option<i64>,
         score_format: Option<&str>,
-    ) -> Result<SavedEntry> {
-        self.save_entry_target(
-            serde_json::json!({"mediaId": media_id}),
-            status,
-            progress,
-            score,
-            repeat,
-            score_format,
-        )
-        .await
-    }
-
-    pub(crate) async fn save_entry_by_id(
-        &self,
-        entry_id: i64,
-        status: Option<ListStatus>,
-        progress: Option<i64>,
-        score: Option<f64>,
-        repeat: Option<i64>,
-        score_format: Option<&str>,
-    ) -> Result<SavedEntry> {
-        let entry = self
-            .save_entry_target(
-                serde_json::json!({"id": entry_id}),
-                status,
-                progress,
-                score,
-                repeat,
-                score_format,
-            )
-            .await?;
-        if entry.id != entry_id {
-            return Err(ApiError::new(
-                reqwest::StatusCode::OK,
-                false,
-                format!("AniList returned entry {} instead of {entry_id}", entry.id),
-            )
-            .into());
-        }
-        Ok(entry)
-    }
-
-    async fn save_entry_target(
-        &self,
-        mut vars: serde_json::Value,
-        status: Option<ListStatus>,
-        progress: Option<i64>,
-        score: Option<f64>,
-        repeat: Option<i64>,
-        score_format: Option<&str>,
-    ) -> Result<SavedEntry> {
+    ) -> Result<(SavedEntry, Option<i64>)> {
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "SaveMediaListEntry")]
             entry: SavedEntry,
         }
         let q = "mutation ($id: Int, $mediaId: Int, $status: MediaListStatus, $progress: Int, $score: Float, $repeat: Int, $scoreFormat: ScoreFormat) {
-            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id status progress score(format: $scoreFormat) repeat updatedAt }
+            SaveMediaListEntry(id: $id, mediaId: $mediaId, status: $status, progress: $progress, score: $score, repeat: $repeat) { id mediaId status progress score(format: $scoreFormat) repeat updatedAt }
         }";
-        let obj = vars.as_object_mut().expect("vars object");
-        obj.insert("scoreFormat".into(), score_format.into());
+        let mut vars = serde_json::json!({"scoreFormat": score_format});
+        if let Some(id) = entry_id {
+            vars["id"] = id.into();
+        } else {
+            vars["mediaId"] = media_id.into();
+        }
         if let Some(st) = status {
-            obj.insert("status".into(), st.as_str().into());
+            vars["status"] = st.as_str().into();
         }
         if let Some(p) = progress {
-            obj.insert("progress".into(), p.into());
+            vars["progress"] = p.into();
         }
         if let Some(s) = score {
-            obj.insert("score".into(), s.into());
+            vars["score"] = s.into();
         }
         if let Some(r) = repeat {
-            obj.insert("repeat".into(), r.into());
+            vars["repeat"] = r.into();
         }
-        let mut r: R = self.gql(q, vars).await?;
-        r.entry.retain_score_in_format(score_format);
-        Ok(r.entry)
+        let r: R = self.gql_request(q, vars).await?;
+        let mut entry = r.entry;
+        entry.check_identity(media_id, entry_id)?;
+        let requested_status = status.map(ListStatus::as_str);
+        let status_changed = requested_status.is_some_and(|status| status != entry.status);
+        let progress_changed = progress.is_some_and(|progress| progress != entry.progress);
+        let mut confirmed_total = None;
+        if !status_changed && progress_changed && status == Some(ListStatus::Completed) {
+            let (remote, total) = self
+                .fetch_entry(media_id, score_format)
+                .await
+                .map_err(|e| e.context(UnconfirmedEntryWrite(None)))?;
+            let Some(remote) = remote.filter(|remote| {
+                remote.id == entry.id
+                    && remote.status == entry.status
+                    && remote.progress == entry.progress
+            }) else {
+                return Err(UnconfirmedEntryWrite(total).into());
+            };
+            entry = remote;
+            confirmed_total = total;
+        }
+        let status_or_progress_changed =
+            status_changed || progress_changed && confirmed_total.flatten() != Some(entry.progress);
+        let score_or_repeat_changed = score
+            .is_some_and(|score| entry.score.unwrap_or(0.0) != score)
+            || repeat.is_some_and(|repeat| entry.repeat != repeat);
+        if status_or_progress_changed || score_or_repeat_changed {
+            return Err(IncompatibleEntryWrite {
+                id: entry.id,
+                status: entry.status,
+                progress: entry.progress,
+                requested_status: requested_status.map(str::to_owned),
+                requested_progress: progress,
+                total: confirmed_total,
+                score_or_repeat_only: !status_or_progress_changed,
+            }
+            .into());
+        }
+        entry.retain_score_in_format(score_format);
+        Ok((entry, confirmed_total.flatten()))
     }
 
     /// False means the entry was already absent remotely.
@@ -1391,15 +1531,24 @@ impl AniList {
             deleted: Option<bool>,
         }
         let q = "mutation ($id: Int!) { DeleteMediaListEntry(id: $id) { deleted } }";
-        let r: R = match self.gql(q, serde_json::json!({ "id": entry_id })).await {
+        let r: R = match self
+            .gql_request(q, serde_json::json!({ "id": entry_id }))
+            .await
+        {
             Ok(r) => r,
             Err(e) if is_not_found(&e) => return Ok(false),
             Err(e) => return Err(e),
         };
-        if r.entry.and_then(|e| e.deleted) != Some(true) {
-            return Err(anyhow!("AniList declined the delete"));
+        match r.entry.and_then(|e| e.deleted) {
+            Some(true) => Ok(true),
+            Some(false) => Err(anyhow!("AniList declined the delete")),
+            None => Err(ApiError::new(
+                reqwest::StatusCode::OK,
+                false,
+                "AniList did not confirm the delete".into(),
+            )
+            .into()),
         }
-        Ok(true)
     }
 
     pub async fn entry_details(&self, media_id: i64) -> Result<EntryDetails> {
@@ -1410,7 +1559,7 @@ impl AniList {
 
     pub(crate) async fn entry_details_with_id(&self, media_id: i64) -> Result<(i64, EntryDetails)> {
         let q = "query ($id: Int!) {
-            Media(id: $id, type: ANIME) { mediaListEntry { id notes startedAt { year month day } completedAt { year month day } customLists } }
+            Media(id: $id, type: ANIME) { mediaListEntry { id mediaId notes startedAt { year month day } completedAt { year month day } customLists } }
             Viewer { mediaListOptions { animeList { customLists } } }
         }";
         let r: serde_json::Value = self.gql(q, serde_json::json!({"id": media_id})).await?;
@@ -1418,12 +1567,7 @@ impl AniList {
             .pointer("/Media/mediaListEntry")
             .filter(|v| !v.is_null())
             .ok_or_else(|| anyhow!("This show has no saved AniList entry yet"))?;
-        let entry_id = raw
-            .get("id")
-            .and_then(|id| id.as_i64())
-            .filter(|id| *id > 0)
-            .ok_or_else(|| anyhow!("AniList did not return the saved entry ID"))?;
-        let mut details = parse_entry_details(raw)?;
+        let (entry_id, mut details) = parse_entry_details(raw, media_id, None)?;
         details.available_custom_lists = r
             .pointer("/Viewer/mediaListOptions/animeList/customLists")
             .and_then(|v| v.as_array())
@@ -1441,6 +1585,7 @@ impl AniList {
 
     pub async fn save_entry_details(
         &self,
+        media_id: i64,
         entry_id: i64,
         notes: Option<&str>,
         started_at: Option<&FuzzyDate>,
@@ -1449,7 +1594,7 @@ impl AniList {
     ) -> Result<EntryDetails> {
         let q = "mutation ($id: Int!, $notes: String, $started: FuzzyDateInput, $completed: FuzzyDateInput, $lists: [String]) {
             SaveMediaListEntry(id: $id, notes: $notes, startedAt: $started, completedAt: $completed, customLists: $lists) {
-                notes startedAt { year month day } completedAt { year month day } customLists
+                id mediaId notes startedAt { year month day } completedAt { year month day } customLists
             }
         }";
         let mut vars = serde_json::json!({"id": entry_id});
@@ -1465,12 +1610,15 @@ impl AniList {
         if let Some(v) = custom_lists {
             vars["lists"] = serde_json::json!(v);
         }
-        let r: serde_json::Value = self.gql(q, vars).await?;
-        parse_entry_details(
+        let r: serde_json::Value = self.gql_request(q, vars).await?;
+        let (_, details) = parse_entry_details(
             r.get("SaveMediaListEntry")
                 .filter(|v| !v.is_null())
                 .ok_or_else(|| anyhow!("AniList did not return the saved entry"))?,
-        )
+            media_id,
+            Some(entry_id),
+        )?;
+        Ok(details)
     }
 
     pub async fn mark_notifications_read(&self) -> Result<()> {
@@ -1484,7 +1632,7 @@ impl AniList {
             #[serde(rename = "notifications")]
             _notifications: Vec<serde_json::Value>,
         }
-        let _: Response = self.gql("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
+        let _: Response = self.gql_request("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
         Ok(())
     }
 
@@ -1505,7 +1653,7 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Page {
-            notifications: Vec<Raw>,
+            notifications: Vec<Option<Raw>>,
             page_info: PageInfo,
         }
         #[derive(Deserialize)]
@@ -1521,12 +1669,12 @@ impl AniList {
         #[derive(Deserialize, Default)]
         #[serde(default, rename_all = "camelCase")]
         struct Raw {
-            id: i64,
+            id: Option<i64>,
             #[serde(rename = "type")]
-            kind: String,
+            kind: Option<String>,
             context: Option<String>,
             // Airing notifications use a list of contexts.
-            contexts: Option<Vec<String>>,
+            contexts: Option<Vec<Option<String>>>,
             created_at: Option<i64>,
             media: Option<MediaRef>,
             episode: Option<i64>,
@@ -1541,7 +1689,7 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct MediaRef {
-            id: i64,
+            id: Option<i64>,
             title: Option<MediaTitle>,
             cover_image: Option<MediaCover>,
         }
@@ -1557,13 +1705,13 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct ThreadRef {
-            id: i64,
+            id: Option<i64>,
             title: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct UserRef {
-            name: String,
+            name: Option<String>,
             avatar: Option<AvatarRef>,
         }
         #[derive(Deserialize)]
@@ -1594,41 +1742,48 @@ impl AniList {
             .page
             .notifications
             .into_iter()
-            .filter(|n| !n.kind.is_empty())
-            .map(|n| Notification {
-                id: n.id,
-                kind: n.kind,
-                context: n.context.or_else(|| {
-                    n.contexts
+            .flatten()
+            .filter_map(|n| {
+                let id = n.id?;
+                let kind = n.kind.filter(|kind| !kind.is_empty())?;
+                Some(Notification {
+                    id,
+                    kind,
+                    context: n.context.or_else(|| {
+                        let parts = n
+                            .contexts
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .collect::<Vec<_>>();
+                        (!parts.is_empty()).then(|| parts.join(" "))
+                    }),
+                    created_at: n.created_at,
+                    media_id: n.media.as_ref().and_then(|m| m.id),
+                    media_title: n
+                        .media
                         .as_ref()
-                        .filter(|v| !v.is_empty())
-                        .map(|v| v.join(" "))
-                }),
-                created_at: n.created_at,
-                media_id: n.media.as_ref().map(|m| m.id),
-                media_title: n
-                    .media
-                    .as_ref()
-                    .and_then(|m| m.title.as_ref())
-                    .and_then(|t| t.user_preferred.clone()),
-                media_cover: n
-                    .media
-                    .as_ref()
-                    .and_then(|m| m.cover_image.as_ref())
-                    .and_then(|c| c.medium.clone()),
-                episode: n.episode,
-                activity_id: n.activity_id,
-                thread_id: n.thread.as_ref().map(|t| t.id),
-                thread_title: n.thread.as_ref().and_then(|t| t.title.clone()),
-                comment_id: n.comment_id,
-                comment_url: n.comment.and_then(|c| c.site_url),
-                reason: n.reason,
-                deleted_media_title: n.deleted_media_title,
-                user_name: n.user.as_ref().map(|u| u.name.clone()),
-                user_avatar: n
-                    .user
-                    .as_ref()
-                    .and_then(|u| u.avatar.as_ref().and_then(|a| a.large.clone())),
+                        .and_then(|m| m.title.as_ref())
+                        .and_then(|t| t.user_preferred.clone()),
+                    media_cover: n
+                        .media
+                        .as_ref()
+                        .and_then(|m| m.cover_image.as_ref())
+                        .and_then(|c| c.medium.clone()),
+                    episode: n.episode,
+                    activity_id: n.activity_id,
+                    thread_id: n.thread.as_ref().and_then(|t| t.id),
+                    thread_title: n.thread.as_ref().and_then(|t| t.title.clone()),
+                    comment_id: n.comment_id,
+                    comment_url: n.comment.and_then(|c| c.site_url),
+                    reason: n.reason,
+                    deleted_media_title: n.deleted_media_title,
+                    user_name: n.user.as_ref().and_then(|u| u.name.clone()),
+                    user_avatar: n
+                        .user
+                        .as_ref()
+                        .and_then(|u| u.avatar.as_ref().and_then(|a| a.large.clone())),
+                })
             })
             .collect();
         Ok(NotificationPage {
@@ -1641,7 +1796,7 @@ impl AniList {
 }
 
 fn require_media_id(expected: i64, actual: i64) -> Result<()> {
-    if actual != expected {
+    if actual <= 0 || actual != expected {
         return Err(ApiError::new(
             reqwest::StatusCode::OK,
             false,
@@ -1652,7 +1807,26 @@ fn require_media_id(expected: i64, actual: i64) -> Result<()> {
     Ok(())
 }
 
-fn parse_entry_details(raw: &serde_json::Value) -> Result<EntryDetails> {
+fn require_entry_id(id: i64, expected: Option<i64>) -> Result<()> {
+    if id <= 0 || expected.is_some_and(|expected| id != expected) {
+        return Err(ApiError::new(
+            reqwest::StatusCode::OK,
+            false,
+            expected.map_or_else(
+                || format!("AniList returned an invalid list entry ID {id}"),
+                |expected| format!("AniList returned entry {id} instead of {expected}"),
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn parse_entry_details(
+    raw: &serde_json::Value,
+    media_id: i64,
+    expected_id: Option<i64>,
+) -> Result<(i64, EntryDetails)> {
     #[derive(Deserialize)]
     struct Date {
         #[serde(deserialize_with = "Option::deserialize")]
@@ -1674,6 +1848,8 @@ fn parse_entry_details(raw: &serde_json::Value) -> Result<EntryDetails> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Details {
+        id: i64,
+        media_id: i64,
         // Selected fields may be null, but must be present.
         #[serde(deserialize_with = "Option::deserialize")]
         notes: Option<String>,
@@ -1685,18 +1861,23 @@ fn parse_entry_details(raw: &serde_json::Value) -> Result<EntryDetails> {
         custom_lists: Option<std::collections::BTreeMap<String, bool>>,
     }
     let entry: Details = serde_json::from_value(raw.clone())?;
-    Ok(EntryDetails {
-        notes: entry.notes.unwrap_or_default(),
-        started_at: entry.started_at.map(FuzzyDate::from),
-        completed_at: entry.completed_at.map(FuzzyDate::from),
-        custom_lists: entry
-            .custom_lists
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(name, enabled)| enabled.then_some(name))
-            .collect(),
-        ..Default::default()
-    })
+    require_media_id(media_id, entry.media_id)?;
+    require_entry_id(entry.id, expected_id)?;
+    Ok((
+        entry.id,
+        EntryDetails {
+            notes: entry.notes.unwrap_or_default(),
+            started_at: entry.started_at.map(FuzzyDate::from),
+            completed_at: entry.completed_at.map(FuzzyDate::from),
+            custom_lists: entry
+                .custom_lists
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, enabled)| enabled.then_some(name))
+                .collect(),
+            ..Default::default()
+        },
+    ))
 }
 
 /// Keep transport errors distinct from AniList errors.
@@ -1712,11 +1893,19 @@ struct ApiError {
 enum ApiErrorKind {
     Other,
     Missing,
+    Partial,
     Rejected,
     Disabled,
 }
 
 impl ApiError {
+    fn not_found(&self) -> bool {
+        self.from_json
+            && !matches!(self.kind, ApiErrorKind::Rejected | ApiErrorKind::Partial)
+            && (self.status == reqwest::StatusCode::NOT_FOUND
+                || self.status.is_success() && self.kind == ApiErrorKind::Missing)
+    }
+
     fn new(status: reqwest::StatusCode, from_json: bool, message: String) -> Self {
         // Classify before redacting diagnostic text.
         let kind = if message == "Not Found" {
@@ -1748,21 +1937,100 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+#[derive(Debug)]
+pub(crate) struct UnsentRequest;
+
+impl std::fmt::Display for UnsentRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The account changed before the request could be sent.")
+    }
+}
+
+impl std::error::Error for UnsentRequest {}
+
+// The mutation may have committed before confirmation failed.
+#[derive(Debug)]
+pub(crate) struct UnconfirmedEntryWrite(pub ReportedEpisodes);
+
+impl std::fmt::Display for UnconfirmedEntryWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AniList did not confirm the requested status and progress.")
+    }
+}
+
+impl std::error::Error for UnconfirmedEntryWrite {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct IncompatibleEntryWrite {
+    pub id: i64,
+    pub status: String,
+    pub progress: i64,
+    pub requested_status: Option<String>,
+    pub requested_progress: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "reported_episodes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub total: ReportedEpisodes,
+    #[serde(skip)]
+    pub(crate) score_or_repeat_only: bool,
+}
+
+impl IncompatibleEntryWrite {
+    pub(crate) const MESSAGE: &'static str =
+        "AniList did not confirm the requested status and progress. Review this saved change.";
+
+    pub(crate) fn matches_entry(&self, entry: &ListEntry) -> bool {
+        entry.id == Some(self.id) && entry.status == self.status && entry.progress == self.progress
+    }
+
+    pub(crate) fn clamped_active_entry(&self, base: &ListEntry) -> bool {
+        self.requested_status.is_none()
+            && matches!(base.status.as_str(), "CURRENT" | "REPEATING")
+            && self.status == "COMPLETED"
+            && self.progress > 0
+            && self.requested_progress.is_some_and(|p| p > self.progress)
+    }
+
+    pub(crate) fn forced_completion(&self) -> bool {
+        self.status == "COMPLETED"
+            && self.requested_progress.is_some()
+            && matches!(
+                self.requested_status.as_deref(),
+                Some("CURRENT" | "REPEATING")
+            )
+    }
+}
+
+impl std::fmt::Display for IncompatibleEntryWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.score_or_repeat_only {
+            f.write_str("AniList did not confirm the requested score or rewatch count. Review this saved change.")
+        } else {
+            f.write_str(Self::MESSAGE)
+        }
+    }
+}
+
+impl std::error::Error for IncompatibleEntryWrite {}
+
 /// AniList can report Not Found inside an HTTP 200 response.
 fn is_not_found(e: &anyhow::Error) -> bool {
-    let Some(api) = e.downcast_ref::<ApiError>() else {
-        return false;
-    };
-    api.from_json
-        && (api.status == reqwest::StatusCode::NOT_FOUND || api.kind == ApiErrorKind::Missing)
+    e.downcast_ref::<ApiError>()
+        .is_some_and(ApiError::not_found)
 }
 
 pub fn is_retryable(error: &anyhow::Error) -> bool {
+    if error.is::<UnconfirmedEntryWrite>() {
+        return !is_auth_rejection(error);
+    }
     if let Some(api) = error.downcast_ref::<ApiError>() {
         if api.from_json && (is_not_found(error) || is_auth_rejection(error)) {
             return false;
         }
         return !api.from_json
+            || api.kind == ApiErrorKind::Partial
             || api.status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || api.status == reqwest::StatusCode::REQUEST_TIMEOUT
             || (api.status == reqwest::StatusCode::FORBIDDEN
@@ -1775,7 +2043,7 @@ pub fn is_retryable(error: &anyhow::Error) -> bool {
 }
 
 pub fn media_not_found(e: &anyhow::Error) -> bool {
-    is_not_found(e)
+    !e.is::<UnconfirmedEntryWrite>() && is_not_found(e)
 }
 
 /// Only a definitive token rejection may clear the session.
@@ -1825,7 +2093,7 @@ fn percent_decode(s: &str) -> String {
 
 pub type OAuthReceiver = oneshot::Receiver<Result<String, String>>;
 
-/// Tests use port zero to avoid the live OAuth listener.
+/// Pass zero to bind an available callback port.
 pub fn start_callback_server_on(port: u16) -> Result<(String, u16, OAuthReceiver)> {
     let state = random_state()?;
     let expected = state.clone();
@@ -1860,86 +2128,96 @@ pub fn start_callback_server_on(port: u16) -> Result<(String, u16, OAuthReceiver
                     return;
                 }
             };
+            let (outcome_tx, mut outcome_rx) =
+                tokio::sync::mpsc::channel::<Result<String, String>>(1);
+            let slots = Arc::new(tokio::sync::Semaphore::new(16));
+            let expected = Arc::new(expected);
             loop {
-                let (mut sock, _) = match tokio::select! {
-                    _ = tx.closed() => return,
-                    acc = listener.accept() => acc,
-                } {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // Bound the whole read so browser preconnects cannot stall the listener.
-                let mut buf = [0u8; 8192];
-                let mut n = 0;
-                let read_headers = async {
-                    loop {
-                        match sock.read(&mut buf[n..]).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(r) => {
-                                n += r;
-                                if n == buf.len()
-                                    || buf[..n].windows(4).any(|w| w == b"\r\n\r\n")
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                };
                 tokio::select! {
                     _ = tx.closed() => return,
-                    _ = tokio::time::timeout(Duration::from_secs(10), read_headers) => {}
-                }
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("");
-                let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-                let param = |k: &str| -> Option<String> {
-                    query.split('&').find_map(|kv| {
-                        let (key, val) = kv.split_once('=')?;
-                        (key == k).then(|| percent_decode(val))
-                    })
-                };
-
-                let (outcome, body) =
-                    if (param("error").is_some() || param("code").is_some())
-                        && param("state").as_deref() != Some(expected.as_str())
-                    {
-                        (None, ERR_HTML)
-                    } else if let Some(err) = param("error") {
-                        let msg = param("error_description").unwrap_or(err);
-                        log::warn!("OAuth callback: AniList denied access: {}", clip_for_log(&msg));
-                        (Some(Err(format!("AniList authorization failed: {}", clip_for_log(&msg)))), ERR_HTML)
-                    } else if let Some(code) = param("code") {
-                        if code.trim().is_empty() {
-                            (Some(Err("AniList returned an empty authorization code.".into())), ERR_HTML)
-                        } else {
-                            (Some(Ok(code)), OK_HTML)
+                    outcome = outcome_rx.recv() => {
+                        if let Some(outcome) = outcome {
+                            let _ = tx.send(outcome);
                         }
-                    } else {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            WAIT_HTML.len(),
-                            WAIT_HTML
-                        );
-                        let _ = sock.write_all(resp.as_bytes()).await;
-                        let _ = sock.shutdown().await;
-                        continue;
-                    };
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
-                if let Some(outcome) = outcome {
-                    let _ = tx.send(outcome);
-                    break;
+                        return;
+                    }
+                    acc = listener.accept() => {
+                        let Ok((mut sock, _)) = acc else {
+                            continue;
+                        };
+                        let Ok(permit) = slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        let expected = expected.clone();
+                        let outcome_tx = outcome_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            // Bound each connection so browser preconnects cannot stall login.
+                            let mut buf = [0u8; 8192];
+                            let mut n = 0;
+                            let read_headers = async {
+                                loop {
+                                    match sock.read(&mut buf[n..]).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(r) => {
+                                            n += r;
+                                            if n == buf.len()
+                                                || buf[..n].windows(4).any(|w| w == b"\r\n\r\n")
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = tokio::time::timeout(Duration::from_secs(10), read_headers).await;
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let path = req
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .unwrap_or("");
+                            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                            let param = |k: &str| -> Option<String> {
+                                query.split('&').find_map(|kv| {
+                                    let (key, val) = kv.split_once('=')?;
+                                    (key == k).then(|| percent_decode(val))
+                                })
+                            };
+                            let (outcome, body) =
+                                if (param("error").is_some() || param("code").is_some())
+                                    && param("state").as_deref() != Some(expected.as_str())
+                                {
+                                    (None, ERR_HTML)
+                                } else if let Some(err) = param("error") {
+                                    let msg = param("error_description").unwrap_or(err);
+                                    log::warn!("OAuth callback: AniList denied access: {}", clip_for_log(&msg));
+                                    (Some(Err(format!("AniList authorization failed: {}", clip_for_log(&msg)))), ERR_HTML)
+                                } else if let Some(code) = param("code") {
+                                    if code.trim().is_empty() {
+                                        (Some(Err("AniList returned an empty authorization code.".into())), ERR_HTML)
+                                    } else {
+                                        (Some(Ok(code)), OK_HTML)
+                                    }
+                                } else {
+                                    (None, WAIT_HTML)
+                                };
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                            let _ = sock.shutdown().await;
+                            if let Some(outcome) = outcome {
+                                let _ = outcome_tx.try_send(outcome);
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -1964,6 +2242,20 @@ pub(crate) mod urlencoding {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn extreme_rate_reset_headers_do_not_panic_or_wait() {
+        let api = super::AniList::new();
+        for reset in [i64::MIN, i64::MAX] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+            headers.insert("x-ratelimit-reset", reset.to_string().parse().unwrap());
+            api.note_rate_headers(&headers);
+            tokio::time::timeout(std::time::Duration::from_millis(100), api.wait_for_budget())
+                .await
+                .expect("out-of-window reset must not delay requests");
+        }
+    }
+
     #[cfg(feature = "test-support")]
     #[test]
     fn fixture_graphql_accepts_only_literal_loopback_http_urls() {
@@ -2464,7 +2756,7 @@ mod regression_tests {
     #[tokio::test]
     async fn entry_lookup_is_scoped_to_the_authenticated_user() {
         let (api, mut requests) = mock_api(vec![(200, json!({"data": {
-            "Media": {"mediaListEntry": {"id": 22, "status": "CURRENT", "progress": 4, "score": 8.5, "repeat": 2}},
+            "Media": {"id":1,"mediaListEntry": {"id": 22,"mediaId":1, "status": "CURRENT", "progress": 4, "score": 8.5, "repeat": 2}},
             "MediaList": {"id": 999, "status": "COMPLETED", "progress": 12, "score": 10.0, "repeat": 0}
         }}))]).await;
         let entry = api.entry_by_media_id(1, None).await.unwrap().unwrap();
@@ -2479,14 +2771,11 @@ mod regression_tests {
     async fn unknown_score_format_drops_only_unscaled_nonzero_scores() {
         for format in [None, Some("POINT_5")] {
             for score in [json!(null), json!(0), json!(4)] {
-                let entry =
-                    json!({"id":22,"status":"CURRENT","progress":4,"score":score,"repeat":0});
-                let mut listed = entry.clone();
-                listed["mediaId"] = json!(1);
+                let entry = json!({"id":22,"mediaId":1,"status":"CURRENT","progress":4,"score":score,"repeat":0});
                 let (api, mut requests) = mock_api(vec![
-                (200, json!({"data":{"Media":{"mediaListEntry":entry}}})),
+                (200, json!({"data":{"Media":{"id":1,"mediaListEntry":entry}}})),
                 (200, json!({"data":{"SaveMediaListEntry":entry}})),
-                (200, json!({"data":{"MediaListCollection":{"user":{"id":7},"lists":[{"entries":[listed]}],"hasNextChunk":false}}})),
+                (200, json!({"data":{"MediaListCollection":{"user":{"id":7},"lists":[{"entries":[entry]}],"hasNextChunk":false}}})),
             ])
             .await;
                 let expected = Some(score.as_f64().unwrap_or(0.0))
@@ -2500,9 +2789,10 @@ mod regression_tests {
                     expected
                 );
                 assert_eq!(
-                    api.save_entry_by_id(22, None, Some(4), None, None, format)
+                    api.save_entry(1, Some(22), None, Some(4), None, None, format)
                         .await
                         .unwrap()
+                        .0
                         .score,
                     expected
                 );
@@ -2521,7 +2811,7 @@ mod regression_tests {
     async fn an_unlisted_anime_is_not_a_missing_anime() {
         let (api, _) = mock_api(vec![(
             200,
-            json!({"data": {"Media": {"mediaListEntry": null}}}),
+            json!({"data": {"Media": {"id":1,"mediaListEntry": null}}}),
         )])
         .await;
         assert!(api.entry_by_media_id(1, None).await.unwrap().is_none());
@@ -2533,6 +2823,7 @@ mod regression_tests {
             json!(null),
             json!([{"entries": null}]),
             json!([{"entries": [null]}]),
+            json!([{"entries": [{"id":22,"mediaId":1,"status":"CURRENT","progress":0,"score":0,"repeat":0,"media":mock_media(2)}]}]),
         ] {
             let (api, _) = mock_api(vec![(
                 200,
@@ -2659,9 +2950,14 @@ mod feature_tests {
         for (transport, reported, message, retry, auth, missing) in [
             (200, json!(429), "Too Many Requests.", true, false, false),
             (200, json!(503), "Service unavailable", true, false, false),
+            (503, json!(404), "Not Found", true, false, false),
+            (404, json!(503), "Not Found", true, false, false),
+            (404, json!(429), "Too Many Requests.", true, false, false),
+            (404, json!(401), "Unauthenticated", false, true, false),
             (200, json!(400), "validation", false, false, false),
             (200, json!(401), "Unauthenticated", false, true, false),
             (200, json!(404), "Anime unavailable", false, false, true),
+            (404, json!(404), "Invalid Token", false, true, false),
             (200, json!(403), "Access denied", false, false, false),
             (
                 403,
@@ -2794,6 +3090,24 @@ mod feature_tests {
         assert!(page.has_next_page);
         assert_eq!(page.items[0].id, 26);
         assert_eq!(requests.recv().await.unwrap()["variables"]["page"], 2);
+    }
+
+    #[tokio::test]
+    async fn notification_pages_require_the_collection_and_page_boundary() {
+        for page in [
+            json!({"pageInfo":{"hasNextPage":false}}),
+            json!({"pageInfo":{"hasNextPage":false},"notifications":null}),
+            json!({"notifications":[]}),
+            json!({"notifications":[],"pageInfo":{}}),
+            json!({"notifications":[],"pageInfo":{"hasNextPage":null}}),
+        ] {
+            let (api, _) = mock_api(vec![(
+                200,
+                json!({"data":{"Viewer":{"unreadNotificationCount":4},"Page":page}}),
+            )])
+            .await;
+            assert!(api.notifications_page(2).await.is_err(), "{page}");
+        }
     }
 
     #[tokio::test]
@@ -3041,8 +3355,7 @@ mod feature_tests {
 
     #[tokio::test]
     async fn explicit_null_metadata_is_a_valid_empty_entry() {
-        let empty =
-            json!({"id":22,"notes":null,"startedAt":null,"completedAt":null,"customLists":null});
+        let empty = json!({"id":22,"mediaId":1,"notes":null,"startedAt":null,"completedAt":null,"customLists":null});
         let (api, _) = mock_api(vec![
             (200, json!({"data":{"Media":{"mediaListEntry":empty}}})),
             (200, json!({"data":{"SaveMediaListEntry":empty}})),
@@ -3050,7 +3363,7 @@ mod feature_tests {
         .await;
         for details in [
             api.entry_details(1).await.unwrap(),
-            api.save_entry_details(22, Some(""), None, None, None)
+            api.save_entry_details(1, 22, Some(""), None, None, None)
                 .await
                 .unwrap(),
         ] {
@@ -3063,15 +3376,15 @@ mod feature_tests {
 
     #[tokio::test]
     async fn notes_mutation_omits_untouched_dates_lists_and_progress() {
-        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":{"notes":"New note","startedAt":{"year":2024,"month":null,"day":null},"completedAt":null,"customLists":{"Favorites":true,"Other":false}}}}))]).await;
+        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"SaveMediaListEntry":{"id":22,"mediaId":1,"notes":"New note","startedAt":{"year":2024,"month":null,"day":null},"completedAt":null,"customLists":{"Favorites":true,"Other":false}}}}))]).await;
         let result = api
-            .save_entry_details(1, Some("New note"), None, None, None)
+            .save_entry_details(1, 22, Some("New note"), None, None, None)
             .await
             .unwrap();
         assert_eq!(result.custom_lists, vec!["Favorites"]);
         assert_eq!(result.started_at.unwrap().year, Some(2024));
         let request = requests.recv().await.unwrap();
-        assert_eq!(request["variables"], json!({"id":1,"notes":"New note"}));
+        assert_eq!(request["variables"], json!({"id":22,"notes":"New note"}));
         assert!(!request["query"].as_str().unwrap().contains("progress:"));
     }
 }

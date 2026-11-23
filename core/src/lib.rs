@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+pub use anilist::valid_account_id;
 pub use commands::{check_bridge_update, install_bridge_update, TrackingConfig};
 pub use db::Db;
 pub use library::LibraryBinding;
@@ -117,7 +118,11 @@ impl Core {
                 anilist.set_token(Some(token));
             }
         }
-        let matchers = recognize::build_matchers(&db);
+        let matchers = if anilist.has_token() {
+            recognize::build_matchers(&db)
+        } else {
+            Vec::new()
+        };
         let (events, _) = broadcast::channel(128);
         Self {
             state: Arc::new(commands::AppState {
@@ -125,8 +130,8 @@ impl Core {
                 db: Arc::new(db),
                 user: Mutex::new(None),
                 auth_intent: tokio::sync::watch::channel(0).0,
-                entry_lock: tokio::sync::Mutex::new(()),
-                remote_lock: tokio::sync::Mutex::new(()),
+                entry_lock: Default::default(),
+                remote_lock: Default::default(),
                 matchers: Mutex::new(Arc::new(matchers)),
                 library_cache: Default::default(),
                 events,
@@ -158,6 +163,28 @@ impl Core {
     pub fn generation(&self) -> u64 {
         *self.state.auth_intent.borrow()
     }
+    pub fn remote_write_active(&self) -> bool {
+        self.state.remote_lock.try_lock().is_err()
+    }
+    /// Waits until active remote writes settle while generation remains current.
+    pub async fn wait_for_remote_settlement(&self, generation: u64) -> bool {
+        if self.generation() != generation {
+            return false;
+        }
+        let mut changes = self.state.auth_intent.subscribe();
+        tokio::select! {
+            biased;
+            _ = changes.wait_for(|current| *current != generation) => false,
+            guard = self.state.remote_lock.lock() => {
+                drop(guard);
+                self.generation() == generation
+            }
+        }
+    }
+    #[cfg(feature = "test-support")]
+    pub async fn hold_remote_lock_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.state.remote_lock.clone().lock_owned().await
+    }
     pub(crate) fn state(&self) -> &commands::AppState {
         &self.state
     }
@@ -176,6 +203,15 @@ impl Core {
 
     pub fn event_is_current(&self, event: &Event) -> bool {
         self.state.event_is_current(event)
+    }
+
+    pub fn cached_tracking_target(&self, prompt: &TrackingPrompt) -> Option<i64> {
+        self.state
+            .db
+            .cached_episode_total(prompt.media_id)
+            .ok()
+            .flatten()
+            .map(|total| total.map_or(prompt.episode, |total| prompt.episode.min(total)))
     }
 
     pub async fn acknowledge_tracking_prompt(&self, event: Event) -> bool {
@@ -233,10 +269,33 @@ impl Core {
     }
 
     pub async fn get_preference(&self, key: String) -> Result<Option<String>, String> {
-        let key = preference_key(&key)?;
-        self.state.db.get_setting(&key).map_err(|e| e.to_string())
+        let db_key = preference_key(&key)?;
+        if is_scoped_list_preference(&key) {
+            let _entry = self.state.entry_lock.lock().await;
+            let has_token = self.state.anilist.lock().has_token();
+            return self
+                .state
+                .db
+                .get_scoped_preference(&db_key, has_token)
+                .map_err(|e| e.to_string());
+        }
+        self.state
+            .db
+            .get_setting(&db_key)
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn confirm_tracking_prompt(
+        &self,
+        event: Event,
+        displayed_target: i64,
+    ) -> Result<(), String> {
+        commands::confirm_tracking_prompt(event, displayed_target, &self.state).await
     }
     pub async fn set_preference(&self, key: String, value: Option<String>) -> Result<(), String> {
+        if is_scoped_list_preference(&key) {
+            return Err("Scoped list preferences require set_workspace_preference".into());
+        }
         let key = preference_key(&key)?;
         match value {
             Some(value) => self
@@ -251,6 +310,33 @@ impl Core {
                 .map_err(|e| e.to_string()),
         }
     }
+
+    pub async fn set_workspace_preference(
+        &self,
+        key: String,
+        value: Option<String>,
+        account: Option<i64>,
+    ) -> Result<(), String> {
+        if is_scoped_list_preference(&key) {
+            let db_key = preference_key(&key)?;
+            // Account replacement and queued list writes must agree on the owner at commit.
+            let _entry = self.state.entry_lock.lock().await;
+            let has_token = self.state.anilist.lock().has_token();
+            return self
+                .state
+                .db
+                .set_scoped_preference(&db_key, value.as_deref(), account, has_token)
+                .map_err(|e| e.to_string());
+        }
+        self.set_preference(key, value).await
+    }
+}
+
+fn is_scoped_list_preference(key: &str) -> bool {
+    matches!(
+        key,
+        "kurisu.list.q" | "kurisu.list.filter" | "kurisu.list.synced"
+    )
 }
 
 fn preference_key(key: &str) -> Result<String, String> {
@@ -371,6 +457,9 @@ impl Core {
     pub async fn get_tracking_config(&self) -> TrackingConfig {
         commands::get_tracking_config(&self.state)
     }
+    pub async fn try_get_tracking_config(&self) -> Result<TrackingConfig, String> {
+        commands::try_get_tracking_config(&self.state)
+    }
     pub async fn set_tracking_config(
         &self,
         mode: String,
@@ -400,10 +489,49 @@ impl Core {
         commands::set_app_setting(key, value, &self.state)
     }
     pub async fn login_with_token(&self, token: String) -> Result<User, String> {
-        commands::login_with_token(token, &self.state).await
+        self.login(Some(token), None).await
     }
     pub async fn login_oauth(&self) -> Result<User, String> {
-        commands::login_oauth(self.platform.as_ref(), &self.state).await
+        self.login(None, None).await
+    }
+
+    fn list_preferences(&self, last_account: Option<i64>) -> db::ListPreferences {
+        match self.channel {
+            UpdateChannel::Native => db::ListPreferences::Native { last_account },
+            UpdateChannel::Legacy => db::ListPreferences::Preserve,
+        }
+    }
+
+    /// An absent token starts browser sign-in. The native list owner can outlive sign-out.
+    pub async fn login(
+        &self,
+        token: Option<String>,
+        last_account: Option<i64>,
+    ) -> Result<User, String> {
+        self.login_for_intent(self.begin_login_intent(), token, last_account)
+            .await
+    }
+
+    pub fn begin_login_intent(&self) -> u64 {
+        self.state.begin_auth_intent()
+    }
+
+    pub async fn login_for_intent(
+        &self,
+        intent: u64,
+        token: Option<String>,
+        last_account: Option<i64>,
+    ) -> Result<User, String> {
+        let preferences = self.list_preferences(last_account);
+        match token {
+            Some(token) => {
+                commands::login_with_token_inner(token, &self.state, intent, preferences).await
+            }
+            None => {
+                commands::login_oauth(self.platform.as_ref(), &self.state, intent, preferences)
+                    .await
+            }
+        }
     }
     pub fn cancel_login(&self) {
         self.state.cancel_login();
@@ -412,13 +540,13 @@ impl Core {
         commands::logout(&self.state).await
     }
     pub async fn current_user(&self) -> Result<Option<User>, String> {
-        commands::current_user(&self.state).await
+        commands::current_user_mode(&self.state, false, self.list_preferences(None)).await
     }
     pub async fn saved_account_id(&self) -> Option<i64> {
-        sync_queue::account_id(&self.state.db)
+        self.state.db.saved_list_owner()
     }
     pub async fn refresh_current_user(&self) -> Result<Option<User>, String> {
-        commands::refresh_current_user(&self.state).await
+        commands::current_user_mode(&self.state, true, self.list_preferences(None)).await
     }
     pub async fn search_anime_page(&self, query: String, page: i64) -> Result<SearchPage, String> {
         commands::search_anime_page(query, page, &self.state).await
@@ -443,7 +571,7 @@ impl Core {
         commands::get_airing_schedule(start, end, &self.state).await
     }
     pub async fn sync_my_list(&self) -> Result<Vec<ListEntry>, String> {
-        commands::sync_my_list(&self.state).await
+        commands::sync_my_list_mode(&self.state, self.list_preferences(None)).await
     }
     pub async fn local_entries(&self) -> Result<Vec<ListEntry>, String> {
         commands::local_entries(&self.state).await
@@ -606,7 +734,22 @@ impl Core {
         commands::install_update(self.data_dir.clone(), self.channel).await
     }
     pub async fn get_pending_changes(&self) -> Result<Vec<PendingChange>, String> {
-        sync_queue::get_pending_changes(&self.state)
+        sync_queue::get_pending_changes(&self.state).await
+    }
+    /// Returns no result if the requested session is no longer current.
+    pub async fn get_pending_changes_for(
+        &self,
+        generation: u64,
+        account: i64,
+    ) -> Result<Option<Vec<PendingChange>>, String> {
+        sync_queue::read_pending_changes(
+            &self.state,
+            Some(EventOrigin {
+                generation,
+                account_id: Some(account),
+            }),
+        )
+        .await
     }
     pub async fn sync_pending_changes(&self) -> Result<Vec<PendingChange>, String> {
         sync_queue::sync_pending_changes(&self.state).await
@@ -667,6 +810,845 @@ mod core_tests {
         )
         .unwrap();
         (core, dir)
+    }
+
+    fn logout_fixture(db: Db) -> Core {
+        db.upsert_media(&Media {
+            id: 1,
+            title_english: Some("Fixture series".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            media_id: 1,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        Core::from_db(
+            db,
+            PathBuf::new(),
+            tokio::runtime::Handle::current(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        )
+    }
+
+    #[tokio::test]
+    async fn partial_logout_keeps_the_cleared_list_empty_until_reconnection() {
+        for key in ["anilist_username", "anilist_user_id"] {
+            let db = Db::open(Path::new(":memory:")).unwrap();
+            db.replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    name: "Fixture".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let core = logout_fixture(db);
+            assert_eq!(core.state.matchers.lock()[0].media_id, 1);
+            let db = &core.state.db;
+            let (_, pending, _) = sync_queue::stage(
+                &core.state,
+                1,
+                sync_queue::Patch {
+                    progress: Some(4),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(core.local_entries().await.unwrap()[0].progress, 4);
+            db.0.lock()
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER fail_logout_cleanup BEFORE DELETE ON settings
+                 WHEN OLD.key = '{key}'
+                 BEGIN SELECT RAISE(ABORT, 'fixture identity cleanup failed'); END;"
+                ))
+                .unwrap();
+
+            let error = core.logout().await.unwrap_err();
+            assert!(error.contains("fixture identity cleanup failed"), "{error}");
+            assert!(core.current_user().await.unwrap().is_none());
+            assert!(db.get_setting("anilist_token").unwrap().is_none());
+            assert!(db.get_entry(1).unwrap().is_none());
+            assert!(core.state.matchers.lock().is_empty());
+            assert!(core.local_entries().await.unwrap().is_empty());
+            assert!(core.get_entry(1).await.unwrap().is_none());
+            assert!(core.get_pending_changes().await.unwrap().is_empty());
+            db.record_watch(7, "/anime/ep01.mkv", 1, 1).unwrap();
+            assert!(core.get_watch_history(None, None).await.unwrap().is_empty());
+            assert_eq!(
+                core.find_show_torrents(1, None, None).await.unwrap_err(),
+                "This show is no longer on your list"
+            );
+            assert_eq!(
+                core.bind_library_path("/anime".into(), 1, None)
+                    .await
+                    .unwrap_err(),
+                "only shows on your list can be linked"
+            );
+            assert_eq!(
+                core.library_binding_details("/anime/ep01.mkv".into())
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(core.sync_pending_changes().await.unwrap().is_empty());
+            assert!(db.get_entry(1).unwrap().is_none());
+            assert!(core.state.matchers.lock().is_empty());
+            assert_eq!(
+                serde_json::to_value(&db.pending(7).unwrap()[0]).unwrap(),
+                serde_json::to_value(pending).unwrap()
+            );
+
+            db.0.lock()
+                .execute_batch("DROP TRIGGER fail_logout_cleanup")
+                .unwrap();
+            core.logout().await.unwrap();
+            assert!(db.cached_user().unwrap().is_none());
+            let (mut api, _requests) = anilist::mock_api(vec![(
+                200,
+                serde_json::json!({
+                    "data":{"Viewer":{"id":7,"name":"Fixture"}}
+                }),
+            )])
+            .await;
+            api.set_token(None);
+            *core.state.anilist.lock() = api;
+            assert_eq!(
+                core.login_with_token("test-session".into())
+                    .await
+                    .unwrap()
+                    .id,
+                7
+            );
+            let entries = core.local_entries().await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!((entries[0].media_id, entries[0].progress), (1, 4));
+            assert_eq!(core.state.matchers.lock()[0].media_id, 1);
+        }
+    }
+
+    fn persistence_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    async fn occupy_blocking_worker(
+        wait: std::time::Duration,
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let occupied = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            blocked.recv_timeout(wait).unwrap();
+        });
+        tokio::time::timeout(wait, started).await.unwrap().unwrap();
+        (release, occupied)
+    }
+
+    #[test]
+    fn admitted_public_logout_finishes_after_its_caller_is_dropped() {
+        use std::{
+            task::{Context, Waker},
+            time::Duration,
+        };
+        persistence_runtime().block_on(async {
+            let db = Db::open(Path::new(":memory:")).unwrap();
+            db.replace_account(
+                "fixture-session",
+                &User {
+                    id: 7,
+                    name: "Fixture".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let core = logout_fixture(db);
+            assert_eq!(core.state.matchers.lock()[0].media_id, 1);
+            let wait = Duration::from_secs(5);
+            let (release, occupied) = occupy_blocking_worker(wait).await;
+            let mut logout = Box::pin(core.logout());
+            assert!(logout
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            drop(logout);
+            assert!(core.state.remote_lock.try_lock().is_err());
+            assert!(core.state.entry_lock.try_lock().is_err());
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            let _remote = tokio::time::timeout(wait, core.state.remote_lock.lock())
+                .await
+                .unwrap();
+            let _entry = tokio::time::timeout(wait, core.state.entry_lock.lock())
+                .await
+                .unwrap();
+            assert!(core.state.db.get_entry(1).unwrap().is_none());
+            assert!(core
+                .state
+                .db
+                .get_setting("anilist_user_id")
+                .unwrap()
+                .is_none());
+            assert!(core.state.matchers.lock().is_empty());
+        });
+    }
+
+    #[test]
+    fn admitted_public_sync_finishes_after_its_caller_is_dropped() {
+        use serde_json::json;
+        use std::{future::poll_fn, task::Poll, time::Duration};
+        use tokio::time::timeout;
+
+        persistence_runtime().block_on(async {
+            let db = Db::open(Path::new(":memory:")).unwrap();
+            db.replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    name: "Fixture".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let core = logout_fixture(db);
+            let state = &core.state;
+            assert_eq!(state.matchers.lock()[0].display, "Fixture series");
+            let (_, mut pending, _) = sync_queue::stage(
+                state,
+                1,
+                sync_queue::Patch {
+                    progress: Some(8),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            pending.conflict = true;
+            state.db.put_pending(7, &pending).unwrap();
+
+            let mut media = anilist::mock_media(1);
+            media["title"]["english"] = json!("Renamed fixture series");
+            let snapshot = json!({"data":{"MediaListCollection":{
+                "user":{"id":7}, "hasNextChunk":false, "lists":[{"entries":[{
+                    "id":22, "mediaId":1, "status":"CURRENT", "progress":3,
+                    "score":0, "repeat":0, "media":media
+                }]}]
+            }}});
+            let viewer = json!({"data":{"Viewer":{"id":7,"name":"Fixture"}}});
+            let (api, _requests) = anilist::mock_api(vec![(200, snapshot), (200, viewer)]).await;
+            *state.anilist.lock() = api;
+
+            let wait = Duration::from_secs(5);
+            let (release, occupied) = occupy_blocking_worker(wait).await;
+            let mut sync = Box::pin(core.sync_my_list());
+            timeout(
+                wait,
+                poll_fn(|cx| {
+                    if let Poll::Ready(result) = sync.as_mut().poll(cx) {
+                        panic!("sync finished before admission: {result:?}");
+                    }
+                    // Only the queued persistence job holds the entry lock between polls.
+                    if state.entry_lock.try_lock().is_err() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .expect("sync must reach persistence");
+            assert!(state.user.lock().is_none());
+            drop(sync);
+            assert!(state.remote_lock.try_lock().is_err());
+            assert!(state.entry_lock.try_lock().is_err());
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            let _remote = timeout(wait, state.remote_lock.lock()).await.unwrap();
+            let _entry = timeout(wait, state.entry_lock.lock()).await.unwrap();
+            assert_eq!(state.user.lock().as_ref().unwrap().id, 7);
+            assert_eq!(
+                state.db.get_entry(1).unwrap().unwrap().progress,
+                8,
+                "pending progress overlay"
+            );
+            assert_eq!(
+                state.matchers.lock()[0].display,
+                "Renamed fixture series",
+                "snapshot matcher refresh"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn failed_cache_clear_keeps_signed_out_lists_and_matchers_empty() {
+        for expired in [false, true] {
+            let db = Db::open(Path::new(":memory:")).unwrap();
+            db.replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    name: "Fixture".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let core = logout_fixture(db);
+            assert_eq!(core.state.matchers.lock()[0].media_id, 1);
+            let db = &core.state.db;
+            assert_eq!(core.local_entries().await.unwrap()[0].media_id, 1);
+            db.0.lock()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_list_clear BEFORE DELETE ON list_entry
+                 BEGIN SELECT RAISE(ABORT, 'fixture list clear failed'); END;",
+                )
+                .unwrap();
+
+            let mut media = anilist::mock_media(1);
+            media["title"]["english"] = serde_json::json!("Fixture series");
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (api, mut requests) = anilist::mock_api_gated(
+                vec![(
+                    200,
+                    serde_json::json!({"data":{"Page":{
+                        "pageInfo":{"hasNextPage":false}, "media":[media]
+                    }}}),
+                )],
+                Some(gate.clone()),
+            )
+            .await;
+            *core.state.anilist.lock() = api;
+            let caller = core.clone();
+            let search =
+                tokio::spawn(
+                    async move { caller.search_anime_page("Fixture series".into(), 1).await },
+                );
+            let wait = std::time::Duration::from_secs(5);
+            let request = tokio::time::timeout(wait, requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request["variables"]["search"], "Fixture series");
+
+            if expired {
+                let (api, _requests) = anilist::mock_api(vec![(
+                    401,
+                    serde_json::json!({"errors":[{"message":"Invalid token"}]}),
+                )])
+                .await;
+                *core.state.anilist.lock() = api;
+                let mut events = core.subscribe();
+                assert!(core.refresh_current_user().await.unwrap().is_none());
+                let event = events.try_recv().unwrap();
+                assert!(matches!(event.kind, EventKind::AuthExpired));
+                assert!(core.event_is_current(&event));
+            } else {
+                let error = core.logout().await.unwrap_err();
+                assert!(error.contains("fixture list clear failed"), "{error}");
+            }
+            assert!(core.current_user().await.unwrap().is_none());
+            assert!(db.get_entry(1).unwrap().is_some());
+            assert!(core.state.matchers.lock().is_empty(), "expired={expired}");
+            assert!(core.local_entries().await.unwrap().is_empty());
+            assert!(core.get_entry(1).await.unwrap().is_none());
+            assert!(core.get_pending_changes().await.unwrap().is_empty());
+            assert!(core.get_watch_history(None, None).await.unwrap().is_empty());
+            assert_eq!(
+                core.find_show_torrents(1, None, None).await.unwrap_err(),
+                "This show is no longer on your list"
+            );
+            assert_eq!(
+                core.bind_library_path("/anime".into(), 1, None)
+                    .await
+                    .unwrap_err(),
+                "only shows on your list can be linked"
+            );
+            assert_eq!(
+                core.library_binding_details("/anime/ep01.mkv".into())
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(core.sync_pending_changes().await.unwrap().is_empty());
+            assert!(db.get_setting("anilist_username").unwrap().is_none());
+            assert!(db.get_setting("anilist_user_id").unwrap().is_none());
+            assert!(db.get_setting("anilist_profile").unwrap().is_none());
+            core.state.refresh_matchers();
+            assert!(core.state.matchers.lock().is_empty());
+
+            gate.add_permits(1);
+            let results = tokio::time::timeout(wait, search)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(results.items.iter().any(|item| item.id == 1));
+            assert!(
+                core.state.matchers.lock().is_empty(),
+                "search restored signed-out recognition, expired={expired}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_cache_without_a_saved_token_keeps_it_hidden() {
+        let core = logout_fixture(Db::open(Path::new(":memory:")).unwrap());
+        assert!(core.state.db.get_entry(1).unwrap().is_some());
+        assert!(core.state.matchers.lock().is_empty());
+        library::bind_path(&core.state.db, "/anime", 1, -2).unwrap();
+        core.state
+            .db
+            .put_pending(
+                7,
+                &sync_queue::Pending {
+                    media_id: 1,
+                    deleting: false,
+                    deletion_id: None,
+                    base: core.state.db.get_entry(1).unwrap(),
+                    patch: sync_queue::Patch {
+                        progress: Some(5),
+                        ..Default::default()
+                    },
+                    error: None,
+                    conflict: false,
+                    missing_media: false,
+                    score_format: None,
+                    playback: false,
+                    base_score_format: None,
+                    rejected_progress: None,
+                    retry_error: None,
+                    rejected_total: None,
+                },
+            )
+            .unwrap();
+        core.state.db.set_setting("anilist_user_id", "7").unwrap();
+        assert!(core.local_entries().await.unwrap().is_empty());
+        assert!(core.get_entry(1).await.unwrap().is_none());
+        assert!(core.get_pending_changes().await.unwrap().is_empty());
+        assert!(core.sync_pending_changes().await.unwrap().is_empty());
+        assert!(core.get_watch_history(None, None).await.unwrap().is_empty());
+        *core.state.matchers.lock() = Arc::new(recognize::build_matchers(&core.state.db));
+        assert!(!core.state.matchers.lock().is_empty());
+        assert_eq!(
+            core.find_show_torrents(1, None, None).await.unwrap_err(),
+            "This show is no longer on your list"
+        );
+        assert_eq!(
+            core.library_binding_details("/anime/ep03.mkv".into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            core.bind_library_path("/anime".into(), 1, None)
+                .await
+                .unwrap_err(),
+            "only shows on your list can be linked"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_token_delete_blanks_token_stays_signed_out_and_cleans_up() {
+        let (core, dir) = open("logout-blank-fallback");
+        let user = User {
+            id: 7,
+            name: "Fixture".into(),
+            ..Default::default()
+        };
+        core.state
+            .db
+            .replace_account("test-session", &user)
+            .unwrap();
+        core.state
+            .db
+            .upsert_media(&Media {
+                id: 1,
+                title_english: Some("Fixture series".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        core.state
+            .db
+            .upsert_entry(&ListEntry {
+                media_id: 1,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        core.state
+            .anilist
+            .lock()
+            .set_token(Some("test-session".into()));
+        *core.state.user.lock() = Some(user);
+        core.state.refresh_matchers();
+        assert_eq!(core.state.matchers.lock()[0].media_id, 1);
+
+        let db = &core.state.db;
+        db.0.lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_token_delete BEFORE DELETE ON settings
+                 WHEN OLD.key = 'anilist_token'
+                 BEGIN SELECT RAISE(ABORT, 'fixture token delete failed'); END;",
+            )
+            .unwrap();
+
+        let error = core.logout().await.unwrap_err();
+        assert!(error.contains("fixture token delete failed"), "{error}");
+        assert!(!core.is_logged_in().await);
+        assert!(core.current_user().await.unwrap().is_none());
+        assert_eq!(
+            db.get_setting("anilist_token").unwrap().as_deref(),
+            Some("")
+        );
+        assert!(db.get_entry(1).unwrap().is_none());
+        assert!(db.get_setting("anilist_username").unwrap().is_none());
+        assert!(db.get_setting("anilist_user_id").unwrap().is_none());
+        assert!(db.get_setting("anilist_profile").unwrap().is_none());
+        assert!(core.state.matchers.lock().is_empty());
+        drop(core);
+
+        let reopened = Core::open(
+            dir.clone(),
+            tokio::runtime::Handle::current(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        )
+        .unwrap();
+        assert!(!reopened.is_logged_in().await);
+        assert!(reopened.current_user().await.unwrap().is_none());
+        assert!(reopened.state.matchers.lock().is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_token_delete_and_blank_restores_in_memory_session_for_retry() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let user = User {
+            id: 7,
+            name: "Fixture".into(),
+            ..Default::default()
+        };
+        db.replace_account("test-session", &user).unwrap();
+        let core = logout_fixture(db);
+        *core.state.user.lock() = Some(user);
+        let db = &core.state.db;
+        db.0.lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_token_delete BEFORE DELETE ON settings
+                 WHEN OLD.key = 'anilist_token'
+                 BEGIN SELECT RAISE(ABORT, 'fixture token delete failed'); END;
+                 CREATE TEMP TRIGGER fail_token_insert BEFORE INSERT ON settings
+                 WHEN NEW.key = 'anilist_token'
+                 BEGIN SELECT RAISE(ABORT, 'fixture token blank failed'); END;
+                 CREATE TEMP TRIGGER fail_token_update BEFORE UPDATE ON settings
+                 WHEN NEW.key = 'anilist_token'
+                 BEGIN SELECT RAISE(ABORT, 'fixture token blank failed'); END;",
+            )
+            .unwrap();
+
+        let error = core.logout().await.unwrap_err();
+        assert!(error.contains("fixture token delete failed"), "{error}");
+        assert!(core.is_logged_in().await);
+        assert_eq!(core.current_user().await.unwrap().unwrap().id, 7);
+        assert_eq!(
+            db.get_setting("anilist_token").unwrap().as_deref(),
+            Some("test-session")
+        );
+        assert!(db.get_entry(1).unwrap().is_some());
+        assert_eq!(core.state.matchers.lock()[0].media_id, 1);
+
+        db.0.lock()
+            .execute_batch(
+                "DROP TRIGGER fail_token_delete;
+                 DROP TRIGGER fail_token_insert;
+                 DROP TRIGGER fail_token_update;",
+            )
+            .unwrap();
+        core.logout().await.unwrap();
+        assert!(!core.is_logged_in().await);
+        assert!(core.current_user().await.unwrap().is_none());
+        assert!(db.get_setting("anilist_token").unwrap().is_none());
+        assert!(db.get_entry(1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn saved_list_owner_prefers_persisted_owner_over_legacy_account_replacement() {
+        let (core, dir) = open("saved-list-owner-precedence");
+        let viewer_a = serde_json::json!({"data":{"Viewer":{"id":71,"name":"Alice"}}});
+        let (api, _) = anilist::mock_api(vec![(200, viewer_a)]).await;
+        *core.state.anilist.lock() = api;
+        assert_eq!(core.login(Some("tok-a".into()), None).await.unwrap().id, 71);
+        core.set_workspace_preference("kurisu.list.q".into(), Some("alice query".into()), Some(71))
+            .await
+            .unwrap();
+        core.state
+            .db
+            .replace_account(
+                "legacy-tok-b",
+                &User {
+                    id: 72,
+                    name: "Bob".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            core.state
+                .db
+                .get_setting("anilist_user_id")
+                .unwrap()
+                .as_deref(),
+            Some("72")
+        );
+        assert_eq!(
+            core.state
+                .db
+                .get_setting(db::LIST_OWNER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("71")
+        );
+        assert_eq!(core.saved_account_id().await, Some(71));
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_list_owner_preservation_clears_scoped_preferences_on_logout_and_expiry() {
+        for expired in [false, true] {
+            let (core, dir) = open(&format!("preserve-owner-failure-{expired}"));
+            let viewer_a = serde_json::json!({"data":{"Viewer":{"id":71,"name":"Alice"}}});
+            let (api, _) = anilist::mock_api(vec![(200, viewer_a)]).await;
+            *core.state.anilist.lock() = api;
+            assert_eq!(core.login(Some("tok-a".into()), None).await.unwrap().id, 71);
+            for (key, val) in [
+                ("kurisu.list.q", "alice private query"),
+                ("kurisu.list.filter", "PAUSED"),
+                ("kurisu.list.synced", "999"),
+            ] {
+                core.set_workspace_preference(key.into(), Some(val.into()), Some(71))
+                    .await
+                    .unwrap();
+            }
+            core.state.db.delete_setting(db::LIST_OWNER_KEY).unwrap();
+            core.state
+                .db
+                .0
+                .lock()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_owner_preserve BEFORE INSERT ON settings
+                     WHEN NEW.key = 'native_preference:kurisu.list.owner'
+                     BEGIN SELECT RAISE(ABORT, 'fixture owner preserve failed'); END;",
+                )
+                .unwrap();
+
+            if expired {
+                let (api, _) = anilist::mock_api(vec![(
+                    401,
+                    serde_json::json!({"errors":[{"message":"Invalid token"}]}),
+                )])
+                .await;
+                *core.state.anilist.lock() = api;
+                assert!(core.refresh_current_user().await.unwrap().is_none());
+            } else {
+                let error = core.logout().await.unwrap_err();
+                assert!(error.contains("fixture owner preserve failed"), "{error}");
+            }
+            for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
+                assert!(
+                    core.get_preference(key.into()).await.unwrap().is_none(),
+                    "expired={expired}, key={key}"
+                );
+            }
+            core.state
+                .db
+                .0
+                .lock()
+                .execute_batch("DROP TRIGGER fail_owner_preserve")
+                .unwrap();
+            let viewer_b = serde_json::json!({"data":{"Viewer":{"id":72,"name":"Bob"}}});
+            let (api, _) = anilist::mock_api(vec![(200, viewer_b)]).await;
+            *core.state.anilist.lock() = api;
+            assert_eq!(core.login(Some("tok-b".into()), None).await.unwrap().id, 72);
+            assert!(core
+                .get_preference("kurisu.list.q".into())
+                .await
+                .unwrap()
+                .is_none());
+            drop(core);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn get_pending_changes_waits_for_entry_lock_account_transition() {
+        use std::task::{Context, Waker};
+
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.replace_account(
+            "tok-7",
+            &User {
+                id: 7,
+                name: "Seven".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let core = logout_fixture(db);
+        sync_queue::stage(
+            &core.state,
+            1,
+            sync_queue::Patch {
+                progress: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let transition = core.state.entry_lock.lock().await;
+        let mut pending = Box::pin(core.get_pending_changes());
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "get_pending_changes must serialize with entry_lock"
+        );
+        core.state
+            .db
+            .replace_account(
+                "tok-8",
+                &User {
+                    id: 8,
+                    name: "Eight".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        core.state.anilist.lock().set_token(Some("tok-8".into()));
+        drop(transition);
+        assert!(pending.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_preference_owner_survives_sign_out_and_restart_and_blocks_late_writes() {
+        for expired in [false, true] {
+            let (core, dir) = open(&format!("restart-list-owner-{expired}"));
+            let viewer_a = serde_json::json!({"data":{"Viewer":{"id":71,"name":"Alice"}}});
+            let (api, _) = anilist::mock_api(vec![(200, viewer_a.clone())]).await;
+            *core.state.anilist.lock() = api;
+            assert_eq!(core.login(Some("tok-a".into()), None).await.unwrap().id, 71);
+            for (key, val) in [
+                ("kurisu.list.q", "private search"),
+                ("kurisu.list.filter", "DROPPED"),
+                ("kurisu.list.synced", "12345"),
+            ] {
+                core.set_workspace_preference(key.into(), Some(val.into()), Some(71))
+                    .await
+                    .unwrap();
+            }
+            core.set_preference("kurisu.list.sort".into(), Some("title".into()))
+                .await
+                .unwrap();
+
+            if expired {
+                let (api, _) = anilist::mock_api(vec![(
+                    401,
+                    serde_json::json!({"errors":[{"message":"Invalid token"}]}),
+                )])
+                .await;
+                *core.state.anilist.lock() = api;
+                assert!(core.refresh_current_user().await.unwrap().is_none());
+            } else {
+                core.logout().await.unwrap();
+            }
+            for late_account in [Some(71), None] {
+                core.set_workspace_preference(
+                    "kurisu.list.q".into(),
+                    Some("late signed-out leak".into()),
+                    late_account,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                core.get_preference("kurisu.list.q".into())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("private search")
+            );
+            drop(core);
+
+            let reopened = Core::open(
+                dir.clone(),
+                tokio::runtime::Handle::current(),
+                Arc::new(TestPlatform),
+                UpdateChannel::Native,
+            )
+            .unwrap();
+            assert_eq!(reopened.saved_account_id().await, Some(71));
+            let (api, _) = anilist::mock_api(vec![(200, viewer_a)]).await;
+            *reopened.state.anilist.lock() = api;
+            assert_eq!(
+                reopened
+                    .login(Some("tok-a2".into()), None)
+                    .await
+                    .unwrap()
+                    .id,
+                71
+            );
+            assert_eq!(
+                reopened
+                    .get_preference("kurisu.list.q".into())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("private search")
+            );
+            reopened.logout().await.unwrap();
+            drop(reopened);
+
+            let reopened = Core::open(
+                dir.clone(),
+                tokio::runtime::Handle::current(),
+                Arc::new(TestPlatform),
+                UpdateChannel::Native,
+            )
+            .unwrap();
+            assert_eq!(reopened.saved_account_id().await, Some(71));
+            let viewer_b = serde_json::json!({"data":{"Viewer":{"id":72,"name":"Bob"}}});
+            let (api, _) = anilist::mock_api(vec![(200, viewer_b)]).await;
+            *reopened.state.anilist.lock() = api;
+            assert_eq!(
+                reopened.login(Some("tok-b".into()), None).await.unwrap().id,
+                72
+            );
+            for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
+                assert!(
+                    reopened.get_preference(key.into()).await.unwrap().is_none(),
+                    "expired={expired}, key={key}"
+                );
+            }
+            assert_eq!(
+                reopened
+                    .get_preference("kurisu.list.sort".into())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("title")
+            );
+            assert_eq!(reopened.saved_account_id().await, Some(72));
+            drop(reopened);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -949,14 +1931,16 @@ mod core_tests {
 
     #[tokio::test]
     async fn accepted_progress_retires_prompt_before_a_rewatch() {
-        let (api, _) = anilist::mock_api(vec![(
+        let (mut api, _) = anilist::mock_api(vec![(
             200,
             serde_json::json!({"data":{"SaveMediaListEntry":{
+                "mediaId": 11,
                 "id":1011,"status":"CURRENT","progress":3,"repeat":0,
                 "score":null,"updatedAt":123
             }}}),
         )])
         .await;
+        api.record_viewer(7);
         let (core, dir) = open("prompt-progress");
         *core.state.anilist.lock() = api;
         core.state
@@ -1017,6 +2001,7 @@ mod core_tests {
 
         let body = if status == 200 {
             serde_json::json!({"data":{"SaveMediaListEntry":{
+                "mediaId": 11,
                 "id":1011,"status":"CURRENT","progress":3,"repeat":0,
                 "score":null,"updatedAt":123
             }}})
@@ -1024,8 +2009,9 @@ mod core_tests {
             serde_json::json!({"errors":[{"message":"Synthetic rejection","status":status}]})
         };
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (api, mut requests) =
+        let (mut api, mut requests) =
             anilist::mock_api_gated(vec![(status, body)], Some(gate.clone())).await;
+        api.record_viewer(7);
         let (core, dir) = open(&format!("prompt-pending-{status}"));
         *core.state.anilist.lock() = api;
         core.state
@@ -1085,16 +2071,18 @@ mod core_tests {
             assert_eq!(core.get_entry(11).await.unwrap().unwrap().progress, 2);
             assert!(core.get_pending_changes().await.unwrap().is_empty());
             assert!(core.event_is_current(&offered));
-            let (api, _) = anilist::mock_api(vec![(
+            let (mut api, _) = anilist::mock_api(vec![(
                 200,
                 serde_json::json!({
                     "data":{"SaveMediaListEntry":{
+                        "mediaId": 11,
                         "id":1011,"status":"CURRENT","progress":3,"repeat":0,
                         "score":null,"updatedAt":124
                     }}
                 }),
             )])
             .await;
+            api.record_viewer(7);
             *core.state.anilist.lock() = api;
             assert_eq!(core.set_progress(11, 3, Some(2)).await.unwrap().progress, 3);
             assert!(core.get_pending_changes().await.unwrap().is_empty());
@@ -1166,6 +2154,80 @@ mod core_tests {
     }
 
     #[tokio::test]
+    async fn offline_preference_writes_distinguish_invalid_and_verified_owners() {
+        let (core, dir) = open("offline-preference-owner");
+        let key = "kurisu.list.filter";
+        core.set_workspace_preference(key.into(), Some("PAUSED".into()), None)
+            .await
+            .unwrap();
+        core.state
+            .db
+            .set_setting("anilist_user_id", "2147483648")
+            .unwrap();
+        core.set_workspace_preference(key.into(), Some("COMPLETED".into()), Some(0))
+            .await
+            .unwrap();
+        let offline_value = core.get_preference(key.into()).await.unwrap();
+
+        core.state.db.set_setting("anilist_user_id", "71").unwrap();
+        core.set_workspace_preference(key.into(), Some("CURRENT".into()), Some(0))
+            .await
+            .unwrap();
+        let stale_value = core.get_preference(key.into()).await.unwrap();
+        core.set_workspace_preference(key.into(), Some("CURRENT".into()), None)
+            .await
+            .unwrap();
+        let signed_out_value = core.get_preference(key.into()).await.unwrap();
+        assert!(!core.state.anilist.lock().has_token());
+        core.set_workspace_preference(key.into(), Some("TOKENLESS".into()), Some(71))
+            .await
+            .unwrap();
+        let tokenless_value = core.get_preference(key.into()).await.unwrap();
+
+        core.state.anilist.lock().set_token(Some("tok-71".into()));
+        core.state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_owner_commit BEFORE INSERT ON settings
+                 WHEN NEW.key = 'native_preference:kurisu.list.owner'
+                 BEGIN SELECT RAISE(ABORT, 'fixture owner commit failed'); END;",
+            )
+            .unwrap();
+        let atomic_err = core
+            .set_workspace_preference(key.into(), Some("UNOWNED".into()), Some(71))
+            .await
+            .unwrap_err();
+        assert!(
+            atomic_err.contains("fixture owner commit failed"),
+            "{atomic_err}"
+        );
+        let rolled_back_value = core.get_preference(key.into()).await.unwrap();
+        core.state
+            .db
+            .0
+            .lock()
+            .execute_batch("DROP TRIGGER fail_owner_commit")
+            .unwrap();
+
+        core.set_workspace_preference(key.into(), Some("PAUSED".into()), Some(71))
+            .await
+            .unwrap();
+        let verified_value = core.get_preference(key.into()).await.unwrap();
+        let recorded_owner = core.state.db.get_setting(db::LIST_OWNER_KEY).unwrap();
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(offline_value.as_deref(), Some("COMPLETED"));
+        assert_eq!(stale_value.as_deref(), Some("COMPLETED"));
+        assert_eq!(signed_out_value.as_deref(), Some("COMPLETED"));
+        assert_eq!(tokenless_value.as_deref(), Some("COMPLETED"));
+        assert_eq!(rolled_back_value.as_deref(), Some("COMPLETED"));
+        assert_eq!(verified_value.as_deref(), Some("PAUSED"));
+        assert_eq!(recorded_owner.as_deref(), Some("71"));
+    }
+
+    #[tokio::test]
     async fn preferences_accept_only_known_scoped_keys() {
         let (core, dir) = open("preferences");
         core.set_preference("kurisu.list.sort".into(), Some("title".into()))
@@ -1195,5 +2257,453 @@ mod core_tests {
         );
         drop(core);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_preference_rejects_scoped_list_keys_without_modifying_db() {
+        let (core, dir) = open("reject-scoped-set-preference");
+        core.set_workspace_preference("kurisu.list.q".into(), Some("keep".into()), None)
+            .await
+            .unwrap();
+        for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
+            assert!(core
+                .set_preference(key.into(), Some("overwrite".into()))
+                .await
+                .is_err());
+            assert!(core.set_preference(key.into(), None).await.is_err());
+        }
+        assert_eq!(
+            core.state
+                .db
+                .get_setting("native_preference:kurisu.list.q")
+                .unwrap()
+                .as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            core.state
+                .db
+                .get_setting("native_preference:kurisu.list.filter")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            core.state
+                .db
+                .get_setting("native_preference:kurisu.list.synced")
+                .unwrap(),
+            None
+        );
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_my_list_applies_native_preference_ownership_on_adoption_and_account_replacement()
+    {
+        for channel in [UpdateChannel::Native, UpdateChannel::Legacy] {
+            for cold_adoption in [true, false] {
+                let viewer_b = serde_json::json!({
+                    "data": {
+                        "Viewer": {
+                            "id": 72,
+                            "name": "Bob",
+                            "mediaListOptions": { "scoreFormat": "POINT_100" }
+                        }
+                    }
+                });
+                let list_b = serde_json::json!({
+                    "data": {
+                        "MediaListCollection": {
+                            "user": { "id": 72 },
+                            "hasNextChunk": false,
+                            "lists": []
+                        }
+                    }
+                });
+                let replies = if cold_adoption {
+                    vec![(200, viewer_b.clone()), (200, list_b), (200, viewer_b)]
+                } else {
+                    vec![(200, list_b), (200, viewer_b)]
+                };
+                let (api, _) = anilist::mock_api(replies).await;
+                let db = Db::open(Path::new(":memory:")).unwrap();
+                db.replace_account_with_preferences(
+                    "tok-alice",
+                    &User {
+                        id: 71,
+                        name: "Alice".into(),
+                        score_format: Some("POINT_100".into()),
+                        ..Default::default()
+                    },
+                    db::ListPreferences::Native { last_account: None },
+                )
+                .unwrap();
+                for (key, value) in [
+                    ("native_preference:kurisu.list.q", "alice-search"),
+                    ("native_preference:kurisu.list.filter", "DROPPED"),
+                    ("native_preference:kurisu.list.synced", "12345"),
+                    ("native_preference:kurisu.list.sort", "title"),
+                ] {
+                    db.set_setting(key, value).unwrap();
+                }
+                if cold_adoption {
+                    db.delete_setting("anilist_user_id").unwrap();
+                    db.delete_setting("anilist_profile").unwrap();
+                    db.set_setting("anilist_token", "tok-bob").unwrap();
+                } else {
+                    db.replace_account(
+                        "tok-bob",
+                        &User {
+                            id: 72,
+                            name: "Bob".into(),
+                            score_format: Some("POINT_100".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                }
+                let core = Core::from_db(
+                    db,
+                    PathBuf::new(),
+                    tokio::runtime::Handle::current(),
+                    Arc::new(TestPlatform),
+                    channel,
+                );
+                *core.state.anilist.lock() = api;
+                core.state.anilist.lock().set_token(Some("tok-bob".into()));
+
+                for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
+                    assert_eq!(
+                        core.get_preference(key.into()).await.unwrap(),
+                        None,
+                        "before sync channel={channel:?}, cold_adoption={cold_adoption}, key={key}"
+                    );
+                }
+
+                assert!(core.sync_my_list().await.unwrap().is_empty());
+                let expected = match channel {
+                    UpdateChannel::Native => [None, None, None],
+                    UpdateChannel::Legacy => [Some("alice-search"), Some("DROPPED"), Some("12345")],
+                };
+                for (key, want) in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"]
+                    .into_iter()
+                    .zip(expected)
+                {
+                    assert_eq!(
+                        core.state
+                            .db
+                            .get_setting(&format!("native_preference:{key}"))
+                            .unwrap()
+                            .as_deref(),
+                        want,
+                        "channel={channel:?}, cold_adoption={cold_adoption}, key={key}"
+                    );
+                    assert_eq!(
+                        core.get_preference(key.into()).await.unwrap(),
+                        None,
+                        "channel={channel:?}, cold_adoption={cold_adoption}, key={key}"
+                    );
+                }
+                assert_eq!(
+                    core.get_preference("kurisu.list.sort".into())
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("title")
+                );
+                assert_eq!(
+                    core.saved_account_id().await,
+                    Some(match channel {
+                        UpdateChannel::Native => 72,
+                        UpdateChannel::Legacy => 71,
+                    }),
+                    "channel={channel:?}, cold_adoption={cold_adoption}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_preference_reads_serialize_with_entry_lock_and_hide_corrupt_saved_account() {
+        use std::task::{Context, Waker};
+
+        let (core, dir) = open("scoped-pref-read-guard");
+        core.state
+            .db
+            .replace_account_with_preferences(
+                "tok-71",
+                &User {
+                    id: 71,
+                    name: "Alice".into(),
+                    ..Default::default()
+                },
+                db::ListPreferences::Native { last_account: None },
+            )
+            .unwrap();
+        core.state.anilist.lock().set_token(Some("tok-71".into()));
+        core.set_workspace_preference("kurisu.list.q".into(), Some("alice".into()), Some(71))
+            .await
+            .unwrap();
+
+        let transition = core.state.entry_lock.lock().await;
+        let mut read = Box::pin(core.get_preference("kurisu.list.q".into()));
+        assert!(
+            read.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "scoped get_preference must serialize with entry_lock"
+        );
+        core.state
+            .db
+            .set_setting("anilist_user_id", "2147483648")
+            .unwrap();
+        drop(transition);
+        assert_eq!(read.await.unwrap(), None);
+
+        core.state.db.delete_setting("anilist_user_id").unwrap();
+        assert_eq!(
+            core.get_preference("kurisu.list.q".into()).await.unwrap(),
+            None
+        );
+
+        core.state.anilist.lock().set_token(None);
+        assert_eq!(
+            core.get_preference("kurisu.list.q".into())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("alice")
+        );
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_settlement_tracks_lock_and_generation_changes() {
+        use std::task::{Context, Waker};
+        use std::time::Duration;
+
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let core = Core::from_db(
+            db,
+            PathBuf::new(),
+            tokio::runtime::Handle::current(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        );
+        let initial = core.generation();
+        assert!(!core.remote_write_active());
+        assert!(core.wait_for_remote_settlement(initial).await);
+        assert!(!core.remote_write_active());
+
+        let remote = core.state.remote_lock.clone().lock_owned().await;
+        assert!(core.remote_write_active());
+        assert!(!core.wait_for_remote_settlement(initial + 1).await);
+
+        let mut waiting = Box::pin(core.wait_for_remote_settlement(initial));
+        assert!(waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(remote);
+        assert!(tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap());
+        assert!(!core.remote_write_active());
+
+        let held = core.state.remote_lock.clone().lock_owned().await;
+        assert!(core.remote_write_active());
+        let waiter_core = core.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_core.wait_for_remote_settlement(initial).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while core.state.auth_intent.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let next = core.begin_login_intent();
+        assert_ne!(next, initial);
+        assert!(!tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(core.remote_write_active());
+
+        let mut cancelled = Box::pin(core.wait_for_remote_settlement(next));
+        assert!(cancelled
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(cancelled);
+        drop(held);
+        assert!(!core.remote_write_active());
+        assert!(core.wait_for_remote_settlement(next).await);
+
+        let raced = core.state.remote_lock.clone().lock_owned().await;
+        let mut simultaneous = Box::pin(core.wait_for_remote_settlement(next));
+        assert!(simultaneous
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(raced);
+        let final_gen = core.begin_login_intent();
+        assert_ne!(final_gen, next);
+        assert!(!tokio::time::timeout(Duration::from_secs(2), simultaneous)
+            .await
+            .unwrap());
+        assert!(!core.remote_write_active());
+        assert!(core.wait_for_remote_settlement(final_gen).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_remote_settlement_observes_superseded_background_flush_without_events() {
+        use serde_json::json;
+        use std::task::{Context, Waker};
+        use std::time::Duration;
+
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let user = User {
+            id: 7,
+            name: "Fixture".into(),
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        db.replace_account("fixture-token", &user).unwrap();
+        let core = logout_fixture(db);
+        core.state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(22),
+                media_id: 1,
+                status: "CURRENT".into(),
+                progress: 3,
+                score: Some(0.0),
+                repeat: 0,
+                updated_at: Some(100),
+                media: None,
+            })
+            .unwrap();
+        *core.state.user.lock() = Some(user);
+
+        let (_, pending, _) = sync_queue::stage(
+            core.state(),
+            1,
+            sync_queue::Patch {
+                progress: Some(8),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        core.state.db.put_pending(7, &pending).unwrap();
+
+        let preflight = json!({
+            "data": {
+                "Media": {
+                    "id": 1,
+                    "episodes": 12,
+                    "mediaListEntry": {
+                        "id": 22,
+                        "mediaId": 1,
+                        "status": "CURRENT",
+                        "progress": 3,
+                        "score": 0.0,
+                        "repeat": 0,
+                        "updatedAt": 100
+                    }
+                }
+            }
+        });
+        let saved = json!({
+            "data": {
+                "SaveMediaListEntry": {
+                    "id": 22,
+                    "mediaId": 1,
+                    "status": "CURRENT",
+                    "progress": 8,
+                    "score": 0.0,
+                    "repeat": 0,
+                    "updatedAt": 200
+                }
+            }
+        });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (mut api, mut requests) =
+            anilist::mock_api_gated(vec![(200, preflight), (200, saved)], Some(gate.clone())).await;
+        api.set_token(Some("fixture-token".into()));
+        api.record_viewer(7);
+        *core.state.anilist.lock() = api;
+
+        let flush_core = core.clone();
+        let flush =
+            tokio::spawn(async move { sync_queue::flush_background(flush_core.state()).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first["query"].as_str().unwrap().contains("mediaListEntry"));
+        gate.add_permits(1);
+
+        let second = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second["query"]
+            .as_str()
+            .unwrap()
+            .contains("SaveMediaListEntry"));
+
+        let mut events = core.subscribe();
+        core.cancel_login();
+        let restored_gen = core.generation();
+        assert!(core.remote_write_active());
+        assert_eq!(core.current_user().await.unwrap().unwrap().id, 7);
+        assert_eq!(
+            core.get_pending_changes_for(restored_gen, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        let pre_settlement = core.local_entries().await.unwrap();
+        assert_eq!(pre_settlement[0].updated_at, Some(100));
+
+        let mut settlement = Box::pin(core.wait_for_remote_settlement(restored_gen));
+        assert!(settlement
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+
+        gate.add_permits(1);
+        assert!(tokio::time::timeout(Duration::from_secs(2), settlement)
+            .await
+            .unwrap());
+        assert!(!core.remote_write_active());
+        assert!(core
+            .get_pending_changes_for(restored_gen, 7)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let entries = core.local_entries().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, Some(22));
+        assert_eq!(entries[0].progress, 8);
+        assert_eq!(entries[0].updated_at, Some(200));
+
+        assert!(tokio::time::timeout(Duration::from_secs(2), flush)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

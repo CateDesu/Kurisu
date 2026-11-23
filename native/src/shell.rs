@@ -19,11 +19,11 @@ use tray_icon::{
 };
 
 use crate::{
-    components::tracked_mono,
+    components::{button, tracked_mono},
     contracts::{CloseIntent, Route, WorkspaceEvent},
     platform::{InstanceGuard, NativePlatform},
     screens::{ModalLayer, Workspace},
-    theme::{ACCENT, BASE, DIM, EDGE, INK, PANEL_2, mono_font, sans_font},
+    theme::{ACCENT, BASE, DIM, EDGE, ERROR, INK, PANEL_2, mono_font, sans_font},
 };
 
 actions!(kurisu_shell, [TabForward, TabBackward, Quit, Escape]);
@@ -151,15 +151,30 @@ pub struct Shell {
     route: Route,
     profile: Option<User>,
     profile_avatar: Option<Arc<RenderImage>>,
+    profile_error: Option<String>,
+    profile_open_request: u64,
     offline: bool,
     modal_layer: Option<ModalLayer>,
-    pre_modal_focus: Option<FocusHandle>,
+    modal_prompt_revision: Option<u64>,
+    modal_focus_epoch: u64,
+    // Keep the capture pending even when no control originally had focus.
+    pre_modal_focus: Option<Option<FocusHandle>>,
     closing: bool,
+    stopping: bool,
+    #[cfg(test)]
+    close_test_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    close_test_quit: bool,
+    #[cfg(test)]
+    close_test_has_tray: bool,
+    #[cfg(test)]
+    profile_open_result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    #[cfg(test)]
+    profile_opened_urls: Vec<String>,
     close_intent: Option<CloseIntent>,
     close_epoch: u64,
     hidden_to_tray: bool,
     minimized_by_program: bool,
-    tray_error: Option<String>,
     tray_clicks: TrayClickFilter,
     restore_activation: Arc<AtomicBool>,
     services: Arc<Mutex<Option<Services>>>,
@@ -186,6 +201,7 @@ impl Shell {
         let profile_avatar = workspace.read(cx).profile_avatar();
         let offline = workspace.read(cx).is_offline();
         let modal_layer = workspace.read(cx).active_modal();
+        let modal_prompt_revision = workspace.read(cx).active_prompt_revision();
         let subscription =
             cx.subscribe_in(&workspace, window, |this, workspace, event, window, cx| {
                 this.on_workspace_event(workspace, event, window, cx);
@@ -193,6 +209,7 @@ impl Shell {
         let modal_subscription =
             cx.observe_in(&workspace, window, |this, workspace, window, cx| {
                 let next = workspace.read(cx).active_modal();
+                let prompt_revision = workspace.read(cx).active_prompt_revision();
                 let avatar = workspace.read(cx).profile_avatar();
                 let avatar_changed = match (&this.profile_avatar, &avatar) {
                     (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
@@ -203,25 +220,37 @@ impl Shell {
                     this.profile_avatar = avatar;
                     cx.notify();
                 }
-                if next == this.modal_layer {
+                let modal = (next, prompt_revision);
+                if modal == (this.modal_layer, this.modal_prompt_revision) {
                     return;
                 }
-                if this.modal_layer.is_none() && next.is_some() {
-                    this.pre_modal_focus = window.focused(cx);
+                if this.modal_layer.is_none()
+                    && next.is_some()
+                    && (this.pre_modal_focus.is_none() || this.has_focused_control(window, cx))
+                {
+                    this.pre_modal_focus = Some(window.focused(cx));
                 }
                 this.modal_layer = next;
+                this.modal_prompt_revision = prompt_revision;
+                this.modal_focus_epoch = this.modal_focus_epoch.wrapping_add(1);
+                let epoch = this.modal_focus_epoch;
                 cx.notify();
                 if next.is_some() {
                     workspace.read(cx).modal_focus().hold(window, cx);
                 } else {
                     window.focus(&this.focus, cx);
                 }
+                if next.is_none() || prompt_revision.is_some() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.resume_overdue_progress(window, cx)
+                    });
+                }
                 cx.on_next_frame(window, move |this, window, cx| {
-                    if this.modal_layer != next {
+                    if this.modal_focus_epoch != epoch {
                         return;
                     }
                     cx.on_next_frame(window, move |this, window, cx| {
-                        if this.modal_layer != next {
+                        if this.modal_focus_epoch != epoch {
                             return;
                         }
                         if next.is_some() {
@@ -229,7 +258,10 @@ impl Shell {
                                 workspace.focus_active_modal(window, cx)
                             });
                         } else {
-                            let prior = this.pre_modal_focus.take();
+                            let prior = this.pre_modal_focus.take().flatten();
+                            if this.has_focused_control(window, cx) {
+                                return;
+                            }
                             if let Some(prior) =
                                 prior.filter(|handle| this.focus.contains(handle, window))
                             {
@@ -257,10 +289,16 @@ impl Shell {
         });
         let restore_activation = Arc::new(AtomicBool::new(false));
         let visibility_flag = restore_activation.clone();
+        let visibility_weak = cx.entity().downgrade();
         let visibility_subscription =
-            window.observe_window_visibility(move |visibility, window, _| {
-                if visibility.is_visible() && visibility_flag.swap(false, Ordering::AcqRel) {
-                    window.activate_window();
+            window.observe_window_visibility(move |visibility, window, cx| {
+                if visibility.is_visible() {
+                    let _ = visibility_weak.update(cx, |this, _| {
+                        this.minimized_by_program = false;
+                    });
+                    if visibility_flag.swap(false, Ordering::AcqRel) {
+                        window.activate_window();
+                    }
                 }
             });
         let weak = cx.entity().downgrade();
@@ -285,15 +323,29 @@ impl Shell {
             route,
             profile,
             profile_avatar,
+            profile_error: None,
+            profile_open_request: 0,
             offline,
             modal_layer,
+            modal_prompt_revision,
+            modal_focus_epoch: 0,
             pre_modal_focus: None,
             closing: false,
+            stopping: false,
+            #[cfg(test)]
+            close_test_gate: None,
+            #[cfg(test)]
+            close_test_quit: false,
+            #[cfg(test)]
+            close_test_has_tray: false,
+            #[cfg(test)]
+            profile_open_result: None,
+            #[cfg(test)]
+            profile_opened_urls: Vec::new(),
             close_intent: None,
             close_epoch: 0,
             hidden_to_tray: false,
             minimized_by_program: false,
-            tray_error: None,
             tray_clicks: TrayClickFilter::default(),
             restore_activation,
             services,
@@ -358,7 +410,14 @@ impl Shell {
             WorkspaceEvent::StateChanged => {
                 let view = workspace.read(cx);
                 self.route = view.route().clone();
-                self.profile = view.profile().cloned();
+                let next_profile = view.profile().cloned();
+                if self.profile.as_ref().map(|user| user.id)
+                    != next_profile.as_ref().map(|user| user.id)
+                {
+                    self.profile_error = None;
+                    self.profile_open_request = self.profile_open_request.wrapping_add(1);
+                }
+                self.profile = next_profile;
                 self.offline = view.is_offline();
                 cx.notify();
             }
@@ -366,9 +425,10 @@ impl Shell {
                 if !self.closing {
                     return;
                 }
+                workspace.read(cx).modal_focus().hold(window, cx);
                 if *intent == CloseIntent::Quit
                     || self.close_intent == Some(CloseIntent::Quit)
-                    || self.tray.is_none()
+                    || !self.has_tray()
                 {
                     self.stop_and_quit(cx);
                 } else {
@@ -376,15 +436,20 @@ impl Shell {
                 }
             }
             WorkspaceEvent::CloseCancelled => {
-                self.closing = false;
-                self.close_intent = None;
-                self.close_epoch = self.close_epoch.wrapping_add(1);
-                cx.notify();
+                self.clear_close_guard(window, cx);
             }
             WorkspaceEvent::UpdateInstallerStarted => {
                 self.request_close(CloseIntent::Quit, window, cx);
             }
         }
+    }
+
+    fn has_tray(&self) -> bool {
+        #[cfg(test)]
+        if self.close_test_has_tray {
+            return true;
+        }
+        self.tray.is_some()
     }
 
     fn finish_window_close(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -405,18 +470,20 @@ impl Shell {
                     this.stop_and_quit(cx);
                 } else {
                     match preference {
-                        Ok(value) if value.as_deref() == Some("1") && this.tray.is_some() => {
+                        Ok(value) if value.as_deref() == Some("1") && this.has_tray() => {
                             match this.hide_window_to_tray(window, cx) {
                                 Ok(()) => {
-                                    this.clear_close_guard(cx);
+                                    this.clear_close_guard(window, cx);
                                 }
-                                Err(error) => this.close_failed(error, cx),
+                                Err(error) => this.close_failed(error, window, cx),
                             }
                         }
                         Ok(_) => this.stop_and_quit(cx),
-                        Err(error) => {
-                            this.close_failed(format!("Could not read window setting: {error}"), cx)
-                        }
+                        Err(error) => this.close_failed(
+                            format!("Could not read window setting: {error}"),
+                            window,
+                            cx,
+                        ),
                     }
                 }
             });
@@ -424,23 +491,31 @@ impl Shell {
         .detach();
     }
 
-    fn clear_close_guard(&mut self, cx: &mut Context<Self>) {
+    fn clear_close_guard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = !self.hidden_to_tray && window.is_visible();
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.resume_after_close_visibility(visible, window, cx)
+        });
         self.closing = false;
         self.close_intent = None;
         self.close_epoch = self.close_epoch.wrapping_add(1);
         cx.notify();
     }
 
-    fn close_failed(&mut self, error: String, cx: &mut Context<Self>) {
+    fn close_failed(&mut self, error: String, window: &mut Window, cx: &mut Context<Self>) {
         log::error!("Window close failed: {error}");
-        self.tray_error = Some(error);
-        self.clear_close_guard(cx);
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.set_tray_error(Some(error), cx)
+        });
+        self.clear_close_guard(window, cx);
     }
 
     fn tray_failed(&mut self, action: &str, error: String, cx: &mut Context<Self>) {
         let message = format!("Could not {action} Kurisu: {error}");
         log::error!("{message}");
-        self.tray_error = Some(message);
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.set_tray_error(Some(message), cx)
+        });
         cx.notify();
     }
 
@@ -449,11 +524,20 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        hide_to_tray(window, cx)?;
+        #[cfg(test)]
+        let result = if self.close_test_has_tray {
+            Ok(())
+        } else {
+            hide_to_tray(window, cx)
+        };
+        #[cfg(not(test))]
+        let result = hide_to_tray(window, cx);
+        result?;
         self.hidden_to_tray = true;
         self.minimized_by_program = false;
         self.restore_activation.store(false, Ordering::Release);
-        self.tray_error = None;
+        self.workspace
+            .update(cx, |workspace, cx| workspace.set_tray_error(None, cx));
         cx.notify();
         Ok(())
     }
@@ -497,7 +581,15 @@ impl Shell {
         }
         if needs_show {
             self.restore_activation.store(true, Ordering::Release);
-            if let Err(error) = show_from_tray(window, cx) {
+            #[cfg(test)]
+            let result = if self.close_test_has_tray {
+                Ok(())
+            } else {
+                show_from_tray(window, cx)
+            };
+            #[cfg(not(test))]
+            let result = show_from_tray(window, cx);
+            if let Err(error) = result {
                 self.restore_activation.store(false, Ordering::Release);
                 self.tray_failed("show", error, cx);
                 return false;
@@ -505,7 +597,8 @@ impl Shell {
             self.hidden_to_tray = false;
         }
         self.minimized_by_program = false;
-        self.tray_error = None;
+        self.workspace
+            .update(cx, |workspace, cx| workspace.set_tray_error(None, cx));
         cx.activate(true);
         window.activate_window();
         cx.notify();
@@ -513,8 +606,9 @@ impl Shell {
     }
 
     fn request_close(&mut self, intent: CloseIntent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closing
-            && (intent != CloseIntent::Quit || self.close_intent == Some(CloseIntent::Quit))
+        if self.stopping
+            || self.closing
+                && (intent != CloseIntent::Quit || self.close_intent == Some(CloseIntent::Quit))
         {
             return;
         }
@@ -535,11 +629,25 @@ impl Shell {
     }
 
     fn stop_and_quit(&mut self, cx: &mut Context<Self>) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        self.workspace
+            .update(cx, |workspace, _| workspace.cancel_reads_for_quit());
         let services = self.services.lock().unwrap().take();
-        cx.spawn(async move |_, cx| {
+        #[cfg(test)]
+        let gate = self.close_test_gate.take();
+        cx.spawn(async move |_this, cx| {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             if let Some(services) = services {
                 services.shutdown().await;
             }
+            #[cfg(test)]
+            let _ = _this.update(cx, |this, _| this.close_test_quit = true);
             cx.update(|cx| cx.quit());
         })
         .detach();
@@ -569,29 +677,60 @@ impl Shell {
             .update(cx, |workspace, cx| workspace.request_logout(window, cx));
     }
 
-    fn open_profile(&self, cx: &mut Context<Self>) {
-        if self.modal_layer.is_some() {
+    fn open_profile(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.closing || self.modal_layer.is_some() {
             return;
         }
-        if let Some(user) = &self.profile {
-            let encoded = user
-                .name
-                .bytes()
-                .map(|byte| {
-                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-                        (byte as char).to_string()
-                    } else {
-                        format!("%{byte:02X}")
-                    }
-                })
-                .collect::<String>();
-            let url = format!("https://anilist.co/user/{encoded}");
-            let core = self.core.clone();
-            core.spawn(async move {
-                let _ = NativePlatform.open_url(&url);
-            });
+        let Some(user) = &self.profile else {
+            return;
+        };
+        let Some(url) = profile_url(&user.name) else {
+            return;
+        };
+        let account = user.id;
+        self.profile_open_request = self.profile_open_request.wrapping_add(1);
+        let request = self.profile_open_request;
+        if self.profile_error.take().is_some() {
             cx.notify();
         }
+        #[cfg(test)]
+        self.profile_opened_urls.push(url.clone());
+        #[cfg(test)]
+        let controlled = self.profile_open_result.take();
+        let core = self.core.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = core
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(controlled) = controlled {
+                        return controlled.await.map_err(|error| error.to_string())?;
+                    }
+                    tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
+                        .await
+                        .map_err(|error| error.to_string())?
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            let _ = this.update_in(cx, |this, _, cx| {
+                if this.stopping
+                    || this.profile_open_request != request
+                    || this.profile.as_ref().map(|user| user.id) != Some(account)
+                {
+                    return;
+                }
+                if let Err(error) = result {
+                    log::warn!("Could not open profile URL: {error}");
+                    this.profile_error = Some(format!("Could not open profile: {error}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn has_focused_control(&self, window: &Window, cx: &App) -> bool {
+        !self.focus.is_focused(window) && self.focus.contains_focused(window, cx)
     }
 
     fn advance_focus(&self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -881,7 +1020,8 @@ impl Shell {
                                 .text_color(rgb(DIM))
                                 .child("AniList profile ↗"),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.open_profile(cx))),
+                        .debug_selector(|| "profile-link".into())
+                        .on_click(cx.listener(|this, _, window, cx| this.open_profile(window, cx))),
                 )
                 .child(
                     div()
@@ -1032,6 +1172,36 @@ impl Shell {
                     )
                 },
             )
+            .when_some(self.profile_error.clone(), |sidebar, error| {
+                sidebar.child(
+                    div()
+                        .id("profile-open-error")
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .mx(px(12.))
+                        .mb(px(8.))
+                        .p(px(8.))
+                        .border_1()
+                        .border_color(rgb(ERROR))
+                        .bg(rgb(PANEL_2))
+                        .text_size(px(12.))
+                        .text_color(rgb(ERROR))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(error)
+                        .child(
+                            button("dismiss-profile-error", "Dismiss", modal_open)
+                                .debug_selector(|| "dismiss-profile-error".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.modal_layer.is_none() {
+                                        this.profile_error = None;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+            })
             .child(profile)
             .when(modal_open, |sidebar| {
                 sidebar.child(
@@ -1043,6 +1213,26 @@ impl Shell {
                 )
             })
     }
+}
+
+fn profile_url(name: &str) -> Option<String> {
+    if name.trim().is_empty()
+        || matches!(name, "." | "..")
+        || name.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+    let encoded = name
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    Some(format!("https://anilist.co/user/{encoded}"))
 }
 
 fn hide_to_tray(window: &mut Window, cx: &mut Context<Shell>) -> Result<(), String> {
@@ -1221,28 +1411,15 @@ impl Render for Shell {
                     )
                     .child(div().w(px(RESIZE_BORDER)).h_full().flex_shrink_0()),
             )
-            .when_some(self.tray_error.clone(), |root, error| {
-                root.child(
-                    div()
-                        .id("tray-error")
-                        .role(Role::Alert)
-                        .absolute()
-                        .top(px(40.))
-                        .right(px(20.))
-                        .max_w(px(420.))
-                        .p(px(10.))
-                        .border_1()
-                        .border_color(rgb(crate::theme::ERROR))
-                        .bg(rgb(PANEL_2))
-                        .text_color(rgb(crate::theme::ERROR))
-                        .child(error),
-                )
-            })
             .when(!window.is_maximized() && !window.is_fullscreen(), |root| {
                 root.children(window_resize_handles())
             })
     }
 }
+
+#[cfg(test)]
+#[path = "close_tests.rs"]
+mod close_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1419,5 +1596,153 @@ mod tests {
             tray_window_action(false, false, None, true),
             TrayWindowAction::Show
         );
+    }
+
+    #[test]
+    fn profile_url_encodes_segments_and_rejects_traversal_or_empty_names() {
+        assert_eq!(
+            profile_url("CateDesu").as_deref(),
+            Some("https://anilist.co/user/CateDesu")
+        );
+        assert_eq!(
+            profile_url("a/b?c#d %2e").as_deref(),
+            Some("https://anilist.co/user/a%2Fb%3Fc%23d%20%252e")
+        );
+        assert_eq!(
+            profile_url("クリス").as_deref(),
+            Some("https://anilist.co/user/%E3%82%AF%E3%83%AA%E3%82%B9")
+        );
+        for invalid in ["", "   ", ".", "..", "bad\nname", "bad\x00name"] {
+            assert_eq!(profile_url(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn open_profile_respects_lifecycle_guards_and_surfaces_dismissible_error(
+        tc: &mut gpui::TestAppContext,
+    ) {
+        struct TempProfile(std::path::PathBuf);
+        impl Drop for TempProfile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = TempProfile(std::env::temp_dir().join(format!(
+            "kurisu-open-profile-{}-{nonce}",
+            std::process::id()
+        )));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let core = Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(NativePlatform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let instance = Arc::new(InstanceGuard::acquire(&dir.0).unwrap());
+        let (shell, cx) = tc.add_window_view(|window, cx| {
+            Shell::new(core, Arc::new(Mutex::new(None)), instance, window, cx)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..16 {
+                cx.run_until_parked();
+                runtime.block_on(async {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                });
+                cx.run_until_parked();
+            }
+        };
+        settle(cx);
+
+        let (_unused_tx, unused_rx) = tokio::sync::oneshot::channel();
+        shell.update_in(cx, |s, win, cx| {
+            s.profile = Some(User {
+                id: 7,
+                name: "Cate/Desu".into(),
+                ..Default::default()
+            });
+            s.profile_open_result = Some(unused_rx);
+            s.stopping = true;
+            s.open_profile(win, cx);
+            s.stopping = false;
+            s.closing = true;
+            s.open_profile(win, cx);
+            s.closing = false;
+            s.modal_layer = Some(ModalLayer::Editor);
+            s.open_profile(win, cx);
+            s.modal_layer = None;
+            s.profile.as_mut().unwrap().name = "..".into();
+            s.open_profile(win, cx);
+            s.profile.as_mut().unwrap().name = "Cate/Desu".into();
+            assert!(s.profile_open_result.is_some());
+        });
+        shell.read_with(cx, |s, _| assert!(s.profile_opened_urls.is_empty()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        shell.update_in(cx, |s, win, cx| {
+            s.profile_open_result = Some(rx);
+            s.open_profile(win, cx);
+        });
+        shell.read_with(cx, |s, _| {
+            assert_eq!(
+                s.profile_opened_urls,
+                vec!["https://anilist.co/user/Cate%2FDesu"]
+            );
+            assert!(s.profile_error.is_none());
+        });
+        tx.send(Err("no browser".into())).unwrap();
+        settle(cx);
+        shell.read_with(cx, |s, _| {
+            assert_eq!(
+                s.profile_error.as_deref(),
+                Some("Could not open profile: no browser")
+            );
+        });
+
+        cx.update(|win, app| win.draw(app).clear(app));
+        let dismiss = cx
+            .debug_bounds("dismiss-profile-error")
+            .expect("dismiss profile error button");
+        cx.simulate_click(dismiss.center(), gpui::Modifiers::default());
+        shell.read_with(cx, |s, _| assert!(s.profile_error.is_none()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        shell.update_in(cx, |s, win, cx| {
+            s.profile_open_result = Some(rx);
+            s.open_profile(win, cx);
+            s.profile = Some(User {
+                id: 8,
+                name: "Other".into(),
+                ..Default::default()
+            });
+        });
+        tx.send(Err("stale account".into())).unwrap();
+        settle(cx);
+        shell.read_with(cx, |s, _| assert!(s.profile_error.is_none()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        shell.update_in(cx, |s, win, cx| {
+            s.profile_open_result = Some(rx);
+            s.open_profile(win, cx);
+            s.stopping = true;
+        });
+        tx.send(Err("shutdown".into())).unwrap();
+        settle(cx);
+        shell.read_with(cx, |s, _| assert!(s.profile_error.is_none()));
+
+        cx.update(|win, _| win.remove_window());
+        drop(shell);
+        cx.run_until_parked();
+        drop(runtime);
     }
 }

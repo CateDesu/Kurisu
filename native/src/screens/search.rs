@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, ListAlignment, ListState as GpuiListState,
-    RenderImage, Subscription, WeakEntity, Window, div, img, list, prelude::*, px, rgb, svg,
+    AnyElement, Context, Entity, FontWeight, ListAlignment, ListState, RenderImage, Subscription,
+    WeakEntity, Window, div, img, list, prelude::*, px, rgb, svg,
 };
 use kurisu_core::models::{ListEntry, Media, SearchPage};
 
@@ -127,7 +127,7 @@ pub(super) struct SearchState {
     pub action_error: String,
     pub request: u64,
     pub resume: Option<(String, bool)>,
-    pub rows: Option<GpuiListState>,
+    pub rows: Option<ListState>,
     pub columns: usize,
 }
 
@@ -142,7 +142,7 @@ pub(super) fn card_columns(width: f32) -> usize {
 }
 
 pub(super) fn reset_card_rows(
-    rows: &GpuiListState,
+    rows: &ListState,
     item_count: usize,
     old_columns: usize,
     columns: usize,
@@ -199,14 +199,23 @@ impl Workspace {
                 &input,
                 window,
                 |this, _, event, window, cx| match event {
-                    TextInputEvent::Changed(value) => this.search.query = value.clone(),
+                    TextInputEvent::Changed(value) => {
+                        if this.stopping || this.writes_fenced() {
+                            let current = this.search.query.clone();
+                            if let Some(input) = &this.search.input {
+                                input.update(cx, |input, cx| input.set_value(current, cx));
+                            }
+                            return;
+                        }
+                        this.search.query = value.clone();
+                    }
                     TextInputEvent::Submitted => this.run_search(false, window, cx),
                 },
             ));
             self.search.input = Some(input);
         }
         if self.search.rows.is_none() {
-            let rows = GpuiListState::new(0, ListAlignment::Top, px(290.))
+            let rows = ListState::new(0, ListAlignment::Top, px(290.))
                 .with_uniform_item_height(px(CARD_ROW_HEIGHT));
             let weak = cx.weak_entity();
             rows.set_scroll_handler(move |event, _window, app| {
@@ -218,9 +227,11 @@ impl Workspace {
             self.search.columns = card_columns(window.bounds().size.width.into());
             self.reset_search_rows();
         }
-        if let Some((term, more)) = self.search.resume.take() {
-            self.search.submitted = term;
-            self.run_search(more, window, cx);
+        if !self.stopping
+            && !self.writes_fenced()
+            && let Some((term, more)) = self.search.resume.take()
+        {
+            self.load_search_page(term, more, window, cx);
         }
         self.refresh_search_covers();
     }
@@ -246,15 +257,28 @@ impl Workspace {
     }
 
     fn run_search(&mut self, more: bool, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() || self.search.searching {
-            return;
-        }
         let term = if more {
             self.search.submitted.clone()
         } else {
             self.search.query.trim().to_string()
         };
-        if term.is_empty() || more && !self.search.has_more {
+        self.load_search_page(term, more, window, cx);
+    }
+
+    fn load_search_page(
+        &mut self,
+        term: String,
+        more: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stopping
+            || self.writes_fenced()
+            || self.profile.is_none()
+            || self.search.searching
+            || term.is_empty()
+            || more && !self.search.has_more
+        {
             return;
         }
         let page = if more { self.search.page + 1 } else { 1 };
@@ -281,7 +305,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.search.request != request
                     || this.search.submitted != term
@@ -466,7 +491,7 @@ impl Workspace {
                                     media.clone(),
                                     this.list.entry(media.id).cloned(),
                                     this.cover_images.get(&(media.id, 174, 176)).cloned(),
-                                    this.editor_adding.contains(&media.id),
+                                    this.discovery_status_blocked(media.id),
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -515,6 +540,10 @@ impl Workspace {
         page.into_any()
     }
 
+    pub(super) fn discovery_status_blocked(&self, media_id: i64) -> bool {
+        self.media_write_blocked(media_id) || self.modal_open()
+    }
+
     pub(super) fn change_discovery_status(
         &mut self,
         media: Media,
@@ -523,12 +552,7 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.profile.is_none()
-            || self.editor_adding.contains(&media.id)
-            || self.barrier.is_some()
-            || self.auth_busy
-            || self.update_busy
-        {
+        if self.discovery_status_blocked(media.id) {
             return;
         }
         let id = media.id;
@@ -541,6 +565,7 @@ impl Workspace {
         }
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
+        let revision = self.list.revision();
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
@@ -554,6 +579,9 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
+                if this.stopping {
+                    return;
+                }
                 if generation != this.generation
                     || account != this.profile.as_ref().map(|user| user.id)
                 {
@@ -566,9 +594,12 @@ impl Workspace {
                         if entry.media.is_none() {
                             entry.media = Some(media);
                         }
-                        let change = this.list.apply_one(entry, now_seconds());
-                        this.apply_list_change(change);
-                        this.discovery_list_changed();
+                        if this.list.revision() == revision {
+                            let change = this.list.apply_one(entry, now_seconds());
+                            this.apply_list_change(change);
+                            this.discovery_list_changed();
+                            this.reconcile_open_entries(Some(&[id]), cx);
+                        }
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
                     Err(error) => match origin {
@@ -796,7 +827,7 @@ mod tests {
 
     #[test]
     fn end_request_survives_paging_and_reflow_before_layout() {
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        let rows = ListState::new(0, ListAlignment::Top, px(0.));
         reset_card_rows(&rows, 30, 3, 3);
         assert_eq!(rows.logical_scroll_top(), gpui::ListOffset::default());
         rows.scroll_to_end();
@@ -810,13 +841,13 @@ mod tests {
 
     #[gpui::test]
     fn paging_preserves_measured_height_estimates(cx: &mut TestAppContext) {
-        struct Rows(GpuiListState);
+        struct Rows(ListState);
         impl Render for Rows {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 list(self.0.clone(), |_, _, _| div().h(px(500.)).into_any()).size_full()
             }
         }
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        let rows = ListState::new(0, ListAlignment::Top, px(0.));
         reset_card_rows(&rows, 30, 3, 3);
         let (_, cx) = cx.add_window_view(|_, _| Rows(rows.clone()));
         cx.run_until_parked();
@@ -833,7 +864,7 @@ mod tests {
 
     #[test]
     fn paging_and_column_changes_keep_the_card_anchor_and_inset() {
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(290.));
+        let rows = ListState::new(0, ListAlignment::Top, px(290.));
         reset_card_rows(&rows, 300, 3, 3);
         assert_eq!(rows.max_offset_for_scrollbar().y, px(30_200.));
         rows.scroll_to(gpui::ListOffset {

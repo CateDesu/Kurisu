@@ -52,7 +52,33 @@ pub struct Media {
 }
 
 impl Media {
+    pub(crate) fn has_metadata(&self) -> bool {
+        self.title().is_some()
+            || self.id_mal.is_some()
+            || self.cover_medium.is_some()
+            || self.cover_large.is_some()
+            || self.format.is_some()
+            || self.status.is_some()
+            || self.average_score.is_some()
+            || self.season.is_some()
+            || self.season_year.is_some()
+            || self.description.is_some()
+            || self.next_airing_episode.is_some()
+            || self.next_airing_at.is_some()
+            || self.banner_image.is_some()
+            || self.genres.is_some()
+            || self.duration.is_some()
+            || self.source.is_some()
+            || self.studios.is_some()
+    }
+
     pub fn display_title(&self) -> String {
+        self.title()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("#{}", self.id))
+    }
+
+    fn title(&self) -> Option<&str> {
         self.title_english
             .as_deref()
             .filter(|title| !title.trim().is_empty())
@@ -66,8 +92,6 @@ impl Media {
                     .as_deref()
                     .filter(|title| !title.trim().is_empty())
             })
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("#{}", self.id))
     }
 }
 

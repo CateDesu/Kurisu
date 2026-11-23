@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use chrono::{Duration, Local, NaiveDate, TimeZone};
 use gpui::{
-    AnyElement, Context, ListAlignment, ListOffset, ListState as GpuiListState, Window, div, img,
-    list, prelude::*, px, rgb,
+    AnyElement, Context, ListAlignment, ListOffset, ListState, Window, div, img, list, prelude::*,
+    px, rgb,
 };
 use kurisu_core::models::AiringItem;
 
@@ -32,12 +32,15 @@ pub(super) fn week_dates(anchor: NaiveDate, offset: i64) -> (NaiveDate, NaiveDat
 }
 
 fn midnight(date: NaiveDate) -> i64 {
+    for hour in 0..=3 {
+        if let Some(local) = date.and_hms_opt(hour, 0, 0)
+            && let Some(resolved) = Local.from_local_datetime(&local).earliest()
+        {
+            return resolved.timestamp();
+        }
+    }
     let local = date.and_hms_opt(0, 0, 0).unwrap();
-    Local
-        .from_local_datetime(&local)
-        .earliest()
-        .unwrap_or_else(|| Local.from_utc_datetime(&local))
-        .timestamp()
+    Local.from_utc_datetime(&local).timestamp()
 }
 
 fn local_date(timestamp: i64) -> NaiveDate {
@@ -86,7 +89,7 @@ pub(super) struct CalendarState {
     pub loaded_once: bool,
     pub error: String,
     pub request: u64,
-    pub rows: Option<GpuiListState>,
+    pub rows: Option<ListState>,
 }
 
 impl Default for CalendarState {
@@ -167,9 +170,9 @@ impl CalendarState {
 }
 
 impl Workspace {
-    pub(super) fn enter_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn enter_calendar(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.calendar.rows.is_none() {
-            let rows = GpuiListState::new(0, ListAlignment::Top, px(84.))
+            let rows = ListState::new(0, ListAlignment::Top, px(84.))
                 .with_uniform_item_height(px(CALENDAR_ROW_HEIGHT));
             let weak = cx.weak_entity();
             rows.set_scroll_handler(move |event, _window, app| {
@@ -179,7 +182,11 @@ impl Workspace {
             });
             self.calendar.rows = Some(rows);
         }
-        if !self.calendar.preference_loaded && !self.calendar.preference_loading {
+        if !self.stopping
+            && !self.writes_fenced()
+            && !self.calendar.preference_loaded
+            && !self.calendar.preference_loading
+        {
             self.calendar.preference_loading = true;
             self.calendar.preference_request += 1;
             let request = self.calendar.preference_request;
@@ -193,7 +200,8 @@ impl Workspace {
             cx.spawn_in(window, async move |this, cx| {
                 let result = joined(job.await);
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.generation != generation
+                    if this.stopping
+                        || this.generation != generation
                         || this.profile.as_ref().map(|user| user.id) != account
                         || this.calendar.preference_request != request
                     {
@@ -232,7 +240,8 @@ impl Workspace {
     }
 
     fn load_calendar(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() || self.calendar.loading {
+        if self.stopping || self.writes_fenced() || self.profile.is_none() || self.calendar.loading
+        {
             return;
         }
         self.calendar.request += 1;
@@ -253,7 +262,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.calendar.request != request
                 {
@@ -277,16 +287,16 @@ impl Workspace {
         cx.notify();
     }
 
-    fn shift_calendar(&mut self, delta: i64, window: &Window, cx: &mut Context<Self>) {
-        if self.calendar.loading {
+    pub(super) fn shift_calendar(&mut self, delta: i64, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() || self.calendar.loading {
             return;
         }
         self.calendar.offset = (self.calendar.offset + delta).clamp(-5200, 5200);
         self.load_calendar(window, cx);
     }
 
-    fn reset_calendar_today(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.calendar.loading {
+    pub(super) fn reset_calendar_today(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() || self.calendar.loading {
             return;
         }
         self.calendar.anchor = today();
@@ -300,9 +310,10 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.calendar.watching_only == watching_only
-            && self.calendar.preference_loaded
-            && !self.calendar.preference_loading
+        if self.edits_fenced()
+            || self.calendar.watching_only == watching_only
+                && self.calendar.preference_loaded
+                && !self.calendar.preference_loading
         {
             return;
         }
@@ -747,7 +758,7 @@ mod tests {
             episode,
             airing_at,
         };
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(84.));
+        let rows = ListState::new(0, ListAlignment::Top, px(84.));
         let mut state = CalendarState {
             rows: Some(rows.clone()),
             items: vec![item(1, 1, 100), item(1, 2, 200)],
@@ -780,7 +791,7 @@ mod tests {
 
     #[test]
     fn end_request_survives_filtering_before_layout() {
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(0.));
+        let rows = ListState::new(0, ListAlignment::Top, px(0.));
         let mut state = CalendarState {
             rows: Some(rows.clone()),
             ..Default::default()
@@ -796,7 +807,7 @@ mod tests {
 
     #[test]
     fn filters_keep_the_airing_anchor_and_inset() {
-        let rows = GpuiListState::new(0, ListAlignment::Top, px(84.));
+        let rows = ListState::new(0, ListAlignment::Top, px(84.));
         let mut state = CalendarState {
             rows: Some(rows.clone()),
             ..Default::default()

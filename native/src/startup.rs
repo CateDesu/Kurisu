@@ -634,7 +634,6 @@ mod tests {
             std::fs::remove_file(&gate).unwrap();
             assert!(ready.join("kurisu.db").is_file());
             assert!(!profile.join("kurisu.db").exists());
-            // Arbitrary data in the prepared stage still blocks recovery.
             let unknown = ready.join("unrelated");
             std::fs::write(&unknown, b"preserve").unwrap();
             assert!(
@@ -787,7 +786,6 @@ mod tests {
             assert!(!profile.join(".kurisu-native-init").exists());
         }
 
-        // No-replacement publication also protects a late, unrelated destination.
         let profile = sandbox.0.join("collision");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let arm = sandbox.0.join("arm");
@@ -807,7 +805,7 @@ mod tests {
         child.0.wait().unwrap();
         std::fs::remove_file(&arm).unwrap();
         std::fs::remove_file(&gate).unwrap();
-        // Exercise the real no-replacement syscall directly after its absence check.
+        // The fixture creates the destination just before renameat2.
         let mut collision = command(&profile);
         collision.env("KURISU_RECOVERY_COLLISION", profile.join("kurisu.db"));
         let status = collision.status().unwrap();
@@ -1083,7 +1081,7 @@ mod tests {
 
     impl Drop for TestPaths {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

@@ -160,6 +160,29 @@ impl Workspace {
         };
         div()
             .id("workspace")
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.close_ready {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(|this, _, _, cx| {
+                if this.close_ready {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                let prompt_repeat = event.is_held
+                    && this.active_modal() == Some(super::ModalLayer::Prompt)
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space" | "escape");
+                if this.close_ready || prompt_repeat {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_key_up(cx.listener(|this, _, _, cx| {
+                if this.close_ready {
+                    cx.stop_propagation();
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -168,6 +191,7 @@ impl Workspace {
             .text_color(rgb(INK))
             .child(self.render_pending_bar(cx))
             .child(self.render_now_playing())
+            .children(self.render_editor_refresh_error(cx))
             .child(content)
             .child(self.render_overlays(window, cx))
             .on_any_mouse_down(cx.listener(|this, _, _, cx| {
@@ -177,32 +201,59 @@ impl Workspace {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if this.route == Route::MyList && this.sort_open && event.keystroke.key == "escape"
-                {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                if this.modal_open() {
+                    this.escape_active_modal(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.route == Route::MyList && this.sort_open {
                     this.sort_open = false;
                     window.focus(&this.sort_menu_focus, cx);
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
-                if event.keystroke.key != "escape" {
-                    return;
-                }
-                if this.prompt.is_some() && !this.prompt_busy {
-                    this.dismiss_prompt(cx);
-                } else if this.logout_confirming {
-                    this.logout_confirming = false;
-                    cx.notify();
-                } else if this.editor.is_some() {
-                    this.close_editor(cx);
-                } else if this.update.is_some() && !this.update_busy {
-                    this.update = None;
-                    cx.notify();
-                } else {
-                    this.back(window, cx);
-                }
+                this.back(window, cx);
             }))
             .into_any()
+    }
+
+    fn render_editor_refresh_error(&self, cx: &mut gpui::Context<Self>) -> Option<AnyElement> {
+        let pending = self
+            .pending_editor
+            .as_ref()
+            .filter(|pending| pending.auto_open && pending.route == self.route)?;
+        let super::PendingEditorWait::RefreshFailed(error) = &pending.wait else {
+            return None;
+        };
+        let id = pending.id;
+        let disabled = self.edits_fenced()
+            || self.modal_open()
+            || self.progress.deleting(self.generation, id)
+            || self
+                .progress
+                .edit(self.generation, id)
+                .is_some_and(|edit| edit.requires_review);
+        Some(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .px(px(20.))
+                .py(px(8.))
+                .text_color(rgb(ERROR))
+                .child(format!("Could not load the entry for editing. {error}"))
+                .child(
+                    button("retry-pending-editor", "Retry edit", disabled).on_click(
+                        cx.listener(move |this, _, window, cx| this.open_editor(id, window, cx)),
+                    ),
+                )
+                .into_any(),
+        )
     }
 
     fn render_my_list(&mut self, window: &Window, cx: &mut gpui::Context<Self>) -> AnyElement {
@@ -492,6 +543,7 @@ impl Workspace {
             .child(sort_control)
             .child(
                 button("sort-direction", if desc { "↓" } else { "↑" }, false)
+                    .debug_selector(|| "sort-direction".into())
                     .w(px(40.))
                     .h(px(42.))
                     .flex()
@@ -604,7 +656,10 @@ impl Workspace {
                     ),
             )
             .child(toolbar);
-        if !self.list.error.is_empty() {
+        for error in [&self.list.error, &self.list.sync_error]
+            .into_iter()
+            .filter(|error| !error.is_empty())
+        {
             content = content.child(
                 div()
                     .border_1()
@@ -614,7 +669,7 @@ impl Workspace {
                     .text_color(rgb(ERROR))
                     .p(px(8.))
                     .mb(px(16.))
-                    .child(self.list.error.clone()),
+                    .child(error.clone()),
             );
         }
         if self.offline {
@@ -661,6 +716,15 @@ impl Workspace {
                     self.list.step_error
                 ));
             if let Some((id, remote)) = self.progress.first_review(self.generation) {
+                let disabled = self.edits_fenced()
+                    || self.modal_open()
+                    || !self.list.loaded
+                    || self.progress.busy(self.generation, id);
+                let label = if remote.is_some() {
+                    "Keep latest"
+                } else {
+                    "Discard edit"
+                };
                 let title = self
                     .list
                     .entry(id)
@@ -681,7 +745,7 @@ impl Workspace {
                             .flex_wrap()
                             .gap(px(6.))
                             .child(
-                                button(format!("keep-latest-{id}"), "Keep latest", false).on_click(
+                                button(format!("keep-latest-{id}"), label, disabled).on_click(
                                     cx.listener(move |this, _, window, cx| {
                                         this.resolve_progress_review(id, false, window, cx)
                                     }),
@@ -689,17 +753,25 @@ impl Workspace {
                             )
                             .when(remote.is_some(), |actions| {
                                 actions.child(
-                                    button(format!("use-my-progress-{id}"), "Use my edit", false)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                    button(
+                                        format!("use-my-progress-{id}"),
+                                        "Use my edit",
+                                        disabled,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
                                             this.resolve_progress_review(id, true, window, cx)
-                                        })),
+                                        },
+                                    )),
                                 )
                             }),
                     );
             } else {
-                warning = warning.child(button("retry-progress", "Retry", false).on_click(
-                    cx.listener(|this, _, window, cx| this.retry_progress_errors(window, cx)),
-                ));
+                warning = warning.child(
+                    button("retry-progress", "Retry", !self.can_retry_progress_errors()).on_click(
+                        cx.listener(|this, _, window, cx| this.retry_progress_errors(window, cx)),
+                    ),
+                );
             }
             content = content.child(warning);
         }
@@ -895,10 +967,12 @@ fn render_list_row(
         };
         meta.push((label, BLUE));
     }
-    let progress = pending.as_ref().map_or(entry.progress, |edit| edit.pending);
     let total = media.and_then(|m| m.episodes);
+    let progress = pending.as_ref().map_or(entry.progress, |edit| edit.pending);
     let saving = pending.as_ref().is_some_and(|edit| edit.in_flight);
     let deleting = pending.as_ref().is_some_and(|edit| edit.deleting);
+    let stepper_locked =
+        saving || deleting || pending.as_ref().is_some_and(|edit| edit.requires_review);
     let at_min = progress <= 0;
     let at_max = progress >= total.unwrap_or(9999);
     let cover_view: AnyElement = if let Some(image) = cover {
@@ -952,7 +1026,7 @@ fn render_list_row(
                 _ => return,
             };
             app.stop_propagation();
-            if saving || deleting || (delta < 0 && at_min) || (delta > 0 && at_max) {
+            if stepper_locked || (delta < 0 && at_min) || (delta > 0 && at_max) {
                 return;
             }
             let _ = weak_keys.update(app, |this, cx| this.step_progress(id, delta, window, cx));
@@ -960,8 +1034,8 @@ fn render_list_row(
         .flex()
         .items_center()
         .gap(px(4.));
-    let less_disabled = at_min || saving || deleting;
-    let more_disabled = at_max || saving || deleting;
+    let less_disabled = at_min || stepper_locked;
+    let more_disabled = at_max || stepper_locked;
     let mut progress_value = div()
         .w(px(44.))
         .text_size(px(14.))

@@ -7,7 +7,7 @@ use kurisu_core::models::{TrackingConfig, UpdateInfo};
 use super::{BarrierAction, Workspace, joined};
 use crate::{
     components::input::{TextInput, TextInputEvent},
-    components::{button, page_heading},
+    components::{button, disable_control_node, page_heading},
     platform::NativePlatform,
     theme::{ACCENT, BASE, DIM, EDGE, ERROR, INK, PANEL_2, serif_font},
 };
@@ -32,6 +32,12 @@ impl SettingKey {
             Self::AutoUpdate => "settings-auto-update",
         }
     }
+    fn error_label(self) -> &'static str {
+        match self {
+            Self::CloseToTray => "the window setting",
+            Self::AutoUpdate => "the update setting",
+        }
+    }
 }
 
 struct Toggle {
@@ -39,8 +45,16 @@ struct Toggle {
     loaded: bool,
     loading: bool,
     saving: bool,
-    error: String,
+    load_error: String,
+    save_error: String,
+    submitted: Option<bool>,
     request: u64,
+}
+
+#[derive(Clone)]
+struct TrackingSubmission {
+    config: TrackingConfig,
+    revision: u64,
 }
 
 impl Toggle {
@@ -50,7 +64,9 @@ impl Toggle {
             loaded: false,
             loading: false,
             saving: false,
-            error: String::new(),
+            load_error: String::new(),
+            save_error: String::new(),
+            submitted: None,
             request: 0,
         }
     }
@@ -65,10 +81,17 @@ pub(super) struct SettingsState {
     save_error: String,
     saved: bool,
     revision: u64,
+    submitted: Option<TrackingSubmission>,
+    #[cfg(test)]
+    save_gate: Option<tracking_save_tests::SaveGate>,
+    #[cfg(test)]
+    toggle_gate: Option<tracking_save_tests::SaveGate>,
     cfg_request: u64,
     seconds: Option<Entity<TextInput>>,
     percent: Option<Entity<TextInput>>,
     socket: Option<Entity<TextInput>>,
+    draft_inputs: [String; 3],
+    fenced_inputs: Option<[String; 3]>,
     subscriptions: Vec<Subscription>,
     close_to_tray: Toggle,
     auto_update: Toggle,
@@ -90,10 +113,17 @@ impl Default for SettingsState {
             save_error: String::new(),
             saved: false,
             revision: 0,
+            submitted: None,
+            #[cfg(test)]
+            save_gate: None,
+            #[cfg(test)]
+            toggle_gate: None,
             cfg_request: 0,
             seconds: None,
             percent: None,
             socket: None,
+            draft_inputs: ["120".into(), "80".into(), String::new()],
+            fenced_inputs: None,
             subscriptions: Vec::new(),
             close_to_tray: Toggle::new(false),
             auto_update: Toggle::new(true),
@@ -107,6 +137,93 @@ impl Default for SettingsState {
 }
 
 impl SettingsState {
+    pub(super) fn reset_account(&mut self) {
+        let previous = std::mem::take(self);
+        if previous.submitted.is_some() {
+            // Global submitted saves and their draft revisions outlive authentication.
+            self.cfg = previous.cfg;
+            self.cfg_loaded = previous.cfg_loaded;
+            self.cfg_saving = previous.cfg_saving;
+            self.save_error = previous.save_error;
+            self.revision = previous.revision;
+            self.submitted = previous.submitted;
+            self.seconds = previous.seconds;
+            self.percent = previous.percent;
+            self.socket = previous.socket;
+            self.draft_inputs = previous.draft_inputs;
+            self.fenced_inputs = previous.fenced_inputs;
+            self.subscriptions = previous.subscriptions;
+        }
+        if previous.close_to_tray.submitted.is_some() {
+            self.close_to_tray = previous.close_to_tray;
+        }
+        if previous.auto_update.submitted.is_some() {
+            self.auto_update = previous.auto_update;
+        }
+    }
+
+    pub(super) fn capture_fenced_inputs(&mut self, cx: &gpui::App) {
+        if self.fenced_inputs.is_none()
+            && let (Some(seconds), Some(percent), Some(socket)) =
+                (&self.seconds, &self.percent, &self.socket)
+        {
+            self.fenced_inputs = Some([
+                seconds.read(cx).value().to_owned(),
+                percent.read(cx).value().to_owned(),
+                socket.read(cx).value().to_owned(),
+            ]);
+        }
+    }
+
+    pub(super) fn clear_fenced_inputs(&mut self, cx: &mut Context<Workspace>) {
+        self.fenced_inputs = None;
+        if self.cfg_loaded {
+            for field in [&self.seconds, &self.percent, &self.socket]
+                .into_iter()
+                .flatten()
+            {
+                field.update(cx, |input, cx| input.set_disabled(false, cx));
+            }
+        }
+    }
+
+    fn restored_input(&self, index: usize) -> String {
+        self.fenced_inputs
+            .as_ref()
+            .map(|values| values[index].clone())
+            .unwrap_or_else(|| self.draft_inputs[index].clone())
+    }
+
+    pub(super) fn discard_failed_saves(&mut self) {
+        if !self.cfg_saving && !self.save_error.is_empty() {
+            self.submitted = None;
+            self.save_error.clear();
+        }
+        for key in [SettingKey::CloseToTray, SettingKey::AutoUpdate] {
+            let toggle = self.toggle_mut(key);
+            if !toggle.saving && !toggle.save_error.is_empty() {
+                if let Some(target) = toggle.submitted.take() {
+                    toggle.value = !target;
+                }
+                toggle.save_error.clear();
+            }
+        }
+    }
+
+    pub(super) fn tracking_save_error(&self) -> Option<&str> {
+        (!self.save_error.is_empty()).then_some(self.save_error.as_str())
+    }
+
+    pub(super) fn app_setting_save_error(&self) -> Option<(&'static str, &str)> {
+        [SettingKey::CloseToTray, SettingKey::AutoUpdate]
+            .into_iter()
+            .find_map(|key| {
+                let toggle = self.toggle(key);
+                (!toggle.save_error.is_empty())
+                    .then_some((key.error_label(), toggle.save_error.as_str()))
+            })
+    }
+
     fn toggle(&self, key: SettingKey) -> &Toggle {
         match key {
             SettingKey::CloseToTray => &self.close_to_tray,
@@ -153,9 +270,15 @@ impl Workspace {
                 input.set_disabled(true, cx);
                 input
             });
-            for input in [&seconds, &percent, &socket] {
-                let subscription = cx.subscribe(input, |this, _, event, cx| {
-                    if matches!(event, TextInputEvent::Changed(_)) {
+            for (index, input) in [(0, &seconds), (1, &percent), (2, &socket)] {
+                let subscription = cx.subscribe(input, move |this, input, event, cx| {
+                    if let TextInputEvent::Changed(value) = event {
+                        if this.edits_fenced() {
+                            let restored = this.settings.restored_input(index);
+                            input.update(cx, |input, cx| input.set_value(restored, cx));
+                            return;
+                        }
+                        this.settings.draft_inputs[index] = value.clone();
                         this.settings.changed();
                         cx.notify();
                     }
@@ -180,7 +303,7 @@ impl Workspace {
     pub(super) fn refresh_settings_covers(&mut self) {}
 
     fn load_tracking_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.settings.cfg_loading {
+        if self.stopping || self.writes_fenced() || self.settings.cfg_loading {
             return;
         }
         self.settings.cfg_loading = true;
@@ -191,12 +314,13 @@ impl Workspace {
         let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
         let worker = core.clone();
-        let job = core.spawn(async move { worker.get_tracking_config().await });
+        let job = core.spawn(async move { worker.try_get_tracking_config().await });
         self.replace_reads("settings-tracking", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
-            let result = job.await;
+            let result = joined(job.await);
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.settings.cfg_request != request
                 {
@@ -205,25 +329,37 @@ impl Workspace {
                 this.settings.cfg_loading = false;
                 match result {
                     Ok(config) => {
+                        let prompt_seconds = config.prompt_seconds.to_string();
+                        let auto_percent = config.auto_percent.to_string();
+                        let mpv_ipc_socket = config.mpv_ipc_socket.clone();
                         this.settings.cfg = config;
                         this.settings.cfg_loaded = true;
                         this.settings.cfg_error.clear();
+                        this.settings.draft_inputs = [
+                            prompt_seconds.clone(),
+                            auto_percent.clone(),
+                            mpv_ipc_socket.clone(),
+                        ];
+                        if this.settings.fenced_inputs.is_some() {
+                            this.settings.fenced_inputs = Some(this.settings.draft_inputs.clone());
+                        }
+                        let disabled = this.edits_fenced();
                         if let Some(input) = &this.settings.seconds {
                             input.update(cx, |input, cx| {
-                                input.set_value(this.settings.cfg.prompt_seconds.to_string(), cx);
-                                input.set_disabled(false, cx);
+                                input.set_value(prompt_seconds, cx);
+                                input.set_disabled(disabled, cx);
                             });
                         }
                         if let Some(input) = &this.settings.percent {
                             input.update(cx, |input, cx| {
-                                input.set_value(this.settings.cfg.auto_percent.to_string(), cx);
-                                input.set_disabled(false, cx);
+                                input.set_value(auto_percent, cx);
+                                input.set_disabled(disabled, cx);
                             });
                         }
                         if let Some(input) = &this.settings.socket {
                             input.update(cx, |input, cx| {
-                                input.set_value(this.settings.cfg.mpv_ipc_socket.clone(), cx);
-                                input.set_disabled(false, cx);
+                                input.set_value(mpv_ipc_socket, cx);
+                                input.set_disabled(disabled, cx);
                             });
                         }
                     }
@@ -236,12 +372,15 @@ impl Workspace {
     }
 
     fn load_app_toggle(&mut self, key: SettingKey, window: &Window, cx: &mut Context<Self>) {
+        if self.stopping || self.writes_fenced() {
+            return;
+        }
         let toggle = self.settings.toggle_mut(key);
-        if toggle.loading || toggle.loaded {
+        if toggle.loading || toggle.loaded || toggle.saving || toggle.submitted.is_some() {
             return;
         }
         toggle.loading = true;
-        toggle.error.clear();
+        toggle.load_error.clear();
         toggle.request = toggle.request.wrapping_add(1);
         let request = toggle.request;
         let generation = self.generation;
@@ -253,7 +392,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.settings.toggle(key).request != request
                 {
@@ -268,8 +408,9 @@ impl Workspace {
                             SettingKey::AutoUpdate => value.as_deref() != Some("0"),
                         };
                         toggle.loaded = true;
+                        toggle.load_error.clear();
                     }
-                    Err(error) => toggle.error = error,
+                    Err(error) => toggle.load_error = error,
                 }
                 cx.notify();
             });
@@ -278,38 +419,63 @@ impl Workspace {
     }
 
     fn toggle_app_setting(&mut self, key: SettingKey, window: &Window, cx: &mut Context<Self>) {
-        let toggle = self.settings.toggle_mut(key);
+        if self.edits_fenced() {
+            return;
+        }
+        let toggle = self.settings.toggle(key);
         if !toggle.loaded || toggle.loading || toggle.saving {
             return;
         }
-        let old = toggle.value;
-        toggle.value = !old;
+        let target = !toggle.value;
+        self.submit_app_setting(key, target, window, cx);
+    }
+
+    fn submit_app_setting(
+        &mut self,
+        key: SettingKey,
+        target: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let toggle = self.settings.toggle_mut(key);
+        if toggle.saving {
+            return;
+        }
+        toggle.value = target;
         toggle.saving = true;
-        toggle.error.clear();
+        toggle.save_error.clear();
+        toggle.submitted = Some(target);
         self.active_writes += 1;
-        let generation = self.generation;
-        let account = self.profile.as_ref().map(|user| user.id);
+        #[cfg(test)]
+        let mut gate = self.settings.toggle_gate.take();
         let core = self.core.clone();
         let worker = core.clone();
         cx.spawn_in(window, async move |this, cx| {
+            #[cfg(test)]
+            tracking_save_tests::pause_save(&mut gate, false).await;
             let result = joined(
                 core.spawn(async move {
                     worker
-                        .set_app_setting(key.name().into(), if old { "0" } else { "1" }.into())
+                        .set_app_setting(key.name().into(), if target { "1" } else { "0" }.into())
                         .await
                 })
                 .await,
             );
+            #[cfg(test)]
+            tracking_save_tests::pause_save(&mut gate, true).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
-                if this.generation == generation
-                    && this.profile.as_ref().map(|user| user.id) == account
-                {
-                    let toggle = this.settings.toggle_mut(key);
-                    toggle.saving = false;
-                    if let Err(error) = result {
-                        toggle.value = old;
-                        toggle.error = error;
+                let toggle = this.settings.toggle_mut(key);
+                toggle.saving = false;
+                match result {
+                    Ok(()) => {
+                        toggle.value = target;
+                        toggle.submitted = None;
+                        toggle.save_error.clear();
+                    }
+                    Err(error) => {
+                        toggle.value = !target;
+                        toggle.save_error = error;
                     }
                 }
                 this.check_barrier(window, cx);
@@ -317,10 +483,40 @@ impl Workspace {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    pub(super) fn retry_app_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
+        for key in [SettingKey::CloseToTray, SettingKey::AutoUpdate] {
+            let retry = {
+                let toggle = self.settings.toggle(key);
+                (!toggle.save_error.is_empty())
+                    .then_some(toggle.submitted)
+                    .flatten()
+            };
+            if let Some(target) = retry {
+                self.submit_app_setting(key, target, window, cx);
+            }
+        }
+    }
+
+    fn dismiss_app_setting_error(&mut self, key: SettingKey, cx: &mut Context<Self>) {
+        if self.edits_fenced() {
+            return;
+        }
+        let toggle = self.settings.toggle_mut(key);
+        if toggle.saving {
+            return;
+        }
+        if let Some(target) = toggle.submitted.take() {
+            toggle.value = !target;
+        }
+        toggle.save_error.clear();
+        cx.notify();
     }
 
     fn edit_tracking_mode(&mut self, mode: &'static str, cx: &mut Context<Self>) {
-        if self.settings.cfg_loaded && !self.settings.cfg_saving {
+        if !self.edits_fenced() && self.settings.cfg_loaded && !self.settings.cfg_saving {
             self.settings.cfg.mode = mode.into();
             self.settings.changed();
             cx.notify();
@@ -328,7 +524,7 @@ impl Workspace {
     }
 
     fn toggle_tracking_option(&mut self, discord: bool, cx: &mut Context<Self>) {
-        if self.settings.cfg_loaded && !self.settings.cfg_saving {
+        if !self.edits_fenced() && self.settings.cfg_loaded && !self.settings.cfg_saving {
             if discord {
                 self.settings.cfg.discord_enabled = !self.settings.cfg.discord_enabled;
             } else {
@@ -339,11 +535,19 @@ impl Workspace {
         }
     }
 
+    pub(super) fn retry_tracking_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.settings.tracking_save_error().is_some()
+            && let Some(submission) = self.settings.submitted.clone()
+        {
+            self.submit_tracking_settings(submission, window, cx);
+        }
+    }
+
     fn save_tracking_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.settings.cfg_loaded || self.settings.cfg_saving {
+        if self.edits_fenced() || !self.settings.cfg_loaded || self.settings.cfg_saving {
             return;
         }
-        let config = self.settings.cfg.clone();
+        let mut config = self.settings.cfg.clone();
         let seconds = self
             .settings
             .seconds
@@ -365,6 +569,11 @@ impl Workspace {
         let prompt_seconds = bounded_number(&seconds, 120, 1, 3600);
         let auto_percent = bounded_number(&percent, 80, 1, 100);
         let mpv_ipc_socket = trim_utf8_bytes(&socket, 512);
+        self.settings.draft_inputs = [
+            prompt_seconds.to_string(),
+            auto_percent.to_string(),
+            mpv_ipc_socket.clone(),
+        ];
         for (input, value) in [
             (self.settings.seconds.as_ref(), prompt_seconds.to_string()),
             (self.settings.percent.as_ref(), auto_percent.to_string()),
@@ -374,46 +583,75 @@ impl Workspace {
                 input.update(cx, |input, cx| input.set_value(value, cx));
             }
         }
+        config.mode = match config.mode.as_str() {
+            "prompt" | "auto" => config.mode,
+            _ => "off".into(),
+        };
+        config.prompt_seconds = prompt_seconds;
+        config.auto_percent = auto_percent;
+        config.mpv_ipc_socket = mpv_ipc_socket;
+        self.submit_tracking_settings(
+            TrackingSubmission {
+                config,
+                revision: self.settings.revision,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn submit_tracking_settings(
+        &mut self,
+        submission: TrackingSubmission,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.cfg_saving {
+            return;
+        }
+        self.settings.submitted = Some(submission.clone());
         self.settings.cfg_saving = true;
         self.settings.save_error.clear();
         self.settings.saved = false;
         self.active_writes += 1;
-        let revision = self.settings.revision;
-        let generation = self.generation;
-        let account = self.profile.as_ref().map(|user| user.id);
+        cx.notify();
+        let TrackingSubmission { config, revision } = submission;
+        #[cfg(test)]
+        let mut gate = self.settings.save_gate.take();
         let core = self.core.clone();
         let worker = core.clone();
         cx.spawn_in(window, async move |this, cx| {
+            #[cfg(test)]
+            tracking_save_tests::pause_save(&mut gate, false).await;
             let result = joined(
                 core.spawn(async move {
                     worker
                         .set_tracking_config(
                             config.mode,
-                            prompt_seconds,
-                            auto_percent,
+                            config.prompt_seconds,
+                            config.auto_percent,
                             config.auto_ask,
-                            mpv_ipc_socket,
+                            config.mpv_ipc_socket,
                             config.discord_enabled,
                         )
                         .await
                 })
                 .await,
             );
+            #[cfg(test)]
+            tracking_save_tests::pause_save(&mut gate, true).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
-                if this.generation == generation
-                    && this.profile.as_ref().map(|user| user.id) == account
-                {
-                    this.settings.cfg_saving = false;
-                    match result {
-                        Ok(saved) => {
-                            if this.settings.revision == revision {
-                                this.settings.cfg = saved;
-                                this.settings.saved = true;
-                            }
+                this.settings.cfg_saving = false;
+                match result {
+                    Ok(saved) => {
+                        this.settings.submitted = None;
+                        if this.settings.revision == revision {
+                            this.settings.cfg = saved;
+                            this.settings.saved = true;
                         }
-                        Err(error) => this.settings.save_error = error,
                     }
+                    Err(error) => this.settings.save_error = error,
                 }
                 this.check_barrier(window, cx);
                 cx.notify();
@@ -423,7 +661,11 @@ impl Workspace {
     }
 
     fn check_settings_update(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.settings.update_checking || self.update_busy {
+        if self.stopping
+            || self.writes_fenced()
+            || self.settings.update_checking
+            || self.update_busy
+        {
             return;
         }
         self.settings.update_checking = true;
@@ -431,6 +673,7 @@ impl Workspace {
         self.settings.update_status.clear();
         self.settings.update = None;
         self.settings.update_request = self.settings.update_request.wrapping_add(1);
+        cx.notify();
         let request = self.settings.update_request;
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
@@ -441,7 +684,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation != generation
+                if this.stopping
+                    || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.settings.update_request != request
                 {
@@ -468,7 +712,7 @@ impl Workspace {
         let Some(info) = self.settings.update.as_ref() else {
             return;
         };
-        if self.update_busy
+        if self.edits_fenced()
             || self.restart_pending
             || !info.available
             || !info.can_install
@@ -476,11 +720,15 @@ impl Workspace {
         {
             return;
         }
+        self.dismissed_update.clear();
         self.show_update(info.clone());
         self.start_barrier(BarrierAction::Install, window, cx);
     }
 
     fn open_update_release(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.edits_fenced() || self.modal_open() {
+            return;
+        }
         let Some(info) = self.settings.update.as_ref() else {
             return;
         };
@@ -490,10 +738,15 @@ impl Workspace {
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = core
-                .spawn(async move { NativePlatform.open_url(&url) })
+                .spawn(async move {
+                    tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
+                        .await
+                        .map_err(|error| error.to_string())?
+                })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.generation == generation
+                if !this.stopping
+                    && this.generation == generation
                     && this.profile.as_ref().map(|user| user.id) == account
                     && let Err(error) = joined(result)
                 {
@@ -589,7 +842,9 @@ impl Workspace {
         }
         content = content.child(account);
 
-        let disabled = !state.cfg_loaded || state.cfg_saving;
+        let fenced = self.edits_fenced();
+        let reads_fenced = self.stopping || self.writes_fenced();
+        let disabled = !state.cfg_loaded || state.cfg_saving || fenced;
         let mut tracking = section("Playback tracking").child(
             div()
                 .mb(px(12.))
@@ -597,19 +852,26 @@ impl Workspace {
                 .child("Detect playback in supported players and update your list."),
         );
         if !state.cfg_error.is_empty() {
+            let error = format!("Couldn't load settings: {}", state.cfg_error);
             tracking = tracking.child(
                 div()
+                    .id("tracking-load-error")
+                    .debug_selector(|| "tracking-load-error".into())
+                    .role(Role::Alert)
+                    .aria_label(error.clone())
                     .text_color(rgb(ERROR))
-                    .child(format!("Couldn't load settings: {}", state.cfg_error)),
+                    .child(error),
             );
             tracking = tracking.child(
-                button("settings-retry-tracking", "Retry", state.cfg_loading).on_click(
-                    cx.listener(|this, _, window, cx| {
-                        if !this.settings.cfg_loading {
-                            this.load_tracking_settings(window, cx);
-                        }
-                    }),
-                ),
+                button(
+                    "settings-retry-tracking",
+                    "Retry",
+                    state.cfg_loading || reads_fenced,
+                )
+                .debug_selector(|| "settings-retry-tracking".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.load_tracking_settings(window, cx);
+                })),
             );
         }
         for (mode, label) in [
@@ -703,6 +965,7 @@ impl Workspace {
                         },
                         disabled,
                     )
+                    .debug_selector(|| "tracking-save".into())
                     .bg(rgb(ACCENT))
                     .text_color(rgb(BASE))
                     .on_click(
@@ -741,7 +1004,7 @@ impl Workspace {
             ),
         ] {
             let toggle = state.toggle(key);
-            let blocked = !toggle.loaded || toggle.loading || toggle.saving;
+            let blocked = !toggle.loaded || toggle.loading || toggle.saving || fenced;
             let mut row = section(title)
                 .child(
                     toggle_button(key.name(), label, toggle.value, blocked).on_click(cx.listener(
@@ -755,19 +1018,62 @@ impl Workspace {
                         .text_color(rgb(DIM))
                         .child(description),
                 );
-            if !toggle.error.is_empty() {
+            let error = if !toggle.save_error.is_empty() {
+                Some(toggle.save_error.as_str())
+            } else if !toggle.load_error.is_empty() {
+                Some(toggle.load_error.as_str())
+            } else {
+                None
+            };
+            if let Some(error) = error {
                 row = row.child(
                     div()
                         .text_color(rgb(ERROR))
-                        .child(format!("{} setting: {}", title, toggle.error)),
+                        .child(format!("{} setting: {}", title, error)),
                 );
                 if !toggle.loaded {
                     row = row.child(
-                        button(format!("retry-{}", key.name()), "Retry", toggle.loading).on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.load_app_toggle(key, window, cx)
-                            }),
-                        ),
+                        button(
+                            format!("retry-{}", key.name()),
+                            "Retry",
+                            toggle.loading || reads_fenced,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.load_app_toggle(key, window, cx),
+                        )),
+                    );
+                } else if let Some(target) = toggle.submitted {
+                    row = row.child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                button(
+                                    format!("retry-save-{}", key.name()),
+                                    "Retry",
+                                    toggle.saving || fenced,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if !this.edits_fenced() {
+                                            this.submit_app_setting(key, target, window, cx);
+                                        }
+                                    },
+                                )),
+                            )
+                            .child(
+                                button(
+                                    format!("dismiss-save-{}", key.name()),
+                                    "Dismiss",
+                                    toggle.saving || fenced,
+                                )
+                                .debug_selector(move || format!("dismiss-save-{}", key.name()))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.dismiss_app_setting_error(key, cx);
+                                    },
+                                )),
+                            ),
                     );
                 }
             }
@@ -782,7 +1088,7 @@ impl Workspace {
                 } else {
                     "Check for updates"
                 },
-                state.update_checking || self.update_busy,
+                state.update_checking || self.update_busy || reads_fenced,
             )
             .on_click(cx.listener(|this, _, window, cx| this.check_settings_update(window, cx))),
         );
@@ -792,7 +1098,7 @@ impl Workspace {
                     button(
                         "settings-install-update",
                         format!("Install {}", info.version),
-                        self.update_busy,
+                        fenced,
                     )
                     .on_click(
                         cx.listener(|this, _, window, cx| this.install_settings_update(window, cx)),
@@ -815,7 +1121,7 @@ impl Workspace {
                     button(
                         "settings-download-release",
                         "Download it from GitHub",
-                        false,
+                        fenced,
                     )
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_update_release(window, cx)),
@@ -931,6 +1237,10 @@ fn radio_control(
             .focusable()
             .focus_visible(|style| style.border_1().border_color(rgb(ACCENT)))
             .cursor_pointer();
+    } else {
+        row = row
+            .aria_description("Unavailable")
+            .a11y_synthetic_children(|builder| disable_control_node(builder.parent_node()));
     }
     row
 }
@@ -993,6 +1303,10 @@ fn toggle_button(
             .focusable()
             .focus_visible(|style| style.border_1().border_color(rgb(ACCENT)))
             .cursor_pointer();
+    } else {
+        row = row
+            .aria_description("Unavailable")
+            .a11y_synthetic_children(|builder| disable_control_node(builder.parent_node()));
     }
     row
 }
@@ -1018,8 +1332,292 @@ fn trim_utf8_bytes(raw: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+#[path = "tracking_save_tests.rs"]
+mod tracking_save_tests;
+
+#[cfg(test)]
+impl Workspace {
+    pub(crate) fn close_test_loaded(&self) -> bool {
+        self.settings.cfg_loaded && self.preferences_loaded && !self.restoring_session
+    }
+
+    pub(crate) fn close_test_draft(&mut self, cx: &mut Context<Self>) {
+        self.toggle_tracking_option(true, cx);
+    }
+
+    pub(crate) fn close_test_state(&self) -> (bool, usize, String) {
+        (
+            self.close_ready,
+            self.active_writes,
+            self.settings.save_error.clone(),
+        )
+    }
+
+    pub(crate) fn close_test_list(&mut self, cx: &mut Context<Self>) -> bool {
+        self.profile = Some(kurisu_core::User {
+            id: 99,
+            offline: true,
+            ..Default::default()
+        });
+        self.offline = true;
+        self.route = crate::contracts::Route::MyList;
+        cx.notify();
+        self.list.desc
+    }
+
+    pub(crate) fn close_test_preference(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.persist_preference("kurisu.list.dir", Some("desc".into()), window, cx);
+    }
+
+    pub(crate) fn close_test_preference_work(&self) -> bool {
+        self.preference_has_work()
+    }
+
+    pub(crate) fn close_test_prepare_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> [Entity<TextInput>; 4] {
+        self.profile = Some(kurisu_core::User {
+            id: 99,
+            offline: false,
+            ..Default::default()
+        });
+        self.offline = false;
+        self.list.set_query("kept".into(), super::now_seconds());
+        self.list_query
+            .update(cx, |input, cx| input.set_value("kept", cx));
+        self.enter_search(window, cx);
+        let search = self.search.input.clone().unwrap();
+        self.search.query = "steins".into();
+        search.update(cx, |input, cx| input.set_value("steins", cx));
+        self.enter_seasons(window, cx);
+        self.leave_seasons();
+        self.seasons.loaded_once = true;
+        let year = self.seasons.year_input.clone().unwrap();
+        self.seasons.selected_year = "2024".into();
+        year.update(cx, |input, cx| input.set_value("2024", cx));
+        self.enter_torrents(window, cx);
+        self.cancel_all_reads();
+        self.torrents.loading = false;
+        self.torrents.entries_loading = false;
+        self.torrents.feeds_loading = false;
+        let torrent = self.torrents.search_input.clone().unwrap();
+        torrent.update(cx, |input, cx| input.set_value("nyaa", cx));
+        self.route = crate::contracts::Route::MyList;
+        cx.notify();
+        [self.list_query.clone(), search, year, torrent]
+    }
+
+    pub(crate) fn close_test_set_route_for_input(
+        &mut self,
+        route: crate::contracts::Route,
+        cx: &mut Context<Self>,
+    ) {
+        self.route = route;
+        cx.notify();
+    }
+
+    pub(crate) fn close_test_reset_submitted_reads(&mut self) {
+        self.cancel_all_reads();
+        self.search.searching = false;
+        self.search.request += 1;
+        self.seasons.loading = false;
+        self.seasons.loaded_once = true;
+        self.seasons.request += 1;
+        self.torrents.searching = false;
+        self.torrents.search_request = self.torrents.search_request.wrapping_add(1);
+    }
+
+    pub(crate) fn close_test_reads_state(&self) -> (String, bool, bool, bool) {
+        (
+            self.list.query.clone(),
+            self.search.searching,
+            self.seasons.loading,
+            self.torrents.searching,
+        )
+    }
+}
+
+#[cfg(all(test, feature = "fixture-runtime"))]
+impl Workspace {
+    pub(crate) fn close_test_freshness(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> (bool, bool, bool, usize) {
+        assert!(window.is_visible());
+        self.route = crate::contracts::Route::MyList;
+        self.profile = Some(kurisu_core::User {
+            id: 99,
+            offline: false,
+            ..Default::default()
+        });
+        self.offline = false;
+        self.list.loaded = true;
+        self.list.synced_at = None;
+        self.last_sync_attempt = None;
+        assert!(self.sync_due());
+        assert!(
+            super::freshness_plan(window.is_visible(), &self.route, self.offline, false).sync_list
+        );
+        self.visible_freshness(window, cx);
+        self.sync_list(window, cx);
+        let syncing = self.list.syncing;
+
+        self.profile = Some(kurisu_core::User {
+            id: 99,
+            offline: true,
+            ..Default::default()
+        });
+        self.offline = true;
+        self.last_reconnect_attempt = None;
+        assert!(
+            super::freshness_plan(window.is_visible(), &self.route, self.offline, false).reconnect
+        );
+        self.visible_freshness(window, cx);
+        self.reconnect_account(true, window, cx);
+        let reconnecting = self.reconnect_busy;
+
+        self.route = crate::contracts::Route::Library;
+        self.visible_freshness(window, cx);
+        self.ensure_library_fresh(window, cx);
+        (
+            syncing,
+            reconnecting,
+            self.library_screen.scanning,
+            self.active_writes,
+        )
+    }
+
+    pub(crate) fn close_test_start_sync(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.profile = Some(kurisu_core::User {
+            id: 99,
+            offline: false,
+            ..Default::default()
+        });
+        self.offline = false;
+        self.list.loaded = true;
+        self.sync_list(window, cx);
+    }
+
+    pub(crate) fn close_test_start_install(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.perform_install(window, cx);
+    }
+
+    pub(crate) fn close_test_try_overwrite_barrier(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.start_barrier(BarrierAction::Install, window, cx);
+        matches!(self.barrier, Some(BarrierAction::Close(_)))
+    }
+
+    pub(crate) fn close_test_begin_window_reads(
+        &mut self,
+        calendar_route: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.profile = Some(kurisu_core::User {
+            id: 7,
+            name: "Fixture".into(),
+            offline: true,
+            ..Default::default()
+        });
+        self.offline = true;
+        if calendar_route {
+            self.list.clear_account();
+            self.route = crate::contracts::Route::Calendar;
+            self.enter_calendar(window, cx);
+        } else {
+            self.route = crate::contracts::Route::MyList;
+        }
+        self.load_list(window, cx);
+        self.refresh_pending(window, cx);
+    }
+
+    pub(crate) fn close_test_queue_deferred_refreshes(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue_list_refresh(None, window, cx);
+        self.refresh_pending(window, cx);
+    }
+
+    pub(crate) fn close_test_list_and_pending_state(&self) -> (bool, bool, usize, String, usize) {
+        (
+            self.list.loading,
+            self.list.loaded,
+            self.list.visible().len(),
+            self.list.error.clone(),
+            self.pending.len(),
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AccessibleAction, TestAppContext};
+
+    struct TrackingChoices;
+
+    impl gpui::Render for TrackingChoices {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().flex().flex_col().children(
+                [
+                    radio_control("auto", "Auto", true, false),
+                    toggle_button("auto-ask", "Auto ask", true, false),
+                    radio_control("off", "Off", false, true),
+                    toggle_button("discord", "Discord", false, true),
+                ]
+                .map(|choice| choice.on_click(|_, _, _| {})),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn tracking_choices_publish_accessibility_states(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, _| TrackingChoices);
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let update = cx
+            .take_accessibility_tree_update()
+            .expect("accessibility tree update");
+
+        for (label, role, disabled) in [
+            ("Auto", Role::RadioButton, false),
+            ("Auto ask", Role::CheckBox, false),
+            ("Off", Role::RadioButton, true),
+            ("Discord", Role::CheckBox, true),
+        ] {
+            let (_, node) = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing accessibility node for {label}"));
+            assert_eq!(node.role(), role, "{label} role");
+            assert_eq!(
+                node.description(),
+                disabled.then_some("Unavailable"),
+                "{label} description"
+            );
+            assert_eq!(
+                node.supports_action(AccessibleAction::Click),
+                !disabled,
+                "{label} Click action"
+            );
+            assert_eq!(
+                node.supports_action(AccessibleAction::Focus),
+                !disabled,
+                "{label} Focus action"
+            );
+            assert_eq!(node.is_disabled(), disabled, "{label} disabled state");
+        }
+    }
 
     #[test]
     fn tracking_numeric_drafts_clamp_before_core_write() {

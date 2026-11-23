@@ -1,3 +1,4 @@
+// Modified for Kurisu: retain test-window accessibility callbacks and tree updates.
 use crate::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
@@ -54,6 +55,8 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
+    pub(crate) a11y_callbacks: Option<crate::A11yCallbacks>,
+    pub(crate) a11y_tree_update: Option<accesskit::TreeUpdate>,
     is_fullscreen: bool,
     scale_factor: f32,
     appearance: WindowAppearance,
@@ -129,8 +132,9 @@ impl TestWindow {
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
+            a11y_callbacks: None,
+            a11y_tree_update: None,
             is_fullscreen: false,
-            // Preserve the test platform's historical 2x default.
             scale_factor: 2.0,
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
@@ -401,6 +405,14 @@ impl PlatformWindow for TestWindow {
 
     fn text_input_state_changed(&self, change: TextInputStateChange) {
         self.0.lock().text_input_state_changes.push(change);
+    }
+
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        self.0.lock().a11y_callbacks = Some(callbacks);
+    }
+
+    fn a11y_tree_update(&self, update: accesskit::TreeUpdate) {
+        self.0.lock().a11y_tree_update = Some(update);
     }
 
     fn prompt(

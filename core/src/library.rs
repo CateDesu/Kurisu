@@ -33,7 +33,7 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     if folders.iter().any(|f| f == path) {
         return Ok(folders);
     }
-    // Overlapping roots produce duplicate paths in the keyed file list.
+    // Reject overlapping roots to avoid scanning the same files twice.
     if let Some(existing) = folders.iter().find(|f| folders_overlap(f, path)) {
         return Err(anyhow!(
             "folder overlaps existing library folder: {existing}"
@@ -45,9 +45,9 @@ pub fn add_folder(db: &Db, path: &str) -> Result<Vec<String>> {
 }
 
 fn folders_overlap(a: &str, b: &str) -> bool {
-    let a = std::fs::canonicalize(a).unwrap_or_else(|_| std::path::PathBuf::from(a));
-    let b = std::fs::canonicalize(b).unwrap_or_else(|_| std::path::PathBuf::from(b));
-    a.starts_with(&b) || b.starts_with(&a)
+    let a = resolved_path(&local_path(a));
+    let b = resolved_path(&local_path(b));
+    path_starts_with(&a, &b) || path_starts_with(&b, &a)
 }
 
 pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
@@ -117,8 +117,8 @@ pub fn bind_path(db: &Db, path: &str, media_id: i64, episode_offset: i64) -> Res
     }
     let _guard = BINDINGS_LOCK.lock();
     let mut bindings = get_bindings(db)?;
-    let resolved = resolved_path(path);
-    bindings.retain(|saved, _| resolved_path(saved) != resolved);
+    let resolved = resolved_path(&local_path(path));
+    bindings.retain(|saved, _| !same_path(&resolved_path(&local_path(saved)), &resolved));
     bindings.insert(
         path.to_string(),
         LibraryBinding {
@@ -137,11 +137,11 @@ pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
 }
 
 pub fn binding_for_exact(db: &Db, path: &str) -> Result<Option<LibraryBinding>> {
-    let resolved = resolved_path(path);
     let local = local_path(path);
+    let resolved = resolved_path(&local);
     Ok(binding_paths(&get_bindings(db)?)
         .into_iter()
-        .filter(|(_, saved, _)| *saved == resolved)
+        .filter(|(_, saved, _)| same_path(saved, &resolved))
         .max_by_key(|(saved, _, _)| (local_path(saved) == local, std::cmp::Reverse(saved.clone())))
         .map(|(_, _, id)| id))
 }
@@ -154,25 +154,284 @@ pub fn effective_binding(db: &Db, path: &str) -> Result<Option<LibraryBinding>> 
     ))
 }
 
-type BindingPath = (String, std::path::PathBuf, LibraryBinding);
+type BindingPath = (String, PathBuf, LibraryBinding);
 
-fn resolved_path(path: &str) -> std::path::PathBuf {
-    let path = local_path(path);
-    std::fs::canonicalize(&path).unwrap_or(path)
+fn resolved_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    #[cfg(windows)]
+    // A missing file can still inherit its folder's binding.
+    for parent in path.ancestors().skip(1) {
+        if let Ok(canonical) = parent.canonicalize() {
+            return canonical.join(path.strip_prefix(parent).unwrap());
+        }
+    }
+    path.to_path_buf()
 }
 
-fn local_path(path: &str) -> std::path::PathBuf {
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        path_eq_ignore_case(a, b) && same_windows_file(a, b).unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    if path.starts_with(prefix) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        case_variant_prefix(path, prefix)
+            .is_some_and(|parent| same_windows_file(parent, prefix).unwrap_or(false))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(any(windows, test))]
+fn fold_utf16_iter(units: impl IntoIterator<Item = u16>) -> impl Iterator<Item = u32> {
+    char::decode_utf16(units).flat_map(|decoded| {
+        let (valid, surrogate) = match decoded {
+            Ok(ch) => (Some(ch), None),
+            Err(err) => (None, Some(u32::from(err.unpaired_surrogate()))),
+        };
+        valid
+            .into_iter()
+            .flat_map(char::to_lowercase)
+            .flat_map(char::to_uppercase)
+            .map(u32::from)
+            .chain(surrogate)
+    })
+}
+
+#[cfg(any(windows, test))]
+fn fold_os_str(value: &std::ffi::OsStr, out: &mut Vec<u32>) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        out.extend(fold_utf16_iter(value.encode_wide()));
+    }
+    #[cfg(not(windows))]
+    {
+        for chunk in value.as_encoded_bytes().utf8_chunks() {
+            out.extend(fold_utf16_iter(chunk.valid().encode_utf16()));
+            out.extend(
+                chunk
+                    .invalid()
+                    .iter()
+                    .map(|byte| 0x0011_0100 + u32::from(*byte)),
+            );
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn os_str_eq_ignore_case(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fold_utf16_iter(a.encode_wide()).eq(fold_utf16_iter(b.encode_wide()))
+    }
+    #[cfg(not(windows))]
+    {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        fold_os_str(a, &mut left);
+        fold_os_str(b, &mut right);
+        left == right
+    }
+}
+
+#[cfg(any(windows, test))]
+fn folded_path_key(path: &Path) -> Vec<u32> {
+    use std::path::{Component, Prefix};
+    const ROOT: u32 = 0x0011_0000;
+    const CUR: u32 = 0x0011_0001;
+    const PARENT: u32 = 0x0011_0002;
+    const NORMAL: u32 = 0x0011_0003;
+    const PREFIX_VERBATIM: u32 = 0x0011_0004;
+    const PREFIX_VERBATIM_UNC: u32 = 0x0011_0005;
+    const PREFIX_VERBATIM_DISK: u32 = 0x0011_0006;
+    const PREFIX_DEVICE_NS: u32 = 0x0011_0007;
+    const PREFIX_UNC: u32 = 0x0011_0008;
+    const PREFIX_DISK: u32 = 0x0011_0009;
+    const PREFIX_SEP: u32 = 0x0011_000A;
+
+    let mut key = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Verbatim(name) => {
+                    key.push(PREFIX_VERBATIM);
+                    fold_os_str(name, &mut key);
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    key.push(PREFIX_VERBATIM_UNC);
+                    fold_os_str(server, &mut key);
+                    key.push(PREFIX_SEP);
+                    fold_os_str(share, &mut key);
+                }
+                Prefix::VerbatimDisk(disk) => {
+                    key.push(PREFIX_VERBATIM_DISK);
+                    key.push(u32::from(disk.to_ascii_uppercase()));
+                }
+                Prefix::DeviceNS(device) => {
+                    key.push(PREFIX_DEVICE_NS);
+                    fold_os_str(device, &mut key);
+                }
+                Prefix::UNC(server, share) => {
+                    key.push(PREFIX_UNC);
+                    fold_os_str(server, &mut key);
+                    key.push(PREFIX_SEP);
+                    fold_os_str(share, &mut key);
+                }
+                Prefix::Disk(disk) => {
+                    key.push(PREFIX_DISK);
+                    key.push(u32::from(disk.to_ascii_uppercase()));
+                }
+            },
+            Component::RootDir => key.push(ROOT),
+            Component::CurDir => key.push(CUR),
+            Component::ParentDir => key.push(PARENT),
+            Component::Normal(part) => {
+                key.push(NORMAL);
+                fold_os_str(part, &mut key);
+            }
+        }
+    }
+    key
+}
+
+#[cfg(any(windows, test))]
+fn component_eq_ignore_case(a: std::path::Component<'_>, b: std::path::Component<'_>) -> bool {
+    use std::path::{Component, Prefix};
+    match (a, b) {
+        (Component::Prefix(a), Component::Prefix(b)) => match (a.kind(), b.kind()) {
+            (Prefix::Verbatim(a), Prefix::Verbatim(b))
+            | (Prefix::DeviceNS(a), Prefix::DeviceNS(b)) => os_str_eq_ignore_case(a, b),
+            (Prefix::VerbatimUNC(a_s, a_sh), Prefix::VerbatimUNC(b_s, b_sh))
+            | (Prefix::UNC(a_s, a_sh), Prefix::UNC(b_s, b_sh)) => {
+                os_str_eq_ignore_case(a_s, b_s) && os_str_eq_ignore_case(a_sh, b_sh)
+            }
+            (Prefix::VerbatimDisk(a), Prefix::VerbatimDisk(b))
+            | (Prefix::Disk(a), Prefix::Disk(b)) => a.eq_ignore_ascii_case(&b),
+            _ => false,
+        },
+        (Component::RootDir, Component::RootDir)
+        | (Component::CurDir, Component::CurDir)
+        | (Component::ParentDir, Component::ParentDir) => true,
+        (Component::Normal(a), Component::Normal(b)) => os_str_eq_ignore_case(a, b),
+        _ => false,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn path_eq_ignore_case(a: &Path, b: &Path) -> bool {
+    let mut left = a.components();
+    let mut right = b.components();
+    loop {
+        match (left.next(), right.next()) {
+            (Some(a), Some(b)) => {
+                if !component_eq_ignore_case(a, b) {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn case_variant_prefix<'a>(path: &'a Path, prefix: &Path) -> Option<&'a Path> {
+    let depth = path
+        .components()
+        .count()
+        .checked_sub(prefix.components().count())?;
+    path.ancestors()
+        .nth(depth)
+        .filter(|parent| *parent != prefix && path_eq_ignore_case(parent, prefix))
+}
+
+#[cfg(windows)]
+fn same_windows_file(a: &Path, b: &Path) -> Option<bool> {
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+        FILE_READ_ATTRIBUTES,
+    };
+
+    fn file_id(file: &File) -> Option<FILE_ID_INFO> {
+        let mut info = FILE_ID_INFO::default();
+        // The file owns the handle and the buffer is sized for FileIdInfo.
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        }
+        .ok()?;
+        (info.FileId.Identifier != [0; 16]).then_some(info)
+    }
+
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0);
+    let a = options.open(a).ok()?;
+    let b = options.open(b).ok()?;
+    Some(file_id(&a)? == file_id(&b)?)
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct SeenPaths(HashMap<Vec<u32>, Vec<PathBuf>>);
+
+#[cfg(windows)]
+impl SeenPaths {
+    fn insert(&mut self, path: PathBuf) -> bool {
+        // Case variants share a bucket, but may name different files.
+        let key = folded_path_key(&path);
+        let paths = self.0.entry(key).or_default();
+        if paths.iter().any(|other| same_path(other, &path)) {
+            return false;
+        }
+        paths.push(path);
+        true
+    }
+}
+
+#[cfg(not(windows))]
+type SeenPaths = std::collections::HashSet<PathBuf>;
+
+fn local_path(path: &str) -> PathBuf {
     reqwest::Url::parse(path)
         .ok()
         .filter(|url| url.scheme() == "file")
         .and_then(|url| url.to_file_path().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from(path))
+        .unwrap_or_else(|| PathBuf::from(path))
 }
 
 fn binding_paths(bindings: &std::collections::HashMap<String, LibraryBinding>) -> Vec<BindingPath> {
     bindings
         .iter()
-        .map(|(path, id)| (path.clone(), resolved_path(path), *id))
+        .map(|(path, id)| (path.clone(), resolved_path(&local_path(path)), *id))
         .collect()
 }
 
@@ -194,7 +453,7 @@ fn bound_path_id(
     path: &str,
     live: impl Fn(i64) -> bool,
 ) -> Option<LibraryBinding> {
-    let resolved = resolved_path(path);
+    let resolved = resolved_path(&local_path(path));
     bound_resolved_path_id(bindings, path, &resolved, live)
 }
 
@@ -207,7 +466,7 @@ fn bound_resolved_path_id(
     let local = local_path(path);
     bindings
         .iter()
-        .filter(|(_, prefix, binding)| resolved.starts_with(prefix) && live(binding.media_id))
+        .filter(|(_, prefix, binding)| path_starts_with(resolved, prefix) && live(binding.media_id))
         .max_by_key(|(source, prefix, _)| {
             (
                 prefix.components().count(),
@@ -230,7 +489,7 @@ impl BindingPaths {
         matchers: &'a [Matcher],
         path: &str,
     ) -> Option<(&'a Matcher, LibraryBinding)> {
-        match_bound_path(matchers, &self.0, path, &resolved_path(path))
+        match_bound_path(matchers, &self.0, path, &resolved_path(&local_path(path)))
     }
 }
 
@@ -287,6 +546,9 @@ pub(crate) fn resolve_bound_episode(
 
 struct CachedMatch {
     resolved: PathBuf,
+    // File identity can change while both case variants keep the same path.
+    #[cfg(windows)]
+    case_variant_binding: bool,
     media_id: Option<i64>,
     matched: Option<String>,
     episode: Option<i64>,
@@ -337,15 +599,14 @@ impl ScanCache {
         let mut paths = Vec::new();
         let mut unreadable = Vec::new();
         for folder in folders {
-            collect_videos(Path::new(folder), 0, &mut paths, &mut unreadable);
+            collect_videos(&local_path(folder), 0, &mut paths, &mut unreadable);
         }
         // Canonical paths deduplicate aliases and overlapping saved roots.
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = SeenPaths::default();
         let mut paths: Vec<_> = paths
             .into_iter()
             .filter_map(|path| {
-                let resolved =
-                    std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+                let resolved = resolved_path(Path::new(&path));
                 seen.insert(resolved.clone()).then_some((path, resolved))
             })
             .collect();
@@ -354,10 +615,13 @@ impl ScanCache {
         let mut files = Vec::with_capacity(paths.len());
         let mut retained = HashMap::with_capacity(paths.len());
         for (path, resolved) in paths {
-            let cached = self
-                .files
-                .remove(&path)
-                .filter(|cached| cached.resolved == resolved);
+            let cached = self.files.remove(&path).filter(|cached| {
+                #[cfg(windows)]
+                if cached.case_variant_binding {
+                    return false;
+                }
+                cached.resolved == resolved
+            });
             let recognized = cached.unwrap_or_else(|| {
                 #[cfg(test)]
                 {
@@ -372,6 +636,11 @@ impl ScanCache {
                     resolve_bound_episode(m, &[base.as_str()], bound.map(|(_, b)| b))
                 });
                 CachedMatch {
+                    #[cfg(windows)]
+                    case_variant_binding: self
+                        .bindings
+                        .iter()
+                        .any(|(_, prefix, _)| case_variant_prefix(&resolved, prefix).is_some()),
                     resolved,
                     media_id: matched.map(|m| m.media_id),
                     matched: matched.map(|m| m.display.clone()),
@@ -413,7 +682,7 @@ fn collect_videos(
     unreadable: &mut Vec<UnreadableFolder>,
 ) {
     let mut pending = std::collections::VecDeque::from([(dir.to_path_buf(), depth)]);
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = SeenPaths::default();
     while let Some((dir, depth)) = pending.pop_front() {
         if depth > MAX_DEPTH {
             unreadable.push(UnreadableFolder {
@@ -422,8 +691,7 @@ fn collect_videos(
             });
             continue;
         }
-        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        if !visited.insert(canonical) {
+        if !visited.insert(resolved_path(&dir)) {
             continue;
         }
         let read = match std::fs::read_dir(&dir) {
@@ -815,6 +1083,8 @@ mod tests {
         for filename in [
             "Some Show NCOP01.mkv",
             "Some Show Trailer01.mkv",
+            "Some Show - 01 - Dawn - NCOP.mkv",
+            "Some Show - 01 - Next Episode Preview.mkv",
             "Some Show - 01.mkv",
         ] {
             std::fs::write(dir.join(filename), []).unwrap();
@@ -825,11 +1095,7 @@ mod tests {
         for bindings in [&HashMap::new(), &bindings] {
             let scan = scan_paths(&folders, &matchers, bindings);
             assert!(scan.unreadable.is_empty());
-            assert_eq!(scan.files.len(), 3);
-            println!(
-                "television bonus scan: {}",
-                serde_json::to_string(&scan).unwrap()
-            );
+            assert_eq!(scan.files.len(), 5);
             for file in &scan.files {
                 assert_eq!(
                     file.episode,
@@ -1437,19 +1703,286 @@ mod tests {
 
     #[test]
     fn scan_dedups_overlapping_folders() {
-        let dir = std::env::temp_dir().join(format!("kurisu-scan-test-{}", std::process::id()));
+        let dir = cache_folder("scan with spaces");
         let nested = dir.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("ep00.mkv"), []).unwrap();
         std::fs::write(nested.join("ep01.mkv"), []).unwrap();
         let folders = vec![
-            dir.to_string_lossy().into_owned(),
             nested.to_string_lossy().into_owned(),
+            reqwest::Url::from_directory_path(&dir).unwrap().to_string(),
         ];
         let scan = scan_paths(&folders, &[], &HashMap::new());
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(scan.files.len(), 1);
-        assert!(scan.files[0].path.ends_with("ep01.mkv"));
+        assert_eq!(scan.files.len(), 2);
+        assert!(scan.files[0].path.ends_with("ep00.mkv"));
+        assert!(scan.files[1].path.ends_with("ep01.mkv"));
         assert!(scan.unreadable.is_empty());
+    }
+
+    #[test]
+    fn case_distinct_library_paths_keep_separate_bindings_and_scan_results() {
+        let root = cache_folder("case-distinct");
+        let upper = root.join("Season");
+        let lower = root.join("season");
+        std::fs::create_dir(&upper).unwrap();
+        if let Err(error) = std::fs::create_dir(&lower) {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let paths = [
+            upper.join("Ep01.mkv"),
+            upper.join("ep01.mkv"),
+            lower.join("Ep01.mkv"),
+        ];
+        for path in &paths {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+        }
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let folders = [upper, lower].map(|path| path.to_str().unwrap().to_owned());
+        for folder in &folders {
+            add_folder(&db, folder).unwrap();
+        }
+        seed_cached_show(&db, 1, "First Show", 12, "CURRENT");
+        seed_cached_show(&db, 2, "Second Show", 12, "CURRENT");
+        super::bind_path(&db, &folders[0], 1, 0).unwrap();
+        super::bind_path(&db, &folders[1], 2, 0).unwrap();
+        for (path, offset) in paths[..2].iter().zip([1, 2]) {
+            super::bind_path(&db, path.to_str().unwrap(), 1, offset).unwrap();
+            assert_eq!(
+                super::binding_for_exact(&db, path.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .episode_offset,
+                offset
+            );
+        }
+        let bindings = super::get_bindings(&db).unwrap();
+        assert_eq!(bindings.len(), 4);
+        let scan = scan_paths(&folders, &crate::recognize::build_matchers(&db), &bindings);
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files.len(), 3);
+        for (path, (id, episode)) in paths.iter().zip([(1, 2), (1, 3), (2, 1)]) {
+            let file = scan
+                .files
+                .iter()
+                .find(|file| file.path == path.to_str().unwrap())
+                .unwrap();
+            assert!(file.bound);
+            assert_eq!((file.media_id, file.episode), (Some(id), Some(episode)));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unicode_case_variant_paths_share_folded_key() {
+        use std::path::Path;
+
+        for (left, right) in [
+            ("/anime/Café/Ep01.mkv", "/anime/café/ep01.mkv"),
+            ("/anime/Café/", "/anime/café"),
+            ("/anime/./Café//Ep01.mkv", "/anime/café/ep01.mkv"),
+            ("/anime/ÜBER/Ep01.mkv", "/anime/über/ep01.mkv"),
+            ("/anime/Straße/Ep01.mkv", "/anime/straße/ep01.mkv"),
+            ("/anime/ẞ/Ep01.mkv", "/anime/ß/ep01.mkv"),
+            ("/anime/Привет/Ep01.mkv", "/anime/привет/ep01.mkv"),
+            ("/anime/ΟΣ/Ep01.mkv", "/anime/ος/ep01.mkv"),
+            ("/anime/ΟΣ/Ep01.mkv", "/anime/Οσ/ep01.mkv"),
+            ("/anime/\u{212A}/Ep01.mkv", "/anime/k/ep01.mkv"),
+            ("/anime/\u{017F}/Ep01.mkv", "/anime/S/ep01.mkv"),
+            ("/anime/\u{00B5}/Ep01.mkv", "/anime/\u{039C}/ep01.mkv"),
+            ("/anime/\u{10400}/Ep01.mkv", "/anime/\u{10428}/ep01.mkv"),
+        ] {
+            let left = Path::new(left);
+            let right = Path::new(right);
+            assert_eq!(
+                super::folded_path_key(left),
+                super::folded_path_key(right),
+                "{left:?} vs {right:?}"
+            );
+            assert!(super::path_eq_ignore_case(left, right));
+        }
+
+        for (left, right) in [
+            ("/anime/Café/Ep01.mkv", "/anime/Cafe/Ep01.mkv"),
+            ("/anime/über/Ep01.mkv", "/anime/uber/Ep01.mkv"),
+            ("/anime/\u{0130}/Ep01.mkv", "/anime/I/Ep01.mkv"),
+            ("/ab/c", "/a/bc"),
+        ] {
+            let left = Path::new(left);
+            let right = Path::new(right);
+            assert_ne!(super::folded_path_key(left), super::folded_path_key(right));
+            assert!(!super::path_eq_ignore_case(left, right));
+        }
+
+        assert_eq!(
+            super::case_variant_prefix(Path::new("/anime/Café/Ep01.mkv"), Path::new("/anime/café")),
+            Some(Path::new("/anime/Café"))
+        );
+        assert_eq!(
+            super::case_variant_prefix(
+                Path::new("/anime/Café/Ep01.mkv"),
+                Path::new("/anime/café/")
+            ),
+            Some(Path::new("/anime/Café"))
+        );
+        assert_eq!(
+            super::case_variant_prefix(
+                Path::new("/anime/Café/./Ep01.mkv"),
+                Path::new("/anime/café/")
+            ),
+            Some(Path::new("/anime/Café"))
+        );
+        assert_eq!(
+            super::case_variant_prefix(Path::new("/anime/café/Ep01.mkv"), Path::new("/anime/café")),
+            None
+        );
+        assert_eq!(
+            super::case_variant_prefix(Path::new("/anime/Cafe/Ep01.mkv"), Path::new("/anime/café")),
+            None
+        );
+
+        let upper_with_surrogate: Vec<u32> = super::fold_utf16_iter([0xD800, 'É' as u16]).collect();
+        let lower_with_surrogate: Vec<u32> = super::fold_utf16_iter([0xD800, 'é' as u16]).collect();
+        let other_surrogate: Vec<u32> = super::fold_utf16_iter([0xD801, 'é' as u16]).collect();
+        let replacement_char: Vec<u32> = super::fold_utf16_iter([0xFFFD, 'é' as u16]).collect();
+        assert_eq!(upper_with_surrogate, lower_with_surrogate);
+        assert_ne!(lower_with_surrogate, other_surrogate);
+        assert_ne!(lower_with_surrogate, replacement_char);
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let upper = Path::new(OsStr::from_bytes(b"/anime/Caf\xc3\xa9-\xff"));
+            let lower = Path::new(OsStr::from_bytes(b"/anime/caf\xc3\xa9-\xff"));
+            let other = Path::new(OsStr::from_bytes(b"/anime/caf\xc3\xa9-\xfe"));
+            let replaced = Path::new("/anime/café-\u{FFFD}");
+            assert_eq!(super::folded_path_key(upper), super::folded_path_key(lower));
+            assert!(super::path_eq_ignore_case(upper, lower));
+            assert_ne!(super::folded_path_key(lower), super::folded_path_key(other));
+            assert!(!super::path_eq_ignore_case(lower, other));
+            assert_ne!(
+                super::folded_path_key(lower),
+                super::folded_path_key(replaced)
+            );
+            assert!(!super::path_eq_ignore_case(lower, replaced));
+        }
+
+        #[cfg(windows)]
+        {
+            for (left, right) in [
+                (r"C:\Anime\Café", "c:/anime/café/"),
+                (r"\\?\C:\Anime\Café", r"\\?\c:\anime\café\"),
+                (r"\\Server\Share\Café", "//server/share/café/"),
+            ] {
+                let left = Path::new(left);
+                let right = Path::new(right);
+                assert_eq!(super::folded_path_key(left), super::folded_path_key(right));
+                assert!(super::path_eq_ignore_case(left, right));
+            }
+            assert_eq!(
+                super::case_variant_prefix(
+                    Path::new(r"C:\Anime\Café\Ep01.mkv"),
+                    Path::new("C:/Anime/café/")
+                ),
+                Some(Path::new(r"C:\Anime\Café"))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_aliases_match_legacy_keys_and_deduplicate_scans() {
+        for (index, (folder_name, alias_name)) in [("Season", "sEaSoN"), ("Café", "café")]
+            .into_iter()
+            .enumerate()
+        {
+            let root = cache_folder(&format!("case-alias-{index}"));
+            let folder = root.join(folder_name);
+            let alias = root.join(alias_name);
+            std::fs::create_dir(&folder).unwrap();
+            if !alias.is_dir() {
+                std::fs::remove_dir_all(root).unwrap();
+                continue;
+            }
+            let file = folder.join("Ep01.mkv");
+            std::fs::write(&file, []).unwrap();
+            let missing = alias.join("Ep02.mkv");
+            let url = reqwest::Url::from_file_path(&alias).unwrap().to_string();
+            let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+            seed_cached_show(&db, 1, "First Show", 12, "CURRENT");
+            db.set_setting(
+                super::BINDINGS_KEY,
+                &serde_json::json!({ (url): 1 }).to_string(),
+            )
+            .unwrap();
+            for path in [folder.as_path(), &folder.canonicalize().unwrap()] {
+                assert_eq!(
+                    super::binding_for_exact(&db, path.to_str().unwrap()).unwrap(),
+                    Some(1.into())
+                );
+            }
+            assert_eq!(
+                super::effective_binding(&db, missing.to_str().unwrap()).unwrap(),
+                Some(1.into())
+            );
+            add_folder(&db, folder.to_str().unwrap()).unwrap();
+            assert!(add_folder(&db, alias.to_str().unwrap()).is_err());
+            let folders = [
+                folder.to_str().unwrap().into(),
+                alias.to_str().unwrap().into(),
+            ];
+            let scan = scan_paths(
+                &folders,
+                &crate::recognize::build_matchers(&db),
+                &super::get_bindings(&db).unwrap(),
+            );
+            assert!(scan.unreadable.is_empty());
+            assert_eq!(scan.files.len(), 1);
+            assert_eq!(scan.files[0].media_id, Some(1));
+            super::bind_path(&db, folder.to_str().unwrap(), 1, 2).unwrap();
+            assert_eq!(super::get_bindings(&db).unwrap().len(), 1);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_cache_refreshes_case_variant_bindings_after_a_file_is_replaced() {
+        let root = cache_folder("case-cache");
+        let upper = root.join("Ep01.mkv");
+        let lower = root.join("ep01.mkv");
+        std::fs::write(&lower, []).unwrap();
+        if let Err(error) = std::fs::hard_link(&lower, &upper) {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 1, "First Show", 12, "CURRENT");
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let folders = [root.to_str().unwrap().into()];
+        let bindings = HashMap::from([(lower.to_str().unwrap().into(), 1.into())]);
+        let mut cache = super::ScanCache::default();
+        let scan = cache.scan(&folders, &matchers, &bindings);
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].path, upper.to_str().unwrap());
+        assert!(scan.files[0].bound);
+
+        std::fs::remove_file(&upper).unwrap();
+        std::fs::write(&upper, []).unwrap();
+        let scan = cache.scan(&folders, &matchers, &bindings);
+        assert_eq!(scan.files.len(), 2);
+        assert_eq!(scan.files[0].path, upper.to_str().unwrap());
+        assert!(!scan.files[0].bound);
+        assert!(scan.files[1].bound);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
