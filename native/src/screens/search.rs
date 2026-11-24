@@ -338,11 +338,9 @@ impl Workspace {
         let columns = self.search.columns.max(1);
         let start = range.start.saturating_sub(2) * columns;
         let end = range.end.saturating_add(3) * columns;
-        let len = self.search.results.len();
         let mut visible = Vec::new();
         let mut nearby = Vec::new();
-        for index in start.min(len)..end.min(len) {
-            let media = &self.search.results[index];
+        for (index, media) in self.search.results.iter().enumerate().take(end).skip(start) {
             if let Some(url) = media
                 .cover_large
                 .as_deref()

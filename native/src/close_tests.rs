@@ -775,4 +775,8 @@ fn window_close_completes_admitted_reads_and_replays_deferred_refreshes_on_resum
         !retry_button.is_disabled(),
         "Calendar retry stayed disabled after failed window close resume"
     );
+    workspace.update(cx, |w, _| w.cancel_reads_for_quit());
+    cx.update(|win, _| win.remove_window());
+    drop((workspace, shell));
+    cx.run_until_parked();
 }

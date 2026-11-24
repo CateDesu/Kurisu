@@ -107,14 +107,14 @@ jobs:
       - name: Release protocol regressions
         run: node --test .github/release-transition.test.mjs .github/prune-native-releases.test.mjs
 
-      - name: Build version regression tests
-        run: python -m unittest discover -s native -p test_build.py
-
       - name: Profile transfer regression tests
         run: python -m unittest discover -s native -p test_migrate.py
 
       - name: Core regressions
         run: cargo test --locked --manifest-path core/Cargo.toml
+
+      - name: Build version regression tests
+        run: python -m unittest discover -s native -p test_build.py
 
       - name: Compile native regressions
         timeout-minutes: 30

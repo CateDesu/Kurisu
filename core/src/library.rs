@@ -171,31 +171,26 @@ fn resolved_path(path: &Path) -> PathBuf {
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
     #[cfg(windows)]
     {
-        path_eq_ignore_case(a, b) && same_windows_file(a, b).unwrap_or(false)
+        a == b || (path_eq_ignore_case(a, b) && same_windows_file(a, b).unwrap_or(false))
     }
     #[cfg(not(windows))]
     {
-        false
+        a == b
     }
 }
 
 fn path_starts_with(path: &Path, prefix: &Path) -> bool {
-    if path.starts_with(prefix) {
-        return true;
-    }
     #[cfg(windows)]
     {
-        case_variant_prefix(path, prefix)
-            .is_some_and(|parent| same_windows_file(parent, prefix).unwrap_or(false))
+        path.starts_with(prefix)
+            || case_variant_prefix(path, prefix)
+                .is_some_and(|parent| same_windows_file(parent, prefix).unwrap_or(false))
     }
     #[cfg(not(windows))]
     {
-        false
+        path.starts_with(prefix)
     }
 }
 
