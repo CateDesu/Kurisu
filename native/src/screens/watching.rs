@@ -508,14 +508,11 @@ impl Workspace {
     fn prefetch_watching_covers(&mut self, range: std::ops::Range<usize>, scale: f32) {
         self.ensure_cover_scale(scale);
         let start = range.start.saturating_sub(6);
-        let end = range
-            .end
-            .saturating_add(10)
-            .min(self.watching.current.len());
+        let end = range.end.saturating_add(10);
         let mut visible = Vec::new();
         let mut nearby = Vec::new();
-        for index in start.min(end)..end {
-            let entry = &self.watching.current[index];
+        let entries = self.watching.current.iter().enumerate();
+        for (index, entry) in entries.take(end).skip(start) {
             if let Some(url) = entry
                 .media
                 .as_ref()
