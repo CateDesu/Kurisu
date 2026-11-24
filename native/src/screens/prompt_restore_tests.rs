@@ -276,7 +276,7 @@ pub(in crate::screens) fn fixture_server(mode: &str) -> Option<PathBuf> {
             write!(stream,"HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())
                 .unwrap_or_else(|error| {
                     if (!viewer || mode.starts_with("quit-"))
-                        && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+                        && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted)
                     {
                         return;
                     }

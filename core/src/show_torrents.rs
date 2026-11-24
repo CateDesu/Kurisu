@@ -1224,7 +1224,9 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&folder).unwrap();
-            fs::write(folder.join(format!("{release}.mkv")), []).unwrap();
+            // Windows reserves ASCII pipes in filenames.
+            let file_stem = release.replace('|', "·");
+            fs::write(folder.join(format!("{file_stem}.mkv")), []).unwrap();
             let root = folder.to_string_lossy().into_owned();
             let mut cache = ScanCache::default();
             let scan = cache.scan(std::slice::from_ref(&root), &matchers, &HashMap::new());

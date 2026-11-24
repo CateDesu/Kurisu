@@ -27,12 +27,36 @@ impl Platform for LocalPlatform {
 struct Profile {
     path: PathBuf,
     app: TestAppContext,
+    remove_on_drop: bool,
+}
+
+impl Profile {
+    fn new(tc: &TestAppContext) -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = NEXT_PROFILE.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kurisu-shell-close-{}-{seq}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self {
+            path,
+            app: tc.clone(),
+            remove_on_drop: true,
+        }
+    }
 }
 
 impl Drop for Profile {
     fn drop(&mut self) {
         self.app.quit();
         self.app.run_until_parked();
+        if !self.remove_on_drop {
+            return;
+        }
         if std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.path);
         } else {
@@ -50,20 +74,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(tc: &TestAppContext) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = NEXT_PROFILE.fetch_add(1, AtomicOrdering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "kurisu-shell-close-{}-{seq}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        let profile = Profile {
-            path,
-            app: tc.clone(),
-        };
+        Self::with_profile(Profile::new(tc))
+    }
+
+    fn with_profile(profile: Profile) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -612,21 +626,27 @@ fn window_close_completes_admitted_reads_and_replays_deferred_refreshes_on_resum
     tc: &mut TestAppContext,
 ) {
     const CHILD: &str = "KURISU_CLOSE_TRAY_READS_CHILD";
-    if std::env::var_os(CHILD).is_none() {
+    let Some(path) = std::env::var_os(CHILD) else {
+        // The parent removes the profile after the child's file handles close.
+        let profile = Profile::new(tc);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "shell::close_tests::window_close_completes_admitted_reads_and_replays_deferred_refreshes_on_resume",
                 "--exact",
                 "--test-threads=1",
             ])
-            .env(CHILD, "1")
+            .env(CHILD, &profile.path)
             .env("KURISU_FIXTURE_GRAPHQL", "http://127.0.0.1:9/graphql")
             .status()
             .unwrap();
         assert!(status.success());
         return;
-    }
-    let fixture = Fixture::new(tc);
+    };
+    let fixture = Fixture::with_profile(Profile {
+        path: PathBuf::from(path),
+        app: tc.clone(),
+        remove_on_drop: false,
+    });
     let user = kurisu_core::User {
         id: 7,
         name: "Fixture".into(),

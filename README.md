@@ -57,11 +57,11 @@ Run the checks from the program root. Core playback tests need MPV on `PATH`; Li
 ```sh
 node --test .github/release-transition.test.mjs .github/prune-native-releases.test.mjs
 python3 .github/test_discord_notify.py
-python3 -m unittest discover -s native -p test_build.py
 python3 -m unittest discover -s native -p test_migrate.py
 cargo fmt --manifest-path core/Cargo.toml -- --check
 cargo fmt --manifest-path native/Cargo.toml -- --check
 cargo test --locked --manifest-path core/Cargo.toml
+python3 -m unittest discover -s native -p test_build.py
 cargo test --locked --manifest-path native/Cargo.toml --features fixture-runtime -- --test-threads=1
 cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
 cargo clippy --locked --manifest-path native/Cargo.toml --features fixture-runtime --all-targets -- -D warnings

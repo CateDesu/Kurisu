@@ -3384,6 +3384,7 @@ fn library_add_folder_and_watching_update_button_respect_busy_and_close_fences(
     std::fs::create_dir(&folder).unwrap();
     let (workspace, cx) =
         cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(900.)));
     settle(cx, &runtime);
 
     workspace.update_in(cx, |w, win, cx| {
@@ -3425,26 +3426,23 @@ fn library_add_folder_and_watching_update_button_respect_busy_and_close_fences(
         w.route = Route::Now;
         w.enter_watching(win, cx);
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !workspace.read_with(cx, |w, _| w.list.loaded) {
-        assert!(Instant::now() < deadline);
-        settle(cx, &runtime);
-        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
-    }
-    for _ in 0..8 {
-        settle(cx, &runtime);
-        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
-    }
     cx.simulate_accessibility_activation();
-    cx.run_until_parked();
-    let open_tree = cx.take_accessibility_tree_update().unwrap();
-    let (_, open_btn) = open_tree
-        .nodes
-        .iter()
-        .find(|(_, node)| {
-            node.role() == gpui::Role::Button && node.label() == Some("Update to Ep 3")
-        })
-        .expect("watching update button before close");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let open_btn = loop {
+        settle(cx, &runtime);
+        if let Some(tree) = cx.take_accessibility_tree_update()
+            && let Some((_, button)) = tree.nodes.into_iter().find(|(_, node)| {
+                node.role() == gpui::Role::Button && node.label() == Some("Update to Ep 3")
+            })
+        {
+            break button;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watching update button before close"
+        );
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+    };
     assert!(!open_btn.is_disabled());
 
     workspace.update_in(cx, |w, win, cx| {
