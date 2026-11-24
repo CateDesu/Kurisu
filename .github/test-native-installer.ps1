@@ -87,7 +87,8 @@ if ((Get-ProductDirectory) -ne $installDirectory) { throw 'Bridge installation i
 if (-not (Test-Path (Join-Path $installDirectory 'kurisu.exe'))) { throw 'Bridge executable missing' }
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Kurisu.lnk'
 $shortcutBefore = (Get-FileHash -LiteralPath $shortcut).Hash
-$uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kurisu'
+$uninstallSubKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Kurisu'
+$uninstallKey = "HKCU:\$uninstallSubKey"
 $registrationBefore = (Get-ItemProperty $uninstallKey | ConvertTo-Json -Compress)
 $binaryBefore = (Get-FileHash (Join-Path $installDirectory 'kurisu.exe')).Hash
 $uninstaller = Join-Path $installDirectory 'uninstall.exe'
@@ -149,6 +150,30 @@ function Assert-RejectedInstall {
     )
     Invoke-RejectedInstall
     Assert-UnchangedInstall @PSBoundParameters
+}
+function Invoke-WithUninstallWriteDenied {
+    param([scriptblock]$Check)
+    $rights = [Security.AccessControl.RegistryRights]::ReadPermissions -bor
+        [Security.AccessControl.RegistryRights]::ChangePermissions
+    $registration = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+        $uninstallSubKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights
+    )
+    if ($null -eq $registration) { throw 'Uninstall registration is missing' }
+    try {
+        $section = [Security.AccessControl.AccessControlSections]::Access
+        $acl = [Microsoft.Win32.RegistryAclExtensions]::GetAccessControl($registration, $section)
+        $original = $acl.GetSecurityDescriptorBinaryForm()
+        $acl.AddAccessRule([Security.AccessControl.RegistryAccessRule]::new(
+            [Security.Principal.WindowsIdentity]::GetCurrent().User,
+            [Security.AccessControl.RegistryRights]::SetValue,
+            [Security.AccessControl.AccessControlType]::Deny
+        ))
+        [Microsoft.Win32.RegistryAclExtensions]::SetAccessControl($registration, $acl)
+        try { & $Check } finally {
+            $acl.SetSecurityDescriptorBinaryForm($original, $section)
+            [Microsoft.Win32.RegistryAclExtensions]::SetAccessControl($registration, $acl)
+        }
+    } finally { $registration.Dispose() }
 }
 New-Item -ItemType Directory -Path $uninstaller | Out-Null
 Assert-RejectedInstall -UninstallerIsDirectory
@@ -250,22 +275,11 @@ Assert-UnchangedInstall
 $product = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\CateDesu\Kurisu', $true)
 try {
     $product.SetValue('', $installDirectory, [Microsoft.Win32.RegistryValueKind]::ExpandString)
-    $originalAcl = Get-Acl $uninstallKey
-    $blockedAcl = Get-Acl $uninstallKey
-    $rule = [Security.AccessControl.RegistryAccessRule]::new(
-        [Security.Principal.WindowsIdentity]::GetCurrent().User,
-        [Security.AccessControl.RegistryRights]::SetValue,
-        [Security.AccessControl.AccessControlType]::Deny
-    )
-    $blockedAcl.AddAccessRule($rule)
-    Set-Acl -Path $uninstallKey -AclObject $blockedAcl
-    try {
+    Invoke-WithUninstallWriteDenied {
         Assert-RejectedInstall
         if ($product.GetValueKind('') -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
             throw 'Failed registration changed the registry value type'
         }
-    } finally {
-        Set-Acl -Path $uninstallKey -AclObject $originalAcl
     }
 } finally {
     $product.SetValue('', $installDirectory, [Microsoft.Win32.RegistryValueKind]::String)
@@ -513,13 +527,9 @@ try {
     Write-InterruptedJournal $interruptedStage
     $product = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\CateDesu\Kurisu', $true)
     try { $product.SetValue('', $alternateDirectory) } finally { $product.Dispose() }
-    $arp = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall\Kurisu', $true)
+    $arp = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($uninstallSubKey, $true)
     try { $arp.SetValue('DisplayName', 'Interrupted') } finally { $arp.Dispose() }
-    $originalArpAcl = Get-Acl $uninstallKey
-    $blockedArpAcl = Get-Acl $uninstallKey
-    $blockedArpAcl.AddAccessRule($rule)
-    Set-Acl -Path $uninstallKey -AclObject $blockedArpAcl
-    try {
+    Invoke-WithUninstallWriteDenied {
         $failed = Start-Process -FilePath $installer[0].FullName -ArgumentList "/S /D=$alternateDirectory" -Wait -PassThru
         if ($failed.ExitCode -ne 1 -or
             -not (Test-Path -LiteralPath (Join-Path $interruptedStage '.swapping'))) {
@@ -532,8 +542,6 @@ try {
                 throw 'Shortcut or ARP write failure skipped restoring the product key'
             }
         } finally { $product.Dispose() }
-    } finally {
-        Set-Acl -Path $uninstallKey -AclObject $originalArpAcl
     }
     Clear-Content -LiteralPath (Join-Path $interruptedStage '.swapping')
     $failed = Start-Process -FilePath $installer[0].FullName -ArgumentList "/S /D=$alternateDirectory" -Wait -PassThru
