@@ -27,6 +27,7 @@ impl Workspace {
             }
             Some(ModalLayer::Editor) if self.editor_status_open => {
                 self.editor_status_open = false;
+                window.focus(&self.editor_status_focus, cx);
                 cx.notify();
             }
             Some(ModalLayer::Editor) => self.dismiss_editor(cx),

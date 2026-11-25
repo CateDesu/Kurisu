@@ -9,8 +9,12 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::{ListEntry, Media};
 
-const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 pub(crate) const LIST_OWNER_KEY: &str = "native_preference:kurisu.list.owner";
+pub(crate) const TOKEN_KEY: &str = "anilist_token";
+pub(crate) const TOKEN_REJECTED_KEY: &str = "anilist_token_rejected";
+const CATALOG_METADATA: u8 = 1;
+const CATALOG_DETAIL: u8 = 2;
 pub(crate) const SCOPED_LIST_PREFERENCE_KEYS: &[&str] = &[
     "native_preference:kurisu.list.q",
     "native_preference:kurisu.list.filter",
@@ -25,28 +29,65 @@ fn parse_valid_account_id(value: Option<&str>) -> Option<i64> {
 
 pub struct Db(pub Mutex<Connection>, Mutex<Vec<Weak<CatalogRead>>>);
 
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogUpdate {
+    Episodes,
+    Metadata,
+    Detail,
+    Section(&'static str),
+}
+
 #[derive(Default)]
 pub(crate) struct CatalogRead {
-    confirmed_totals: Mutex<HashSet<i64>>,
+    newer: Mutex<CatalogChanges>,
     removed: Mutex<HashSet<i64>>,
 }
 
+#[derive(Default)]
+struct CatalogChanges {
+    episodes: HashSet<i64>,
+    metadata: HashSet<i64>,
+    detail: HashSet<i64>,
+    sections: HashSet<(i64, &'static str)>,
+}
+
 impl CatalogRead {
-    // Keep the entry lock through the cache write so a lookup cannot intervene.
-    pub(crate) fn preserve_totals<'a>(
+    // Keep the entry lock through the cache write.
+    pub(crate) fn preserve_newer<'a>(
         &self,
         db: &Db,
         media: impl IntoIterator<Item = &'a mut Media>,
     ) {
-        let confirmed = std::mem::take(&mut *self.confirmed_totals.lock());
-        if confirmed.is_empty() {
+        let newer = self.newer.lock();
+        if newer.metadata.is_empty() && newer.detail.is_empty() && newer.episodes.is_empty() {
             return;
         }
-        db.restore_cached_totals(
-            media
-                .into_iter()
-                .filter(|item| confirmed.contains(&item.id)),
-        );
+        let conn = db.0.lock();
+        for item in media {
+            let keep_detail = newer.detail.contains(&item.id);
+            if keep_detail || newer.metadata.contains(&item.id) {
+                if let Ok(Some((cached, _))) = read_media_row(&conn, item.id) {
+                    *item = if keep_detail {
+                        cached
+                    } else {
+                        cached.with_detail_fields_from(std::mem::take(item))
+                    };
+                }
+            } else if newer.episodes.contains(&item.id) {
+                if let Ok(Some(total)) = cached_episode_total(&conn, item.id) {
+                    item.episodes = total;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn has_newer_media(&self, id: i64) -> bool {
+        let newer = self.newer.lock();
+        newer.metadata.contains(&id) || newer.detail.contains(&id)
+    }
+
+    pub(crate) fn has_newer_section(&self, id: i64, section: &'static str) -> bool {
+        self.newer.lock().sections.contains(&(id, section))
     }
 
     pub(crate) fn removed_media(&self) -> HashSet<i64> {
@@ -54,8 +95,13 @@ impl CatalogRead {
     }
 
     // Call after the cache write commits, while holding the entry lock.
-    pub(crate) fn record_totals(&self, db: &Db, media_ids: impl Iterator<Item = i64> + Clone) {
-        mark_catalog_reads(&mut db.1.lock(), Some(self), media_ids);
+    pub(crate) fn record_write(
+        &self,
+        db: &Db,
+        update: CatalogUpdate,
+        media_ids: impl Iterator<Item = i64> + Clone,
+    ) {
+        mark_catalog_reads(&mut db.1.lock(), Some(self), update, media_ids);
     }
 }
 
@@ -222,6 +268,26 @@ impl Db {
                  ON watch_history (account_id,id);",
             )?;
         }
+        if version < 8 {
+            Self::ensure_column(conn, "list_entry", "queued_creation", "TEXT")?;
+            conn.execute(
+                "UPDATE pending_change
+                 SET payload = json_set(payload, '$.patch.creation_key', lower(hex(randomblob(16))))
+                 WHERE json_valid(payload)
+                   AND json_type(payload, '$.base') = 'null'
+                   AND json_extract(payload, '$.patch.creation_key') IS NULL",
+                [],
+            )?;
+        }
+        if version <= 8 {
+            // Selected nulls have different semantics from episode-only rows.
+            Self::ensure_column(
+                conn,
+                "media",
+                "catalog_fields",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
@@ -253,11 +319,14 @@ impl Db {
         read
     }
 
-    pub(crate) fn restore_cached_totals<'a>(&self, media: impl IntoIterator<Item = &'a mut Media>) {
-        let conn = self.0.lock();
-        for item in media {
-            if let Ok(Some(total)) = cached_episode_total(&conn, item.id) {
-                item.episodes = total;
+    pub(crate) fn restore_cached_metadata(&self, media: &mut Media) {
+        if let Ok(Some((cached, fields))) = read_media_row(&self.0.lock(), media.id) {
+            if fields == CATALOG_DETAIL {
+                *media = cached;
+            } else if fields == CATALOG_METADATA || cached.has_metadata() {
+                *media = cached.with_detail_fields_from(std::mem::take(media));
+            } else {
+                media.episodes = cached.episodes;
             }
         }
     }
@@ -269,9 +338,13 @@ impl Db {
         let conn = self.0.lock();
         relations.retain_mut(|relation| {
             let id = relation.media.id;
-            match cached_episode_total(&conn, id) {
-                Ok(Some(total)) => {
-                    relation.media.episodes = total;
+            match read_media_row(&conn, id) {
+                Ok(Some((cached, fields))) => {
+                    if fields >= CATALOG_METADATA || cached.has_metadata() {
+                        relation.media = cached;
+                    } else {
+                        relation.media.episodes = cached.episodes;
+                    }
                     true
                 }
                 Ok(None) => !conn
@@ -289,8 +362,37 @@ impl Db {
     pub(crate) fn cache_episode_total(&self, media_id: i64, episodes: Option<i64>) -> Result<bool> {
         let mut reads = self.1.lock();
         let changed = write_episode_total(&self.0.lock(), media_id, episodes)?;
-        mark_catalog_reads(&mut reads, None, std::iter::once(media_id));
+        mark_catalog_reads(
+            &mut reads,
+            None,
+            CatalogUpdate::Episodes,
+            std::iter::once(media_id),
+        );
         Ok(changed)
+    }
+
+    pub(crate) fn durable_write_with_episode_total(
+        &self,
+        media_id: i64,
+        total: crate::anilist::ReportedEpisodes,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let Some(total) = total else {
+            return self.durable_write(write);
+        };
+        let mut reads = self.1.lock();
+        self.durable_write(|tx| {
+            write(tx)?;
+            write_episode_total(tx, media_id, total)?;
+            Ok(())
+        })?;
+        mark_catalog_reads(
+            &mut reads,
+            None,
+            CatalogUpdate::Episodes,
+            std::iter::once(media_id),
+        );
+        Ok(())
     }
 
     pub fn upsert_media_batch(&self, media: &[Media]) -> Result<()> {
@@ -305,12 +407,13 @@ impl Db {
     /// Detail fetches can clear fields that lean queries must preserve.
     pub fn upsert_media_detail(&self, m: &Media) -> Result<()> {
         let c = self.0.lock();
-        c.execute(
+        let written = c.execute(
             "INSERT INTO media
              (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
               episodes,format,status,average_score,season,season_year,description,
-              next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,cached_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,
+              cached_at,catalog_fields)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
               id_mal=excluded.id_mal, title_romaji=excluded.title_romaji,
               title_english=excluded.title_english, title_native=excluded.title_native,
@@ -325,32 +428,66 @@ impl Db {
               duration=excluded.duration,
               source=excluded.source,
               studios=excluded.studios,
-              cached_at=excluded.cached_at",
+              cached_at=excluded.cached_at,
+              catalog_fields=excluded.catalog_fields",
             rusqlite::params![
-                m.id, m.id_mal, m.title_romaji, m.title_english, m.title_native,
-                m.cover_medium, m.cover_large, m.episodes.filter(|total| *total > 0), m.format, m.status,
-                m.average_score, m.season, m.season_year, m.description,
-                m.next_airing_episode, m.next_airing_at,
+                m.id,
+                m.id_mal,
+                m.title_romaji,
+                m.title_english,
+                m.title_native,
+                m.cover_medium,
+                m.cover_large,
+                m.episodes.filter(|total| *total > 0),
+                m.format,
+                m.status,
+                m.average_score,
+                m.season,
+                m.season_year,
+                m.description,
+                m.next_airing_episode,
+                m.next_airing_at,
                 m.banner_image,
-                m.genres.as_ref().and_then(|g| serde_json::to_string(g).ok()),
-                m.duration, m.source,
-                m.studios.as_ref().and_then(|s| serde_json::to_string(s).ok()),
+                m.genres
+                    .as_ref()
+                    .and_then(|g| serde_json::to_string(g).ok()),
+                m.duration,
+                m.source,
+                m.studios
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok()),
                 chrono::Utc::now().timestamp(),
+                CATALOG_DETAIL,
             ],
         )?;
+        anyhow::ensure!(written == 1, "the media detail was not cached");
+        Ok(())
+    }
+
+    pub(crate) fn cache_media_detail_sections(
+        &self,
+        key: &str,
+        detail: &crate::models::MediaDetail,
+    ) -> Result<()> {
+        let value = serde_json::to_string(detail)?;
+        let written = self.0.lock().execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            [key, &value],
+        )?;
+        anyhow::ensure!(written == 1, "the media detail sections were not cached");
         Ok(())
     }
 
     pub fn get_media(&self, id: i64) -> Result<Option<Media>> {
-        let c = self.0.lock();
-        let mut stmt = c.prepare(
-            "SELECT id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
-                    episodes,format,status,average_score,season,season_year,description,
-                    next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios
-             FROM media WHERE id = ?",
-        )?;
-        let row = stmt.query_row([id], row_to_media).optional()?;
-        Ok(row.filter(Media::has_metadata))
+        Ok(read_media_row(&self.0.lock(), id)?
+            .map(|(media, _)| media)
+            .filter(Media::has_metadata))
+    }
+
+    pub(crate) fn cached_catalog_media(&self, id: i64) -> Result<Option<Media>> {
+        Ok(read_media_row(&self.0.lock(), id)?
+            .filter(|(media, fields)| *fields >= CATALOG_METADATA || media.has_metadata())
+            .map(|(media, _)| media))
     }
 
     pub fn episode_total(&self, id: i64) -> Result<Option<i64>> {
@@ -367,10 +504,24 @@ impl Db {
     }
 
     pub(crate) fn write_entry(c: &Connection, e: &ListEntry) -> Result<()> {
+        Self::write_entry_with_creation(
+            c,
+            e,
+            e.queued_creation.as_deref().filter(|_| e.id.is_none()),
+        )
+    }
+
+    pub(crate) fn write_entry_with_creation(
+        c: &Connection,
+        e: &ListEntry,
+        queued_creation: Option<&str>,
+    ) -> Result<()> {
         c.prepare_cached(
             "INSERT OR REPLACE INTO list_entry
-             (media_id,entry_id,status,progress,score,repeat,updated_at)
-             VALUES (?,?,?,?,?,?,?)",
+             (media_id,entry_id,status,progress,score,repeat,updated_at,queued_creation)
+             VALUES (?,?,?,?,?,?,?,COALESCE(?, (
+                 SELECT queued_creation FROM list_entry WHERE media_id = ?1 AND entry_id = ?2
+             )))",
         )?
         .execute(rusqlite::params![
             e.media_id,
@@ -379,15 +530,25 @@ impl Db {
             e.progress,
             e.score,
             e.repeat,
-            e.updated_at
+            e.updated_at,
+            queued_creation
         ])?;
         Ok(())
     }
 
     pub fn delete_entry(&self, media_id: i64) -> Result<()> {
-        self.0
-            .lock()
-            .execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
+        Self::delete_entry_from(&self.0.lock(), media_id)
+    }
+
+    pub(crate) fn delete_entry_from(conn: &Connection, media_id: i64) -> Result<()> {
+        if conn.execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])? == 0 {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM list_entry WHERE media_id = ?)",
+                [media_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(!exists, "the list entry was not removed");
+        }
         Ok(())
     }
 
@@ -398,27 +559,16 @@ impl Db {
         base: Option<&ListEntry>,
         reported_total: crate::anilist::ReportedEpisodes,
     ) -> Result<()> {
-        let mut reads = self.1.lock();
-        self.durable_write(|tx| {
-            if let Some(total) = reported_total {
-                write_episode_total(tx, media_id, total)?;
-            }
+        self.durable_write_with_episode_total(media_id, reported_total, |tx| {
             match base {
-                Some(e) => Self::write_entry(tx, e)?,
-                None => {
-                    tx.execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
+                Some(entry) => {
+                    Self::write_entry(tx, entry)?;
+                    anyhow::ensure!(tx.changes() == 1, "the remote entry was not cached");
                 }
+                None => Self::delete_entry_from(tx, media_id)?,
             }
-            tx.execute(
-                "DELETE FROM pending_change WHERE account_id = ? AND media_id = ?",
-                [account, media_id],
-            )?;
-            Ok(())
-        })?;
-        if reported_total.is_some() {
-            mark_catalog_reads(&mut reads, None, std::iter::once(media_id));
-        }
-        Ok(())
+            Self::delete_pending_from(tx, account, media_id)
+        })
     }
 
     pub fn delete_media(&self, media_id: i64) -> Result<()> {
@@ -472,7 +622,9 @@ impl Db {
                  ON CONFLICT(media_id) DO UPDATE SET
                   entry_id=excluded.entry_id, status=excluded.status,
                   progress=excluded.progress, score=excluded.score,
-                  repeat=excluded.repeat, updated_at=excluded.updated_at
+                  repeat=excluded.repeat, updated_at=excluded.updated_at,
+                  queued_creation=CASE WHEN list_entry.entry_id = excluded.entry_id
+                                       THEN list_entry.queued_creation END
                  WHERE (list_entry.entry_id,list_entry.status,list_entry.progress,
                         list_entry.score,list_entry.repeat,list_entry.updated_at)
                    IS NOT (excluded.entry_id,excluded.status,excluded.progress,
@@ -499,6 +651,7 @@ impl Db {
             "DELETE FROM list_entry WHERE media_id NOT IN (SELECT value FROM json_each(?))",
             [serde_json::to_string(&keep)?],
         )?;
+        Self::write_completion_baselines(tx)?;
         Ok(())
     }
 
@@ -517,7 +670,7 @@ impl Db {
                     m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
                     m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,
                     m.season_year,NULL,m.next_airing_episode,m.next_airing_at,
-                    NULL,NULL,NULL,NULL,NULL
+                    NULL,NULL,NULL,NULL,NULL,e.queued_creation
              FROM list_entry e LEFT JOIN media m ON m.id = e.media_id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -530,6 +683,7 @@ impl Db {
                 score: r.get(4)?,
                 repeat: r.get(5)?,
                 updated_at: r.get(6)?,
+                queued_creation: r.get(28)?,
                 media: row_to_media_offset(r, 7)
                     .ok()
                     .filter(Media::has_metadata)
@@ -562,7 +716,7 @@ impl Db {
                         m.id,m.id_mal,m.title_romaji,m.title_english,m.title_native,m.cover_medium,
                         m.cover_large,m.episodes,m.format,m.status,m.average_score,m.season,
                         m.season_year,NULL,m.next_airing_episode,m.next_airing_at,
-                        NULL,NULL,NULL,NULL,NULL
+                        NULL,NULL,NULL,NULL,NULL,e.queued_creation
                  FROM list_entry e LEFT JOIN media m ON m.id = e.media_id
                  WHERE e.media_id = ?",
                 [media_id],
@@ -575,6 +729,7 @@ impl Db {
                         score: r.get(4)?,
                         repeat: r.get(5)?,
                         updated_at: r.get(6)?,
+                        queued_creation: r.get(28)?,
                         media: row_to_media_offset(r, 7).ok().filter(Media::has_metadata),
                     })
                 },
@@ -678,7 +833,7 @@ impl Db {
             }
         }
         for (key, value) in [
-            ("anilist_token", token),
+            (TOKEN_KEY, token),
             ("anilist_username", user.name.as_str()),
             ("anilist_user_id", id.as_str()),
             ("anilist_profile", profile.as_str()),
@@ -688,6 +843,7 @@ impl Db {
                 [key, value],
             )?;
         }
+        Self::delete_setting_from(&tx, TOKEN_REJECTED_KEY)?;
         if let Some(entries) = entries {
             Self::write_list_snapshot(&tx, entries)?;
         }
@@ -844,6 +1000,20 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn saved_token(&self) -> Result<Option<String>> {
+        let token = self
+            .0
+            .lock()
+            .query_row(
+                "SELECT value FROM settings WHERE key = ? AND value != ''
+                 AND NOT EXISTS (SELECT 1 FROM settings WHERE key = ?)",
+                [TOKEN_KEY, TOKEN_REJECTED_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(token)
+    }
+
     pub fn cached_user(&self) -> Result<Option<crate::models::User>> {
         let settings = self.get_settings_batch(&["anilist_user_id", "anilist_profile"])?;
         let user = settings
@@ -867,18 +1037,19 @@ impl Db {
         let mut c = self.0.lock();
         let tx = c.transaction()?;
         for (k, v) in kvs {
-            tx.execute(
+            let written = tx.execute(
                 "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
                 [k, v],
             )?;
+            anyhow::ensure!(written == 1, "setting {k} was not written");
         }
         tx.commit()?;
         Ok(())
     }
     /// Scrub freed pages and the WAL as well as the live table.
     pub fn scrub_setting(&self, key: &str) -> Result<()> {
+        self.durable_write(|tx| Self::delete_setting_from(tx, key))?;
         let c = self.0.lock();
-        c.execute("DELETE FROM settings WHERE key = ?", [key])?;
         // VACUUM must run outside a transaction.
         c.execute_batch("VACUUM")?;
         // A busy checkpoint leaves token pages in the WAL. Report the failed scrub.
@@ -898,6 +1069,14 @@ impl Db {
                 r.get::<_, String>(0)
             })
             .optional()?)
+    }
+    pub(crate) fn get_list_sort_preferences(&self) -> [Result<Option<String>>; 2] {
+        self.0.lock().query_row(
+            "SELECT (SELECT value FROM settings WHERE key = 'native_preference:kurisu.list.sort'),
+                    (SELECT value FROM settings WHERE key = 'native_preference:kurisu.list.dir')",
+            [],
+            |row| Ok([row.get(0).map_err(Into::into), row.get(1).map_err(Into::into)]),
+        ).unwrap_or_else(|error| [Err(anyhow::anyhow!(error.to_string())), Err(error.into())])
     }
     /// Read under one lock so a settings update cannot split the snapshot.
     pub fn get_settings_batch(
@@ -922,6 +1101,17 @@ impl Db {
         self.0
             .lock()
             .execute("DELETE FROM settings WHERE key = ?", [key])?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_setting_from(conn: &Connection, key: &str) -> Result<()> {
+        conn.execute("DELETE FROM settings WHERE key = ?", [key])?;
+        let remains: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?)",
+            [key],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(!remains, "the saved setting was not deleted");
         Ok(())
     }
 
@@ -983,6 +1173,7 @@ impl Db {
 fn mark_catalog_reads(
     reads: &mut Vec<Weak<CatalogRead>>,
     source: Option<&CatalogRead>,
+    update: CatalogUpdate,
     media_ids: impl Iterator<Item = i64> + Clone,
 ) {
     // Reads register in request order. Confirmed lookup totals have no catalog source.
@@ -995,7 +1186,16 @@ fn mark_catalog_reads(
             older = false;
         }
         if older {
-            read.confirmed_totals.lock().extend(media_ids.clone());
+            let mut newer = read.newer.lock();
+            let ids = media_ids.clone();
+            match update {
+                CatalogUpdate::Episodes => newer.episodes.extend(ids),
+                CatalogUpdate::Metadata => newer.metadata.extend(ids),
+                CatalogUpdate::Detail => newer.detail.extend(ids),
+                CatalogUpdate::Section(section) => {
+                    newer.sections.extend(ids.map(|id| (id, section)))
+                }
+            }
         }
         true
     });
@@ -1004,11 +1204,12 @@ fn mark_catalog_reads(
 fn write_episode_total(conn: &Connection, media_id: i64, episodes: Option<i64>) -> Result<bool> {
     let changed = cached_episode_total(conn, media_id)? != Some(episodes);
     if changed {
-        conn.execute(
+        let written = conn.execute(
             "INSERT INTO media (id,episodes,cached_at) VALUES (?,?,?)
                  ON CONFLICT(id) DO UPDATE SET episodes=excluded.episodes",
             rusqlite::params![media_id, episodes, chrono::Utc::now().timestamp()],
         )?;
+        anyhow::ensure!(written == 1, "the confirmed episode total was not cached");
     }
     Ok(changed)
 }
@@ -1022,14 +1223,29 @@ fn cached_episode_total(conn: &Connection, id: i64) -> Result<Option<Option<i64>
         .map(|episodes| episodes.filter(|total| *total > 0)))
 }
 
+fn read_media_row(conn: &Connection, id: i64) -> Result<Option<(Media, u8)>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
+                    episodes,format,status,average_score,season,season_year,description,
+                    next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,
+                    catalog_fields
+             FROM media WHERE id = ?",
+        )?
+        .query_row([id], |row| Ok((row_to_media(row)?, row.get(21)?)))
+        .optional()?)
+}
+
 /// Preserve cached detail fields that lean queries never fetch.
 fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
-    c.prepare_cached(
-        "INSERT INTO media
+    let written = c
+        .prepare_cached(
+            "INSERT INTO media
          (id,id_mal,title_romaji,title_english,title_native,cover_medium,cover_large,
           episodes,format,status,average_score,season,season_year,description,
-          next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,cached_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          next_airing_episode,next_airing_at,banner_image,genres,duration,source,studios,
+          cached_at,catalog_fields)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
           id_mal=excluded.id_mal, title_romaji=excluded.title_romaji,
           title_english=excluded.title_english, title_native=excluded.title_native,
@@ -1044,36 +1260,39 @@ fn upsert_media_row(c: &Connection, m: &Media) -> Result<()> {
           duration=COALESCE(excluded.duration, duration),
           source=COALESCE(excluded.source, source),
           studios=COALESCE(excluded.studios, studios),
-          cached_at=excluded.cached_at",
-    )?
-    .execute(rusqlite::params![
-        m.id,
-        m.id_mal,
-        m.title_romaji,
-        m.title_english,
-        m.title_native,
-        m.cover_medium,
-        m.cover_large,
-        m.episodes.filter(|total| *total > 0),
-        m.format,
-        m.status,
-        m.average_score,
-        m.season,
-        m.season_year,
-        m.description,
-        m.next_airing_episode,
-        m.next_airing_at,
-        m.banner_image,
-        m.genres
-            .as_ref()
-            .and_then(|g| serde_json::to_string(g).ok()),
-        m.duration,
-        m.source,
-        m.studios
-            .as_ref()
-            .and_then(|s| serde_json::to_string(s).ok()),
-        chrono::Utc::now().timestamp(),
-    ])?;
+          cached_at=excluded.cached_at,
+          catalog_fields=MAX(catalog_fields, excluded.catalog_fields)",
+        )?
+        .execute(rusqlite::params![
+            m.id,
+            m.id_mal,
+            m.title_romaji,
+            m.title_english,
+            m.title_native,
+            m.cover_medium,
+            m.cover_large,
+            m.episodes.filter(|total| *total > 0),
+            m.format,
+            m.status,
+            m.average_score,
+            m.season,
+            m.season_year,
+            m.description,
+            m.next_airing_episode,
+            m.next_airing_at,
+            m.banner_image,
+            m.genres
+                .as_ref()
+                .and_then(|g| serde_json::to_string(g).ok()),
+            m.duration,
+            m.source,
+            m.studios
+                .as_ref()
+                .and_then(|s| serde_json::to_string(s).ok()),
+            chrono::Utc::now().timestamp(),
+            CATALOG_METADATA,
+        ])?;
+    anyhow::ensure!(written == 1, "the media metadata was not cached");
     Ok(())
 }
 
@@ -1415,6 +1634,7 @@ mod tests {
                     title_english: Some("Fixture Title".into()),
                     ..Default::default()
                 }),
+                queued_creation: None,
             },
             ListEntry {
                 id: Some(12),
@@ -1699,6 +1919,16 @@ mod tests {
             )
             .unwrap();
         }
+        if version >= 7 {
+            conn.execute_batch(
+                "CREATE INDEX watch_history_account_id ON watch_history (account_id,id);",
+            )
+            .unwrap();
+        }
+        if version >= 8 {
+            conn.execute_batch("ALTER TABLE list_entry ADD COLUMN queued_creation TEXT;")
+                .unwrap();
+        }
         conn.execute(
             "INSERT INTO media (id,title_romaji,episodes,cached_at) VALUES (7,'Old Show',12,1)",
             [],
@@ -1784,6 +2014,49 @@ mod tests {
     }
 
     #[test]
+    fn reopened_catalog_distinguishes_explicit_nulls_from_episode_only_rows() {
+        let path = temp_db_path("catalog-null-metadata");
+        let _ = std::fs::remove_file(&path);
+        build_db_at_version(&path, 8);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.get_media(7).unwrap().unwrap().display_title(),
+            "Old Show"
+        );
+        db.upsert_media(&Media {
+            id: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        for id in [10, 11] {
+            db.cache_episode_total(id, Some(12)).unwrap();
+        }
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        for (id, title) in [(10, "#10"), (11, "Saved title")] {
+            let saved = Media {
+                id,
+                title_english: Some("Saved title".into()),
+                ..Default::default()
+            };
+            let mut detail = saved.clone();
+            db.restore_cached_metadata(&mut detail);
+            assert_eq!(detail.display_title(), title);
+            assert_eq!(detail.episodes, Some(12));
+            let mut relations = vec![crate::models::MediaRelation {
+                relation: "PREQUEL".into(),
+                media: saved,
+            }];
+            db.restore_cached_relations(&mut relations);
+            assert_eq!(relations[0].media.display_title(), title);
+            assert_eq!(relations[0].media.episodes, Some(12));
+        }
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn history_index_migration_preserves_existing_rows_and_pending_intent() {
         for from in [5, 6] {
             check_history_index_migration(from);
@@ -1828,6 +2101,8 @@ mod tests {
             conn.execute("INSERT INTO pending_change VALUES (7,7,?)", [&payload])
                 .unwrap();
         }
+        let original: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let mut previous_key = None;
         for _ in 0..2 {
             let db = Db::open(&path).unwrap();
             let conn = db.0.lock();
@@ -1846,15 +2121,24 @@ mod tests {
                     (43, 9, "episode.mkv".into(), 7, 4, 1000),
                 ]
             );
-            assert_eq!(
-                conn.query_row(
+            let migrated: String = conn
+                .query_row(
                     "SELECT payload FROM pending_change WHERE account_id=7 AND media_id=7",
                     [],
-                    |r| r.get::<_, String>(0)
+                    |r| r.get(0),
                 )
-                .unwrap(),
-                payload
-            );
+                .unwrap();
+            let mut migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+            let key = migrated["patch"]
+                .as_object_mut()
+                .unwrap()
+                .remove("creation_key")
+                .unwrap();
+            assert_eq!(migrated, original);
+            assert_eq!(key.as_str().unwrap().len(), 32);
+            if let Some(previous) = previous_key.replace(key.clone()) {
+                assert_eq!(key, previous);
+            }
             assert_eq!(
                 conn.query_row(
                     "SELECT watched_at FROM watched_file WHERE path='legacy.mkv'",
@@ -1914,12 +2198,13 @@ mod tests {
     fn future_schema_is_not_rewritten_or_downgraded() {
         let path = temp_db_path("future-history-index");
         let _ = std::fs::remove_file(&path);
-        build_db_at_version(&path, 6);
+        build_db_at_version(&path, SCHEMA_VERSION);
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE future_state (value TEXT);
                  INSERT INTO future_state VALUES ('preserved');
+                 DROP INDEX watch_history_account_id;
                  PRAGMA user_version = 999;",
             )
             .unwrap();
@@ -2054,6 +2339,7 @@ mod tests {
             repeat: 1,
             updated_at: Some(42),
             media: None,
+            queued_creation: None,
         })
         .unwrap();
         let rows = db.entries_with_media().unwrap();

@@ -275,7 +275,7 @@ impl Workspace {
             }
             page = page.child(section("Formats", body));
         }
-        if stats.release_years.len() > 1 {
+        if !stats.release_years.is_empty() {
             let max = stats
                 .release_years
                 .iter()
@@ -285,6 +285,7 @@ impl Workspace {
                 .max(1);
             let mut bars = div()
                 .id("stats-years")
+                .debug_selector(|| "stats-years".into())
                 .h(px(112.))
                 .flex()
                 .items_end()
@@ -294,6 +295,7 @@ impl Workspace {
                 bars = bars.child(
                     div()
                         .id(format!("stats-year-{}", row.year))
+                        .role(gpui::Role::Image)
                         .aria_label(format!("{}: {}", row.year, row.count))
                         .min_w(px(8.))
                         .flex_1()
@@ -312,7 +314,7 @@ impl Workspace {
                         .text_size(px(11.))
                         .text_color(rgb(DIM))
                         .child(first.to_string())
-                        .child(last.to_string()),
+                        .when(first != last, |labels| labels.child(last.to_string())),
                 ),
             ));
         }
@@ -382,4 +384,40 @@ fn bar_row(label: &str, count: i64, max: i64, detail: Option<String>) -> Div {
                 .text_color(rgb(DIM))
                 .child(detail.unwrap_or_else(|| count.to_string())),
         )
+}
+
+#[cfg(test)]
+#[gpui::test]
+fn stats_shows_a_single_release_year(cx: &mut gpui::TestAppContext) {
+    use kurisu_core::models::{User, YearCount};
+
+    let (core, _runtime, _dir) = super::workspace_tests::fixture();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    view.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 7,
+            ..Default::default()
+        });
+        w.route = super::Route::Stats;
+        w.stats.data = Some(UserStats {
+            count: 2,
+            release_years: vec![YearCount {
+                year: 2025,
+                count: 2,
+            }],
+            ..Default::default()
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_accessibility_activation();
+    cx.update(|window, app| window.draw(app).clear(app));
+    assert!(cx.debug_bounds("stats-years").is_some());
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    assert!(
+        tree.nodes.iter().any(|(_, node)| {
+            node.role() == gpui::Role::Image && node.label() == Some("2025: 2")
+        })
+    );
 }

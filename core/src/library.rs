@@ -58,10 +58,19 @@ pub fn remove_folder(db: &Db, path: &str) -> Result<Vec<String>> {
     Ok(folders)
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryBindingScope {
+    File,
+    Folder,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct LibraryBinding {
     pub media_id: i64,
     pub episode_offset: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LibraryBindingScope>,
 }
 
 impl<'de> Deserialize<'de> for LibraryBinding {
@@ -76,19 +85,24 @@ impl<'de> Deserialize<'de> for LibraryBinding {
                 media_id: i64,
                 #[serde(default)]
                 episode_offset: i64,
+                #[serde(default)]
+                scope: Option<LibraryBindingScope>,
             },
         }
         Ok(match SavedBinding::deserialize(deserializer)? {
             SavedBinding::Legacy(media_id) => Self {
                 media_id,
                 episode_offset: 0,
+                scope: None,
             },
             SavedBinding::Current {
                 media_id,
                 episode_offset,
+                scope,
             } => Self {
                 media_id,
                 episode_offset,
+                scope,
             },
         })
     }
@@ -99,6 +113,7 @@ impl From<i64> for LibraryBinding {
         Self {
             media_id,
             episode_offset: 0,
+            scope: None,
         }
     }
 }
@@ -111,21 +126,87 @@ pub fn get_bindings(db: &Db) -> Result<HashMap<String, LibraryBinding>> {
         .unwrap_or_default())
 }
 
+pub fn library_binding_folder(file: &str, roots: &[String]) -> Option<String> {
+    let file = local_path(file);
+    let folder = file.parent()?;
+    if !folder_binding_allowed(folder, &resolved_path(folder), roots) {
+        return None;
+    }
+    folder.to_str().map(str::to_owned)
+}
+
+fn folder_binding_allowed(folder: &Path, resolved: &Path, roots: &[String]) -> bool {
+    folder.parent().is_some()
+        && resolved.parent().is_some()
+        && !roots.iter().any(|root| {
+            let root = local_path(root);
+            path_starts_with(&root, folder) || path_starts_with(&resolved_path(&root), resolved)
+        })
+}
+
+pub fn bind_scoped_path(
+    db: &Db,
+    path: &str,
+    scope: LibraryBindingScope,
+    media_id: i64,
+    episode_offset: i64,
+) -> Result<()> {
+    store_binding(
+        db,
+        path,
+        LibraryBinding {
+            media_id,
+            episode_offset,
+            scope: Some(scope),
+        },
+    )
+}
+
+#[cfg(test)]
 pub fn bind_path(db: &Db, path: &str, media_id: i64, episode_offset: i64) -> Result<()> {
-    if !(-9999..=9999).contains(&episode_offset) {
+    store_binding(
+        db,
+        path,
+        LibraryBinding {
+            media_id,
+            episode_offset,
+            scope: None,
+        },
+    )
+}
+
+fn store_binding(db: &Db, path: &str, binding: LibraryBinding) -> Result<()> {
+    if !(-9999..=9999).contains(&binding.episode_offset) {
         return Err(anyhow!("episode offset must be between -9999 and 9999"));
     }
     let _guard = BINDINGS_LOCK.lock();
     let mut bindings = get_bindings(db)?;
-    let resolved = resolved_path(&local_path(path));
+    let _folders =
+        (binding.scope == Some(LibraryBindingScope::Folder)).then(|| FOLDERS_LOCK.lock());
+    let local = local_path(path);
+    let resolved = resolved_path(&local);
+    match binding.scope {
+        Some(LibraryBindingScope::File) if !resolved.is_file() => {
+            return Err(anyhow!(
+                "This file is no longer available. Rescan the Library and try again."
+            ));
+        }
+        Some(LibraryBindingScope::Folder) => {
+            if !resolved.is_dir() {
+                return Err(anyhow!(
+                    "This folder is no longer available. Rescan the Library and try again."
+                ));
+            }
+            if !folder_binding_allowed(&local, &resolved, &get_folders(db)?) {
+                return Err(anyhow!(
+                    "Choose a show folder inside the Library or link a single file."
+                ));
+            }
+        }
+        _ => {}
+    }
     bindings.retain(|saved, _| !same_path(&resolved_path(&local_path(saved)), &resolved));
-    bindings.insert(
-        path.to_string(),
-        LibraryBinding {
-            media_id,
-            episode_offset,
-        },
-    );
+    bindings.insert(path.to_string(), binding);
     db.set_setting(BINDINGS_KEY, &serde_json::to_string(&bindings)?)
 }
 
@@ -139,18 +220,30 @@ pub fn unbind_media(db: &Db, media_id: i64) -> Result<()> {
 pub fn binding_for_exact(db: &Db, path: &str) -> Result<Option<LibraryBinding>> {
     let local = local_path(path);
     let resolved = resolved_path(&local);
-    Ok(binding_paths(&get_bindings(db)?)
+    Ok(get_bindings(db)?
         .into_iter()
-        .filter(|(_, saved, _)| same_path(saved, &resolved))
-        .max_by_key(|(saved, _, _)| (local_path(saved) == local, std::cmp::Reverse(saved.clone())))
-        .map(|(_, _, id)| id))
+        .filter(|(saved, _)| same_path(&resolved_path(&local_path(saved)), &resolved))
+        .max_by_key(|(saved, _)| {
+            (
+                same_directory_entry(&local, &local_path(saved), resolved_path),
+                std::cmp::Reverse(saved.clone()),
+            )
+        })
+        .map(|(_, binding)| binding))
 }
 
-pub fn effective_binding(db: &Db, path: &str) -> Result<Option<LibraryBinding>> {
+pub fn effective_binding(
+    db: &Db,
+    path: &str,
+    matchers: &[Matcher],
+) -> Result<Option<LibraryBinding>> {
     Ok(bound_path_id(
         &binding_paths(&get_bindings(db)?),
         path,
-        |id| db.get_entry(id).ok().flatten().is_some(),
+        |id| {
+            matchers.iter().any(|matcher| matcher.media_id == id)
+                && db.get_entry(id).ok().flatten().is_some()
+        },
     ))
 }
 
@@ -181,6 +274,16 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn same_directory_entry(a: &Path, b: &Path, mut resolve: impl FnMut(&Path) -> PathBuf) -> bool {
+    same_path(a, b)
+        || a.file_name().is_some()
+            && a.file_name() == b.file_name()
+            && a.parent().zip(b.parent()).is_some_and(|(a, b)| {
+                let a = resolve(a);
+                same_path(&a, &resolve(b))
+            })
+}
+
 fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -191,6 +294,36 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     #[cfg(not(windows))]
     {
         path.starts_with(prefix)
+    }
+}
+
+fn is_direct_path(local: &Path, resolved: &Path) -> bool {
+    let is_direct = local == resolved || (local.is_relative() && resolved.ends_with(local));
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut local_parts = local.components();
+        let mut resolved_parts = resolved.components();
+        let device_prefix = match (local_parts.next(), resolved_parts.next()) {
+            (Some(Component::Prefix(a)), Some(Component::Prefix(b))) => {
+                match (a.kind(), b.kind()) {
+                    (Prefix::Disk(a), Prefix::VerbatimDisk(b)) => a.eq_ignore_ascii_case(&b),
+                    (Prefix::UNC(a, b), Prefix::VerbatimUNC(c, d)) => {
+                        os_str_eq_ignore_case(a, c) && os_str_eq_ignore_case(b, d)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        is_direct
+            || path_eq_ignore_case(local, resolved)
+            || (device_prefix
+                && path_eq_ignore_case(local_parts.as_path(), resolved_parts.as_path()))
+    }
+    #[cfg(not(windows))]
+    {
+        is_direct
     }
 }
 
@@ -361,6 +494,14 @@ fn case_variant_prefix<'a>(path: &'a Path, prefix: &Path) -> Option<&'a Path> {
 
 #[cfg(windows)]
 fn same_windows_file(a: &Path, b: &Path) -> Option<bool> {
+    Some(file_identity(a)? == file_identity(b)?)
+}
+
+#[cfg(windows)]
+pub(crate) type FileIdentity = (u64, [u8; 16]);
+
+#[cfg(windows)]
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
     use std::fs::{File, OpenOptions};
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -389,9 +530,26 @@ fn same_windows_file(a: &Path, b: &Path) -> Option<bool> {
     options
         .access_mode(FILE_READ_ATTRIBUTES.0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0);
-    let a = options.open(a).ok()?;
-    let b = options.open(b).ok()?;
-    Some(file_id(&a)? == file_id(&b)?)
+    let info = file_id(&options.open(path).ok()?)?;
+    Some((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+#[cfg(not(windows))]
+pub(crate) type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = path.metadata().ok()?;
+    metadata
+        .is_file()
+        .then_some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_identity(_: &Path) -> Option<FileIdentity> {
+    None
 }
 
 #[cfg(windows)]
@@ -426,7 +584,16 @@ fn local_path(path: &str) -> PathBuf {
 fn binding_paths(bindings: &std::collections::HashMap<String, LibraryBinding>) -> Vec<BindingPath> {
     bindings
         .iter()
-        .map(|(path, id)| (path.clone(), resolved_path(&local_path(path)), *id))
+        .filter_map(|(path, binding)| {
+            let resolved = resolved_path(&local_path(path));
+            let wrong_type = binding.scope.is_some_and(|scope| {
+                resolved.metadata().is_ok_and(|metadata| match scope {
+                    LibraryBindingScope::File => !metadata.is_file(),
+                    LibraryBindingScope::Folder => !metadata.is_dir(),
+                })
+            });
+            (!wrong_type).then(|| (path.clone(), resolved, *binding))
+        })
         .collect()
 }
 
@@ -449,27 +616,71 @@ fn bound_path_id(
     live: impl Fn(i64) -> bool,
 ) -> Option<LibraryBinding> {
     let resolved = resolved_path(&local_path(path));
-    bound_resolved_path_id(bindings, path, &resolved, live)
+    bound_resolved_path(bindings, path, &resolved, live, resolved_path).map(|binding| binding.2)
 }
 
-fn bound_resolved_path_id(
-    bindings: &[BindingPath],
+fn bound_resolved_path<'a>(
+    bindings: &'a [BindingPath],
     path: &str,
     resolved: &Path,
     live: impl Fn(i64) -> bool,
-) -> Option<LibraryBinding> {
+    mut resolve_parent: impl FnMut(&Path) -> PathBuf,
+) -> Option<&'a BindingPath> {
+    if bindings.is_empty() {
+        return None;
+    }
     let local = local_path(path);
-    bindings
-        .iter()
-        .filter(|(_, prefix, binding)| path_starts_with(resolved, prefix) && live(binding.media_id))
-        .max_by_key(|(source, prefix, _)| {
-            (
-                prefix.components().count(),
-                local.starts_with(local_path(source)),
-                std::cmp::Reverse(source.as_str()),
-            )
-        })
-        .map(|(_, _, id)| *id)
+    let best = |identity: &Path, exact: bool, ancestor: bool, resolve_parent: &mut _| {
+        bindings
+            .iter()
+            .filter(|(_, prefix, binding)| {
+                let matches = if binding.scope == Some(LibraryBindingScope::File) {
+                    !ancestor && same_path(identity, prefix)
+                } else if exact {
+                    same_path(identity, prefix)
+                } else {
+                    path_starts_with(identity, prefix)
+                };
+                matches && live(binding.media_id)
+            })
+            .max_by_key(|(source, prefix, _)| {
+                let source_path = local_path(source);
+                (
+                    prefix.components().count(),
+                    local.starts_with(&source_path)
+                        || exact
+                            && same_directory_entry(&local, &source_path, &mut *resolve_parent),
+                    std::cmp::Reverse(source.as_str()),
+                )
+            })
+    };
+    if local != resolved {
+        if let Some(binding) = best(resolved, true, false, &mut resolve_parent) {
+            return Some(binding);
+        }
+        let parents = local.ancestors().skip(1);
+        // After '..', earlier lexical parents may be outside the actual route.
+        let crossed_parent = parents.clone().find(|parent| parent.ends_with(".."));
+        let resolved_parent = crossed_parent.map(&mut resolve_parent);
+        let above = resolved_parent
+            .as_deref()
+            .filter(|parent| !parent.ends_with(".."))
+            .into_iter()
+            .flat_map(Path::ancestors);
+        for parent in parents
+            .take_while(|parent| Some(*parent) != crossed_parent)
+            .chain(above)
+        {
+            let identity = resolve_parent(parent);
+            if let Some(binding) = best(&identity, false, true, &mut resolve_parent) {
+                if !path_starts_with(resolved, &binding.1) {
+                    return Some(binding);
+                }
+                break;
+            }
+        }
+    }
+    best(resolved, false, false, &mut resolve_parent)
 }
 
 pub(crate) struct BindingPaths(Vec<BindingPath>);
@@ -484,7 +695,14 @@ impl BindingPaths {
         matchers: &'a [Matcher],
         path: &str,
     ) -> Option<(&'a Matcher, LibraryBinding)> {
-        match_bound_path(matchers, &self.0, path, &resolved_path(&local_path(path)))
+        match_bound_path(
+            matchers,
+            &self.0,
+            path,
+            &resolved_path(&local_path(path)),
+            resolved_path,
+        )
+        .map(|(matcher, binding)| (matcher, binding.2))
     }
 }
 
@@ -497,16 +715,21 @@ pub(crate) fn bound_match<'a>(
     BindingPaths::new(bindings).bound_match(matchers, path)
 }
 
-fn match_bound_path<'a>(
+fn match_bound_path<'a, 'b>(
     matchers: &'a [Matcher],
-    bindings: &[BindingPath],
+    bindings: &'b [BindingPath],
     path: &str,
     resolved: &Path,
-) -> Option<(&'a Matcher, LibraryBinding)> {
-    let binding = bound_resolved_path_id(bindings, path, resolved, |id| {
-        matchers.iter().any(|m| m.media_id == id)
-    })?;
-    let matched = matchers.iter().find(|m| m.media_id == binding.media_id)?;
+    resolve_parent: impl FnMut(&Path) -> PathBuf,
+) -> Option<(&'a Matcher, &'b BindingPath)> {
+    let binding = bound_resolved_path(
+        bindings,
+        path,
+        resolved,
+        |id| matchers.iter().any(|m| m.media_id == id),
+        resolve_parent,
+    )?;
+    let matched = matchers.iter().find(|m| m.media_id == binding.2.media_id)?;
     Some((matched, binding))
 }
 
@@ -541,13 +764,10 @@ pub(crate) fn resolve_bound_episode(
 
 struct CachedMatch {
     resolved: PathBuf,
-    // File identity can change while both case variants keep the same path.
-    #[cfg(windows)]
-    case_variant_binding: bool,
+    binding: Option<LibraryBinding>,
     media_id: Option<i64>,
     matched: Option<String>,
     episode: Option<i64>,
-    bound: bool,
 }
 
 #[derive(Default)]
@@ -591,67 +811,103 @@ impl ScanCache {
     }
 
     fn scan_paths(&mut self, folders: &[String], matchers: &[Matcher]) -> LibraryScan {
-        let mut paths = Vec::new();
+        let mut paths = HashMap::<String, bool>::new();
         let mut unreadable = Vec::new();
-        for folder in folders {
-            collect_videos(&local_path(folder), 0, &mut paths, &mut unreadable);
-        }
-        // Canonical paths deduplicate aliases and overlapping saved roots.
-        let mut seen = SeenPaths::default();
-        let mut paths: Vec<_> = paths
-            .into_iter()
-            .filter_map(|path| {
-                let resolved = resolved_path(Path::new(&path));
-                seen.insert(resolved.clone()).then_some((path, resolved))
+        let scopes: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|(_, _, binding)| matchers.iter().any(|m| m.media_id == binding.media_id))
+            .map(|(source, resolved, binding)| {
+                (local_path(source), resolved.as_path(), binding.scope)
             })
             .collect();
-        paths.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for folder in folders {
+            collect_videos(
+                &local_path(folder),
+                0,
+                &scopes,
+                |path, direct| *paths.entry(path).or_default() |= direct,
+                &mut unreadable,
+            );
+        }
 
-        let mut files = Vec::with_capacity(paths.len());
+        let mut candidates = Vec::with_capacity(paths.len());
         let mut retained = HashMap::with_capacity(paths.len());
-        for (path, resolved) in paths {
-            let cached = self.files.remove(&path).filter(|cached| {
-                #[cfg(windows)]
-                if cached.case_variant_binding {
-                    return false;
+        let mut parents = HashMap::<PathBuf, PathBuf>::new();
+        for (path, direct_from_root) in paths {
+            let local = Path::new(&path);
+            let resolved = resolved_path(local);
+            let direct = is_direct_path(local, &resolved);
+            let mut resolve_parent = |parent: &Path| {
+                if let Some(resolved) = parents.get(parent) {
+                    return resolved.clone();
                 }
-                cached.resolved == resolved
+                let resolved = resolved_path(parent);
+                parents.insert(parent.to_path_buf(), resolved.clone());
+                resolved
+            };
+            let bound = match_bound_path(
+                matchers,
+                &self.bindings,
+                &path,
+                &resolved,
+                &mut resolve_parent,
+            );
+            let binding = bound.map(|(_, binding)| binding.2);
+            let explicit = bound.is_some_and(|(_, (source, _, _))| {
+                same_directory_entry(local, &local_path(source), resolve_parent)
             });
+            let cached = self
+                .files
+                .remove(&path)
+                .filter(|cached| cached.resolved == resolved && cached.binding == binding);
             let recognized = cached.unwrap_or_else(|| {
                 #[cfg(test)]
                 {
                     self.recognized += 1;
                 }
                 let base = basename(&path);
-                let bound = match_bound_path(matchers, &self.bindings, &path, &resolved);
                 let matched = bound
                     .map(|(m, _)| m)
                     .or_else(|| match_title(matchers, "", &path));
-                let episode = matched.and_then(|m| {
-                    resolve_bound_episode(m, &[base.as_str()], bound.map(|(_, b)| b))
-                });
+                let episode =
+                    matched.and_then(|m| resolve_bound_episode(m, &[base.as_str()], binding));
                 CachedMatch {
-                    #[cfg(windows)]
-                    case_variant_binding: self
-                        .bindings
-                        .iter()
-                        .any(|(_, prefix, _)| case_variant_prefix(&resolved, prefix).is_some()),
                     resolved,
+                    binding,
                     media_id: matched.map(|m| m.media_id),
                     matched: matched.map(|m| m.display.clone()),
                     episode,
-                    bound: bound.is_some(),
                 }
             });
-            files.push(LibraryFile {
-                path: path.clone(),
-                media_id: recognized.media_id,
-                matched: recognized.matched.clone(),
-                episode: recognized.episode,
-                bound: recognized.bound,
-            });
+            let quality = (
+                binding.is_some(),
+                explicit,
+                recognized.episode.is_some(),
+                recognized.media_id.is_some(),
+                direct,
+                direct_from_root,
+            );
+            candidates.push((std::cmp::Reverse(quality), path.clone()));
             retained.insert(path, recognized);
         }
+        // Choose the most useful path to each file before sorting the display.
+        candidates.sort_unstable();
+        let mut seen = SeenPaths::default();
+        let mut files = Vec::with_capacity(candidates.len());
+        for (_, path) in candidates {
+            let recognized = &retained[&path];
+            if seen.insert(recognized.resolved.clone()) {
+                files.push(LibraryFile {
+                    path,
+                    media_id: recognized.media_id,
+                    matched: recognized.matched.clone(),
+                    episode: recognized.episode,
+                    bound: recognized.binding.is_some(),
+                });
+            }
+        }
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         self.files = retained;
         LibraryScan { files, unreadable }
     }
@@ -671,14 +927,28 @@ fn scan_paths(
 }
 
 fn collect_videos(
-    dir: &std::path::Path,
+    root: &Path,
     depth: usize,
-    out: &mut Vec<String>,
+    binding_scopes: &[(PathBuf, &Path, Option<LibraryBindingScope>)],
+    mut visit_video: impl FnMut(String, bool),
     unreadable: &mut Vec<UnreadableFolder>,
 ) {
-    let mut pending = std::collections::VecDeque::from([(dir.to_path_buf(), depth)]);
-    let mut visited = SeenPaths::default();
-    while let Some((dir, depth)) = pending.pop_front() {
+    let resolved_root = resolved_path(root);
+    let mut pending =
+        std::collections::VecDeque::from([(root.to_path_buf(), depth, Vec::new(), None)]);
+    let mut visited = HashMap::<_, SeenPaths>::new();
+    while let Some((dir, depth, mut ancestors, parent_scope)) = pending.pop_front() {
+        let resolved = if dir == root {
+            resolved_root.clone()
+        } else {
+            resolved_path(&dir)
+        };
+        if ancestors
+            .iter()
+            .any(|parent: &PathBuf| same_path(parent, &resolved))
+        {
+            continue;
+        }
         if depth > MAX_DEPTH {
             unreadable.push(UnreadableFolder {
                 path: dir.to_string_lossy().into_owned(),
@@ -686,9 +956,35 @@ fn collect_videos(
             });
             continue;
         }
-        if !visited.insert(resolved_path(&dir)) {
+        // A resolved ancestor's binding can apply even after a link leaves that folder.
+        let resolved_scope = binding_scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, path, scope))| {
+                *scope != Some(LibraryBindingScope::File) && path_starts_with(&resolved, path)
+            })
+            .max_by_key(|(_, (_, path, _))| path.components().count())
+            .map(|(index, _)| index)
+            .or(parent_scope);
+        let lexical_scope: Vec<_> = binding_scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, (source, _, _))| {
+                path_starts_with(&dir, source) || path_starts_with(source, &dir)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let direct = resolved
+            .strip_prefix(&resolved_root)
+            .is_ok_and(|relative| dir.strip_prefix(root).is_ok_and(|local| local == relative));
+        if !visited
+            .entry((lexical_scope, resolved_scope, direct))
+            .or_default()
+            .insert(resolved.clone())
+        {
             continue;
         }
+        ancestors.push(resolved);
         let read = match std::fs::read_dir(&dir) {
             Ok(read) => read,
             Err(error) => {
@@ -717,9 +1013,9 @@ fn collect_videos(
                 continue;
             }
             let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(kind) if !kind.is_symlink() => Ok(kind),
-                _ => followed_file_type(&path),
+            let (file_type, followed_link) = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => (Ok(kind), false),
+                _ => (followed_file_type(&path), true),
             };
             let file_type = match file_type {
                 Ok(kind) => kind,
@@ -732,7 +1028,7 @@ fn collect_videos(
                 }
             };
             if file_type.is_dir() {
-                pending.push_back((path, depth + 1));
+                pending.push_back((path, depth + 1, ancestors.clone(), resolved_scope));
             } else if file_type.is_file()
                 && path
                     .extension()
@@ -742,7 +1038,7 @@ fn collect_videos(
             {
                 // Lossy paths cannot be reopened reliably and may collide.
                 match path.to_str() {
-                    Some(p) => out.push(p.to_owned()),
+                    Some(p) => visit_video(p.to_owned(), direct && !followed_link),
                     None => log::warn!(
                         "library scan skipping non UTF-8 file: {}",
                         path.to_string_lossy()
@@ -821,7 +1117,7 @@ mod tests {
         let before = super::TRAVERSAL_METADATA_READS.get();
         let mut paths = Vec::new();
         let mut unreadable = Vec::new();
-        super::collect_videos(&dir, 0, &mut paths, &mut unreadable);
+        super::collect_videos(&dir, 0, &[], |path, _| paths.push(path), &mut unreadable);
         assert_eq!(
             paths,
             [
@@ -864,7 +1160,7 @@ mod tests {
         let before = super::TRAVERSAL_METADATA_READS.get();
         let mut paths = Vec::new();
         let mut unreadable = Vec::new();
-        super::collect_videos(&root, 0, &mut paths, &mut unreadable);
+        super::collect_videos(&root, 0, &[], |path, _| paths.push(path), &mut unreadable);
         assert_eq!(
             paths,
             ["a.MP4", "c.mkv/ep.MKV", "f-dir/ep02.mkv"].map(|path| root
@@ -890,7 +1186,7 @@ mod tests {
         let before = super::TRAVERSAL_METADATA_READS.get();
         let mut paths = Vec::new();
         let mut unreadable = Vec::new();
-        super::collect_videos(&dir, 0, &mut paths, &mut unreadable);
+        super::collect_videos(&dir, 0, &[], |path, _| paths.push(path), &mut unreadable);
         assert_eq!(paths.len(), 500);
         assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(unreadable.is_empty());
@@ -1011,6 +1307,437 @@ mod tests {
         assert!(!unlinked.bound);
         assert_eq!(unlinked.media_id, None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_keeps_recognized_episode_when_a_file_alias_is_added() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        seed_cached_show(&db, 6, "Another Show", 12, "CURRENT");
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let dir = cache_folder("recognized-alias");
+        let file = dir.join("Some Show - 03.mkv");
+        std::fs::write(&file, []).unwrap();
+        let folders = [dir.to_str().unwrap().into()];
+        let mut cache = super::ScanCache::default();
+        let first = cache.scan(&folders, &matchers, &HashMap::new());
+        assert_eq!(first.files[0].episode, Some(3));
+        std::os::unix::fs::symlink(&file, dir.join("A.mkv")).unwrap();
+        let second = cache.scan(&folders, &matchers, &HashMap::new());
+        let named_alias = dir.join("Another Show - 04.mkv");
+        std::os::unix::fs::symlink(&file, &named_alias).unwrap();
+        let third = cache.scan(&folders, &matchers, &HashMap::new());
+        super::bind_path(&db, named_alias.to_str().unwrap(), 6, -2).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let linked = cache.scan(&folders, &matchers, &bindings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        for scan in [second, third] {
+            assert_eq!(scan.files.len(), 1);
+            let found = &scan.files[0];
+            assert_eq!(
+                (
+                    found.path.as_str(),
+                    found.media_id,
+                    found.episode,
+                    found.bound
+                ),
+                (file.to_str().unwrap(), Some(5), Some(3), false)
+            );
+        }
+        assert_eq!(linked.files.len(), 1);
+        let found = &linked.files[0];
+        assert_eq!(
+            (
+                found.path.as_str(),
+                found.media_id,
+                found.episode,
+                found.bound
+            ),
+            (named_alias.to_str().unwrap(), Some(6), Some(2), true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_directory_alias_does_not_replace_the_canonical_scan_path() {
+        use std::os::unix::fs::symlink;
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let dir = cache_folder("implicit-directory-alias");
+        let root = dir.join("root");
+        let root_alias = dir.join("root-alias");
+        let real = root.join("shows/season");
+        std::fs::create_dir_all(&real).unwrap();
+        let file = real.join("Some Show - 03.mkv");
+        std::fs::write(&file, []).unwrap();
+        symlink(&root, &root_alias).unwrap();
+        let alias = root.join("alias");
+        let scans = [&root, &root_alias].map(|folder| {
+            let folders = [folder.to_str().unwrap().into()];
+            let mut cache = super::ScanCache::default();
+            let before = cache.scan(&folders, &matchers, &HashMap::new());
+            symlink(&real, &alias).unwrap();
+            let after = cache.scan(&folders, &matchers, &HashMap::new());
+            std::fs::remove_file(&alias).unwrap();
+            (
+                folder.join(file.strip_prefix(&root).unwrap()),
+                [before, after],
+            )
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (expected, scans) in scans {
+            for scan in scans {
+                assert_eq!(scan.files.len(), 1);
+                assert_eq!(scan.files[0].path, expected.to_str().unwrap());
+                assert_eq!(scan.files[0].episode, Some(3));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_file_alias_keeps_its_unnumbered_release() {
+        use std::os::unix::fs::symlink;
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let dir = cache_folder("explicit-unnumbered-alias");
+        let file = dir.join("Some Show - 03.mkv");
+        let alias = dir.join("Some Show - NCOP 01.mkv");
+        std::fs::write(&file, []).unwrap();
+        symlink(&file, &alias).unwrap();
+        super::bind_path(&db, alias.to_str().unwrap(), 5, 0).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let scan = scan_paths(&[dir.to_str().unwrap().into()], &matchers, &bindings);
+        let url = reqwest::Url::from_file_path(&alias).unwrap();
+        let (matched, binding) = super::bound_match(&matchers, &bindings, url.as_str()).unwrap();
+        let playback_episode = super::resolve_bound_episode(
+            matched,
+            &[&crate::recognize::basename(url.as_str())],
+            Some(binding),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(playback_episode, None);
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].path, alias.to_str().unwrap());
+        assert_eq!(scan.files[0].media_id, Some(5));
+        assert_eq!(scan.files[0].episode, playback_episode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_file_numbering_survives_an_aliased_scan_root() {
+        use std::os::unix::fs::symlink;
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        seed_cached_show(&db, 6, "Another Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let dir = cache_folder("explicit-file-through-root-alias");
+        let root = dir.join("root");
+        let root_alias = dir.join("root-alias");
+        std::fs::create_dir(&root).unwrap();
+        symlink(&root, &root_alias).unwrap();
+        let file = root.join("Episode 13.mkv");
+        let alias = root.join("Episode 14.mkv");
+        std::fs::write(&file, []).unwrap();
+        symlink(&file, &alias).unwrap();
+        super::bind_path(&db, alias.to_str().unwrap(), 5, -12).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+
+        let path = root_alias.join(alias.file_name().unwrap());
+        let url = reqwest::Url::from_file_path(&path).unwrap();
+        let (matched, binding) = super::bound_match(&matchers, &bindings, url.as_str()).unwrap();
+        let playback_episode = super::resolve_bound_episode(
+            matched,
+            &[&crate::recognize::basename(url.as_str())],
+            Some(binding),
+        );
+        let scan = scan_paths(&[root_alias.to_str().unwrap().into()], &matchers, &bindings);
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].path, path.to_str().unwrap());
+        assert_eq!(scan.files[0].episode, Some(2));
+        assert_eq!(scan.files[0].episode, playback_episode);
+
+        let other = root.join("A.mkv");
+        std::fs::write(&other, []).unwrap();
+        super::bind_path(&db, other.to_str().unwrap(), 6, -11).unwrap();
+        std::fs::remove_file(&other).unwrap();
+        symlink(&file, &other).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let exact = super::binding_for_exact(&db, url.as_str()).unwrap();
+        let effective = super::effective_binding(&db, url.as_str(), &matchers).unwrap();
+        let playback = super::bound_match(&matchers, &bindings, url.as_str()).map(|(_, b)| b);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(exact, Some(binding));
+        assert_eq!(effective, exact);
+        assert_eq!(playback, exact);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_folder_link_keeps_the_more_specific_target_binding() {
+        use std::os::unix::fs::symlink;
+        let dir = cache_folder("specific-target-binding");
+        let season = dir.join("season");
+        std::fs::create_dir(&season).unwrap();
+        let file = season.join("Episode 13.mkv");
+        let alias = dir.join("Episode 13.mkv");
+        std::fs::write(&file, []).unwrap();
+        symlink(&file, &alias).unwrap();
+        let bindings = HashMap::from([
+            (dir.to_str().unwrap().into(), 1),
+            (season.to_str().unwrap().into(), 2),
+        ]);
+        let binding = bound_live(&bindings, alias.to_str().unwrap(), |_| true);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(binding, Some(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_binding_covers_outbound_file_links_for_library_and_playback() {
+        use super::LibraryBindingScope::{File, Folder};
+        use std::os::unix::fs::symlink;
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        seed_cached_show(&db, 6, "Another Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let dir = cache_folder("outbound-alias");
+        let folder = dir.join("show");
+        std::fs::create_dir(&folder).unwrap();
+        let target = dir.join("outside.mkv");
+        let linked = folder.join("Episode 13.mkv");
+        let regular = folder.join("Episode 14.mkv");
+        std::fs::write(&target, []).unwrap();
+        std::fs::write(&regular, []).unwrap();
+        symlink(&target, &linked).unwrap();
+        let directory_alias = dir.join("alias");
+        symlink(&folder, &directory_alias).unwrap();
+        symlink(&folder, folder.join("loop")).unwrap();
+        let url = reqwest::Url::from_directory_path(&directory_alias).unwrap();
+        super::bind_scoped_path(&db, url.as_str(), Folder, 5, -12).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let scan = scan_paths(&[folder.to_str().unwrap().into()], &matchers, &bindings);
+        let url = reqwest::Url::from_file_path(directory_alias.join("Episode 13.mkv")).unwrap();
+        let playback =
+            super::bound_match(&matchers, &bindings, url.as_str()).map(|(matched, binding)| {
+                (
+                    matched.media_id,
+                    super::resolve_bound_episode(matched, &["Episode 13.mkv"], Some(binding)),
+                )
+            });
+        let details = super::effective_binding(&db, linked.to_str().unwrap(), &matchers).unwrap();
+        let nested = folder.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let dotted = nested.join("../Episode 13.mkv");
+        let dotted_details =
+            super::effective_binding(&db, dotted.to_str().unwrap(), &matchers).unwrap();
+        let outside = super::effective_binding(&db, target.to_str().unwrap(), &matchers).unwrap();
+        let outside_alias = dir.join("unbound.mkv");
+        symlink(&target, &outside_alias).unwrap();
+        let dotted_outside = folder.join("../unbound.mkv");
+        let dotted_outside_binding =
+            super::effective_binding(&db, dotted_outside.to_str().unwrap(), &matchers).unwrap();
+        super::bind_scoped_path(&db, linked.to_str().unwrap(), File, 6, -11).unwrap();
+        let override_binding = super::effective_binding(&db, url.as_str(), &matchers).unwrap();
+        let exact_target =
+            super::effective_binding(&db, target.to_str().unwrap(), &matchers).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(
+            scan.files
+                .iter()
+                .map(|f| (f.media_id, f.episode, f.bound))
+                .collect::<Vec<_>>(),
+            [(Some(5), Some(1), true), (Some(5), Some(2), true)]
+        );
+        assert_eq!(playback, Some((5, Some(1))));
+        assert_eq!(dotted_details, details);
+        assert_eq!(
+            details,
+            Some(super::LibraryBinding {
+                media_id: 5,
+                episode_offset: -12,
+                scope: Some(Folder),
+            })
+        );
+        assert_eq!(outside, None);
+        assert_eq!(dotted_outside_binding, None);
+        assert_eq!(
+            override_binding,
+            Some(super::LibraryBinding {
+                media_id: 6,
+                episode_offset: -11,
+                scope: Some(File),
+            })
+        );
+        assert_eq!(exact_target, override_binding);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_alias_keeps_its_linked_scope_without_revisiting_cycles() {
+        use std::os::unix::fs::symlink;
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let dir = cache_folder("aliased-directory-scope");
+        let archive = dir.join("A-Archive");
+        let show = dir.join("Z-Show");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::create_dir(&show).unwrap();
+        std::fs::write(archive.join("Episode 13.mkv"), []).unwrap();
+        symlink(&archive, show.join("Season")).unwrap();
+        symlink(&show, archive.join("loop")).unwrap();
+        super::bind_path(&db, show.to_str().unwrap(), 5, -12).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let scan = scan_paths(&[dir.to_str().unwrap().into()], &matchers, &bindings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files.len(), 1);
+        let file = &scan.files[0];
+        assert_eq!(
+            file.path,
+            show.join("Season/Episode 13.mkv").to_str().unwrap()
+        );
+        assert_eq!(
+            (file.media_id, file.episode, file.bound),
+            (Some(5), Some(1), true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_keeps_the_route_bound_through_a_different_directory_alias() {
+        use std::os::unix::fs::symlink;
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let dir = cache_folder("resolved-directory-scope");
+        let root = dir.join("library");
+        let first = root.join("a");
+        let bound = root.join("b");
+        let target = dir.join("target");
+        for folder in [&first, &bound, &target] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::write(target.join("Episode 13.mkv"), []).unwrap();
+        symlink(&target, first.join("linked")).unwrap();
+        symlink(&target, bound.join("linked")).unwrap();
+        symlink(&root, target.join("loop")).unwrap();
+        let binding_alias = dir.join("binding-alias");
+        symlink(&bound, &binding_alias).unwrap();
+        super::bind_path(&db, binding_alias.to_str().unwrap(), 5, -12).unwrap();
+
+        let bindings = super::get_bindings(&db).unwrap();
+        let scan = scan_paths(&[root.to_str().unwrap().into()], &matchers, &bindings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files.len(), 1);
+        let file = &scan.files[0];
+        assert_eq!(
+            file.path,
+            bound.join("linked/Episode 13.mkv").to_str().unwrap()
+        );
+        assert_eq!(
+            (file.media_id, file.episode, file.bound),
+            (Some(5), Some(1), true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_keeps_the_route_entering_a_subfolder_of_a_bound_directory() {
+        use std::os::unix::fs::symlink;
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
+        let dir = cache_folder("bound-subfolder-route");
+        let root = dir.join("library");
+        let unbound = dir.join("unbound");
+        let bound = dir.join("bound");
+        let season = bound.join("season");
+        let target = dir.join("target");
+        for folder in [&root, &unbound, &season, &target] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        symlink(&unbound, root.join("a")).unwrap();
+        symlink(&season, root.join("b")).unwrap();
+        symlink(&target, unbound.join("linked")).unwrap();
+        symlink(&target, season.join("linked")).unwrap();
+        symlink(&root, target.join("loop")).unwrap();
+        std::fs::write(target.join("Episode 13.mkv"), []).unwrap();
+        super::bind_path(&db, bound.to_str().unwrap(), 5, -12).unwrap();
+
+        let path = root.join("b/linked/Episode 13.mkv");
+        let url = reqwest::Url::from_file_path(&path).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let playback =
+            super::bound_match(&matchers, &bindings, url.as_str()).map(|(matched, binding)| {
+                (
+                    matched.media_id,
+                    super::resolve_bound_episode(matched, &["Episode 13"], Some(binding)),
+                )
+            });
+        let details = super::effective_binding(&db, path.to_str().unwrap(), &matchers).unwrap();
+        let scan = scan_paths(&[root.to_str().unwrap().into()], &matchers, &bindings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files.len(), 1);
+        let file = &scan.files[0];
+        assert_eq!(file.path, path.to_str().unwrap());
+        assert_eq!(
+            (file.media_id, file.episode, file.bound),
+            (Some(5), Some(1), true)
+        );
+        assert_eq!(playback, Some((5, Some(1))));
+        assert_eq!(
+            details,
+            Some(super::LibraryBinding {
+                media_id: 5,
+                episode_offset: -12,
+                scope: None,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_cache_refreshes_folder_scope_when_the_file_target_stays_the_same() {
+        use std::os::unix::fs::symlink;
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_cached_show(&db, 5, "Some Show", 12, "CURRENT");
+        let matchers = std::sync::Arc::new(crate::recognize::build_matchers(&db));
+        let dir = cache_folder("aliased-directory-retarget");
+        let target = dir.join("video.mkv");
+        let linked = dir.join("linked");
+        let other = dir.join("other");
+        let alias = dir.join("alias");
+        std::fs::write(&target, []).unwrap();
+        for folder in [&linked, &other] {
+            std::fs::create_dir(folder).unwrap();
+            symlink(&target, folder.join("Episode 13.mkv")).unwrap();
+        }
+        symlink(&linked, &alias).unwrap();
+        super::bind_path(&db, linked.to_str().unwrap(), 5, -12).unwrap();
+        let bindings = super::get_bindings(&db).unwrap();
+        let folders = [alias.to_str().unwrap().into()];
+        let mut cache = super::ScanCache::default();
+        let before = cache.scan(&folders, &matchers, &bindings);
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        let after = cache.scan(&folders, &matchers, &bindings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(before.files.len(), 1);
+        assert_eq!(after.files.len(), 1);
+        assert_eq!(before.files[0].path, after.files[0].path);
+        assert_eq!(before.files[0].episode, Some(1));
+        assert_eq!(after.files[0].media_id, None);
     }
 
     #[cfg(unix)]
@@ -1265,18 +1992,14 @@ mod tests {
     #[test]
     fn numbering_details_preserve_inherited_offsets_and_file_overrides() {
         let db = Db::open(std::path::Path::new(":memory:")).unwrap();
-        db.upsert_entry(&crate::models::ListEntry {
-            media_id: 1,
-            status: "CURRENT".into(),
-            ..Default::default()
-        })
-        .unwrap();
+        seed_cached_show(&db, 1, "Some Show", 12, "CURRENT");
+        let matchers = crate::recognize::build_matchers(&db);
         let root = std::env::temp_dir().join("kurisu-inherited-numbering");
         let folder = root.join("season");
         let file = folder.join("episode13.mkv");
         super::bind_path(&db, root.to_str().unwrap(), 1, -12).unwrap();
         assert_eq!(
-            super::effective_binding(&db, file.to_str().unwrap())
+            super::effective_binding(&db, file.to_str().unwrap(), &matchers)
                 .unwrap()
                 .unwrap()
                 .episode_offset,
@@ -1284,7 +2007,7 @@ mod tests {
         );
         super::bind_path(&db, folder.to_str().unwrap(), 1, -24).unwrap();
         assert_eq!(
-            super::effective_binding(&db, file.to_str().unwrap())
+            super::effective_binding(&db, file.to_str().unwrap(), &matchers)
                 .unwrap()
                 .unwrap()
                 .episode_offset,
@@ -1293,7 +2016,7 @@ mod tests {
         super::bind_path(&db, file.to_str().unwrap(), 1, -36).unwrap();
         let url = reqwest::Url::from_file_path(&file).unwrap();
         assert_eq!(
-            super::effective_binding(&db, url.as_str())
+            super::effective_binding(&db, url.as_str(), &matchers)
                 .unwrap()
                 .unwrap()
                 .episode_offset,
@@ -1301,7 +2024,7 @@ mod tests {
         );
         db.delete_entry(1).unwrap();
         assert_eq!(
-            super::effective_binding(&db, file.to_str().unwrap()).unwrap(),
+            super::effective_binding(&db, file.to_str().unwrap(), &matchers).unwrap(),
             None
         );
     }
@@ -1367,6 +2090,7 @@ mod tests {
         let binding = super::LibraryBinding {
             media_id: 1,
             episode_offset: -85,
+            scope: None,
         };
         assert_eq!(
             super::resolve_bound_episode(matched, &["86 - 86"], Some(binding)),
@@ -1460,6 +2184,7 @@ mod tests {
         let binding = Some(super::LibraryBinding {
             media_id: 1,
             episode_offset: -12,
+            scope: None,
         });
         for filename in ["Some Show - 13.mkv", "ep13.mkv"] {
             assert_eq!(
@@ -1676,7 +2401,7 @@ mod tests {
                     .unwrap();
                 assert!(super::get_bindings(&db).is_err());
                 assert!(super::binding_for_exact(&db, "/anime").is_err());
-                assert!(super::effective_binding(&db, "/anime").is_err());
+                assert!(super::effective_binding(&db, "/anime", &[]).is_err());
                 let result = if bind {
                     super::bind_path(&db, "/anime", 1, 0)
                 } else {
@@ -1924,7 +2649,12 @@ mod tests {
                 );
             }
             assert_eq!(
-                super::effective_binding(&db, missing.to_str().unwrap()).unwrap(),
+                super::effective_binding(
+                    &db,
+                    missing.to_str().unwrap(),
+                    &crate::recognize::build_matchers(&db)
+                )
+                .unwrap(),
                 Some(1.into())
             );
             add_folder(&db, folder.to_str().unwrap()).unwrap();
@@ -2099,7 +2829,7 @@ mod tests {
         std::fs::write(dir.join("ep05.mkv"), []).unwrap();
         std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
         let mut paths = Vec::new();
-        super::collect_videos(&dir, 0, &mut paths, &mut Vec::new());
+        super::collect_videos(&dir, 0, &[], |path, _| paths.push(path), &mut Vec::new());
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
             paths,

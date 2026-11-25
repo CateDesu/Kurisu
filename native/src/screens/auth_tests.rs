@@ -345,7 +345,7 @@ fn queued_list_preferences_cannot_follow_account_replacement(cx: &mut TestAppCon
         assert_eq!(w.preference_active, Some("kurisu.list.filter"));
         w.stage_query(Some("old search".into()));
         w.persist_preference("kurisu.list.synced", Some("123".into()), window, cx);
-        w.persist_preference("kurisu.list.sort", Some("title".into()), window, cx);
+        w.select_sort(SortKey::Title, window, cx);
         w.request_close(CloseIntent::Quit, window, cx);
         assert!(!w.close_ready);
     });
@@ -429,62 +429,13 @@ fn failed_confirmed_logout_cancels_quit(cx: &mut TestAppContext) {
 
 #[cfg(feature = "fixture-runtime")]
 fn serve_viewer_for_auth_child(child_flag: &str, test_name: &str) {
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
-    use std::process::{Command, Stdio};
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
-        .env(child_flag, "1")
-        .env(
-            "KURISU_FIXTURE_GRAPHQL",
-            format!("http://{}", listener.local_addr().unwrap()),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        while child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "auth child timed out");
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(e) => panic!("{e}"),
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut length = None;
-            let mut auth = String::new();
-            loop {
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((key, value)) = line.split_once(':') {
-                    if key.eq_ignore_ascii_case("content-length") {
-                        length = Some(value.trim().parse::<usize>().unwrap());
-                    } else if key.eq_ignore_ascii_case("authorization") {
-                        auth = value.trim().to_owned();
-                    }
-                }
-            }
-            let mut bytes = vec![0; length.unwrap()];
-            reader.read_exact(&mut bytes).unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    super::super::fixture_server::serve(
+        test_name,
+        child_flag,
+        "KURISU_FIXTURE_GRAPHQL",
+        |mut http, _| {
+            let request = http.json();
+            let auth = &http.authorization;
             let query = request["query"].as_str().unwrap();
             let viewer = query.contains("Viewer") && !query.contains("unreadNotificationCount");
             let id = if auth.contains("second-session") {
@@ -505,32 +456,14 @@ fn serve_viewer_for_auth_child(child_flag: &str, test_name: &str) {
             } else {
                 (
                     200,
-                    serde_json::json!({"data":{"MediaListCollection":{"lists":[]},"Page":{"pageInfo":{"hasNextPage":false},"media":[],"notifications":[]},"Viewer":{"unreadNotificationCount":0}}}),
+                    serde_json::json!({"data":{"MediaListCollection":{"lists":[]},"Page":{"pageInfo":{"currentPage":1,"hasNextPage":false},"media":[],"notifications":[]},"Viewer":{"unreadNotificationCount":0}}}),
                 )
             };
-            let body = body.to_string();
-            let result = write!(
-                stream,
-                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            let result = http.reply_json(status, body);
             if viewer {
                 result.unwrap();
             }
-        }
-    }));
-    if served.is_err() {
-        let _ = child.kill();
-    }
-    let output = child.wait_with_output().unwrap();
-    if let Err(error) = served {
-        std::panic::resume_unwind(error);
-    }
-    assert!(
-        output.status.success(),
-        "auth child failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        },
     );
 }
 
@@ -541,7 +474,7 @@ fn signed_out_restart_clears_list_preferences_for_replacement_and_blocks_logout_
     #[cfg(feature = "fixture-runtime")]
     {
         const CHILD: &str = "KURISU_AUTH_SIGNED_OUT_RESTART_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if super::super::fixture_server::child_gate(CHILD).is_none() {
             serve_viewer_for_auth_child(
                 CHILD,
                 "screens::workspace_tests::auth_tests::signed_out_restart_clears_list_preferences_for_replacement_and_blocks_logout_edits",
@@ -712,7 +645,7 @@ fn signed_out_restart_clears_list_preferences_for_replacement_and_blocks_logout_
 #[gpui::test]
 fn mixed_list_owner_and_saved_account_resets_concurrent_preference_read(cx: &mut TestAppContext) {
     const CHILD: &str = "KURISU_AUTH_MIXED_OWNER_CHILD";
-    if std::env::var_os(CHILD).is_none() {
+    if super::super::fixture_server::child_gate(CHILD).is_none() {
         serve_viewer_for_auth_child(
             CHILD,
             "screens::workspace_tests::auth_tests::mixed_list_owner_and_saved_account_resets_concurrent_preference_read",

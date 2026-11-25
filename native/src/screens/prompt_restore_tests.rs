@@ -1,7 +1,5 @@
+use super::super::fixture_server::{child_gate, serve};
 use super::*;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::process::{Command, Stdio};
 
 #[path = "auth_recovery_tests.rs"]
 mod auth_recovery_tests;
@@ -148,124 +146,111 @@ fn restored_prompt(cx: &mut TestAppContext, mode: &str) {
     settle(cx, &runtime);
 }
 
-// The parent serves loopback requests while the child runs the selected test.
 pub(in crate::screens) fn fixture_server(mode: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("KURISU_PROMPT_RESTORE_GATE") {
-        let gate = PathBuf::from(path);
-        std::fs::write(gate.with_extension("entered"), []).unwrap();
+    const CHILD: &str = "KURISU_PROMPT_RESTORE_GATE";
+    if let Some(gate) = child_gate(CHILD) {
         return Some(gate);
     }
     let thread = std::thread::current();
     let test_name = thread.name().expect("named test thread");
-    let dir = FixtureDir(std::env::temp_dir().join(format!(
-            "kurisu-prompt-gate-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
-    std::fs::create_dir(&dir.0).unwrap();
-    let gate = dir.0.join("viewer");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
-        .env("KURISU_PROMPT_RESTORE_GATE", &gate)
-        .env(
-            "KURISU_FIXTURE_GRAPHQL",
-            format!("http://{}", listener.local_addr().unwrap()),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        'serve: while child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "prompt child timed out");
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(e) => panic!("{e}"),
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut length = None;
-            let mut rejected_login = false;
-            let mut replacement_login = false;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    continue 'serve;
-                }
-                if line == "\r\n" {
-                    break;
-                }
-                rejected_login |=
-                    line.eq_ignore_ascii_case("authorization: Bearer rejected-fixture-token\r\n");
-                replacement_login |= line
-                    .eq_ignore_ascii_case("authorization: Bearer replacement-fixture-token\r\n");
-                if let Some((key, value)) = line.split_once(':')
-                    && key.eq_ignore_ascii_case("content-length")
-                {
-                    length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let mut bytes = vec![0; length.unwrap()];
-            reader.read_exact(&mut bytes).unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut progress = match mode {
+        "progress-completed" => 12,
+        "progress-review" => 6,
+        _ => 2,
+    };
+    let episodes = if mode == "progress-short" { 3 } else { 12 };
+    let mut progress_status = if mode == "progress-completed" {
+        "COMPLETED".to_string()
+    } else {
+        "CURRENT".to_string()
+    };
+    serve(
+        test_name,
+        CHILD,
+        "KURISU_FIXTURE_GRAPHQL",
+        |mut http, child| {
+            let request = http.json();
+            let rejected_login = http
+                .authorization
+                .eq_ignore_ascii_case("Bearer rejected-fixture-token");
+            let replacement_login = http
+                .authorization
+                .eq_ignore_ascii_case("Bearer replacement-fixture-token");
             let query = request["query"].as_str().unwrap();
             let viewer = query.contains("Viewer") && !query.contains("unreadNotificationCount");
-            let offline = viewer && mode == "reconnect" && !gate.exists();
+            let offline = viewer && mode == "reconnect" && !child.gate.exists();
             let body = if offline {
                 serde_json::json!({"errors":[{"message":"Unavailable","status":503}]})
             } else if viewer {
-                if !matches!(mode, "route" | "progress" | "reconnect") {
-                    std::fs::write(gate.with_extension("started"), "started").unwrap();
-                    while !gate.exists() {
-                        assert!(Instant::now() < deadline, "Viewer gate timed out");
-                        assert!(child.try_wait().unwrap().is_none(), "child exited before consuming the subscription");
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
+                if !matches!(mode, "route" | "calendar-range" | "reconnect")
+                    && !mode.starts_with("progress")
+                {
+                    std::fs::write(child.gate.with_extension("started"), "started").unwrap();
+                    child.wait_for_gate();
                 }
                 if mode == "expired" || rejected_login {
                     serde_json::json!({"errors":[{"message":"Invalid token", "status":401}]})
                 } else {
                     serde_json::json!({"data":{"Viewer":{"id":if replacement_login || matches!(mode, "other_account" | "quit-login" | "quit-restore" | "quit-restore-barrier") {9} else {7},"name":"Saved","mediaListOptions":{"scoreFormat":"POINT_5"}}}})
                 }
-            } else if mode == "route" {
+            } else if matches!(mode, "route" | "calendar-range") {
                 let media = serde_json::json!({
                     "id":42,"isAdult":false,"idMal":null,"title":{"romaji":"Fixture show","english":null,"native":null},
                     "coverImage":null,"episodes":null,"format":null,"status":null,"averageScore":null,
                     "season":null,"seasonYear":null,"description":null,"nextAiringEpisode":null
                 });
                 let at = request["variables"]["startExclusive"].as_i64().unwrap_or(0) + 1;
-                serde_json::json!({"data":{"Page":{"pageInfo":{"hasNextPage":false},
-                    "airingSchedules":[{"airingAt":at,"episode":3,"media":media}],"media":[media],
+                let response = (mode == "calendar-range" && query.contains("airingSchedules"))
+                    .then(|| std::fs::read_to_string(child.gate.with_extension("calendar")).ok())
+                    .flatten();
+                let page = if response.is_some() {
+                    request["variables"]["page"].as_i64().unwrap()
+                } else {
+                    1
+                };
+                let more = page == 1 && matches!(response.as_deref(), Some("overlap" | "repeated"));
+                let row = serde_json::json!({"airingAt":at,"episode":3,"media":media});
+                let schedules = match response.as_deref() {
+                    Some("unavailable") => serde_json::Value::Null,
+                    Some("empty") => serde_json::json!([]),
+                    Some("overlap") if page == 2 => serde_json::json!([
+                        row, {"airingAt":at + 60,"episode":4,"media":media}
+                    ]),
+                    Some("repeated") => serde_json::json!([
+                        {"airingAt":at + 120,"episode":5,"media":media}
+                    ]),
+                    _ => serde_json::json!([row]),
+                };
+                serde_json::json!({"data":{"Page":{"pageInfo":{"currentPage":page,"hasNextPage":more},
+                    "airingSchedules":schedules,"media":[media],
                     "notifications":[]},"Viewer":{"unreadNotificationCount":0},"MediaListCollection":{"lists":[]}}})
+            } else if mode.starts_with("progress")
+                && query.contains("mediaListEntry")
+                && request["variables"]["mediaId"] == 9
+            {
+                serde_json::json!({"data":{"Media":{"id":9,"episodes":episodes,"mediaListEntry":{
+                    "id":90,"mediaId":9,"status":progress_status,"progress":progress,
+                    "score":0.0,"repeat":0,"updatedAt":1
+                }}}})
             } else if query.contains("SaveMediaListEntry") {
+                if let Some(value) = request["variables"]["progress"].as_i64() {
+                    progress = value;
+                }
+                if let Some(value) = request["variables"]["status"].as_str() {
+                    progress_status = value.into();
+                }
                 serde_json::json!({"data":{"SaveMediaListEntry":{
                     "id": 90,
                     "mediaId": 9,
-                    "status": request["variables"]["status"].as_str().unwrap_or("CURRENT"),
-                    "progress": request["variables"]["progress"],
+                    "status": progress_status,
+                    "progress": progress,
                     "score": 0.0,
                     "repeat": 0,
                     "updatedAt": 1
                 }}})
             } else {
-                serde_json::json!({"data":{"Page":{"pageInfo":{"hasNextPage":false},"media":[],"airingSchedules":[],"notifications":[]},"MediaListCollection":{"lists":[]},"Viewer":{"unreadNotificationCount":0}}})
-            }.to_string();
+                serde_json::json!({"data":{"Page":{"pageInfo":{"currentPage":1,"hasNextPage":false},"media":[],"airingSchedules":[],"notifications":[]},"MediaListCollection":{"lists":[]},"Viewer":{"unreadNotificationCount":0}}})
+            };
             let status = if offline {
                 503
             } else if viewer && (mode == "expired" || rejected_login) {
@@ -273,47 +258,24 @@ pub(in crate::screens) fn fixture_server(mode: &str) -> Option<PathBuf> {
             } else {
                 200
             };
-            write!(stream,"HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())
-                .unwrap_or_else(|error| {
-                    if (!viewer || mode.starts_with("quit-"))
-                        && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted)
-                    {
-                        return;
-                    }
-                    let phase = if viewer { "Viewer" } else { "background" };
-                    panic!("writing {phase} response: {error}");
-                });
+            http.reply_json(status, body).unwrap_or_else(|error| {
+                if (!viewer || mode.starts_with("quit-"))
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    )
+                {
+                    return;
+                }
+                let phase = if viewer { "Viewer" } else { "background" };
+                panic!("writing {phase} response: {error}");
+            });
             if viewer {
-                std::fs::write(gate.with_extension("responded"), "responded").unwrap();
+                std::fs::write(child.gate.with_extension("responded"), "responded").unwrap();
             }
-        }
-    }));
-    if let Err(error) = result {
-        let status_before_cleanup = child.try_wait();
-        let kill = if matches!(status_before_cleanup, Ok(Some(_))) {
-            None
-        } else {
-            Some(child.kill())
-        };
-        let output = child.wait_with_output().unwrap();
-        eprintln!(
-            "prompt child before cleanup: {status_before_cleanup:?}; kill: {kill:?}; collected status: {}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        std::panic::resume_unwind(error);
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "prompt child failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        gate.with_extension("entered").is_file(),
-        "child skipped {test_name}"
+        },
     );
     None
 }
@@ -509,7 +471,9 @@ quit_case!(
     "quit-restore-barrier"
 );
 
-fn signed_in_fixture(entry: Option<&ListEntry>) -> (Core, tokio::runtime::Runtime, User) {
+pub(in crate::screens) fn signed_in_fixture(
+    entry: Option<&ListEntry>,
+) -> (Core, tokio::runtime::Runtime, User) {
     let db = kurisu_core::Db::open(Path::new(":memory:")).unwrap();
     let user = User {
         id: 7,
@@ -733,7 +697,7 @@ fn unrelated_editor_keeps_discovery_write_blocked_until_completion(tc: &mut Test
             id: 10,
             ..Default::default()
         };
-        w.change_discovery_status(media.clone(), "PLANNING", Route::Search, win, cx);
+        w.change_discovery_status(media.clone(), None, "PLANNING", Route::Search, win, cx);
         assert!(w.discovery_status_blocked(10));
         w.open_editor(9, win, cx);
         assert!(w.editor.is_some());
@@ -741,7 +705,7 @@ fn unrelated_editor_keeps_discovery_write_blocked_until_completion(tc: &mut Test
         w.close_editor(cx);
         assert!(w.editor.is_none());
         assert!(w.discovery_status_blocked(10));
-        w.change_discovery_status(media, "PLANNING", Route::Search, win, cx);
+        w.change_discovery_status(media, None, "PLANNING", Route::Search, win, cx);
         assert_eq!(w.active_writes, 1);
     });
     drop(gate);
@@ -755,7 +719,7 @@ fn unrelated_editor_keeps_discovery_write_blocked_until_completion(tc: &mut Test
 fn queued_accessibility_clicks_cannot_act_on_replacement_tracking_prompt(tc: &mut TestAppContext) {
     use gpui::accesskit::{Action, ActionRequest, TreeId, TreeUpdate};
 
-    if fixture_server("progress").is_none() {
+    if fixture_server("progress-short").is_none() {
         return;
     }
     let (core, runtime, _dir, db, user, entry) = pending_editor_fixture();
@@ -1222,7 +1186,7 @@ fn failed_login_resumes_the_deferred_calendar_for_the_saved_account(tc: &mut Tes
 
 #[gpui::test]
 fn bucket_b_completed_decrement_regroups_after_save(cx: &mut TestAppContext) {
-    if fixture_server("progress").is_none() {
+    if fixture_server("progress-completed").is_none() {
         return;
     }
     let mut entry = completed_fixture();
@@ -1254,6 +1218,51 @@ fn bucket_b_completed_decrement_regroups_after_save(cx: &mut TestAppContext) {
         w.reset_list_widget();
         assert_eq!(w.visible_ids.as_slice(), &[9]);
     });
+}
+
+#[gpui::test]
+fn remote_progress_review_saves_the_buffered_edit_before_opening_editor(tc: &mut TestAppContext) {
+    if fixture_server("progress-review").is_none() {
+        return;
+    }
+    let (core, runtime, _dir, db, user, mut entry) = pending_editor_fixture();
+    entry.progress = 5;
+    db.upsert_entry(&entry).unwrap();
+    let (view, cx) =
+        tc.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+    view.update_in(cx, |w, win, cx| {
+        w.profile = Some(user);
+        w.offline = true;
+        w.list.replace(vec![entry], 0);
+        w.step_progress(9, 1, win, cx);
+        w.step_progress(9, 1, win, cx);
+        w.open_editor(9, win, cx);
+        assert_eq!(w.active_writes, 1);
+    });
+    wait(cx, &runtime, |cx| {
+        view.read_with(cx, |w, _| w.active_writes == 0)
+    });
+    view.update_in(cx, |w, win, cx| {
+        assert!(w.editor.is_none() && w.pending_editor.is_some());
+        let edit = w.progress.edit(w.generation, 9).unwrap();
+        assert_eq!(
+            (edit.saved, edit.pending, edit.remote_progress),
+            (5, 7, Some(6))
+        );
+        assert_eq!(db.get_entry(9).unwrap().unwrap().progress, 6);
+        let review = w.progress.review(w.generation, 9).unwrap();
+        w.resolve_progress_review(&review, true, win, cx);
+        assert_eq!(w.active_writes, 1);
+    });
+    wait(cx, &runtime, |cx| {
+        view.read_with(cx, |w, _| w.active_writes == 0)
+    });
+    view.read_with(cx, |w, _| {
+        assert!(w.pending_editor.is_none());
+        assert_eq!(w.editor.as_ref().unwrap().progress, 7);
+        assert_eq!(db.get_entry(9).unwrap().unwrap().progress, 7);
+    });
+    cx.update(|win, _| win.remove_window());
 }
 
 #[gpui::test]

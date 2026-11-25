@@ -328,7 +328,7 @@ impl Workspace {
                         button(
                             "detail-more",
                             "+",
-                            stepper_locked || media.episodes.is_some_and(|total| progress >= total),
+                            stepper_locked || progress >= media.episodes.unwrap_or(9999),
                         )
                         .aria_label("One more episode")
                         .on_click(cx.listener(
@@ -344,13 +344,10 @@ impl Workspace {
                 list_card =
                     list_card.child(div().text_size(px(14.)).text_color(rgb(DIM)).child(score));
             }
-            if let Some(file) = self
-                .library_files
-                .iter()
-                .find(|file| file.media_id == Some(id) && file.episode == Some(entry.progress + 1))
+            if let Some(episode) = entry.progress.checked_add(1)
+                && let Some(file) = self.library_files.episode(id, episode)
             {
                 let path = file.path.clone();
-                let episode = file.episode.unwrap_or(entry.progress + 1);
                 list_card = list_card.child(
                     button(
                         "play-next-local",
@@ -481,11 +478,16 @@ impl Workspace {
                         .flex_col()
                         .gap(px(4.))
                         .cursor_pointer()
-                        .on_key_down(cx.listener(
+                        .capture_key_down(cx.listener(
                             move |this, event: &gpui::KeyDownEvent, window, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                                let stroke = &event.keystroke;
+                                if !stroke.modifiers.modified()
+                                    && matches!(stroke.key.as_str(), "enter" | "space" | " ")
+                                {
                                     cx.stop_propagation();
-                                    this.navigate(Route::Anime(related_id), window, cx);
+                                    if !event.is_held {
+                                        this.navigate(Route::Anime(related_id), window, cx);
+                                    }
                                 }
                             },
                         ))
@@ -658,14 +660,16 @@ impl Workspace {
                             .focusable()
                             .tab_stop(true)
                             .cursor_pointer()
-                            .on_key_down(cx.listener(
+                            .capture_key_down(cx.listener(
                                 move |this, event: &gpui::KeyDownEvent, window, cx| {
-                                    if matches!(
-                                        event.keystroke.key.as_str(),
-                                        "enter" | "space" | " "
-                                    ) {
+                                    let stroke = &event.keystroke;
+                                    if !stroke.modifiers.modified()
+                                        && matches!(stroke.key.as_str(), "enter" | "space" | " ")
+                                    {
                                         cx.stop_propagation();
-                                        this.navigate(Route::Anime(rec_id), window, cx);
+                                        if !event.is_held {
+                                            this.navigate(Route::Anime(rec_id), window, cx);
+                                        }
                                     }
                                 },
                             ))
@@ -731,22 +735,23 @@ impl Workspace {
                 .child(edit.error.clone().unwrap_or_else(|| {
                     "Progress changed on your list. Review before saving.".into()
                 }));
-        if edit.requires_review {
-            if edit.remote_progress.is_some() {
+        if let Some(review) = self.progress.review(self.generation, id) {
+            if review.progress.is_some() {
+                let review = review.clone();
                 banner = banner.child(button("detail-use-edit", "Use my edit", disabled).on_click(
                     cx.listener(move |this, _, window, cx| {
-                        this.resolve_progress_review(id, true, window, cx)
+                        this.resolve_progress_review(&review, true, window, cx)
                     }),
                 ));
             }
-            let label = if edit.remote_progress.is_some() {
+            let label = if review.progress.is_some() {
                 "Keep latest"
             } else {
                 "Discard edit"
             };
             banner = banner.child(button("detail-keep-latest", label, disabled).on_click(
                 cx.listener(move |this, _, window, cx| {
-                    this.resolve_progress_review(id, false, window, cx)
+                    this.resolve_progress_review(&review, false, window, cx)
                 }),
             ));
         } else {
@@ -838,15 +843,8 @@ impl Workspace {
                 {
                     return;
                 }
-                this.ensure_cover_scale(window.scale_factor());
-                if let Ok(items) = &result {
-                    for media in items {
-                        if let Some(url) = media.cover_medium.as_deref() {
-                            this.request_cover(media.id, url, 112, 160);
-                        }
-                    }
-                }
                 this.detail.finish_recommendations(id, request, result);
+                this.refresh_detail_covers(window.scale_factor());
                 cx.notify();
             });
         })
@@ -1023,7 +1021,11 @@ fn plain_description(html: &str) -> String {
 mod tests {
     use super::super::{BarrierAction, CloseIntent};
     use super::{Route, Workspace, airing_label, plain_description, score_label};
-    use gpui::{TestAppContext, px, size};
+    use gpui::accesskit::{ActionRequest, NodeId, TreeId};
+    use gpui::{
+        AccessibleAction, KeyDownEvent, KeyUpEvent, Keystroke, TestAppContext, VisualTestContext,
+        px, size,
+    };
     use kurisu_core::models::{ListEntry, Media, MediaDetail, User};
     use kurisu_core::{Core, Platform, UpdateChannel};
     use std::path::{Path, PathBuf};
@@ -1073,6 +1075,463 @@ mod tests {
         )
         .unwrap();
         (core, runtime, FixtureDir(path))
+    }
+
+    fn accessible_control(cx: &mut VisualTestContext, label: &str) -> NodeId {
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        cx.take_accessibility_tree_update()
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find_map(|(id, node)| (node.label() == Some(label)).then_some(id))
+            .unwrap_or_else(|| panic!("missing {label}"))
+    }
+
+    fn accessible_action(cx: &VisualTestContext, target_node: NodeId, action: AccessibleAction) {
+        cx.simulate_accessibility_action(ActionRequest {
+            action,
+            target_tree: TreeId::ROOT,
+            target_node,
+            data: None,
+        });
+    }
+
+    fn press_activation_key(cx: &mut VisualTestContext, key: &str, is_held: bool) {
+        let os = cx.update(|_, app| app.platform_info().os);
+        let keystroke = Keystroke::parse_with_os(key, os).unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke });
+    }
+
+    #[gpui::test]
+    fn recommendation_opens_with_plain_enter_or_accessibility_click(tc: &mut TestAppContext) {
+        for use_keyboard in [true, false] {
+            let (core, _runtime, _dir) = fixture();
+            let (workspace, cx) = tc.add_window_view(|window, cx| {
+                Workspace::new_with_session_restore(core, window, cx, false)
+            });
+            cx.simulate_resize(size(px(1100.), px(1200.)));
+            workspace.update_in(cx, |w, _, cx| {
+                w.profile = Some(User {
+                    id: 47,
+                    ..Default::default()
+                });
+                w.route = Route::Anime(9);
+                let request = w.detail.start(9);
+                w.detail.finish_detail(
+                    9,
+                    request,
+                    Ok(MediaDetail {
+                        media: Media {
+                            id: 9,
+                            ..Default::default()
+                        },
+                        relations: vec![],
+                        characters: vec![],
+                        staff: vec![],
+                        cached_at: None,
+                        warning: None,
+                        unavailable_sections: vec![],
+                    }),
+                );
+                w.detail.finish_recommendations(
+                    9,
+                    request,
+                    Ok(vec![Media {
+                        id: 10,
+                        title_english: Some("Recommendation fixture".into()),
+                        ..Default::default()
+                    }]),
+                );
+                cx.notify();
+            });
+            let id = accessible_control(cx, "Open Recommendation fixture");
+            accessible_action(cx, id, AccessibleAction::Focus);
+            for key in ["ctrl-enter", "shift-enter", "alt-space"] {
+                press_activation_key(cx, key, false);
+            }
+            press_activation_key(cx, "enter", true);
+            assert_eq!(
+                workspace.read_with(cx, |w, _| w.route.clone()),
+                Route::Anime(9)
+            );
+            if use_keyboard {
+                press_activation_key(cx, "enter", false);
+            } else {
+                accessible_action(cx, id, AccessibleAction::Click);
+            }
+            assert_eq!(
+                workspace.read_with(cx, |w, _| w.route.clone()),
+                Route::Anime(10)
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn search_completed_submits_with_plain_enter_or_accessibility_click(tc: &mut TestAppContext) {
+        for use_keyboard in [true, false] {
+            let (core, _runtime, _dir) = fixture();
+            let (workspace, cx) = tc.add_window_view(|window, cx| {
+                Workspace::new_with_session_restore(core, window, cx, false)
+            });
+            cx.simulate_resize(size(px(1100.), px(1200.)));
+            workspace.update_in(cx, |w, window, cx| {
+                w.profile = Some(User {
+                    id: 47,
+                    ..Default::default()
+                });
+                w.route = Route::Search;
+                w.search.results.push(Media {
+                    id: 10,
+                    title_english: Some("Search fixture".into()),
+                    ..Default::default()
+                });
+                w.enter_search(window, cx);
+                cx.notify();
+            });
+            let id = accessible_control(cx, "Completed");
+            accessible_action(cx, id, AccessibleAction::Focus);
+            for key in ["ctrl-enter", "shift-enter", "alt-space"] {
+                press_activation_key(cx, key, false);
+            }
+            press_activation_key(cx, "enter", true);
+            assert_eq!(workspace.read_with(cx, |w, _| w.active_writes), 0);
+            if use_keyboard {
+                press_activation_key(cx, "enter", false);
+            } else {
+                accessible_action(cx, id, AccessibleAction::Click);
+            }
+            assert_eq!(workspace.read_with(cx, |w, _| w.active_writes), 1);
+        }
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn large_only_detail_thumbnails_load_on_initial_read_retry_and_scale(tc: &mut TestAppContext) {
+        use super::super::fixture_server::{child_gate, serve};
+        use super::super::workspace_tests::prompt_restore_tests::signed_in_fixture;
+        use serde_json::json;
+        use std::io::{Cursor, Write};
+        use std::time::Duration;
+
+        const CHILD: &str = "KURISU_DETAIL_THUMBNAILS_CHILD";
+        if child_gate(CHILD).is_none() {
+            let mut png = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                336,
+                480,
+                image::Rgba([1, 2, 3, 255]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            let png = png.into_inner();
+            let mut failed = false;
+            let thread = std::thread::current();
+            serve(
+                thread.name().unwrap(),
+                CHILD,
+                "KURISU_FIXTURE_GRAPHQL",
+                |mut http, _| {
+                    if http.target == "/cover.png" {
+                        write!(
+                            http.stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            png.len()
+                        )
+                        .unwrap();
+                        http.stream.write_all(&png).unwrap();
+                        return;
+                    }
+                    let request = http.json();
+                    let query = request["query"].as_str().unwrap();
+                    let url = format!("http://{}/cover.png", http.stream.local_addr().unwrap());
+                    let media = |id| {
+                        json!({
+                            "id": id, "idMal": null, "title": {"romaji": "Fixture", "english": null, "native": null},
+                            "coverImage": {"medium": null, "large": url}, "episodes": 12, "format": null,
+                            "status": null, "averageScore": null, "season": null, "seasonYear": null,
+                            "description": null, "nextAiringEpisode": null
+                        })
+                    };
+                    let data = if query.contains("recommendations(") {
+                        let id = request["variables"]["mediaId"].as_i64().unwrap();
+                        let recommendations = if id == 19 && !std::mem::replace(&mut failed, true) {
+                            serde_json::Value::Null
+                        } else {
+                            json!([{"mediaRecommendation": media(id + 1)}])
+                        };
+                        json!({"Page": {"recommendations": recommendations}})
+                    } else {
+                        assert!(query.contains("relations"), "unexpected fixture query");
+                        let id = request["variables"]["id"].as_i64().unwrap();
+                        let mut detail = media(id);
+                        detail["bannerImage"] = serde_json::Value::Null;
+                        detail["genres"] = serde_json::Value::Null;
+                        detail["duration"] = serde_json::Value::Null;
+                        detail["source"] = serde_json::Value::Null;
+                        detail["studios"] = serde_json::Value::Null;
+                        let mut relation = media(id + 2);
+                        relation["type"] = json!("ANIME");
+                        detail["relations"] =
+                            json!({"edges": [{"relationType": "SEQUEL", "node": relation}]});
+                        detail["characters"] = json!({"edges": []});
+                        detail["staff"] = json!({"edges": []});
+                        json!({"Media": detail})
+                    };
+                    http.reply_json(200, json!({"data": data})).unwrap();
+                },
+            );
+            return;
+        }
+        let (core, runtime, user) = signed_in_fixture(None);
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1200.)));
+        let await_jobs = |jobs: Vec<tokio::task::AbortHandle>| {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    while jobs.iter().any(|job| !job.is_finished()) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        };
+        for (id, retry) in [(9, false), (19, true)] {
+            cx.simulate_scale_factor_change(1.);
+            let jobs = workspace.update_in(cx, |w, window, cx| {
+                w.profile = Some(user.clone());
+                w.route = Route::Anime(id);
+                w.retain_cover_route();
+                w.load_detail(id, window, cx);
+                w.read_aborts["detail"].clone()
+            });
+            await_jobs(jobs);
+            cx.run_until_parked();
+            workspace.read_with(cx, |w, _| {
+                assert!(
+                    w.detail.detail_error.is_empty(),
+                    "{}",
+                    w.detail.detail_error
+                );
+                assert_eq!(
+                    !w.detail.recommendation_error.is_empty(),
+                    retry,
+                    "{}",
+                    w.detail.recommendation_error
+                );
+            });
+            if retry {
+                let control = accessible_control(cx, "Retry recommendations");
+                accessible_action(cx, control, AccessibleAction::Click);
+                await_jobs(
+                    workspace.read_with(cx, |w, _| w.read_aborts["detail-recommendations"].clone()),
+                );
+                cx.run_until_parked();
+            }
+            for scale in [1, 2] {
+                cx.simulate_scale_factor_change(scale as f32);
+                cx.executor().advance_clock(Duration::from_millis(120));
+                cx.run_until_parked();
+                let keys = [(id + 1, 112, 160), (id + 2, 112, 160)];
+                workspace.read_with(cx, |w, _| {
+                    for key in keys {
+                        assert!(
+                            w.cover_tickets.contains_key(&key),
+                            "missing {key:?} at {scale}x"
+                        );
+                    }
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(4);
+                while !workspace.read_with(cx, |w, _| {
+                    keys.iter().all(|key| w.cover_images.contains_key(key))
+                }) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "thumbnails did not load at {scale}x"
+                    );
+                    runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                    cx.executor().advance_clock(Duration::from_millis(120));
+                    cx.run_until_parked();
+                }
+                workspace.read_with(cx, |w, _| {
+                    for key in keys {
+                        let pixels = w.cover_images[&key].size(0);
+                        assert_eq!(
+                            (i32::from(pixels.width), i32::from(pixels.height)),
+                            (112 * scale, 160 * scale)
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn failed_recommendation_retry_reloads_detail_cover_at_new_scale(tc: &mut TestAppContext) {
+        use std::io::Cursor;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (core, runtime, _dir) = fixture();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let url = format!("http://{}/cover.png", listener.local_addr().unwrap());
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            320,
+            460,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let png = png.into_inner();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            png.len()
+        );
+        let (old_started, old_request) = tokio::sync::oneshot::channel();
+        let (release_old, release) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let mut hold_old = Some((old_started, release));
+            for index in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                while socket.read_line(&mut line).await.unwrap() != 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let gate = (index == 1).then(|| hold_old.take().unwrap());
+                let header = header.clone();
+                let png = png.clone();
+                tokio::spawn(async move {
+                    if let Some((started, release)) = gate {
+                        started.send(()).unwrap();
+                        if release.await.is_err() {
+                            return;
+                        }
+                    }
+                    socket.get_mut().write_all(header.as_bytes()).await.unwrap();
+                    socket.get_mut().write_all(&png).await.unwrap();
+                });
+            }
+        });
+
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1200.)));
+        cx.simulate_scale_factor_change(1.);
+        let completed = workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.route = Route::Anime(9);
+            let request = w.detail.start(9);
+            w.detail.finish_detail(
+                9,
+                request,
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 9,
+                        cover_large: Some(url),
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            w.detail
+                .finish_recommendations(9, request, Err("Initial failure".into()));
+            w.ensure_cover_scale(window.scale_factor());
+            w.requeue_detail_covers();
+            cx.notify();
+            w.covers.completion_signal()
+        });
+        let wait_for_cover = || {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), completed.notified())
+                    .await
+                    .expect("cover worker must finish");
+            });
+        };
+        let key = (9, 128, 184);
+        let cover_size = |w: &Workspace| {
+            let size = w.cover_images[&key].size(0);
+            (i32::from(size.width), i32::from(size.height))
+        };
+        wait_for_cover();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert_eq!(workspace.read_with(cx, |w, _| cover_size(w)), (128, 184));
+
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (retry, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Retry recommendations"))
+            .expect("recommendation retry button");
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Click,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *retry,
+            data: None,
+        });
+        workspace.update_in(cx, |w, _, _| {
+            assert!(w.detail.recommendations_loading);
+            w.cancel_reads("detail-recommendations");
+        });
+        cx.simulate_scale_factor_change(2.);
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.cover_scale, 2.);
+            assert!(!w.detail.recommendations_loading);
+            assert!(!w.detail.recommendation_error.is_empty());
+            assert!(
+                w.cover_tickets.contains_key(&key),
+                "2x detail cover was never queued"
+            );
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), old_request)
+                .await
+                .expect("2x cover request must reach the server")
+                .unwrap();
+        });
+
+        let next_scale = 241. / 120.;
+        cx.simulate_scale_factor_change(next_scale);
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert_eq!(workspace.read_with(cx, |w, _| w.cover_scale), next_scale);
+        wait_for_cover();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert_eq!(workspace.read_with(cx, |w, _| cover_size(w)), (258, 371));
+
+        release_old.send(()).unwrap();
+        wait_for_cover();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert_eq!(workspace.read_with(cx, |w, _| cover_size(w)), (258, 371));
     }
 
     #[gpui::test]
@@ -1132,6 +1591,41 @@ mod tests {
     }
 
     #[gpui::test]
+    fn progress_review_requires_the_displayed_entry_even_at_the_same_progress(
+        cx: &mut TestAppContext,
+    ) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            let entry = |id| ListEntry {
+                id: Some(id),
+                media_id: 9,
+                progress: 2,
+                status: "CURRENT".into(),
+                ..Default::default()
+            };
+            let edit = w.progress.entry(w.generation, &entry(10));
+            assert!(edit.step(1, std::time::Instant::now()));
+            w.list.replace(vec![entry(11)], 0);
+            w.progress.reconcile_entries(w.generation, &w.list);
+            let displayed = w.progress.review(w.generation, 9).unwrap();
+            w.list.replace(vec![entry(12)], 0);
+            w.progress.reconcile_entries(w.generation, &w.list);
+            w.resolve_progress_review(&displayed, true, window, cx);
+            assert_eq!(w.active_writes, 0);
+            let replacement = w.progress.review(w.generation, 9).unwrap();
+            assert_eq!(displayed.progress, replacement.progress);
+            assert_ne!(displayed.identity, replacement.identity);
+            w.resolve_progress_review(&replacement, false, window, cx);
+            let edit = w.progress.edit(w.generation, 9).unwrap();
+            assert!(!edit.dirty());
+            assert_eq!(edit.identity, kurisu_core::EntryIdentity::Remote(12));
+        });
+    }
+
+    #[gpui::test]
     fn deleted_entry_shows_review_and_locks_add_until_the_save_settles(cx: &mut TestAppContext) {
         let (core, _runtime, _dir) = fixture();
         let (workspace, cx) = cx.add_window_view(|window, cx| {
@@ -1175,7 +1669,8 @@ mod tests {
             w.list.replace(vec![], 0);
             w.progress.reconcile_entries(w.generation, &w.list);
             w.reconcile_open_entries(None, cx);
-            w.resolve_progress_review(9, false, window, cx);
+            let review = w.progress.review(w.generation, 9).unwrap();
+            w.resolve_progress_review(&review, false, window, cx);
             w.add_media(9, "CURRENT", None, window, cx);
             assert!(!w.editor_adding.contains(&9));
             assert!(w.progress.edit(w.generation, 9).unwrap().in_flight);
@@ -1425,6 +1920,90 @@ mod tests {
             assert!(w.read_aborts.contains_key("detail"));
             w.cancel_reads_for_quit();
         });
+    }
+
+    #[gpui::test]
+    fn detail_omits_next_episode_when_progress_cannot_advance(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1000.)));
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.route = Route::Anime(9);
+            let request = w.detail.start(9);
+            w.detail.finish_detail(
+                9,
+                request,
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 9,
+                        title_english: Some("Unknown episode count".into()),
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            w.library_files.replace(
+                [i64::MIN, i64::MAX]
+                    .into_iter()
+                    .map(|episode| kurisu_core::models::LibraryFile {
+                        path: format!("/fixture/episode-{episode}.mkv"),
+                        media_id: Some(9),
+                        episode: Some(episode),
+                        ..Default::default()
+                    })
+                    .collect(),
+            );
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        for (progress, play_next) in [(i64::MAX, false), (i64::MAX - 1, true)] {
+            workspace.update_in(cx, |w, _, cx| {
+                w.detail.reconcile_entry(Some(ListEntry {
+                    media_id: 9,
+                    status: "CURRENT".into(),
+                    progress,
+                    ..Default::default()
+                }));
+                cx.notify();
+            });
+            cx.update(|window, app| window.draw(app).clear(app));
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            if progress == i64::MAX {
+                assert!(tree.nodes.iter().any(|(_, node)| node.label()
+                    == Some("One more episode")
+                    && node.is_disabled()));
+                workspace.update_in(cx, |w, window, cx| {
+                    w.step_progress(9, 1, window, cx);
+                    assert!(
+                        w.progress
+                            .edit(w.generation, 9)
+                            .is_none_or(|edit| !edit.dirty())
+                    );
+                });
+            }
+            let labels: Vec<_> = tree
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.label())
+                .filter(|label| label.starts_with("Play Ep "))
+                .collect();
+            if play_next {
+                assert_eq!(labels, [format!("Play Ep {}", i64::MAX)]);
+            } else {
+                assert!(labels.is_empty());
+            }
+        }
     }
 
     #[gpui::test]

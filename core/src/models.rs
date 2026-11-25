@@ -24,7 +24,7 @@ impl ListStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Media {
     pub id: i64,
     pub id_mal: Option<i64>,
@@ -52,6 +52,17 @@ pub struct Media {
 }
 
 impl Media {
+    pub(crate) fn with_detail_fields_from(self, details: Self) -> Self {
+        Self {
+            banner_image: details.banner_image,
+            genres: details.genres,
+            duration: details.duration,
+            source: details.source,
+            studios: details.studios,
+            ..self
+        }
+    }
+
     pub(crate) fn has_metadata(&self) -> bool {
         self.title().is_some()
             || self.id_mal.is_some()
@@ -106,6 +117,43 @@ pub struct ListEntry {
     pub repeat: i64,
     pub updated_at: Option<i64>,
     pub media: Option<Media>,
+    #[serde(skip)]
+    pub queued_creation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryIdentity {
+    Remote(i64),
+    Queued(String),
+    Unverified,
+}
+
+impl EntryIdentity {
+    pub fn matches(&self, entry: &ListEntry) -> bool {
+        match self {
+            Self::Remote(id) => entry.id == Some(*id),
+            Self::Queued(key) => entry.queued_creation.as_ref() == Some(key),
+            Self::Unverified => false,
+        }
+    }
+}
+
+impl ListEntry {
+    pub fn identity(&self) -> EntryIdentity {
+        if let Some(id) = self.id {
+            EntryIdentity::Remote(id)
+        } else if let Some(key) = &self.queued_creation {
+            EntryIdentity::Queued(key.clone())
+        } else {
+            EntryIdentity::Unverified
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EntryEditTarget {
+    pub account_id: Option<i64>,
+    pub identity: EntryIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

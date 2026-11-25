@@ -6,6 +6,7 @@ const MOVING: &str = ".publish-by-move";
 const MOVE_CONTENT: &[u8] = b"kurisu-native-init-move-v1\n";
 const DATABASE: &str = "kurisu.db";
 const MARKER: &str = ".kurisu-native-profile";
+const CONFLICT: &str = "Existing profile data conflicts with initialization. Keep it for recovery";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn lock(path: &Path) -> Result<File, String> {
@@ -30,7 +31,7 @@ pub(super) fn lock(path: &Path) -> Result<File, String> {
     Ok(lock)
 }
 
-fn sync_directory(path: &Path) -> Result<(), String> {
+pub(super) fn sync_directory(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -106,8 +107,7 @@ pub(super) fn create(path: &Path) -> Result<(), String> {
     if path_present(&ready)? {
         return Err("Profile initialization staging already exists. Keep it for recovery".into());
     }
-    std::fs::rename(&stage.0, &ready).map_err(|error| error.to_string())?;
-    sync_directory(path)?;
+    rename_stage(&stage.0, &ready).map_err(|error| error.to_string())?;
     recover(path)
 }
 
@@ -116,6 +116,7 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
     if !path_present(&ready)? {
         return Ok(());
     }
+    super::sync_parent(path)?;
     let moving = ready.join(MOVING);
     let by_move = path_present(&moving)?;
     if by_move {
@@ -128,6 +129,8 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
                 "Profile initialization publication record is damaged. Keep it for recovery".into(),
             );
         }
+        // The record may be visible after its directory sync failed.
+        sync_directory(&ready)?;
     } else if !super::has_native_profile_unlocked(&ready)? {
         return Err("Profile initialization staging is incomplete. Keep it for recovery".into());
     }
@@ -147,12 +150,10 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
         "kurisu.db-wal",
         "kurisu.db-shm",
         "kurisu.db-journal",
-        ".kurisu-transfer.json",
+        kurisu_core::profile_transfer::RECEIPT,
     ] {
         if !path_present(&path.join(MARKER))? && path_present(&path.join(name))? {
-            return Err(
-                "Existing profile data conflicts with initialization. Keep it for recovery".into(),
-            );
+            return Err(CONFLICT.into());
         }
     }
     // Existing pairs must share file identity, including when switching to moves.
@@ -163,10 +164,7 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
         let destination_present = path_present(&destination)?;
         if source_present && destination_present {
             if !same_file::is_same_file(&source, &destination).map_err(|error| error.to_string())? {
-                return Err(
-                    "Existing profile data conflicts with initialization. Keep it for recovery"
-                        .into(),
-                );
+                return Err(CONFLICT.into());
             }
         } else if !source_present && (!by_move || !destination_present) {
             return Err(
@@ -209,12 +207,21 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
         kurisu_core::profile_transfer::validate_database_with_scratch(&source, path)
             .map_err(|error| error.to_string())?;
     }
+    // Make the recovery name durable before publishing any files from it.
+    sync_directory(path)?;
     for name in [DATABASE, MARKER] {
         let source = ready.join(name);
         let destination = path.join(name);
         if path_present(&destination)? {
-            if by_move && path_present(&source)? {
-                std::fs::remove_file(&source).map_err(|error| error.to_string())?;
+            if path_present(&source)? {
+                if !same_file::is_same_file(&source, &destination)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(CONFLICT.into());
+                }
+                if by_move {
+                    std::fs::remove_file(&source).map_err(|error| error.to_string())?;
+                }
             }
         } else if by_move {
             // A synced move record and an absent source identify an interrupted atomic move.
@@ -236,7 +243,6 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             drop(record);
             rename_new(&temporary, &moving).map_err(|error| error.to_string())?;
-            sync_directory(&ready)?;
             return recover(path);
         }
         sync_directory(path)?;
@@ -251,11 +257,18 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     if !path_present(&cleanup)? {
-        std::fs::rename(&ready, &cleanup).map_err(|error| error.to_string())?;
+        rename_stage(&ready, &cleanup).map_err(|error| error.to_string())?;
         sync_directory(path)?;
         drop(Stage(cleanup));
     }
     Ok(())
+}
+
+fn rename_stage(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", windows))]
+    return rename_new(source, destination);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    std::fs::rename(source, destination)
 }
 
 fn links_unavailable(error: &std::io::Error) -> bool {

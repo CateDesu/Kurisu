@@ -10,6 +10,83 @@ fn release() -> TorrentItem {
     }
 }
 
+#[gpui::test]
+fn escape_dismisses_each_torrent_filter_before_navigating(tc: &mut TestAppContext) {
+    tc.update(bind_keys);
+    let fixture = Fixture::new(tc);
+    fixture.db.set_setting("rss_feeds", "[]").unwrap();
+    let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    let workspace = fixture.load(&shell, cx);
+    workspace.update(cx, |w, cx| w.close_test_list(cx));
+    shell.update_in(cx, |s, win, cx| s.navigate(Route::Torrents, win, cx));
+    let menus =
+        |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.test_torrent_filter_menus());
+    fixture.wait(cx, |cx| menus(cx).is_some());
+    cx.simulate_accessibility_activation();
+    cx.run_until_parked();
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    let control = |role, label| {
+        tree.nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == role && node.label() == Some(label)).then_some(*id)
+            })
+            .unwrap_or_else(|| panic!("missing {label} control"))
+    };
+    let act = |cx: &mut VisualTestContext, id, action| {
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: id,
+            data: None,
+        });
+    };
+    let focus = |cx: &mut VisualTestContext, id| {
+        act(cx, id, gpui::AccessibleAction::Focus);
+        draw(cx);
+        assert_eq!(cx.take_accessibility_tree_update().unwrap().focus, id);
+    };
+    let held_escape = |cx: &mut VisualTestContext| {
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("escape").unwrap(),
+            is_held: true,
+            prefer_character_input: false,
+        });
+    };
+    let sidebar = control(Role::Button, "Settings");
+    for (label, open) in [
+        ("All languages", (true, false)),
+        ("All releases", (false, true)),
+    ] {
+        let filter = control(Role::ComboBox, label);
+        act(cx, filter, gpui::AccessibleAction::Click);
+        focus(cx, filter);
+        assert_eq!(menus(cx), Some(open));
+        cx.simulate_keystrokes("ctrl-escape");
+        assert_eq!(menus(cx), Some(open));
+        held_escape(cx);
+        assert_eq!(menus(cx), Some(open));
+
+        focus(cx, sidebar);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(menus(cx), Some((false, false)));
+        assert_eq!(shell.read_with(cx, |s, _| s.route.clone()), Route::Torrents);
+        held_escape(cx);
+        assert_eq!(shell.read_with(cx, |s, _| s.route.clone()), Route::Torrents);
+    }
+    cx.simulate_keystrokes("escape");
+    assert_eq!(shell.read_with(cx, |s, _| s.route.clone()), Route::MyList);
+}
+
 fn opener_close(tc: &mut TestAppContext, outcome: &str) {
     let f = Fixture::new(tc);
     let instance = Arc::new(InstanceGuard::acquire(&f.profile.path).unwrap());

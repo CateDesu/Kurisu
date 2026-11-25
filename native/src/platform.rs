@@ -6,10 +6,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -192,27 +189,64 @@ pub fn data_dir(argument: Option<PathBuf>) -> Result<PathBuf, String> {
             .to_path_buf(),
     };
     validate_profile_path(&path)?;
-    create_private_dir(&path)?;
+    let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+    if !path_present(&path)? {
+        create_private_dir(&path)?;
+    }
     let path = path.canonicalize().map_err(|error| error.to_string())?;
     reject_forbidden(&path)?;
     let _initialization = profile_init::lock(&path)?;
     profile_init::recover(&path)?;
     if !has_native_profile_unlocked(&path)? {
+        sync_parent(&path)?;
         profile_init::create(&path)?;
+    } else {
+        #[cfg(unix)]
+        if path_present(&path.join(kurisu_core::profile_transfer::RECEIPT))? {
+            // Sync the selected directory entry without following paths in the receipt.
+            sync_parent(&path)?;
+        }
     }
     Ok(path)
 }
 
 pub(crate) fn create_private_dir(path: &Path) -> Result<(), String> {
     validate_profile_path(path)?;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+    return create_private_dir_synced(path);
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn create_private_dir_synced(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    if !path.is_dir() {
+        // Sync each entry before creating descendants. The deepest directory
+        // already present may be the last entry made by an interrupted attempt.
+        if let Some(parent) = path.parent() {
+            create_private_dir_synced(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
-    builder.create(path).map_err(|error| error.to_string())
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        profile_init::sync_directory(parent).map_err(|error| {
+            format!(
+                "Could not sync the parent directory of {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn has_native_profile(path: &Path) -> Result<bool, String> {
@@ -254,15 +288,19 @@ fn has_native_profile_unlocked(path: &Path) -> Result<bool, String> {
         }
         for suffix in ["-wal", "-shm", "-journal"] {
             let sidecar = path.join(format!("kurisu.db{suffix}"));
-            if path_present(&sidecar)?
-                && !std::fs::metadata(sidecar)
-                    .map_err(|error| error.to_string())?
-                    .is_file()
-            {
-                return Err(format!(
-                    "Native profile sidecars must be regular files. Keep this profile for recovery: {}",
-                    path.display()
-                ));
+            match std::fs::symlink_metadata(sidecar) {
+                Ok(metadata) if link_or_reparse(&metadata) => {
+                    return Err("Data directory cannot use symbolic links or reparse points".into());
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(format!(
+                        "Native profile sidecars must be regular files. Keep this profile for recovery: {}",
+                        path.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
             }
         }
         return Ok(true);
@@ -272,7 +310,7 @@ fn has_native_profile_unlocked(path: &Path) -> Result<bool, String> {
         "kurisu.db-wal",
         "kurisu.db-shm",
         "kurisu.db-journal",
-        ".kurisu-transfer.json",
+        kurisu_core::profile_transfer::RECEIPT,
     ] {
         if path_present(&path.join(name))? {
             return Err("Existing profile data lacks the native profile marker. Keep it in place and use the Kurisu transition release.".into());
@@ -347,9 +385,25 @@ fn link_or_reparse(metadata: &std::fs::Metadata) -> bool {
 pub struct InstanceGuard {
     pub profile_id: String,
     _profile_lock: File,
-    activate: Arc<AtomicBool>,
-    running: Arc<AtomicBool>,
+    activation: Arc<Mutex<Activation>>,
     listener_thread: Option<JoinHandle<()>>,
+}
+
+struct Activation {
+    running: bool,
+    pending: Vec<TcpStream>,
+}
+
+fn awaiting_activation(stream: &TcpStream) -> bool {
+    matches!(stream.peek(&mut [0]), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+#[derive(Debug)]
+pub enum InstanceError {
+    Activated,
+    Declined,
+    Occupied,
+    Open(String),
 }
 
 const INSTANCE_LOCK: &str = ".kurisu-native.lock";
@@ -358,6 +412,8 @@ const INSTANCE_ENDPOINT: &str = ".kurisu-native.endpoint";
 #[cfg(not(windows))]
 const INSTANCE_ENDPOINT: &str = INSTANCE_LOCK;
 const ACTIVATION_WAIT: Duration = Duration::from_secs(1);
+const MAX_PENDING_ACTIVATIONS: usize = 32;
+const ACTIVATION_DECLINED: &[u8; 16] = b"request declined";
 
 fn open_instance_file(path: &Path, writable: bool) -> Result<File, String> {
     if let Ok(meta) = std::fs::symlink_metadata(path)
@@ -414,30 +470,34 @@ fn read_activation_endpoint(path: &Path) -> Option<(u16, String)> {
 }
 
 impl InstanceGuard {
-    pub fn acquire(path: &Path) -> Result<Self, String> {
+    pub fn acquire(path: &Path) -> Result<Self, InstanceError> {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         path.hash(&mut hash);
         let profile_id = format!("{:016x}", hash.finish());
-        let profile_lock = open_instance_file(&path.join(INSTANCE_LOCK), true)?;
-        match profile_lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                let deadline = Instant::now() + ACTIVATION_WAIT;
-                while Instant::now() < deadline {
-                    if let Some((port, secret)) = read_activation_endpoint(path)
-                        && activate_instance_at(port, &profile_id, &secret, deadline).is_some()
-                    {
-                        break;
-                    }
-                    thread::sleep(
-                        deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(25)),
-                    );
+        let profile_lock =
+            open_instance_file(&path.join(INSTANCE_LOCK), true).map_err(InstanceError::Open)?;
+        let deadline = Instant::now() + ACTIVATION_WAIT;
+        loop {
+            match profile_lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::Error(error)) => {
+                    return Err(InstanceError::Open(error.to_string()));
                 }
-                return Err("This data profile is already open".into());
+                Err(TryLockError::WouldBlock) => {}
             }
-            Err(TryLockError::Error(error)) => return Err(error.to_string()),
+            if Instant::now() >= deadline {
+                return Err(InstanceError::Occupied);
+            }
+            if let Some((port, secret)) = read_activation_endpoint(path)
+                && let Some(reply) = activate_instance_at(port, &profile_id, &secret, deadline)
+            {
+                return Err(reply);
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25)),
+            );
         }
         // Tighten legacy lock permissions only after owning the lock and before publishing the secret.
         #[cfg(unix)]
@@ -445,22 +505,20 @@ impl InstanceGuard {
             use std::os::unix::fs::PermissionsExt;
             profile_lock
                 .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| InstanceError::Open(error.to_string()))?;
         }
-        let mut guard = Self {
+        Ok(Self {
             profile_id,
             _profile_lock: profile_lock,
-            activate: Arc::new(AtomicBool::new(false)),
-            running: Arc::new(AtomicBool::new(true)),
+            activation: Arc::new(Mutex::new(Activation {
+                running: true,
+                pending: Vec::new(),
+            })),
             listener_thread: None,
-        };
-        if let Err(error) = guard.start_activation(path) {
-            log::warn!("Could not enable profile window activation: {error}");
-        }
-        Ok(guard)
+        })
     }
 
-    fn start_activation(&mut self, _path: &Path) -> Result<(), String> {
+    pub(crate) fn start_activation(&mut self, _path: &Path) -> Result<(), String> {
         let listener = (0..16)
             .find_map(|attempt| TcpListener::bind(instance_address(&self.profile_id, attempt)).ok())
             .ok_or("Could not reserve a window activation port")?;
@@ -483,31 +541,31 @@ impl InstanceGuard {
             .write_all(record.as_bytes())
             .map_err(|error| error.to_string())?;
 
-        let activate = self.activate.clone();
-        let running = self.running.clone();
-        let identity = self.profile_id.clone();
+        let activation = self.activation.clone();
         let expected_secret = secret.into_bytes();
         self.listener_thread = Some(
             thread::Builder::new()
                 .spawn(move || {
-                    while running.load(Ordering::Relaxed) {
+                    while activation.lock().unwrap().running {
                         match listener.accept() {
                             Ok((mut stream, _)) => {
                                 if stream.set_nonblocking(false).is_ok()
                                     && stream
                                         .set_read_timeout(Some(Duration::from_millis(250)))
                                         .is_ok()
-                                    && stream
-                                        .set_write_timeout(Some(Duration::from_millis(250)))
-                                        .is_ok()
                                 {
                                     let mut token = [0u8; 32];
                                     if stream.read_exact(&mut token).is_ok()
                                         && token == expected_secret.as_slice()
+                                        && stream.set_nonblocking(true).is_ok()
                                     {
-                                        // Publish before acknowledging so later UI input can supersede it.
-                                        activate.store(true, Ordering::Release);
-                                        let _ = stream.write_all(identity.as_bytes());
+                                        let mut activation = activation.lock().unwrap();
+                                        activation.pending.retain(awaiting_activation);
+                                        if activation.running
+                                            && activation.pending.len() < MAX_PENDING_ACTIVATIONS
+                                        {
+                                            activation.pending.push(stream);
+                                        }
                                     }
                                 }
                             }
@@ -520,8 +578,47 @@ impl InstanceGuard {
         Ok(())
     }
 
-    pub fn take_activation(&self) -> bool {
-        self.activate.swap(false, Ordering::AcqRel)
+    pub(crate) fn has_pending_activation(&self) -> bool {
+        let mut activation = self.activation.lock().unwrap();
+        activation.pending.retain(awaiting_activation);
+        !activation.pending.is_empty()
+    }
+
+    fn reply_to_activations(&self, reply: &[u8]) {
+        let mut activation = self.activation.lock().unwrap();
+        for mut stream in activation.pending.drain(..).filter(awaiting_activation) {
+            let _ = stream.write_all(reply);
+        }
+    }
+
+    pub(crate) fn acknowledge_activations(&self) {
+        self.reply_to_activations(self.profile_id.as_bytes());
+    }
+
+    pub(crate) fn decline_activations(&self) {
+        self.reply_to_activations(ACTIVATION_DECLINED);
+    }
+
+    pub(crate) fn stop_activation(&self) {
+        let mut activation = self.activation.lock().unwrap();
+        activation.running = false;
+        activation.pending.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_pending_activations(&self, count: usize) {
+        let deadline = Instant::now() + ACTIVATION_WAIT;
+        loop {
+            let pending = self.activation.lock().unwrap().pending.len();
+            if pending >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {pending} requests reached the owner"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -537,7 +634,7 @@ fn activate_instance_at(
     profile_id: &str,
     secret: &str,
     deadline: Instant,
-) -> Option<()> {
+) -> Option<InstanceError> {
     let timeout = || {
         let remaining = deadline.saturating_duration_since(Instant::now());
         (!remaining.is_zero()).then_some(remaining.min(Duration::from_millis(250)))
@@ -545,25 +642,35 @@ fn activate_instance_at(
     let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&address, timeout()?).ok()?;
     stream.set_write_timeout(Some(timeout()?)).ok()?;
-    if stream.write(secret.as_bytes()).ok()? != secret.len() {
-        return None;
-    }
+    stream.write_all(secret.as_bytes()).ok()?;
     let mut reply = [0u8; 16];
     let mut remaining = &mut reply[..];
     while !remaining.is_empty() {
-        stream.set_read_timeout(Some(timeout()?)).ok()?;
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining_time.is_zero() {
+            return None;
+        }
+        stream
+            .set_read_timeout(Some(remaining_time.min(Duration::from_millis(400))))
+            .ok()?;
         let count = stream.read(remaining).ok()?;
         if count == 0 {
             return None;
         }
         remaining = &mut remaining[count..];
     }
-    (reply == profile_id.as_bytes()).then_some(())
+    if reply == profile_id.as_bytes() {
+        Some(InstanceError::Activated)
+    } else if reply == *ACTIVATION_DECLINED {
+        Some(InstanceError::Declined)
+    } else {
+        None
+    }
 }
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        self.stop_activation();
         if let Some(thread) = self.listener_thread.take() {
             let _ = thread.join();
         }
@@ -660,58 +767,99 @@ mod tests {
         }
     }
 
+    fn active_instance(path: &Path) -> InstanceGuard {
+        let mut guard = InstanceGuard::acquire(path).unwrap();
+        guard.start_activation(path).unwrap();
+        guard
+    }
+
+    fn assert_duplicate_activates(owner: &InstanceGuard, path: &Path) {
+        thread::scope(|scope| {
+            let contender = scope.spawn(|| InstanceGuard::acquire(path));
+            owner.wait_for_pending_activations(1);
+            assert!(
+                !contender.is_finished(),
+                "activation was acknowledged before acceptance"
+            );
+            owner.acknowledge_activations();
+            assert!(matches!(
+                contender.join().unwrap(),
+                Err(InstanceError::Activated)
+            ));
+            assert!(!owner.has_pending_activation());
+        });
+    }
+
     #[test]
     fn separate_profiles_get_separate_identity() {
         let a = TestProfile::new("a");
         let b = TestProfile::new("b");
-        let left = InstanceGuard::acquire(&a.0).unwrap();
-        let right = InstanceGuard::acquire(&b.0).unwrap();
+        let left = active_instance(&a.0);
+        let right = active_instance(&b.0);
         assert_ne!(left.profile_id, right.profile_id);
-        assert!(InstanceGuard::acquire(&a.0).is_err());
+        assert_duplicate_activates(&left, &a.0);
     }
 
     #[test]
     fn instance_listener_stops_before_identity_is_reused() {
         let profile = TestProfile::new("reuse");
         let path = &profile.0;
-        let first = InstanceGuard::acquire(path).unwrap();
+        let first = active_instance(path);
         let identity = first.profile_id.clone();
         drop(first);
-        let second = InstanceGuard::acquire(path).unwrap();
+        let second = active_instance(path);
         assert_eq!(second.profile_id, identity);
     }
 
     #[test]
-    fn duplicate_reply_publishes_activation_and_later_requests_survive_consumption() {
+    fn duplicate_waits_for_acceptance_and_later_requests_survive_consumption() {
         let profile = TestProfile::new("activation-order");
-        let first = InstanceGuard::acquire(&profile.0).unwrap();
-        assert!(InstanceGuard::acquire(&profile.0).is_err());
-        assert!(first.take_activation());
-        assert!(!first.take_activation());
-        assert!(InstanceGuard::acquire(&profile.0).is_err());
-        assert!(first.take_activation());
-        assert!(!first.take_activation());
+        let first = active_instance(&profile.0);
+        assert_duplicate_activates(&first, &profile.0);
+        assert_duplicate_activates(&first, &profile.0);
+    }
+
+    #[test]
+    fn duplicate_acquires_lock_after_owner_disconnects_without_acknowledgment() {
+        let profile = TestProfile::new("released-lock");
+        let owner = active_instance(&profile.0);
+        thread::scope(|scope| {
+            let contender = scope.spawn(|| InstanceGuard::acquire(&profile.0));
+            owner.wait_for_pending_activations(1);
+            owner.stop_activation();
+            drop(owner);
+            let guard = contender.join().unwrap().unwrap();
+            assert!(!guard.has_pending_activation());
+        });
+    }
+
+    #[test]
+    fn duplicate_reports_occupied_without_acknowledgment() {
+        let profile = TestProfile::new("unresponsive-owner");
+        let owner = open_instance_file(&profile.0.join(INSTANCE_LOCK), true).unwrap();
+        owner.try_lock().unwrap();
+        assert!(matches!(
+            InstanceGuard::acquire(&profile.0),
+            Err(InstanceError::Occupied)
+        ));
     }
 
     #[test]
     fn duplicate_waits_for_delayed_endpoint_publication() {
         let profile = TestProfile::new("delayed-endpoint");
-        let first = InstanceGuard::acquire(&profile.0).unwrap();
-        let path = profile.0.join(INSTANCE_ENDPOINT);
-        let (port, secret) = read_activation_endpoint(&profile.0).unwrap();
-        let mut endpoint = open_instance_file(&path, true).unwrap();
-        endpoint.set_len(0).unwrap();
-        let publisher = thread::spawn(move || {
+        let mut first = InstanceGuard::acquire(&profile.0).unwrap();
+        thread::scope(|scope| {
+            let contender = scope.spawn(|| InstanceGuard::acquire(&profile.0));
             thread::sleep(Duration::from_millis(350));
-            writeln!(endpoint, "{port}:{secret}").unwrap();
+            assert!(!contender.is_finished());
+            first.start_activation(&profile.0).unwrap();
+            first.wait_for_pending_activations(1);
+            first.acknowledge_activations();
+            assert!(matches!(
+                contender.join().unwrap(),
+                Err(InstanceError::Activated)
+            ));
         });
-
-        assert_eq!(
-            InstanceGuard::acquire(&profile.0).err().as_deref(),
-            Some("This data profile is already open")
-        );
-        publisher.join().unwrap();
-        assert!(first.take_activation());
     }
 
     #[cfg(windows)]
@@ -719,13 +867,14 @@ mod tests {
     fn endpoint_error_keeps_profile_open_and_locked() {
         let profile = TestProfile::new("endpoint-error");
         std::fs::create_dir(profile.0.join(INSTANCE_ENDPOINT)).unwrap();
-        let first = InstanceGuard::acquire(&profile.0).unwrap();
+        let mut first = InstanceGuard::acquire(&profile.0).unwrap();
+        assert!(first.start_activation(&profile.0).is_err());
 
-        assert_eq!(
-            InstanceGuard::acquire(&profile.0).err().as_deref(),
-            Some("This data profile is already open")
-        );
-        assert!(!first.take_activation());
+        assert!(matches!(
+            InstanceGuard::acquire(&profile.0),
+            Err(InstanceError::Occupied)
+        ));
+        assert!(!first.has_pending_activation());
     }
 
     #[test]
@@ -736,17 +885,9 @@ mod tests {
         path.hash(&mut hash);
         let profile_id = format!("{:016x}", hash.finish());
         let occupied = TcpListener::bind(instance_address(&profile_id, 0)).unwrap();
-        let first = InstanceGuard::acquire(path).unwrap();
+        let first = active_instance(path);
         drop(occupied);
-        assert!(InstanceGuard::acquire(path).is_err());
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !first.take_activation() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Activation was not delivered"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert_duplicate_activates(&first, path);
         drop(first);
     }
 
@@ -806,7 +947,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let guard = InstanceGuard::acquire(&dir).unwrap();
+        let guard = active_instance(&dir);
         let (port, _secret) = read_activation_endpoint(&dir).unwrap();
         let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250)).unwrap();
@@ -814,7 +955,7 @@ mod tests {
         let mut reply = [0u8; 16];
         assert!(stream.read_exact(&mut reply).is_err());
         thread::sleep(Duration::from_millis(40));
-        assert!(!guard.take_activation());
+        assert!(!guard.has_pending_activation());
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -833,16 +974,12 @@ mod tests {
             0o644
         );
 
-        let guard = InstanceGuard::acquire(&profile.0).unwrap();
+        let guard = active_instance(&profile.0);
         assert_eq!(
             std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
             0o600
         );
-        assert_eq!(
-            InstanceGuard::acquire(&profile.0).err().as_deref(),
-            Some("This data profile is already open")
-        );
-        assert!(guard.take_activation());
+        assert_duplicate_activates(&guard, &profile.0);
         assert_eq!(
             std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
             0o600
@@ -857,14 +994,10 @@ mod tests {
 
         let profile = TestProfile::new("lock-perms-held");
         let lock_path = profile.0.join(INSTANCE_LOCK);
-        let guard = InstanceGuard::acquire(&profile.0).unwrap();
+        let guard = active_instance(&profile.0);
         std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert_eq!(
-            InstanceGuard::acquire(&profile.0).err().as_deref(),
-            Some("This data profile is already open")
-        );
-        assert!(guard.take_activation());
+        assert_duplicate_activates(&guard, &profile.0);
         assert_eq!(
             std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o7777,
             0o644

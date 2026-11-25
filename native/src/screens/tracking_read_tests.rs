@@ -62,6 +62,20 @@ fn tracking_read_failure_disables_save_and_retry_restores_real_values(tc: &mut T
     assert!(off.is_disabled());
     assert!(!off.supports_action(gpui::AccessibleAction::Click));
     assert!(!off.supports_action(gpui::AccessibleAction::Focus));
+    let socket = published_control(cx, "MPV socket path");
+    assert_eq!(socket.role(), Role::TextInput);
+    assert!(socket.is_disabled());
+    assert!(socket.is_read_only());
+    for action in [
+        gpui::AccessibleAction::Focus,
+        gpui::AccessibleAction::SetValue,
+        gpui::AccessibleAction::SetTextSelection,
+    ] {
+        assert!(
+            !socket.supports_action(action),
+            "disabled socket offers {action:?}"
+        );
+    }
     click(cx, "tracking-save");
     w.read_with(cx, |w, _| {
         assert!(!w.settings.cfg_saving && w.settings.submitted.is_none());

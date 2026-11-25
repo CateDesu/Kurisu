@@ -203,6 +203,119 @@ fn ownership_after_resize(cx: &mut TestAppContext) {
     exact(&w, cx, "after resize without repair input");
 }
 
+#[cfg(feature = "fixture-runtime")]
+#[gpui::test]
+fn tall_discovery_viewports_request_newly_visible_covers(tc: &mut TestAppContext) {
+    use super::fixture_server::{child_gate, serve};
+    use std::io::{Cursor, Write};
+    use std::time::Instant;
+
+    const CHILD: &str = "KURISU_DISCOVERY_RESIZE_CHILD";
+    const ENDPOINT: &str = "KURISU_DISCOVERY_RESIZE_URL";
+    if child_gate(CHILD).is_none() {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            16,
+            16,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let png = png.into_inner();
+        let mut targets = HashSet::new();
+        serve(
+            std::thread::current().name().unwrap(),
+            CHILD,
+            ENDPOINT,
+            |mut http, _| {
+                targets.insert(http.target.clone());
+                write!(
+                    http.stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                )
+                .unwrap();
+                http.stream.write_all(&png).unwrap();
+            },
+        );
+        assert_eq!(
+            targets,
+            HashSet::from(["/search.png".into(), "/season.png".into()])
+        );
+        return;
+    }
+
+    let (core, runtime, _dir) = fixture();
+    let (workspace, cx) = tc
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    let endpoint = std::env::var(ENDPOINT).unwrap();
+    for (route, path, offset) in [
+        (Route::Search, "search.png", 0),
+        (Route::Seasons, "season.png", 100),
+    ] {
+        cx.simulate_resize(size(px(790.), px(600.)));
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            let media: Vec<_> = (1..=24)
+                .map(|id| Media {
+                    id: offset + id,
+                    cover_large: (id == 15).then(|| format!("{endpoint}/{path}")),
+                    ..Default::default()
+                })
+                .collect();
+            w.route = route.clone();
+            w.retain_cover_route();
+            if route == Route::Search {
+                w.search.results = media;
+                w.enter_search(window, cx);
+            } else {
+                w.seasons.media = media;
+                w.seasons.loaded_once = true;
+                w.enter_seasons(window, cx);
+            }
+            cx.notify();
+        });
+        frames(cx, 2);
+        let key = (offset + 15, 174, 176);
+        workspace.read_with(cx, |w, _| assert!(!w.cover_tickets.contains_key(&key)));
+        cx.simulate_resize(size(px(790.), px(5100.)));
+        frames(cx, 2);
+        workspace.read_with(cx, |w, _| {
+            let rows = if route == Route::Search {
+                w.search.rows.as_ref().unwrap()
+            } else {
+                w.seasons.rows.as_ref().unwrap()
+            };
+            assert!(rows.bounds_for_item(14).unwrap().top() < rows.viewport_bounds().bottom());
+            assert!(
+                w.cover_regions[&CoverOwner::Route(route.clone())]
+                    .audit_visible()
+                    .contains(&key)
+            );
+            assert!(w.cover_tickets.contains_key(&key));
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !workspace.read_with(cx, |w, _| w.cover_images.contains_key(&key)) {
+            assert!(
+                Instant::now() < deadline,
+                "cover did not load for {route:?}"
+            );
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            cx.executor().advance_clock(Duration::from_millis(120));
+            cx.run_until_parked();
+        }
+        cx.simulate_resize(size(px(790.), px(600.)));
+        frames(cx, 2);
+        workspace.read_with(cx, |w, _| {
+            assert!(!w.cover_tickets.contains_key(&key));
+            assert!(!w.cover_images.contains_key(&key));
+        });
+    }
+}
+
 #[gpui::test]
 fn ownership_after_scale(cx: &mut TestAppContext) {
     let (core, _runtime, _dir) = fixture();

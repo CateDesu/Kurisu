@@ -14,7 +14,7 @@ Older updaters always choose the highest stable release. For this reason, legacy
 
 An existing valid native profile takes precedence and keeps its native-only changes. Earlier native candidate profiles remain usable. An explicit `--data-dir` opens only that isolated native profile and never searches for a legacy profile.
 
-Fresh native initialization prepares and syncs the database and marker privately before publication. Retry and restart can finish interrupted publication under a profile initialization lock. Filesystems without hard links use a synced publication record and atomic moves that refuse existing destinations. Existing unmarked databases remain refused. Unrelated files are preserved, including private staging directories left by an interrupted preparation.
+Fresh native initialization prepares and syncs the database and marker privately before publication. On Unix, Kurisu syncs new directory entries before initializing the profile. Retry and restart can finish interrupted publication under a profile initialization lock. Filesystems without hard links use a synced publication record and atomic moves that refuse existing destinations. Existing unmarked databases remain refused. Unrelated files are preserved, including private staging directories left by an interrupted preparation.
 
 ## What is kept
 
@@ -35,17 +35,27 @@ Kurisu shows the reason with **Retry** and **Quit**. It does not start with an e
 - **Backup already exists:** an interrupted transfer can reuse only an identical complete backup. If it differs, preserve it. Use a separate controlled recovery destination instead of overwriting it.
 - **Native marker or database damaged:** preserve the native profile, including unsynced changes. Recover it before retrying; the legacy copy must not replace it automatically.
 
-A complete backup can remain after a later transfer step fails. A failed transfer never publishes a partial native profile. Retry keeps the original source and any complete backup.
+A complete backup can remain after a later transfer step fails. A directory sync error after publication can also leave the complete native profile in place. On Unix, startup syncs the published directory entry before opening a transferred profile, even if the original source is gone.
+
+Backup and profile publication require atomic moves that refuse existing destinations. Hard link support is optional. If the filesystem cannot perform those moves, use a supported local filesystem for the backup and native profile.
 
 ## Validation and controlled recovery
 
-Transfer accepts legacy schema versions 1 through 7. It validates SQLite integrity and required schema, copies committed WAL changes into a private standalone snapshot, applies prepared interface preferences to a separate native copy, and publishes the new profile atomically. Supported schema upgrades happen in the native copy. The original and backup retain their source schema version.
+Transfer accepts schema versions 1 through 8. It validates SQLite integrity and required schema, copies committed WAL changes into a private standalone snapshot, applies prepared interface preferences to a separate native copy, and publishes the new profile atomically. Supported schema upgrades happen in the native copy. The original and backup retain their source schema version.
 
-A nonempty WAL must have a complete valid header, page size and current frame checksums. Valid uncommitted frames are allowed and excluded from the snapshot. After a valid current commit, coherent older generations left by SQLite WAL reuse are excluded as well. Damaged current frames, incomplete frames, inconsistent generations and current frames after an obsolete tail stop transfer. These checks cannot detect missing files or damage that still forms a valid WAL. Recover uncertain input in a separate copy with SQLite-aware tools, verify its latest changes, then transfer that verified copy. Never discard the original WAL to make a check pass.
+A nonempty WAL must have a complete valid header, page size and current frame checksums. Valid uncommitted frames are allowed and excluded from the snapshot. After a valid current frame, coherent older generations left by SQLite WAL reuse are excluded as well. Damaged current frames, incomplete frames, inconsistent generations and current frames after an obsolete tail stop transfer. These checks cannot detect missing files or damage that still forms a valid WAL. Recover uncertain input in a separate copy with SQLite-aware tools, verify its latest changes, then transfer that verified copy. Never discard the original WAL to make a check pass.
+
+A rollback followed by a smaller commit can leave frames from the same generation whose checksums no longer match. Transfer stops because a damaged commit can leave the same warning signs. SQLite can open a separate copy and pass its integrity check even when its recovered view omits recent changes.
 
 Paths must be absolute and local and cannot use symlinks, reparse points or prohibited directory names. A new native destination and backup must be outside the source profile. Windows transfers keep them under `%LOCALAPPDATA%`. No media files are read and no AniList request is made during transfer.
 
-The optional `native/migrate.py` source helper remains available for controlled recovery into an explicitly chosen new destination. It requires Python 3.10 or newer and the transition release's exported UI preferences. Run `python3 native/migrate.py --help` from the program root. Existing destination and backup paths are refused by this helper. Normal packages omit this helper because ordinary updates do not need it. Do not point either program at the other's database directory.
+The optional `native/migrate.py` source helper remains available for controlled recovery into an explicitly chosen new destination. It requires Python 3.10 or newer and the transition release's exported UI preferences. Run `python3 native/migrate.py --help` from the program root. After an interruption, rerun with the same paths. The helper can reuse a byte-identical standalone backup or finish syncing a published profile with a matching transfer receipt. When it resumes an already published profile, it reports that the rollback backup was unchecked. Keep any other existing data and choose a new destination or backup path. Normal packages omit this helper because ordinary updates do not need it. Do not point either program at the other's database directory.
+
+## Return to an earlier native release
+
+Opening a native profile with the schema 8 release upgrades its database. Native releases that support up to schema 7 refuse that profile. To reopen its latest data, including unsynced edits, use a native release that supports schema 8. Keep the profile directory and all its sidecars together when recovering it. Do not reset the schema version or remove queued creation keys to make an earlier release open it.
+
+An earlier native release can open a verified copy of the native profile made before the upgrade. Use a separate `--data-dir` for that copy so the upgraded profile stays intact. Changes made after the copy remain in the upgraded profile.
 
 ## Return to the legacy program
 

@@ -19,7 +19,7 @@ use kurisu_core::{
 
 use crate::{
     components::{button, heading},
-    platform::{self, InstanceGuard, NativePlatform},
+    platform::{self, InstanceError, InstanceGuard, NativePlatform},
     shell::{Quit, Shell, TabBackward, TabForward},
     theme::{BASE, DIM, ERROR, INK, sans_font},
 };
@@ -242,12 +242,22 @@ fn open_profile(
     runtime: tokio::runtime::Handle,
 ) -> Result<OpenOutcome, String> {
     let data_dir = prepare_profile_with(argument, default_paths)?;
-    let instance = match InstanceGuard::acquire(&data_dir) {
-        Ok(instance) => Arc::new(instance),
-        Err(error) if error == "This data profile is already open" => {
-            return Ok(OpenOutcome::Activated);
+    let mut instance = match InstanceGuard::acquire(&data_dir) {
+        Ok(instance) => instance,
+        Err(InstanceError::Activated) => return Ok(OpenOutcome::Activated),
+        Err(InstanceError::Declined) => {
+            return Err(
+                "This data profile is already open, and its window was minimized or hidden. Retry to bring it forward."
+                    .into(),
+            );
         }
-        Err(error) => return Err(error),
+        Err(InstanceError::Occupied) => {
+            return Err(
+                "This data profile is already open, but its window did not respond. Close the other instance or retry."
+                    .into(),
+            );
+        }
+        Err(InstanceError::Open(error)) => return Err(error),
     };
     profile_transfer::validate_database(&data_dir.join("kurisu.db")).map_err(|error| {
         format!(
@@ -256,12 +266,18 @@ fn open_profile(
         )
     })?;
     let core = Core::open(
-        data_dir,
+        data_dir.clone(),
         runtime,
         Arc::new(NativePlatform),
         UpdateChannel::Native,
     )?;
-    Ok(OpenOutcome::Ready(Ready { core, instance }))
+    if let Err(error) = instance.start_activation(&data_dir) {
+        log::warn!("Could not enable profile window activation: {error}");
+    }
+    Ok(OpenOutcome::Ready(Ready {
+        core,
+        instance: Arc::new(instance),
+    }))
 }
 
 pub(crate) struct Startup {
@@ -422,6 +438,13 @@ mod tests {
         if let Some(path) = std::env::var_os("KURISU_FRESH_PROFILE") {
             let path = PathBuf::from(path);
             let runtime = tokio::runtime::Runtime::new().unwrap();
+            if let Ok(expected) = std::env::var("KURISU_FRESH_EXPECT_ERROR") {
+                let error = open_profile(Some(path), runtime.handle().clone())
+                    .err()
+                    .expect("initialization should reject the collision");
+                assert!(error.contains(&expected), "{error}");
+                return;
+            }
             if std::env::var_os("KURISU_FRESH_RETRY").is_some() {
                 let first = open_profile(Some(path.clone()), runtime.handle().clone());
                 assert!(
@@ -429,6 +452,16 @@ mod tests {
                     "the requested storage fault was not exercised"
                 );
                 eprintln!("injected first-open failure: {}", first.err().unwrap());
+                if std::env::var_os("KURISU_FRESH_PARENT_SYNC").is_some() {
+                    let error = open_profile(Some(path.clone()), runtime.handle().clone())
+                        .err()
+                        .expect("retry must still wait for the parent sync");
+                    assert!(
+                        error.contains("Could not sync the parent directory"),
+                        "{error}"
+                    );
+                    assert!(!path.join("kurisu.db").exists());
+                }
                 std::fs::remove_file(std::env::var_os("KURISU_RECOVERY_ARM").unwrap()).unwrap();
                 if std::env::var("KURISU_FRESH_RETRY").unwrap() == "restart" {
                     return;
@@ -453,6 +486,84 @@ mod tests {
                 .env("KURISU_FRESH_PROFILE", path);
             command
         };
+        for (recovery, fail_deep) in [("retry", false), ("restart", true)] {
+            let root = sandbox.0.join(format!("ancestor-{recovery}"));
+            std::fs::create_dir(&root).unwrap();
+            let parent = root.join("data");
+            let profile = parent.join("native");
+            let arm = root.join("arm");
+            std::fs::write(&arm, []).unwrap();
+            Process(
+                command(&profile)
+                    .env("LD_PRELOAD", &shim)
+                    .env("KURISU_FRESH_RETRY", recovery)
+                    .env("KURISU_FRESH_PARENT_SYNC", "1")
+                    .env("KURISU_RECOVERY_OP", "sync")
+                    .env(
+                        "KURISU_RECOVERY_MATCH",
+                        if fail_deep { &parent } else { &root },
+                    )
+                    .env("KURISU_RECOVERY_MATCH_EXACT", "1")
+                    .env("KURISU_RECOVERY_ARM", &arm)
+                    .spawn()
+                    .unwrap(),
+            )
+            .success();
+            Process(command(&profile).spawn().unwrap()).success();
+            assert!(platform::has_native_profile(&profile).unwrap());
+        }
+        for (operation, name, expected) in [
+            ("rename", ".kurisu-native-init", "File exists"),
+            ("create", "kurisu.db", "conflicts with initialization"),
+        ] {
+            let root = sandbox.0.join(format!("collision-{operation}"));
+            std::fs::create_dir(&root).unwrap();
+            let profile = root.join("native");
+            let ready = profile.join(".kurisu-native-init");
+            let collision = profile.join(name);
+            let arm = root.join("arm");
+            let gate = root.join("gate");
+            std::fs::write(&arm, []).unwrap();
+            let mut child = command(&profile);
+            if operation == "rename" {
+                child
+                    .env("KURISU_RECOVERY_MATCH", &ready)
+                    .env("KURISU_RECOVERY_MATCH_EXACT", "1");
+            } else {
+                child
+                    .env("KURISU_RECOVERY_MATCH", "/.kurisu-transfer-")
+                    .env("KURISU_RECOVERY_AFTER", &ready);
+            }
+            let mut child = Process(
+                child
+                    .env("LD_PRELOAD", &shim)
+                    .env("KURISU_FRESH_EXPECT_ERROR", expected)
+                    .env("KURISU_RECOVERY_OP", operation)
+                    .env("KURISU_RECOVERY_ARM", &arm)
+                    .env("KURISU_RECOVERY_GATE", &gate)
+                    .spawn()
+                    .unwrap(),
+            );
+            child.gate(&gate);
+            if operation == "rename" {
+                std::fs::create_dir(&collision).unwrap();
+            } else {
+                std::fs::write(&collision, b"preserve collision").unwrap();
+            }
+            std::fs::remove_file(&arm).unwrap();
+            child.success();
+            if operation == "rename" {
+                assert!(std::fs::read_dir(&collision).unwrap().next().is_none());
+                assert!(!profile.join("kurisu.db").exists());
+                std::fs::remove_dir(&collision).unwrap();
+            } else {
+                assert_eq!(std::fs::read(&collision).unwrap(), b"preserve collision");
+                assert!(ready.join("kurisu.db").is_file());
+                std::fs::remove_file(&collision).unwrap();
+            }
+            assert!(!profile.join(".kurisu-native-profile").exists());
+            Process(command(&profile).spawn().unwrap()).success();
+        }
         for (index, (operation, name)) in [
             ("create", "/kurisu.db"),
             ("create", "/.kurisu-native-profile"),
@@ -570,6 +681,96 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn transferred_profile_syncs_before_startup() {
+        use recovery::{Process, Sandbox};
+        use std::process::Command;
+
+        const TEST: &str = "startup::tests::transferred_profile_syncs_before_startup";
+        if let Some(root) = std::env::var_os("KURISU_TRANSFER_FIXTURE") {
+            let paths = TestPaths(root.into());
+            let defaults = || {
+                let mut paths = paths.defaults();
+                paths.native = paths.native.with_file_name("published").join("native");
+                paths
+            };
+            paths.legacy(true);
+            let destination = defaults().native;
+            let error = prepare_default(defaults(), || Ok(())).unwrap_err();
+            assert!(error.contains("published native profile"), "{error}");
+            let backup = std::fs::read(defaults().backup).unwrap();
+            let database = std::fs::read(destination.join("kurisu.db")).unwrap();
+            std::fs::rename(paths.0.join("legacy"), paths.0.join("unavailable")).unwrap();
+            let prepare = || {
+                prepare_default(defaults(), || -> Result<(), String> {
+                    panic!("published transfer must not reopen the legacy profile")
+                })
+            };
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let open = || open_profile(Some(destination.clone()), runtime.handle().clone());
+            for error in [prepare().unwrap_err(), open().err().unwrap()] {
+                assert!(
+                    error.contains("Could not sync the parent directory"),
+                    "{error}"
+                );
+            }
+            assert!(!destination.join(".kurisu-native.lock").exists());
+            std::fs::remove_file(paths.0.join("arm")).unwrap();
+            assert_eq!(prepare().unwrap(), destination);
+            assert_eq!(std::fs::read(defaults().backup).unwrap(), backup);
+            assert_eq!(
+                std::fs::read(destination.join("kurisu.db")).unwrap(),
+                database
+            );
+            let OpenOutcome::Ready(first) = open().unwrap() else {
+                panic!("transferred profile should open after syncing its parent");
+            };
+            let arm = paths.0.join("arm");
+            std::fs::write(&arm, []).unwrap();
+            let error = open()
+                .err()
+                .expect("activation should wait for parent sync");
+            assert!(
+                error.contains("Could not sync the parent directory"),
+                "{error}"
+            );
+            assert!(!first.instance.has_pending_activation());
+            std::fs::remove_file(arm).unwrap();
+            std::thread::scope(|scope| {
+                let contender = scope.spawn(open);
+                first.instance.wait_for_pending_activations(1);
+                first.instance.acknowledge_activations();
+                assert!(matches!(
+                    contender.join().unwrap().unwrap(),
+                    OpenOutcome::Activated
+                ));
+            });
+            return;
+        }
+
+        let sandbox = Sandbox::new("transfer-parent");
+        let shim = sandbox.shim();
+        let root = sandbox.0.join("fixture");
+        std::fs::create_dir(&root).unwrap();
+        let arm = root.join("arm");
+        std::fs::write(&arm, []).unwrap();
+        Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("KURISU_TRANSFER_FIXTURE", &root)
+                .env("LD_PRELOAD", &shim)
+                .env("KURISU_RECOVERY_OP", "sync")
+                .env("KURISU_RECOVERY_MATCH", root.join("published"))
+                .env("KURISU_RECOVERY_MATCH_EXACT", "1")
+                .env("KURISU_RECOVERY_AFTER", root.join("published/native"))
+                .env("KURISU_RECOVERY_ARM", arm)
+                .spawn()
+                .unwrap(),
+        )
+        .success();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn prepared_validation_survives_process_death() {
         use recovery::{Process, Sandbox};
         use std::process::Command;
@@ -651,6 +852,53 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn validation_in_progress_cannot_acknowledge_a_duplicate_launch() {
+        use recovery::{Process, Sandbox};
+        use std::process::Command;
+
+        const TEST: &str =
+            "startup::tests::validation_in_progress_cannot_acknowledge_a_duplicate_launch";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if let Some(profile) = std::env::var_os("KURISU_VALIDATION_HANDOFF_PROFILE") {
+            assert!(matches!(
+                open_profile(Some(profile.into()), runtime.handle().clone()).unwrap(),
+                OpenOutcome::Ready(_)
+            ));
+            return;
+        }
+        let sandbox = Sandbox::new("validation-handoff");
+        let profile = platform::data_dir(Some(sandbox.0.join("profile"))).unwrap();
+        let arm = sandbox.0.join("arm");
+        let gate = sandbox.0.join("gate");
+        std::fs::write(&arm, []).unwrap();
+        let mut child = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("KURISU_VALIDATION_HANDOFF_PROFILE", &profile)
+                .env("LD_PRELOAD", sandbox.shim())
+                .env("KURISU_RECOVERY_OP", "create")
+                .env("KURISU_RECOVERY_MATCH", "/.kurisu-transfer-")
+                .env("KURISU_RECOVERY_ARM", &arm)
+                .env("KURISU_RECOVERY_GATE", &gate)
+                .spawn()
+                .unwrap(),
+        );
+        child.gate(&gate);
+        let result = open_profile(Some(profile.clone()), runtime.handle().clone());
+        assert!(result.is_err_and(|error| error.contains("window did not respond")));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(matches!(
+            open_profile(Some(profile), runtime.handle().clone()).unwrap(),
+            OpenOutcome::Ready(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn fresh_profile_without_hard_links() {
         use recovery::{Process, Sandbox};
         use std::process::Command;
@@ -659,8 +907,30 @@ mod tests {
         if let Some(profile) = std::env::var_os("KURISU_NO_LINK_PROFILE") {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let profile = PathBuf::from(profile);
+            if std::env::var_os("KURISU_RECOVERY_COLLISION").is_some() {
+                let error = open_profile(Some(profile), runtime.handle().clone())
+                    .err()
+                    .expect("the competing database should prevent publication");
+                assert_eq!(
+                    error,
+                    std::io::Error::from_raw_os_error(libc::EEXIST).to_string()
+                );
+                return;
+            }
             if let Ok(recovery) = std::env::var("KURISU_NO_LINK_RETRY") {
-                assert!(open_profile(Some(profile.clone()), runtime.handle().clone()).is_err());
+                let first_error = open_profile(Some(profile.clone()), runtime.handle().clone())
+                    .err()
+                    .expect("the requested storage fault was not exercised");
+                if recovery == "record-directory" {
+                    let ready = profile.join(".kurisu-native-init");
+                    assert!(ready.join(".publish-by-move").is_file());
+                    let error = open_profile(Some(profile.clone()), runtime.handle().clone())
+                        .err()
+                        .expect("retry should still wait for the move record sync");
+                    assert_eq!(error, first_error);
+                    assert!(ready.join("kurisu.db").is_file());
+                    assert!(!profile.join("kurisu.db").exists());
+                }
                 std::fs::remove_file(std::env::var_os("KURISU_RECOVERY_ARM").unwrap()).unwrap();
                 if recovery == "restart" {
                     return;
@@ -710,6 +980,24 @@ mod tests {
                 .unwrap(),
         )
         .success();
+
+        let profile = sandbox.0.join("record-directory");
+        let ready = profile.join(".kurisu-native-init");
+        let arm = sandbox.0.join("arm");
+        std::fs::write(&arm, []).unwrap();
+        Process(
+            command(&profile)
+                .env("KURISU_NO_LINK_RETRY", "record-directory")
+                .env("KURISU_RECOVERY_OP", "sync")
+                .env("KURISU_RECOVERY_MATCH", &ready)
+                .env("KURISU_RECOVERY_MATCH_EXACT", "1")
+                .env("KURISU_RECOVERY_AFTER", ready.join(".publish-by-move"))
+                .env("KURISU_RECOVERY_ARM", &arm)
+                .spawn()
+                .unwrap(),
+        )
+        .success();
+        assert!(!ready.exists());
 
         for operation in ["create", "write", "sync"] {
             for recovery in ["retry", "restart"] {
@@ -806,10 +1094,13 @@ mod tests {
         std::fs::remove_file(&arm).unwrap();
         std::fs::remove_file(&gate).unwrap();
         // The fixture creates the destination just before renameat2.
-        let mut collision = command(&profile);
-        collision.env("KURISU_RECOVERY_COLLISION", profile.join("kurisu.db"));
-        let status = collision.status().unwrap();
-        assert!(!status.success());
+        Process(
+            command(&profile)
+                .env("KURISU_RECOVERY_COLLISION", profile.join("kurisu.db"))
+                .spawn()
+                .unwrap(),
+        )
+        .success();
         assert_eq!(
             std::fs::read(profile.join("kurisu.db")).unwrap(),
             b"preserve collision"
@@ -823,24 +1114,146 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn linux_update_fixture(sandbox: &recovery::Sandbox) -> PathBuf {
+        // The updater copies and syncs this executable several times per case.
+        let fixture = sandbox.0.join("fixture");
+        let status = std::process::Command::new("strip")
+            .arg("--strip-debug")
+            .arg("-o")
+            .arg(&fixture)
+            .arg(std::env::current_exe().unwrap())
+            .status()
+            .expect("run strip on the Linux update fixture");
+        assert!(status.success(), "strip exited with {status}");
+        fixture
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_update_reports_install_directory_sync_failures() {
+        use kurisu_core::updater::{
+            apply_linux_update, init_install_path, sweep_install_dir, update_applied,
+        };
+        use recovery::{Process, Sandbox};
+        use std::io::Write;
+        use std::process::Command;
+
+        const TEST: &str = "startup::tests::linux_update_reports_install_directory_sync_failures";
+        if let Ok(phase) = std::env::var("KURISU_UPDATE_SYNC_PHASE") {
+            init_install_path().unwrap();
+            let exe = std::env::current_exe().unwrap();
+            if phase == "sweep" {
+                sweep_install_dir();
+            } else {
+                let payload = exe.with_file_name("payload");
+                let error =
+                    apply_linux_update(&mut std::fs::File::open(payload).unwrap()).unwrap_err();
+                assert!(error.contains("os error 28"), "{error}");
+                let detail = if phase == "backup" {
+                    "could not secure the rollback executable"
+                } else {
+                    "the executable was replaced, but the installation could not be synced"
+                };
+                assert!(error.contains(detail), "{error}");
+                assert_eq!(update_applied(), phase == "swap");
+            }
+            return;
+        }
+
+        let sandbox = Sandbox::new("update-dir-sync");
+        let shim = sandbox.shim();
+        let fixture = linux_update_fixture(&sandbox);
+        let fixture_size = std::fs::metadata(&fixture).unwrap().len();
+        for (phase, skip, swapped) in [("backup", "0", false), ("swap", "1", true)] {
+            let dir = sandbox.0.join(phase);
+            std::fs::create_dir(&dir).unwrap();
+            let exe = dir.join("install");
+            let backup = exe.with_file_name("install.kurisu-old");
+            let payload = exe.with_file_name("payload");
+            std::fs::copy(&fixture, &exe).unwrap();
+            std::fs::copy(&fixture, &payload).unwrap();
+            let suffix = b"replacement";
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&payload)
+                .unwrap()
+                .write_all(suffix)
+                .unwrap();
+            let arm = dir.join("arm");
+            std::fs::write(&arm, []).unwrap();
+            let command = |phase: &str, skip: &str| {
+                let mut cmd = Command::new(&exe);
+                cmd.args(["--exact", TEST, "--nocapture"])
+                    .env("KURISU_UPDATE_SYNC_PHASE", phase)
+                    .env("LD_PRELOAD", &shim)
+                    .env("KURISU_RECOVERY_OP", "sync")
+                    .env("KURISU_RECOVERY_MATCH", &dir)
+                    .env("KURISU_RECOVERY_MATCH_EXACT", "1")
+                    .env("KURISU_RECOVERY_ARM", &arm)
+                    .env("KURISU_RECOVERY_SKIP", skip)
+                    .env("KURISU_RECOVERY_NO_LINKS", &exe);
+                cmd
+            };
+            Process(command(phase, skip).spawn().unwrap()).success();
+            assert_eq!(std::fs::metadata(&backup).unwrap().len(), fixture_size);
+            assert_eq!(
+                std::fs::metadata(&exe).unwrap().len(),
+                fixture_size + if swapped { suffix.len() as u64 } else { 0 }
+            );
+            Process(command("sweep", "0").spawn().unwrap()).success();
+            assert!(backup.is_file());
+            if swapped {
+                Process(command("backup", "0").spawn().unwrap()).success();
+                assert_eq!(std::fs::metadata(&backup).unwrap().len(), fixture_size);
+                std::fs::remove_file(&arm).unwrap();
+                Process(command("sweep", "0").spawn().unwrap()).success();
+                assert!(!backup.exists());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_linux_update_survives_other_profile_startup_cleanup() {
         use kurisu_core::updater::{apply_linux_update, init_install_path, sweep_install_dir};
         use recovery::{Process, Sandbox};
-        use std::io::Read;
+        use std::io::{Read, Write};
         use std::process::Command;
 
         const TEST: &str =
             "startup::tests::live_linux_update_survives_other_profile_startup_cleanup";
         if let Ok(mode) = std::env::var("KURISU_INSTALL_CASE") {
-            init_install_path().unwrap();
+            let path = init_install_path();
+            if mode == "backup-sweep" {
+                assert!(path.is_err());
+            } else {
+                path.unwrap();
+            }
             let exe = std::env::current_exe().unwrap();
             let dir = exe.parent().unwrap();
             let profile = dir.join(format!("profile-{mode}"));
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            let _ready = open_profile(Some(profile), runtime.handle().clone()).unwrap();
-            if mode == "sweep" {
+            let OpenOutcome::Ready(_ready) =
+                open_profile(Some(profile), runtime.handle().clone()).unwrap()
+            else {
+                panic!("startup must open the test profile")
+            };
+            if mode == "waiting-sweep" {
+                std::fs::write(dir.join("sweep-ready"), []).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !dir.join("sweep-go").exists() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if mode.ends_with("sweep") {
                 assert!(!sweep_install_dir());
+                return;
+            }
+            if mode == "apply-valid" {
+                let payload = dir.join("payload");
+                apply_linux_update(&mut std::fs::File::open(payload).unwrap()).unwrap();
                 return;
             }
             let mut header = [0; 20];
@@ -864,26 +1277,48 @@ mod tests {
             return;
         }
 
+        let phases = ["sync", "linked"];
+        let selected = std::env::var_os("KURISU_RECOVERY_UPDATE_PHASE");
+        if let Some(phase) = &selected {
+            assert!(
+                phases.iter().any(|&name| phase == name),
+                "unknown update fixture phase {phase:?}"
+            );
+        }
         let sandbox = Sandbox::new("update");
         let shim = sandbox.shim();
-        for (index, operation) in ["sync", "linked"].into_iter().enumerate() {
-            if std::env::var("KURISU_RECOVERY_UPDATE_PHASE").is_ok_and(|phase| phase != operation) {
+        let fixture = linux_update_fixture(&sandbox);
+        let command = |path: &std::path::Path, mode: &str| {
+            let mut command = Command::new(path);
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env("KURISU_INSTALL_CASE", mode);
+            command
+        };
+        for (index, operation) in phases.into_iter().enumerate() {
+            if selected.as_ref().is_some_and(|phase| phase != operation) {
                 continue;
             }
             let dir = sandbox.0.join(format!("install-{index}"));
             std::fs::create_dir(&dir).unwrap();
             let installer = dir.join("install");
             let sweeper = dir.join("sweep");
-            std::fs::copy(std::env::current_exe().unwrap(), &installer).unwrap();
+            let backup = dir.join("install.kurisu-old");
+            std::fs::copy(&fixture, &installer).unwrap();
             std::fs::hard_link(&installer, &sweeper).unwrap();
             let original = std::fs::metadata(&installer).unwrap().len();
+            std::fs::copy(&installer, &backup).unwrap();
+            Process(command(&installer, "sweep").spawn().unwrap()).success();
+            assert!(backup.is_file());
+
+            let mut waiting = Process(command(&installer, "waiting-sweep").spawn().unwrap());
+            waiting.gate(&dir.join("sweep-ready"));
+
             let arm = dir.join("arm");
             let gate = dir.join("gate");
             std::fs::write(&arm, []).unwrap();
             let mut install = Process(
-                Command::new(&installer)
-                    .args(["--exact", TEST, "--nocapture"])
-                    .env("KURISU_INSTALL_CASE", "apply")
+                command(&installer, "apply")
                     .env("LD_PRELOAD", &shim)
                     .env("KURISU_RECOVERY_OP", operation)
                     .env("KURISU_RECOVERY_MATCH", "/.kurisu-new-")
@@ -908,51 +1343,116 @@ mod tests {
             };
             let live = stages();
             assert_eq!(live.len(), index + 1);
-            Process(
-                Command::new(&sweeper)
-                    .args(["--exact", TEST, "--nocapture"])
-                    .env("KURISU_INSTALL_CASE", "sweep")
-                    .spawn()
-                    .unwrap(),
-            )
-            .success();
+            Process(command(&sweeper, "sweep").spawn().unwrap()).success();
             assert!(
                 live.iter().all(|path| path.is_file()),
                 "startup removed a live stage"
             );
-            Process(
-                Command::new(&sweeper)
-                    .args(["--exact", TEST, "--nocapture"])
-                    .env("KURISU_INSTALL_CASE", "busy")
-                    .spawn()
-                    .unwrap(),
-            )
-            .success();
+            Process(command(&sweeper, "busy").spawn().unwrap()).success();
             std::fs::remove_file(&arm).unwrap();
             install.success();
-            assert_eq!(
-                std::fs::metadata(dir.join("install.kurisu-old"))
-                    .unwrap()
-                    .len(),
-                original
-            );
+            assert_eq!(std::fs::metadata(&backup).unwrap().len(), original);
             assert!(stages().is_empty());
+            assert!(command(&installer, "sweep").spawn().is_err());
+
+            std::fs::write(dir.join("sweep-go"), []).unwrap();
+            waiting.success();
+            assert!(backup.is_file());
 
             let abandoned = dir.join(".kurisu-new-abandoned");
             let only_copy = dir.join("missing.kurisu-old");
             std::fs::write(&abandoned, b"abandoned stage").unwrap();
             std::fs::write(&only_copy, b"last working copy").unwrap();
-            Process(
-                Command::new(&sweeper)
-                    .args(["--exact", TEST, "--nocapture"])
-                    .env("KURISU_INSTALL_CASE", "sweep")
+            Process(command(&sweeper, "sweep").spawn().unwrap()).success();
+            assert!(!abandoned.exists());
+            assert!(backup.is_file());
+
+            let replacement = dir.join("valid-replacement");
+            std::fs::copy(&sweeper, &replacement).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&replacement)
+                .unwrap()
+                .write_all(b"valid replacement")
+                .unwrap();
+            std::fs::rename(&replacement, &installer).unwrap();
+            Process(command(&installer, "sweep").spawn().unwrap()).success();
+            assert!(!backup.exists());
+            assert_eq!(std::fs::read(&only_copy).unwrap(), b"last working copy");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        for (label, published, copied) in [
+            ("linked-backup", false, false),
+            ("copied-backup", false, true),
+            ("published", true, false),
+        ] {
+            let dir = sandbox.0.join(label);
+            std::fs::create_dir(&dir).unwrap();
+            let installer = dir.join("install");
+            let original = dir.join("original");
+            let backup = dir.join("install.kurisu-old");
+            let payload = dir.join("payload");
+            for (path, suffix) in [
+                (&installer, b"old executable"),
+                (&payload, b"new executable"),
+            ] {
+                std::fs::copy(&fixture, path).unwrap();
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(suffix)
+                    .unwrap();
+            }
+            std::fs::hard_link(&installer, &original).unwrap();
+            let original_size = std::fs::metadata(&original).unwrap().len();
+
+            let arm = dir.join("arm");
+            let gate = dir.join("gate");
+            std::fs::write(&arm, []).unwrap();
+            let mut update = command(&installer, "apply-valid");
+            if copied {
+                update.env("KURISU_RECOVERY_NO_LINKS", &installer);
+            }
+            let mut update = Process(
+                update
+                    .env("LD_PRELOAD", &shim)
+                    .env("KURISU_RECOVERY_OP", "renamed")
+                    .env(
+                        "KURISU_RECOVERY_MATCH",
+                        if published { &installer } else { &backup },
+                    )
+                    .env("KURISU_RECOVERY_MATCH_EXACT", "1")
+                    .env("KURISU_RECOVERY_ARM", &arm)
+                    .env("KURISU_RECOVERY_GATE", &gate)
                     .spawn()
                     .unwrap(),
-            )
-            .success();
-            assert!(!abandoned.exists());
-            assert!(!dir.join("install.kurisu-old").exists());
-            assert_eq!(std::fs::read(&only_copy).unwrap(), b"last working copy");
+            );
+            update.gate(&gate);
+            assert_eq!(
+                same_file::is_same_file(&installer, &original).unwrap(),
+                !published
+            );
+            assert_eq!(
+                same_file::is_same_file(&backup, &original).unwrap(),
+                !copied
+            );
+            assert_eq!(std::fs::metadata(&backup).unwrap().len(), original_size);
+            update.0.kill().unwrap();
+            update.0.wait().unwrap();
+
+            Process(command(&backup, "backup-sweep").spawn().unwrap()).success();
+            assert!(backup.is_file());
+            Process(command(&installer, "sweep").spawn().unwrap()).success();
+            assert_eq!(backup.exists(), !published);
+            assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|entry| {
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".kurisu-new-")
+            }));
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
@@ -1348,7 +1848,8 @@ mod tests {
             .lock()
             .execute_batch(
                 "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;
-             INSERT INTO pending_change VALUES(42,7,'{\"progress\":6}');",
+             INSERT INTO pending_change VALUES(42,7,'{\"progress\":6}');
+             UPDATE pending_change SET payload='{\"progress\":7}' WHERE account_id=42 AND media_id=7;",
             )
             .unwrap();
         let native = platform::data_dir(Some(paths.defaults().native)).unwrap();
@@ -1358,9 +1859,32 @@ mod tests {
         let valid_wal = std::fs::read(paths.0.join("writer.db-wal")).unwrap();
         drop(writer);
         let mut damaged_wal = valid_wal.clone();
-        damaged_wal[48] ^= 1;
+        let page_size = u32::from_be_bytes(valid_wal[8..12].try_into().unwrap()) as usize;
+        let last_frame = valid_wal.len() - page_size - 24;
+        assert_ne!(valid_wal[last_frame + 4..last_frame + 8], [0; 4]);
+        damaged_wal[last_frame + 4..last_frame + 8].fill(0);
         std::fs::write(&wal_path, &damaged_wal).unwrap();
         let before = std::fs::read(&database).unwrap();
+        let pending = |db: &Db| -> String {
+            db.0.lock()
+                .query_row(
+                    "SELECT payload FROM pending_change WHERE account_id=42 AND media_id=7",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let control = paths.0.join("control.db");
+        std::fs::copy(&database, &control).unwrap();
+        std::fs::write(paths.0.join("control.db-wal"), &damaged_wal).unwrap();
+        let db = Db::open(&control).unwrap();
+        let integrity: String =
+            db.0.lock()
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(pending(&db), r#"{"progress":6}"#);
+        drop(db);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1379,15 +1903,7 @@ mod tests {
         assert!(matches!(ready, OpenOutcome::Ready(_)));
         drop(ready);
         let db = Db::open(&database).unwrap();
-        let pending: i64 =
-            db.0.lock()
-                .query_row(
-                    "SELECT COUNT(*) FROM pending_change WHERE account_id=42 AND media_id=7",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-        assert_eq!(pending, 1);
+        assert_eq!(pending(&db), r#"{"progress":7}"#);
     }
 
     #[test]
@@ -1447,11 +1963,16 @@ mod tests {
         let OpenOutcome::Ready(first) = first else {
             panic!("first launch must open the controlled profile")
         };
-        assert!(matches!(
-            open_profile(argument, runtime.handle().clone()).unwrap(),
-            OpenOutcome::Activated
-        ));
-        assert!(first.instance.take_activation());
+        std::thread::scope(|scope| {
+            let contender = scope.spawn(|| open_profile(argument, runtime.handle().clone()));
+            first.instance.wait_for_pending_activations(1);
+            assert!(!contender.is_finished());
+            first.instance.acknowledge_activations();
+            assert!(matches!(
+                contender.join().unwrap().unwrap(),
+                OpenOutcome::Activated
+            ));
+        });
         assert_eq!(first.core.channel(), UpdateChannel::Native);
     }
 

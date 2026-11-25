@@ -1,4 +1,5 @@
 use super::*;
+use library::LibraryBindingScope::{File, Folder};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, atomic::Ordering, mpsc};
@@ -57,6 +58,19 @@ impl Fixture {
     fn entry(&self, id: i64) {
         self.state
             .db
+            .upsert_media(&Media {
+                id,
+                title_english: Some(format!("Fixture Show {id}")),
+                ..Default::default()
+            })
+            .unwrap();
+        self.entry_without_media(id);
+        self.state.refresh_matchers();
+    }
+
+    fn entry_without_media(&self, id: i64) {
+        self.state
+            .db
             .upsert_entry(&ListEntry {
                 media_id: id,
                 status: "CURRENT".into(),
@@ -74,6 +88,160 @@ impl Drop for Fixture {
 
 fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+#[tokio::test]
+async fn binding_rejects_a_configured_file_url_root() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    let state = &fixture.state;
+    let root = fixture.path("library root");
+    std::fs::create_dir(&root).unwrap();
+    let file = std::path::Path::new(&root).join("Episode 01.mkv");
+    std::fs::write(&file, []).unwrap();
+    let url = reqwest::Url::from_directory_path(&root)
+        .unwrap()
+        .to_string();
+    add_library_folder(url.clone(), state).await.unwrap();
+    assert_eq!(
+        scan_library(state).await.unwrap().files[0].path,
+        file.to_str().unwrap()
+    );
+    for target in [root.clone(), url] {
+        assert!(bind_library_path(target, 1, None, Folder, state)
+            .await
+            .is_err());
+    }
+    #[cfg(unix)]
+    {
+        let alias = fixture.path("root alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(bind_library_path(alias, 1, None, Folder, state)
+            .await
+            .is_err());
+    }
+    assert!(library::get_bindings(&state.db).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn binding_rejects_an_alias_that_would_cover_a_library_root() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    let state = &fixture.state;
+    let root = fixture.root.join("library root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("Episode 01.mkv"), []).unwrap();
+    std::fs::write(fixture.root.join("Episode 02.mkv"), []).unwrap();
+    let alias = root.join("shows");
+    std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+    let roots = add_library_folder(
+        reqwest::Url::from_directory_path(&root).unwrap().into(),
+        state,
+    )
+    .await
+    .unwrap();
+    let scan = scan_library(state).await.unwrap();
+    let aliased_file = alias.join("Episode 02.mkv");
+    let aliased_path = aliased_file.to_str().unwrap();
+    assert!(scan.files.iter().any(|file| file.path == aliased_path));
+    assert_eq!(library::library_binding_folder(aliased_path, &roots), None);
+    assert_eq!(
+        bind_library_path(alias.to_str().unwrap().into(), 1, None, Folder, state)
+            .await
+            .unwrap_err(),
+        "Choose a show folder inside the Library or link a single file."
+    );
+    assert!(library::get_bindings(&state.db).unwrap().is_empty());
+
+    bind_library_path(aliased_path.into(), 1, None, File, state)
+        .await
+        .unwrap();
+    for file in scan_library(state).await.unwrap().files {
+        assert_eq!(file.bound, file.path == aliased_path);
+    }
+}
+
+#[tokio::test]
+async fn binding_scope_rejects_a_file_replaced_by_a_directory() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    let state = &fixture.state;
+    let path = fixture.path("Episode 01.mkv");
+    add_library_folder(fixture.root.to_str().unwrap().into(), state)
+        .await
+        .unwrap();
+    std::fs::write(&path, []).unwrap();
+    assert_eq!(scan_library(state).await.unwrap().files[0].path, path);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(bind_library_path(path.clone(), 1, None, File, state)
+        .await
+        .is_err());
+    assert!(library::get_bindings(&state.db).unwrap().is_empty());
+
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, []).unwrap();
+    assert!(bind_library_path(path.clone(), 1, None, Folder, state)
+        .await
+        .is_err());
+    let url = reqwest::Url::from_file_path(&path).unwrap().to_string();
+    bind_library_path(url.clone(), 1, Some(2), File, state)
+        .await
+        .unwrap();
+    assert!(scan_library(state).await.unwrap().files[0].bound);
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(
+        library_binding_for(url.clone(), state).await.unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        library_binding_details(url.clone(), state).await.unwrap(),
+        None
+    );
+    let descendant = std::path::Path::new(&path).join("Episode 02.mkv");
+    std::fs::write(&descendant, []).unwrap();
+    #[cfg(unix)]
+    {
+        let target = fixture.path("outside.txt");
+        std::fs::write(&target, []).unwrap();
+        let alias = descendant.with_file_name("Episode 03.mkv");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert_eq!(
+            library_binding_details(alias.to_str().unwrap().into(), state)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    assert!(scan_library(state)
+        .await
+        .unwrap()
+        .files
+        .iter()
+        .all(|file| !file.bound));
+    assert_eq!(
+        library_binding_details(descendant.to_str().unwrap().into(), state)
+            .await
+            .unwrap(),
+        None
+    );
+
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, []).unwrap();
+    assert_eq!(
+        library_binding_details(url, state).await.unwrap(),
+        Some(library::LibraryBinding {
+            media_id: 1,
+            episode_offset: 2,
+            scope: Some(File),
+        })
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -105,6 +273,7 @@ async fn every_library_command_yields_before_waiting_for_sqlite() {
     fixture.entry(1);
     let state = &fixture.state;
     let path = fixture.path("season");
+    std::fs::create_dir(&path).unwrap();
     let db = state.db.clone();
     let (entered, started) = tokio::sync::oneshot::channel();
     let (release, blocked) = mpsc::channel();
@@ -116,6 +285,7 @@ async fn every_library_command_yields_before_waiting_for_sqlite() {
     started.await.unwrap();
     let mut commands: Vec<CommandFuture<'_>> = vec![
         Box::pin(async { get_library_folders_inner(state).await.map(|_| ()) }),
+        Box::pin(async { scan_library(state).await.map(|_| ()) }),
         Box::pin(async {
             add_library_folder_inner(path.clone(), state)
                 .await
@@ -126,7 +296,7 @@ async fn every_library_command_yields_before_waiting_for_sqlite() {
                 .await
                 .map(|_| ())
         }),
-        Box::pin(bind_library_path_inner(path.clone(), 1, None, state)),
+        Box::pin(bind_library_path(path.clone(), 1, None, Folder, state)),
         Box::pin(async {
             library_binding_for_inner(path.clone(), state)
                 .await
@@ -157,34 +327,33 @@ async fn folder_and_binding_commands_preserve_validation_and_offsets() {
     let state = &fixture.state;
     let folder = fixture.path("season");
     let file = fixture.path("season/episode13.mkv");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(&file, []).unwrap();
+    let root = fixture.root.to_str().unwrap().to_owned();
     assert!(get_library_folders_inner(state).await.unwrap().is_empty());
     assert_eq!(
-        add_library_folder_inner(folder.clone(), state)
-            .await
-            .unwrap(),
-        std::slice::from_ref(&folder)
+        add_library_folder_inner(root.clone(), state).await.unwrap(),
+        std::slice::from_ref(&root)
     );
     assert_eq!(
-        add_library_folder_inner(folder.clone(), state)
-            .await
-            .unwrap(),
-        std::slice::from_ref(&folder)
+        add_library_folder_inner(root.clone(), state).await.unwrap(),
+        std::slice::from_ref(&root)
     );
     assert_eq!(
         add_library_folder_inner(file.clone(), state)
             .await
             .unwrap_err(),
-        format!("folder overlaps existing library folder: {folder}")
+        format!("folder overlaps existing library folder: {root}")
     );
     assert_eq!(
-        bind_library_path_inner(folder.clone(), 1, None, state)
+        bind_library_path(folder.clone(), 1, None, Folder, state)
             .await
             .unwrap_err(),
         "only shows on your list can be linked"
     );
     fixture.entry(1);
     assert_eq!(
-        bind_library_path_inner(folder.clone(), 1, None, state)
+        bind_library_path(folder.clone(), 1, None, Folder, state)
             .await
             .unwrap_err(),
         "only shows on your list can be linked"
@@ -192,12 +361,12 @@ async fn folder_and_binding_commands_preserve_validation_and_offsets() {
     fixture.account(7);
     fixture.entry(1);
     assert_eq!(
-        bind_library_path_inner(folder.clone(), 1, Some(10000), state)
+        bind_library_path(folder.clone(), 1, Some(10000), Folder, state)
             .await
             .unwrap_err(),
         "episode offset must be between -9999 and 9999"
     );
-    bind_library_path_inner(folder.clone(), 1, Some(-12), state)
+    bind_library_path(folder.clone(), 1, Some(-12), Folder, state)
         .await
         .unwrap();
     assert_eq!(
@@ -218,10 +387,11 @@ async fn folder_and_binding_commands_preserve_validation_and_offsets() {
             .unwrap(),
         Some(library::LibraryBinding {
             media_id: 1,
-            episode_offset: -12
+            episode_offset: -12,
+            scope: Some(Folder),
         })
     );
-    bind_library_path_inner(file.clone(), 1, None, state)
+    bind_library_path(file.clone(), 1, None, File, state)
         .await
         .unwrap();
     let file_url = reqwest::Url::from_file_path(&file).unwrap().to_string();
@@ -237,7 +407,8 @@ async fn folder_and_binding_commands_preserve_validation_and_offsets() {
             .unwrap(),
         Some(library::LibraryBinding {
             media_id: 1,
-            episode_offset: 0
+            episode_offset: 0,
+            scope: Some(File),
         })
     );
     state.db.delete_entry(1).unwrap();
@@ -255,11 +426,198 @@ async fn folder_and_binding_commands_preserve_validation_and_offsets() {
     );
     unbind_library_media_inner(1, state).await.unwrap();
     assert_eq!(library_binding_for_inner(file, state).await.unwrap(), None);
-    assert!(remove_library_folder_inner(folder, state)
+    assert!(remove_library_folder_inner(root, state)
         .await
         .unwrap()
         .is_empty());
     assert!(get_library_folders_inner(state).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn link_requires_a_current_matcher_and_works_after_metadata_arrives() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry_without_media(5);
+    fixture.entry_without_media(6);
+    let state = &fixture.state;
+    let path = fixture.path("Some Show - 03.mkv");
+    std::fs::write(&path, []).unwrap();
+    state
+        .db
+        .upsert_media(&Media {
+            id: 5,
+            title_english: Some("Some Show".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    state.refresh_matchers();
+    add_library_folder(fixture.root.to_str().unwrap().into(), state)
+        .await
+        .unwrap();
+    let recognized = |scan: LibraryScan| {
+        assert_eq!(scan.files.len(), 1);
+        let file = &scan.files[0];
+        (file.media_id, file.episode, file.bound)
+    };
+    assert_eq!(
+        recognized(scan_library(state).await.unwrap()),
+        (Some(5), Some(3), false)
+    );
+    let missing = bind_library_path(path.clone(), 6, Some(-2), File, state).await;
+    let saved = library_binding_for(path.clone(), state).await.unwrap();
+    let after_attempt = recognized(scan_library(state).await.unwrap());
+    assert_eq!(after_attempt, (Some(5), Some(3), false));
+    assert_eq!(
+        (missing, saved),
+        (
+            Err("Show details are unavailable. Refresh your list and try again.".into()),
+            None
+        )
+    );
+
+    state
+        .db
+        .upsert_media(&Media {
+            id: 6,
+            title_english: Some("Another Show".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    state.refresh_media_matchers(&[6]);
+    bind_library_path(path.clone(), 6, Some(-2), File, state)
+        .await
+        .unwrap();
+    assert_eq!(library_binding_for(path, state).await.unwrap(), Some(6));
+    assert_eq!(
+        recognized(scan_library(state).await.unwrap()),
+        (Some(6), Some(1), true)
+    );
+}
+
+#[tokio::test]
+async fn numbering_uses_the_same_live_binding_as_scan_and_preserves_inactive_links() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(5);
+    fixture.entry_without_media(6);
+    let state = &fixture.state;
+    let folder = fixture.root.to_str().unwrap();
+    let path = fixture.path("Episode 13.mkv");
+    std::fs::write(&path, []).unwrap();
+    add_library_folder(folder.into(), state).await.unwrap();
+    library::bind_path(&state.db, folder, 5, -12).unwrap();
+    library::bind_path(&state.db, &path, 6, -11).unwrap();
+
+    let scan = scan_library(state).await.unwrap();
+    let file = &scan.files[0];
+    assert_eq!((file.media_id, file.episode), (Some(5), Some(1)));
+    assert_eq!(
+        library_binding_details(path.clone(), state).await.unwrap(),
+        Some(library::LibraryBinding {
+            media_id: 5,
+            episode_offset: -12,
+            scope: None,
+        })
+    );
+    assert_eq!(
+        library_binding_for(path.clone(), state).await.unwrap(),
+        Some(6)
+    );
+
+    fixture.entry(6);
+    let scan = scan_library(state).await.unwrap();
+    let file = &scan.files[0];
+    assert_eq!((file.media_id, file.episode), (Some(6), Some(2)));
+    assert_eq!(
+        library_binding_details(path, state).await.unwrap(),
+        Some(library::LibraryBinding {
+            media_id: 6,
+            episode_offset: -11,
+            scope: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn queued_scan_does_not_use_matchers_from_a_replaced_account() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    std::fs::write(fixture.path("Fixture Show 1 - 03.mkv"), []).unwrap();
+    let state = &fixture.state;
+    add_library_folder(fixture.root.to_str().unwrap().into(), state)
+        .await
+        .unwrap();
+    let transition = state.entry_lock.lock().await;
+    let mut scan = Box::pin(scan_library(state));
+    assert!(poll_once(scan.as_mut()).is_pending());
+    fixture.account(9);
+    fixture.entry(2);
+    drop(transition);
+    let result = scan.await;
+    assert!(
+        matches!(result, Err(ref error) if error == "Your AniList account changed. Try again."),
+        "stale scan returned a result: {}",
+        serde_json::to_string(&result).unwrap()
+    );
+    assert_eq!(scan_library(state).await.unwrap().files[0].media_id, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn in_flight_scan_rejects_a_different_account_with_the_same_token() {
+    let fixture = Fixture::new();
+    fixture.account(7);
+    fixture.entry(1);
+    std::fs::write(fixture.path("Fixture Show 1 - 03.mkv"), []).unwrap();
+    let state = &fixture.state;
+    add_library_folder(fixture.root.to_str().unwrap().into(), state)
+        .await
+        .unwrap();
+    let cache = state.library_cache.clone();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, blocked) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _cache = cache.lock();
+        entered.send(()).unwrap();
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    started.await.unwrap();
+    let mut scan = Box::pin(scan_library(state));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            assert!(scan.as_mut().poll(cx).is_pending());
+            if state.entry_lock.try_lock().is_ok() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    state
+        .db
+        .replace_account(
+            "session-7",
+            &User {
+                id: 9,
+                name: "User 9".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fixture.entry(2);
+    release.send(()).unwrap();
+    holder.join().unwrap();
+
+    let result = scan.await;
+    assert!(
+        matches!(result, Err(ref error) if error == "Your AniList account changed. Try again."),
+        "stale scan returned a result: {}",
+        serde_json::to_string(&result).unwrap()
+    );
+    assert_eq!(scan_library(state).await.unwrap().files[0].media_id, None);
 }
 
 #[tokio::test]
@@ -291,7 +649,7 @@ async fn library_commands_propagate_storage_errors_without_overwriting_data() {
     );
     let binding_error = library::get_bindings(&state.db).unwrap_err().to_string();
     assert_eq!(
-        bind_library_path_inner(path.clone(), 1, None, state)
+        bind_library_path(path.clone(), 1, None, Folder, state)
             .await
             .unwrap_err(),
         binding_error
@@ -325,7 +683,7 @@ async fn library_commands_propagate_storage_errors_without_overwriting_data() {
         .execute_batch("DROP TABLE list_entry")
         .unwrap();
     assert_eq!(
-        bind_library_path_inner(path, 1, None, state)
+        bind_library_path(path, 1, None, File, state)
             .await
             .unwrap_err(),
         "no such table: list_entry"
@@ -407,7 +765,7 @@ async fn queued_library_account_checks_reject_replaced_sessions() {
     state.db.record_watch(7, &path, 1, 7).unwrap();
     state.db.record_watch(9, &path, 1, 9).unwrap();
     let account_transition = state.entry_lock.lock().await;
-    let mut bind = Box::pin(bind_library_path_inner(path.clone(), 1, None, state));
+    let mut bind = Box::pin(bind_library_path(path.clone(), 1, None, Folder, state));
     let mut details = Box::pin(library_binding_details_inner(path.clone(), state));
     let mut history = Box::pin(get_watch_history_inner(None, None, state));
     assert!(poll_once(bind.as_mut()).is_pending());
@@ -437,10 +795,12 @@ async fn queued_folder_and_unlink_writes_do_not_cross_accounts() {
     let state = &fixture.state;
     let existing = fixture.path("existing");
     let new_folder = fixture.path("new");
+    let linked = fixture.path("existing/show");
+    std::fs::create_dir_all(&linked).unwrap();
     add_library_folder_inner(existing.clone(), state)
         .await
         .unwrap();
-    bind_library_path_inner(existing.clone(), 1, None, state)
+    bind_library_path(linked.clone(), 1, None, Folder, state)
         .await
         .unwrap();
     let transition = state.entry_lock.lock().await;
@@ -464,7 +824,7 @@ async fn queued_folder_and_unlink_writes_do_not_cross_accounts() {
         std::slice::from_ref(&existing)
     );
     assert_eq!(
-        library_binding_for_inner(existing, state).await.unwrap(),
+        library_binding_for_inner(linked, state).await.unwrap(),
         Some(1)
     );
 }
@@ -478,7 +838,7 @@ async fn queued_library_writes_reject_a_new_intent_for_the_same_account() {
     let path = fixture.path("same-account");
     let transition = state.entry_lock.lock().await;
     let mut add = Box::pin(add_library_folder_inner(path.clone(), state));
-    let mut bind = Box::pin(bind_library_path_inner(path.clone(), 1, None, state));
+    let mut bind = Box::pin(bind_library_path(path.clone(), 1, None, Folder, state));
     assert!(poll_once(add.as_mut()).is_pending());
     assert!(poll_once(bind.as_mut()).is_pending());
     state.begin_auth_intent();
@@ -542,8 +902,9 @@ fn library_account_checks_hold_the_guard_until_blocking_work_finishes() {
         fixture.entry(1);
         let state = &fixture.state;
         let path = fixture.path("season");
+        std::fs::create_dir(&path).unwrap();
         let commands: Vec<CommandFuture<'_>> = vec![
-            Box::pin(bind_library_path_inner(path.clone(), 1, None, state)),
+            Box::pin(bind_library_path(path.clone(), 1, None, Folder, state)),
             Box::pin(async {
                 library_binding_details_inner(path.clone(), state)
                     .await
@@ -611,6 +972,7 @@ async fn signed_out_binding_details_and_rejected_session_binds_do_not_expose_or_
         Some(library::LibraryBinding {
             media_id: 1,
             episode_offset: -12,
+            scope: None,
         })
     );
     state
@@ -624,10 +986,11 @@ async fn signed_out_binding_details_and_rejected_session_binds_do_not_expose_or_
         .unwrap();
     let other_folder = fixture.path("season2");
     let guard = state.entry_lock.lock().await;
-    let mut bind = Box::pin(bind_library_path_inner(
+    let mut bind = Box::pin(bind_library_path(
         other_folder.clone(),
         1,
         None,
+        Folder,
         state,
     ));
     assert!(poll_once(bind.as_mut()).is_pending());
@@ -638,7 +1001,7 @@ async fn signed_out_binding_details_and_rejected_session_binds_do_not_expose_or_
         "Your AniList account changed. Try again."
     );
     assert_eq!(
-        bind_library_path_inner(other_folder.clone(), 1, None, state)
+        bind_library_path(other_folder.clone(), 1, None, Folder, state)
             .await
             .unwrap_err(),
         "only shows on your list can be linked"

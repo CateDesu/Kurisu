@@ -24,6 +24,10 @@ use crate::{
     theme::{ACCENT, BASE, DIM, EDGE, ERROR, INK, OCHRE, PANEL, PANEL_2, serif_font},
 };
 
+#[cfg(all(test, feature = "fixture-runtime"))]
+#[path = "torrent_read_tests.rs"]
+mod torrent_read_tests;
+
 const STATUS_ORDER: [&str; 6] = [
     "CURRENT",
     "PLANNING",
@@ -96,7 +100,7 @@ impl TorrentDisplayRow {
     fn key(&self) -> String {
         match self {
             Self::SearchHeading => "search-heading".into(),
-            Self::SearchRelease(item) => format!("search-{}", item.guid),
+            Self::SearchRelease(item) => format!("search-{}", release_row_key(item)),
             Self::Category { status, .. } => format!("category-{status}"),
             Self::Filter { status, .. } => format!("filter-{status}"),
             Self::Show(group) => format!("show-{}", group.entry.media_id),
@@ -104,7 +108,9 @@ impl TorrentDisplayRow {
             Self::ChoiceSection {
                 media_id, title, ..
             } => format!("choice-{media_id}-section-{title}"),
-            Self::ChoiceRelease { media_id, item } => format!("choice-{media_id}-{}", item.guid),
+            Self::ChoiceRelease { media_id, item } => {
+                format!("choice-{media_id}-{}", release_row_key(item))
+            }
             Self::ChoiceMore {
                 media_id, title, ..
             } => format!("choice-{media_id}-more-{title}"),
@@ -175,10 +181,10 @@ pub(super) struct TorrentsState {
     expanded_statuses: HashSet<&'static str>,
     expanded_shows: HashSet<i64>,
     choices: HashMap<i64, ChoiceState>,
-    opened_links: HashSet<String>,
     opened_identities: HashSet<String>,
     submitted_query: String,
     error: String,
+    feed_error: String,
     entries_error: String,
     feeds_error: String,
     prefs_loaded: bool,
@@ -228,10 +234,10 @@ impl Default for TorrentsState {
             expanded_statuses: HashSet::from(["CURRENT"]),
             expanded_shows: HashSet::new(),
             choices: HashMap::new(),
-            opened_links: HashSet::new(),
             opened_identities: HashSet::new(),
             submitted_query: String::new(),
             error: String::new(),
+            feed_error: String::new(),
             entries_error: String::new(),
             feeds_error: String::new(),
             prefs_loaded: false,
@@ -256,6 +262,15 @@ impl Drop for TorrentsState {
 }
 
 impl TorrentsState {
+    fn apply_opened_releases(&self, items: &mut [TorrentItem]) {
+        for item in items {
+            if self.opened_identities.contains(release_identity(item)) {
+                item.seen = true;
+                item.is_new = false;
+            }
+        }
+    }
+
     pub(super) fn abort_choices(&mut self) {
         for choice in self.choices.values_mut() {
             if let Some(abort) = choice.abort.take() {
@@ -407,10 +422,14 @@ impl Workspace {
         self.replace_reads("torrents-preferences", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
-            let _ = this.update_in(cx, |this, _, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 if !this.torrent_scope_matches(generation, account)
                     || this.torrents.prefs_request != request
                 {
+                    return;
+                }
+                if this.writes_fenced() {
+                    this.route_entry_deferred |= this.route == Route::Torrents;
                     return;
                 }
                 match result {
@@ -428,6 +447,8 @@ impl Workspace {
                                 .filter(|status| statuses.iter().any(|item| item == status))
                                 .collect();
                         }
+                        let old_category = this.torrents.category.clone();
+                        let old_release = this.torrents.release.clone();
                         if this.preference_revision("kurisu.torrents.filters") == filters_revision
                             && let Some(filters) = filters.and_then(|value| {
                                 serde_json::from_str::<serde_json::Value>(&value).ok()
@@ -447,7 +468,13 @@ impl Workspace {
                             }
                         }
                         this.torrents.prefs_loaded = true;
-                        this.rebuild_torrent_rows();
+                        if this.torrents.category != old_category
+                            || this.torrents.release != old_release
+                        {
+                            this.reload_torrent_filter_results(window, cx);
+                        } else {
+                            this.rebuild_torrent_rows();
+                        }
                     }
                     Err(error) => {
                         this.torrents.error = format!("Could not read torrent preferences: {error}")
@@ -575,7 +602,8 @@ impl Workspace {
             return;
         }
         self.torrents.loading = true;
-        self.torrents.error.clear();
+        self.torrents.feed_error.clear();
+        self.torrents.refreshed = None;
         cx.notify();
         self.torrents.request = self.torrents.request.wrapping_add(1);
         let request = self.torrents.request;
@@ -596,16 +624,7 @@ impl Workspace {
                 this.torrents.loading = false;
                 match result {
                     Ok(mut result) => {
-                        for item in &mut result.items {
-                            if this.torrents.opened_links.contains(&item.link)
-                                || identities(item)
-                                    .iter()
-                                    .any(|id| this.torrents.opened_identities.contains(id))
-                            {
-                                item.seen = true;
-                                item.is_new = false;
-                            }
-                        }
+                        this.torrents.apply_opened_releases(&mut result.items);
                         this.torrents.items = result.items;
                         this.torrents.failures = result.failures;
                         this.torrents.loaded = true;
@@ -621,7 +640,7 @@ impl Workspace {
                         this.rebuild_torrent_rows();
                         this.reload_expanded_torrent_choices(window, cx);
                     }
-                    Err(error) => this.torrents.error = error,
+                    Err(error) => this.torrents.feed_error = error,
                 }
                 cx.notify();
             });
@@ -630,14 +649,39 @@ impl Workspace {
     }
 }
 
-fn identities(item: &TorrentItem) -> Vec<String> {
-    let mut ids = vec![item.guid.clone()];
-    if let Some(id) = &item.seen_guid
-        && id != &item.guid
-    {
-        ids.push(id.clone());
+fn release_identity(item: &TorrentItem) -> &str {
+    item.seen_guid.as_deref().unwrap_or(&item.guid)
+}
+
+fn release_row_key(item: &TorrentItem) -> String {
+    let id = release_identity(item);
+    if id == item.guid {
+        item.guid.clone()
+    } else {
+        format!("{}\u{1}{id}", item.guid)
     }
-    ids
+}
+
+#[derive(Default)]
+struct FeedReleases<'a> {
+    ids: HashSet<(Option<i64>, &'a str)>,
+    links: HashSet<(Option<i64>, &'a str)>,
+}
+
+impl<'a> FeedReleases<'a> {
+    fn insert(&mut self, group: Option<i64>, item: &'a TorrentItem) -> bool {
+        let id = (group, release_identity(item));
+        let link = (group, item.link.as_str());
+        // A download URL can be reused by torrents with different hashes.
+        if self.ids.contains(&id) || (item.magnet.is_none() && self.links.contains(&link)) {
+            return false;
+        }
+        self.ids.insert(id);
+        if !item.link.is_empty() {
+            self.links.insert(link);
+        }
+        true
+    }
 }
 
 fn matches_filters(item: &TorrentItem, category: &str, release: &str) -> bool {
@@ -667,6 +711,7 @@ fn display_groups(
     new_only: bool,
 ) -> Vec<ShowGroup> {
     let mut by_id: HashMap<i64, ShowGroup> = HashMap::new();
+    let mut releases = FeedReleases::default();
     for entry in entries {
         by_id.insert(
             entry.media_id,
@@ -694,7 +739,7 @@ fn display_groups(
             continue;
         };
         let is_new = is_new_for(item, &group.entry);
-        if new_only && !is_new {
+        if (new_only && !is_new) || !releases.insert(Some(group.entry.media_id), item) {
             continue;
         }
         let mut item = item.clone();
@@ -807,7 +852,6 @@ impl Workspace {
                             &mut rows,
                             group,
                             self.torrents.choices.get(&group.entry.media_id),
-                            &self.torrents.opened_links,
                             &self.torrents.opened_identities,
                         );
                     }
@@ -819,11 +863,13 @@ impl Workspace {
                 .iter()
                 .map(|entry| entry.media_id)
                 .collect();
+            let mut releases = FeedReleases::default();
             let unmatched = self
                 .torrents
                 .items
                 .iter()
                 .filter(|item| item.media_id.is_none_or(|id| !ids.contains(&id)))
+                .filter(|item| releases.insert(None, item))
                 .count();
             if unmatched > 0 {
                 rows.push(TorrentDisplayRow::Unmatched(unmatched));
@@ -896,7 +942,8 @@ impl Workspace {
                 }
                 this.torrents.searching = false;
                 match result {
-                    Ok(results) => {
+                    Ok(mut results) => {
+                        this.torrents.apply_opened_releases(&mut results);
                         this.torrents.results = results;
                         this.torrents.searched = true;
                     }
@@ -932,19 +979,24 @@ impl Workspace {
             serde_json::json!({"category":self.torrents.category,"release":self.torrents.release})
                 .to_string();
         self.persist_preference("kurisu.torrents.filters", Some(value), window, cx);
-        self.rebuild_torrent_rows();
-        if !self.torrents.submitted_query.is_empty() {
-            self.torrents.searching = false;
-            self.search_torrents(Some(self.torrents.submitted_query.clone()), window, cx);
-        }
+        self.reload_torrent_filter_results(window, cx);
+        cx.notify();
+    }
+
+    fn reload_torrent_filter_results(&mut self, window: &Window, cx: &mut Context<Self>) {
         for choice in self.torrents.choices.values_mut() {
             if let Some(abort) = choice.abort.take() {
                 abort.abort();
             }
         }
         self.torrents.choices.clear();
+        if !self.torrents.submitted_query.is_empty() {
+            self.torrents.searching = false;
+            self.search_torrents(Some(self.torrents.submitted_query.clone()), window, cx);
+        } else {
+            self.rebuild_torrent_rows();
+        }
         self.reload_expanded_torrent_choices(window, cx);
-        cx.notify();
     }
 
     pub(super) fn reload_expanded_torrent_choices(
@@ -1089,7 +1141,6 @@ fn append_choice_rows(
     rows: &mut Vec<TorrentDisplayRow>,
     group: &ShowGroup,
     state: Option<&ChoiceState>,
-    opened_links: &HashSet<String>,
     opened_ids: &HashSet<String>,
 ) {
     let id = group.entry.media_id;
@@ -1155,8 +1206,7 @@ fn append_choice_rows(
             let expanded = state.expanded_sections.contains(&title);
             for item in items.iter().take(if expanded { usize::MAX } else { 6 }) {
                 let mut item = item.clone();
-                item.seen |= opened_links.contains(&item.link)
-                    || identities(&item).iter().any(|key| opened_ids.contains(key));
+                item.seen |= opened_ids.contains(release_identity(&item));
                 rows.push(TorrentDisplayRow::ChoiceRelease {
                     media_id: id,
                     item: Arc::new(item),
@@ -1164,7 +1214,7 @@ fn append_choice_rows(
             }
             for item in items {
                 found_links.insert(item.link.clone());
-                found_ids.extend(identities(item));
+                found_ids.insert(release_identity(item));
             }
             if items.len() > 6 {
                 rows.push(TorrentDisplayRow::ChoiceMore {
@@ -1190,8 +1240,8 @@ fn append_choice_rows(
         .items
         .iter()
         .filter(|item| {
-            !found_links.contains(&item.link)
-                && !identities(item).iter().any(|key| found_ids.contains(key))
+            (item.magnet.is_some() || !found_links.contains(&item.link))
+                && !found_ids.contains(release_identity(item))
         })
         .collect();
     if !remaining.is_empty() {
@@ -1214,9 +1264,22 @@ impl Workspace {
         self.torrents.feeds_request = self.torrents.feeds_request.wrapping_add(1);
         self.torrents.feeds_loading = false;
         self.cancel_reads("torrents-feeds");
+        let enabled: HashSet<_> = feeds.iter().map(String::as_str).collect();
+        let previous_count = self.torrents.items.len();
+        self.torrents.items.retain(|item| {
+            item.guid
+                .split_once('\u{1}')
+                .is_some_and(|(feed, _)| enabled.contains(feed))
+        });
+        self.torrents
+            .failures
+            .retain(|failure| enabled.contains(failure.url.as_str()));
         self.torrents.feeds = feeds;
         self.torrents.feeds_loaded = true;
         self.torrents.feeds_error.clear();
+        if self.torrents.items.len() != previous_count {
+            self.rebuild_torrent_rows();
+        }
     }
 
     fn restart_torrent_feed(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -1422,40 +1485,30 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        self.torrents.opened_links.insert(item.link.clone());
-        let mut guids: HashSet<_> = identities(&item).into_iter().collect();
-        for other in &self.torrents.items {
-            if other.link == item.link || identities(other).iter().any(|id| guids.contains(id)) {
-                guids.extend(identities(other));
-            }
-        }
-        self.torrents.opened_identities.extend(guids.clone());
+        let id = release_identity(&item).to_owned();
+        self.torrents.opened_identities.insert(id.clone());
+        let choices = self
+            .torrents
+            .choices
+            .values_mut()
+            .filter_map(|choice| choice.choices.as_mut())
+            .flat_map(|found| {
+                found
+                    .batches
+                    .iter_mut()
+                    .chain(found.episodes.iter_mut())
+                    .chain(found.other.iter_mut())
+            });
         for other in self
             .torrents
             .items
             .iter_mut()
             .chain(self.torrents.results.iter_mut())
+            .chain(choices)
         {
-            if other.link == item.link || identities(other).iter().any(|id| guids.contains(id)) {
+            if release_identity(other) == id {
                 other.seen = true;
                 other.is_new = false;
-            }
-        }
-        for choice in self.torrents.choices.values_mut() {
-            if let Some(found) = choice.choices.as_mut() {
-                for other in found
-                    .batches
-                    .iter_mut()
-                    .chain(found.episodes.iter_mut())
-                    .chain(found.other.iter_mut())
-                {
-                    if other.link == item.link
-                        || identities(other).iter().any(|id| guids.contains(id))
-                    {
-                        other.seen = true;
-                        other.is_new = false;
-                    }
-                }
             }
         }
         self.rebuild_torrent_rows();
@@ -1466,10 +1519,8 @@ impl Workspace {
         self.active_writes += 1;
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(
-                core.spawn(
-                    async move { worker.mark_torrents_seen(guids.into_iter().collect()).await },
-                )
-                .await,
+                core.spawn(async move { worker.mark_torrents_seen(vec![id]).await })
+                    .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
@@ -1520,6 +1571,15 @@ impl Workspace {
     }
 }
 
+impl TorrentsState {
+    pub(super) fn dismiss_menu(&mut self) -> bool {
+        let open = self.category_menu || self.release_menu;
+        self.category_menu = false;
+        self.release_menu = false;
+        open
+    }
+}
+
 impl Workspace {
     pub(super) fn render_torrents(
         &mut self,
@@ -1530,8 +1590,7 @@ impl Workspace {
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         if self.modal_open() {
-            self.torrents.category_menu = false;
-            self.torrents.release_menu = false;
+            self.torrents.dismiss_menu();
         }
         let state = &self.torrents;
         let visible_new = state
@@ -1550,18 +1609,7 @@ impl Workspace {
             .min_h_0()
             .flex()
             .flex_col()
-            .p(px(28.))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape"
-                    && !this.modal_open()
-                    && (this.torrents.category_menu || this.torrents.release_menu)
-                {
-                    this.torrents.category_menu = false;
-                    this.torrents.release_menu = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }));
+            .p(px(28.));
         page = page.child(
             div()
                 .min_h(px(92.))
@@ -2034,7 +2082,8 @@ impl Workspace {
         }
         page = page.child(tips);
         for (id, error) in [
-            ("torrent-error-feed", &state.error),
+            ("torrent-error", &state.error),
+            ("torrent-error-feed", &state.feed_error),
             ("torrent-error-entries", &state.entries_error),
             ("torrent-error-feeds", &state.feeds_error),
         ] {
@@ -2063,7 +2112,7 @@ impl Workspace {
                 ),
             );
         }
-        if !state.failures.is_empty() {
+        if state.feed_error.is_empty() && !state.failures.is_empty() {
             let mut failures = div()
                 .mb(px(8.))
                 .p(px(8.))
@@ -2377,14 +2426,28 @@ fn render_torrent_row(
         TorrentDisplayRow::Show(group) => {
             let id = group.entry.media_id;
             let title = group.title.clone();
-            let progress = group.entry.progress;
-            let total = group.entry.media.as_ref().and_then(|media| media.episodes);
+            let progress = group.entry.progress.max(0);
+            let total = group
+                .entry
+                .media
+                .as_ref()
+                .and_then(|media| media.episodes)
+                .filter(|total| *total > 0);
             let finished = group
                 .entry
                 .media
                 .as_ref()
                 .and_then(|media| media.status.as_deref())
                 == Some("FINISHED");
+            let next = progress
+                .checked_add(1)
+                .filter(|next| total.is_none_or(|total| *next <= total))
+                .map_or_else(String::new, |episode| format!("Next episode {episode} · "));
+            let caption = format!(
+                "Find batches · {next}{} feed releases{}",
+                group.items.len(),
+                if finished { " · Finished airing" } else { "" }
+            );
             let weak_toggle = weak.clone();
             let weak_details = weak.clone();
             let expanded = weak
@@ -2395,6 +2458,7 @@ fn render_torrent_row(
                 .id(format!("torrent-show-{id}"))
                 .role(Role::Button)
                 .aria_label(format!("Download options for {title}"))
+                .aria_description(caption.clone())
                 .aria_expanded(expanded)
                 .tab_stop(true)
                 .focusable()
@@ -2433,22 +2497,7 @@ fn render_torrent_row(
                             },
                         ),
                     )
-                    .child(div().text_size(px(12.)).text_color(rgb(DIM)).child(
-                        if total.is_none_or(|total| progress < total) {
-                            format!(
-                                "Find batches · Next episode {} · {} feed releases{}",
-                                progress + 1,
-                                group.items.len(),
-                                if finished { " · Finished airing" } else { "" }
-                            )
-                        } else {
-                            format!(
-                                "Find batches · {} feed releases{}",
-                                group.items.len(),
-                                if finished { " · Finished airing" } else { "" }
-                            )
-                        },
-                    ))
+                    .child(div().text_size(px(12.)).text_color(rgb(DIM)).child(caption))
                     .when(group.has_new, |row| {
                         row.child(
                             div()
@@ -2562,7 +2611,7 @@ fn render_release_row(
     scope: String,
     weak: WeakEntity<Workspace>,
 ) -> AnyElement {
-    let guid = item.guid.clone();
+    let guid = release_row_key(item);
     let title = item.title.clone();
     let mut meta = Vec::new();
     if item.is_new {
@@ -2719,6 +2768,12 @@ impl Workspace {
         self.torrents.feed_input.clone().unwrap()
     }
 
+    pub(crate) fn test_torrent_filter_menus(&self) -> Option<(bool, bool)> {
+        self.torrents
+            .prefs_loaded
+            .then_some((self.torrents.category_menu, self.torrents.release_menu))
+    }
+
     pub(crate) fn test_torrent_error(&self) -> &str {
         &self.torrents.error
     }
@@ -2747,8 +2802,68 @@ impl Workspace {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use kurisu_core::{Core, Db, UpdateChannel};
+    use kurisu_core::{Core, Db, UpdateChannel, models::Media};
     use std::path::Path;
+
+    #[gpui::test]
+    fn torrent_next_episode_handles_progress_boundaries(cx: &mut TestAppContext) {
+        let (core, _runtime) = fixture(&[], Some("[]"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(1000.)));
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.offline = true;
+            w.torrents.prefs_loaded = true;
+            w.torrents.loaded = true;
+            w.torrents.entries_loaded = true;
+            w.torrents.feeds_loaded = true;
+            w.navigate(Route::Torrents, window, cx);
+        });
+        cx.simulate_accessibility_activation();
+        for (progress, total, next) in [
+            (i64::MAX, None, None),
+            (i64::MAX - 1, None, Some(i64::MAX)),
+            (12, Some(12), None),
+            (-1, Some(0), Some(1)),
+        ] {
+            workspace.update_in(cx, |w, _, cx| {
+                w.torrents.entries = vec![ListEntry {
+                    media_id: 9,
+                    progress,
+                    status: "CURRENT".into(),
+                    media: Some(Media {
+                        id: 9,
+                        episodes: total,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }];
+                w.rebuild_torrent_rows();
+                cx.notify();
+            });
+            cx.update(|window, app| window.draw(app).clear(app));
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            let text = tree
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.description())
+                .find(|text| text.starts_with("Find batches"))
+                .unwrap();
+            assert_eq!(
+                text,
+                next.map_or_else(
+                    || "Find batches · 0 feed releases".into(),
+                    |episode| format!("Find batches · Next episode {episode} · 0 feed releases"),
+                )
+            );
+        }
+    }
 
     struct TestPlatform;
 
@@ -3082,10 +3197,12 @@ mod tests {
                 .preference_writes
                 .entry("kurisu.torrents.new")
                 .or_default();
-            write.pending = Some(crate::screens::QueuedPreference {
-                value: Some("1".into()),
-                account: Some(47),
-            });
+            write.pending = Some(crate::screens::PreferenceEdit::Setting(
+                crate::screens::QueuedPreference {
+                    value: Some("1".into()),
+                    account: Some(47),
+                },
+            ));
             write.error = Some("storage failure".into());
             cx.notify();
         });
@@ -3496,13 +3613,7 @@ mod tests {
             ..Default::default()
         });
         let mut rows = Vec::new();
-        append_choice_rows(
-            &mut rows,
-            &group,
-            Some(&state),
-            &HashSet::new(),
-            &HashSet::new(),
-        );
+        append_choice_rows(&mut rows, &group, Some(&state), &HashSet::new());
         assert_eq!(
             rows.iter()
                 .filter(|row| matches!(row, TorrentDisplayRow::ChoiceRelease { .. }))

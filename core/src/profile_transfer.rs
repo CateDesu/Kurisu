@@ -24,8 +24,9 @@ pub const UI_PREFERENCE_KEYS: [&str; 9] = [
 const FORMAT: &str = "kurisu-ui-preferences-v1";
 const MARKER: &str = ".kurisu-native-profile";
 const MARKER_CONTENT: &[u8] = b"kurisu-native-v1\n";
-const RECEIPT: &str = ".kurisu-transfer.json";
+pub const RECEIPT: &str = ".kurisu-transfer.json";
 const MAX_PREFERENCES_SIZE: u64 = 1024 * 1024;
+const MAX_RECEIPT_SIZE: u64 = 1024 * 1024;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +69,7 @@ struct Preferences {
     preferences: BTreeMap<String, Option<String>>,
 }
 
-pub fn encode_preferences(values: &BTreeMap<String, Option<String>>) -> Result<Vec<u8>> {
+fn validate_preference_keys(values: &BTreeMap<String, Option<String>>) -> Result<()> {
     ensure!(
         values.len() == UI_PREFERENCE_KEYS.len()
             && UI_PREFERENCE_KEYS
@@ -76,6 +77,11 @@ pub fn encode_preferences(values: &BTreeMap<String, Option<String>>) -> Result<V
                 .all(|key| values.contains_key(*key)),
         "Expected exactly the nine UI preferences"
     );
+    Ok(())
+}
+
+pub fn encode_preferences(values: &BTreeMap<String, Option<String>>) -> Result<Vec<u8>> {
+    validate_preference_keys(values)?;
     let mut bytes = serde_json::to_vec_pretty(&Preferences {
         format: FORMAT.into(),
         preferences: values.clone(),
@@ -88,19 +94,27 @@ pub fn encode_preferences(values: &BTreeMap<String, Option<String>>) -> Result<V
     Ok(bytes)
 }
 
-fn load_preferences(path: &Path) -> Result<BTreeMap<String, Option<String>>> {
+fn read_preferences(path: &Path) -> Result<Vec<u8>> {
     regular_file(path)?;
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_PREFERENCES_SIZE + 1)
+        .read_to_end(&mut bytes)?;
     ensure!(
-        fs::metadata(path)?.len() <= MAX_PREFERENCES_SIZE,
+        bytes.len() as u64 <= MAX_PREFERENCES_SIZE,
         "UI preference export is too large"
     );
-    let values: Preferences = serde_json::from_slice(&fs::read(path)?)
-        .context("Preference export is not valid UTF-8 JSON")?;
+    Ok(bytes)
+}
+
+fn load_preferences(bytes: &[u8]) -> Result<BTreeMap<String, Option<String>>> {
+    let values: Preferences =
+        serde_json::from_slice(bytes).context("Preference export is not valid UTF-8 JSON")?;
     ensure!(
         values.format == FORMAT,
         "Unsupported preference export format"
     );
-    encode_preferences(&values.preferences)?;
+    validate_preference_keys(&values.preferences)?;
     Ok(values.preferences)
 }
 
@@ -289,6 +303,11 @@ fn copy_private(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_matches(source: &Path, destination: &Path, expected: &[u8]) -> Result<bool> {
+    copy_private(source, destination)?;
+    Ok(digest(destination)? == expected)
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut output = create_private(path)?;
     output.write_all(bytes)?;
@@ -302,6 +321,16 @@ fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+fn sync_published_parent(path: &Path, description: &str) -> Result<()> {
+    let parent = path.parent().context("Missing destination parent")?;
+    sync_directory(parent).with_context(|| {
+        format!(
+            "Could not sync the parent of the published {description} at {}",
+            path.display()
+        )
+    })
 }
 
 struct Stage(PathBuf);
@@ -363,7 +392,7 @@ fn validate_schema(db: &Connection) -> Result<()> {
     ensure!(integrity == ["ok"], "Database integrity check failed");
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        (1..=7).contains(&version),
+        (1..=crate::db::SCHEMA_VERSION).contains(&version),
         "Unsupported legacy schema version: {version}"
     );
     let mut columns = vec![
@@ -432,7 +461,18 @@ fn validate_schema(db: &Connection) -> Result<()> {
             ],
         ));
     }
+    if version >= 8 {
+        columns[2].1.push("queued_creation");
+    }
+    let tables: BTreeSet<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     for (table, required) in columns {
+        ensure!(
+            tables.contains(table),
+            "Database schema is missing the {table} table"
+        );
         let present: BTreeSet<String> = db
             .prepare(&format!("PRAGMA table_info({table})"))?
             .query_map([], |r| r.get(1))?
@@ -443,7 +483,9 @@ fn validate_schema(db: &Connection) -> Result<()> {
         );
     }
     let indexes: BTreeSet<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")?
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'watch_history'",
+        )?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for (minimum, name) in [
@@ -523,8 +565,9 @@ fn validate_wal(database: &Path, wal: &Path) -> Result<()> {
     ensure!(remaining % frame_size == 0, "{}", refuse());
     let mut frame = vec![0; frame_size as usize];
     let salts = (word(&header, 16), word(&header, 20));
-    let mut committed = false;
+    let mut has_current_frame = false;
     let mut obsolete = None;
+    let mut obsolete_orders = [true, true];
     for _ in 0..remaining / frame_size {
         input.read_exact(&mut frame).map_err(|_| refuse())?;
         ensure!(
@@ -533,31 +576,44 @@ fn validate_wal(database: &Path, wal: &Path) -> Result<()> {
             refuse()
         );
         let frame_salts = (word(&frame, 8), word(&frame, 12));
-        if frame_salts != salts {
-            // SQLite keeps checkpointed frames when it reuses a WAL.
-            ensure!(committed, "{}", refuse());
+        let frame_sum = (word(&frame, 16), word(&frame, 20));
+        let frame_checksum =
+            |little| checksum(&frame[24..], little, checksum(&frame[..8], little, sum));
+        if frame_salts == salts {
+            ensure!(
+                obsolete.is_none() && frame_checksum(little) == frame_sum,
+                "{}",
+                refuse()
+            );
+            has_current_frame = true;
+        } else {
+            // A restarted WAL can spill frames before the new generation commits.
+            ensure!(has_current_frame, "{}", refuse());
             if obsolete == Some(frame_salts) {
-                sum = checksum(&frame[..8], little, sum);
-                sum = checksum(&frame[24..], little, sum);
-                ensure!(sum == (word(&frame, 16), word(&frame, 20)), "{}", refuse());
+                for (possible, little) in obsolete_orders.iter_mut().zip([true, false]) {
+                    *possible = *possible && frame_checksum(little) == frame_sum;
+                }
+                ensure!(
+                    obsolete_orders.into_iter().any(|possible| possible),
+                    "{}",
+                    refuse()
+                );
             } else {
                 let previous = obsolete.unwrap_or(salts);
+                // A current frame with damaged salts still continues the current checksum.
                 ensure!(
-                    (1..=i32::MAX as u32).contains(&previous.0.wrapping_sub(frame_salts.0))
+                    (obsolete.is_some() || frame_checksum(little) != frame_sum)
+                        && (1..=i32::MAX as u32).contains(&previous.0.wrapping_sub(frame_salts.0))
                         && previous.1 != frame_salts.1,
                     "{}",
                     refuse()
                 );
+                // SQLite uses the writer's byte order when it starts a new generation.
+                obsolete_orders = [true, true];
             }
             obsolete = Some(frame_salts);
-            sum = (word(&frame, 16), word(&frame, 20));
-            continue;
         }
-        ensure!(obsolete.is_none(), "{}", refuse());
-        sum = checksum(&frame[..8], little, sum);
-        sum = checksum(&frame[24..], little, sum);
-        ensure!(sum == (word(&frame, 16), word(&frame, 20)), "{}", refuse());
-        committed |= word(&frame, 4) != 0;
+        sum = frame_sum;
     }
     Ok(())
 }
@@ -579,11 +635,18 @@ fn open_snapshot(
 ) -> Result<(Connection, BTreeMap<PathBuf, Vec<u8>>)> {
     let original = profile_fingerprints(source)?;
     let copied = scratch.join("kurisu.db");
-    copy_private(source, &copied)?;
+    ensure!(
+        copy_matches(source, &copied, &original[source])?,
+        "Staged database differs from the original snapshot"
+    );
     let wal = sidecar(source, "-wal");
-    if original.contains_key(&wal) {
-        copy_private(&wal, &sidecar(&copied, "-wal"))?;
-        validate_wal(&copied, &sidecar(&copied, "-wal"))?;
+    if let Some(expected) = original.get(&wal) {
+        let copied_wal = sidecar(&copied, "-wal");
+        ensure!(
+            copy_matches(&wal, &copied_wal, expected)?,
+            "Staged WAL differs from the original snapshot"
+        );
+        validate_wal(&copied, &copied_wal)?;
     }
     ensure!(
         original == profile_fingerprints(source)?,
@@ -618,12 +681,16 @@ fn snapshot(source: &Path, scratch: &Path, backup: &Path) -> Result<BTreeMap<Pat
 
 fn populate(
     backup: &Path,
+    backup_digest: &[u8],
     stage: &Path,
     values: BTreeMap<String, Option<String>>,
     request: &TransferRequest,
 ) -> Result<()> {
     let database = stage.join("kurisu.db");
-    copy_private(backup, &database)?;
+    ensure!(
+        copy_matches(backup, &database, backup_digest)?,
+        "Native database copy differs from the prepared snapshot"
+    );
     let mut db = Connection::open(&database)?;
     db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
     validate_schema(&db)?;
@@ -662,14 +729,13 @@ fn populate(
     sync_directory(stage)
 }
 
-fn publish_directory(stage: &Path, destination: &Path) -> Result<()> {
+fn rename_no_replace(stage: &Path, destination: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         let source = CString::new(stage.as_os_str().as_bytes())?;
         let target = CString::new(destination.as_os_str().as_bytes())?;
-        // No replacement, including an empty directory created by another launch.
         let result = unsafe {
             libc::renameat2(
                 libc::AT_FDCWD,
@@ -684,10 +750,31 @@ fn publish_directory(stage: &Path, destination: &Path) -> Result<()> {
         }
     }
     #[cfg(windows)]
-    fs::rename(stage, destination)?;
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            core::PCWSTR,
+            Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH},
+        };
+        let source = stage.canonicalize()?;
+        let parent = destination.parent().context("Missing destination parent")?;
+        let name = destination
+            .file_name()
+            .context("Missing destination name")?;
+        let target = parent.canonicalize()?.join(name);
+        let source: Vec<_> = source.as_os_str().encode_wide().chain([0]).collect();
+        let target: Vec<_> = target.as_os_str().encode_wide().chain([0]).collect();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )?;
+        }
+    }
     #[cfg(not(any(windows, target_os = "linux")))]
     bail!("Profile transfer supports Linux and Windows only");
-    sync_directory(destination.parent().context("Missing destination parent")?)
+    Ok(())
 }
 
 /// Copies a stopped legacy profile. Never opens the source with SQLite.
@@ -734,63 +821,86 @@ pub fn transfer(request: &TransferRequest) -> Result<TransferOutcome> {
         "Transfer paths must be distinct"
     );
     if !absent(destination)? {
-        regular_file(&destination.join(MARKER))?;
-        regular_file(&destination.join(RECEIPT))?;
-        regular_file(&destination.join("kurisu.db"))?;
+        let database = destination.join("kurisu.db");
+        let marker = destination.join(MARKER);
+        let receipt = destination.join(RECEIPT);
+        regular_file(&marker)?;
+        regular_file(&receipt)?;
+        let mut contents = Vec::new();
+        File::open(marker)?
+            .take(MARKER_CONTENT.len() as u64 + 1)
+            .read_to_end(&mut contents)?;
         ensure!(
-            fs::read(destination.join(MARKER))? == MARKER_CONTENT,
+            contents == MARKER_CONTENT,
             "Existing native profile has an unknown marker"
         );
-        let receipt: TransferRequest =
-            serde_json::from_slice(&fs::read(destination.join(RECEIPT))?)?;
+        contents.clear();
+        File::open(receipt)?
+            .take(MAX_RECEIPT_SIZE + 1)
+            .read_to_end(&mut contents)?;
+        ensure!(
+            contents.len() as u64 <= MAX_RECEIPT_SIZE,
+            "Transfer receipt is too large"
+        );
+        let receipt: TransferRequest = serde_json::from_slice(&contents)?;
         ensure!(
             receipt == *request,
             "Existing native profile belongs to another transfer"
         );
+        let scratch_parent = destination.parent().context("Missing destination parent")?;
+        validate_database_with_scratch(&database, scratch_parent)
+            .context("Could not validate the existing native profile")?;
+        sync_published_parent(destination, "native profile")?;
         return Ok(TransferOutcome::AlreadyTransferred);
     }
-    let preferences_digest = digest(preferences)?;
-    let values = load_preferences(preferences)?;
-    ensure!(
-        digest(preferences)? == preferences_digest,
-        "Preferences changed while reading the export"
-    );
+    let export = read_preferences(preferences)?;
+    let values = load_preferences(&export)?;
     let backup_parent = backup.parent().context("Missing backup parent")?;
     let destination_parent = destination.parent().context("Missing destination parent")?;
     ensure!(
         backup_parent.is_dir() && destination_parent.is_dir(),
         "Create destination parents first"
     );
-    standalone_if_absent(backup)?;
+    check_backup_sidecars(backup)?;
     let scratch = Stage::new(backup_parent)?;
     let prepared_backup = scratch.0.join("backup.db");
     let source_stage = Stage::new(&scratch.0)?;
     let original = snapshot(source, &source_stage.0, &prepared_backup)?;
     let backup_digest = digest(&prepared_backup)?;
-    if absent(backup)? {
-        fs::hard_link(&prepared_backup, backup)
+    let native_source = if absent(backup)? {
+        rename_no_replace(&prepared_backup, backup)
             .context("Could not publish standalone backup without replacing existing data")?;
-        sync_directory(backup_parent)?;
+        backup
     } else {
         regular_file(backup)?;
         ensure!(
             digest(backup)? == backup_digest,
             "Existing backup differs from this source. Keep it and choose a new backup path"
         );
-    }
+        &prepared_backup
+    };
+    sync_published_parent(backup, "standalone backup")?;
     let native_stage = Stage::new(destination_parent)?;
-    populate(&prepared_backup, &native_stage.0, values, request)?;
+    populate(
+        native_source,
+        &backup_digest,
+        &native_stage.0,
+        values,
+        request,
+    )?;
+    check_backup_sidecars(backup)?;
     ensure!(
         digest(backup)? == backup_digest
             && original == fingerprints(source)?
-            && digest(preferences)? == preferences_digest,
+            && read_preferences(preferences)? == export,
         "Source, backup or preferences changed during transfer"
     );
-    publish_directory(&native_stage.0, destination)?;
+    rename_no_replace(&native_stage.0, destination).context("Could not publish new profile")?;
+    sync_published_parent(destination, "native profile")?;
     Ok(TransferOutcome::Created)
 }
 
-fn standalone_if_absent(path: &Path) -> Result<()> {
+fn check_backup_sidecars(path: &Path) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         ensure!(
             absent(&sidecar(path, suffix))?,
@@ -830,7 +940,8 @@ mod tests {
                  INSERT INTO settings VALUES ('library_folders','[\"/synthetic/media\"]');
                  INSERT INTO settings VALUES ('binding:/synthetic/show','7');
                  INSERT INTO media (id,title_romaji,episodes,cached_at) VALUES (7,'Fixture show',12,100);
-                 INSERT INTO list_entry VALUES (7,70,'CURRENT',5,8.5,2,101);
+                 INSERT INTO list_entry (media_id,entry_id,status,progress,score,repeat,updated_at)
+                 VALUES (7,70,'CURRENT',5,8.5,2,101);
                  INSERT INTO pending_change VALUES (42,7,'{\"progress\":6}');
                  INSERT INTO pending_change VALUES (99,7,'{\"progress\":3}');
                  INSERT INTO watched_file VALUES ('/synthetic/file',7,5,102);
@@ -909,7 +1020,7 @@ mod tests {
                 .unwrap();
             assert_eq!(rusqlite::types::Value::Text(value), row[1]);
         }
-        let values = load_preferences(&r.preferences).unwrap();
+        let values = load_preferences(&read_preferences(&r.preferences).unwrap()).unwrap();
         for key in UI_PREFERENCE_KEYS {
             let actual: String = native
                 .query_row(
@@ -954,6 +1065,78 @@ mod tests {
         fs::remove_file(r.destination.join(RECEIPT)).unwrap();
         assert!(transfer(r).is_err());
         assert_eq!(digest(&native).unwrap(), before);
+    }
+
+    #[test]
+    fn retry_refuses_a_truncated_database_with_matching_receipt() {
+        let fixture = Fixture::new();
+        let request = &fixture.request;
+        transfer(request).unwrap();
+        let native = request.destination.join("kurisu.db");
+        let truncated = fs::read(&native).unwrap()[..101].to_vec();
+        fs::write(&native, &truncated).unwrap();
+        fs::remove_file(&request.source_db).unwrap();
+        let error = transfer(request).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("validate the existing native profile"));
+        assert_eq!(fs::read(&native).unwrap(), truncated);
+    }
+
+    #[test]
+    fn preference_size_limit_uses_the_export_bytes() {
+        let fixture = Fixture::new();
+        let request = &fixture.request;
+        let mut export: Preferences =
+            serde_json::from_slice(&read_preferences(&request.preferences).unwrap()).unwrap();
+        let query = export.preferences.get_mut("kurisu.list.q").unwrap();
+        *query = Some(String::new());
+        let overhead = serde_json::to_vec(&export).unwrap().len();
+        let query = "x".repeat(MAX_PREFERENCES_SIZE as usize - overhead);
+        export
+            .preferences
+            .insert("kurisu.list.q".into(), Some(query));
+        let mut bytes = serde_json::to_vec(&export).unwrap();
+        bytes.push(b'\n');
+        fs::write(&request.preferences, &bytes).unwrap();
+        let error = transfer(request).unwrap_err();
+        assert!(error.to_string().contains("export is too large"));
+        assert!(!request.backup_db.exists());
+        bytes.pop();
+        fs::write(&request.preferences, &bytes).unwrap();
+        assert_eq!(transfer(request).unwrap(), TransferOutcome::Created);
+    }
+
+    #[test]
+    fn rejects_changed_backup_copy_before_applying_native_preferences() {
+        let fixture = Fixture::new();
+        let request = &fixture.request;
+        let scratch = Stage::new(&fixture.root.0).unwrap();
+        snapshot(&request.source_db, &scratch.0, &request.backup_db).unwrap();
+        let expected = digest(&request.backup_db).unwrap();
+        let changed = Connection::open(&request.backup_db).unwrap();
+        changed
+            .execute(
+                "UPDATE settings SET value='43' WHERE key='anilist_user_id'",
+                [],
+            )
+            .unwrap();
+        validate_schema(&changed).unwrap();
+        drop(changed);
+
+        let stage = Stage::new(&fixture.root.0).unwrap();
+        let values = load_preferences(&read_preferences(&request.preferences).unwrap()).unwrap();
+        let error = populate(&request.backup_db, &expected, &stage.0, values, request).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("differs from the prepared snapshot"));
+        assert_eq!(
+            digest(&stage.0.join("kurisu.db")).unwrap(),
+            digest(&request.backup_db).unwrap()
+        );
+        assert!(!stage.0.join(MARKER).exists());
+        assert!(!stage.0.join(RECEIPT).exists());
+        assert!(!request.destination.exists());
     }
 
     #[test]
@@ -1028,8 +1211,8 @@ mod tests {
     }
 
     #[test]
-    fn versions_one_through_seven_preserve_source_and_backup_version() {
-        for version in 1..=7 {
+    fn supported_versions_preserve_source_and_backup_version() {
+        for version in 1..=crate::db::SCHEMA_VERSION {
             let fixture = Fixture::new();
             let r = &fixture.request;
             Connection::open(&r.source_db)
@@ -1050,6 +1233,69 @@ mod tests {
     }
 
     #[test]
+    fn transferred_queue_keys_survive_upgrade_and_reopen() {
+        for version in [7, 8] {
+            let fixture = Fixture::new();
+            let request = &fixture.request;
+            let source = Connection::open(&request.source_db).unwrap();
+            source.execute_batch(
+                "UPDATE list_entry SET entry_id = NULL WHERE media_id = 7;
+                 UPDATE pending_change SET payload =
+                    '{\"media_id\":7,\"base\":null,\"patch\":{\"status\":\"CURRENT\",\"progress\":5},\"conflict\":false}'
+                 WHERE account_id = 42 AND media_id = 7;"
+            ).unwrap();
+            if version == 7 {
+                source.execute_batch("ALTER TABLE list_entry DROP COLUMN queued_creation; PRAGMA user_version = 7;").unwrap();
+            } else {
+                source.execute_batch(
+                    "UPDATE list_entry SET queued_creation = 'fixture-creation';
+                     UPDATE pending_change SET payload = json_set(payload, '$.patch.creation_key', 'fixture-creation')
+                     WHERE account_id = 42 AND media_id = 7;"
+                ).unwrap();
+            }
+            drop(source);
+            let original = fingerprints(&request.source_db).unwrap();
+            transfer(request).unwrap();
+            let backup = Connection::open(&request.backup_db).unwrap();
+            assert_eq!(
+                backup
+                    .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+            let installed = request.destination.join("kurisu.db");
+            let key = || {
+                crate::Db::open(&installed)
+                    .unwrap()
+                    .pending_change(42, 7)
+                    .unwrap()
+                    .unwrap()
+                    .patch
+                    .creation_key
+                    .unwrap()
+            };
+            let first = key();
+            if version == 7 {
+                assert_eq!(first.len(), 32);
+            } else {
+                assert_eq!(first, "fixture-creation");
+                assert_eq!(
+                    crate::Db::open(&installed)
+                        .unwrap()
+                        .get_entry(7)
+                        .unwrap()
+                        .unwrap()
+                        .queued_creation
+                        .as_deref(),
+                    Some(first.as_str())
+                );
+            }
+            assert_eq!(key(), first);
+            assert_eq!(fingerprints(&request.source_db).unwrap(), original);
+        }
+    }
+
+    #[test]
     fn damaged_future_and_missing_schema_never_publish() {
         for kind in ["future", "schema", "integrity", "journal", "preferences"] {
             let fixture = Fixture::new();
@@ -1057,7 +1303,7 @@ mod tests {
             match kind {
                 "future" => Connection::open(&r.source_db)
                     .unwrap()
-                    .pragma_update(None, "user_version", 8)
+                    .pragma_update(None, "user_version", crate::db::SCHEMA_VERSION + 1)
                     .unwrap(),
                 "schema" => Connection::open(&r.source_db)
                     .unwrap()
@@ -1122,6 +1368,20 @@ mod tests {
         }
     }
 
+    fn set_wal_checksum_order(bytes: &mut [u8], little: bool) {
+        let magic = if little { 0x377f0682u32 } else { 0x377f0683u32 };
+        bytes[..4].copy_from_slice(&magic.to_be_bytes());
+        let page_size = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let mut sum = checksum(&bytes[..24], little, (0, 0));
+        bytes[24..28].copy_from_slice(&sum.0.to_be_bytes());
+        bytes[28..32].copy_from_slice(&sum.1.to_be_bytes());
+        for frame in bytes[32..].chunks_exact_mut(24 + page_size) {
+            sum = checksum(&frame[24..], little, checksum(&frame[..8], little, sum));
+            frame[16..20].copy_from_slice(&sum.0.to_be_bytes());
+            frame[20..24].copy_from_slice(&sum.1.to_be_bytes());
+        }
+    }
+
     #[test]
     fn valid_uncommitted_wal_tail_is_excluded_and_both_checksum_orders_work() {
         for big in [false, true] {
@@ -1142,17 +1402,7 @@ mod tests {
             tail[index..index + committed.len()].copy_from_slice(uncommitted);
             tail[4..8].copy_from_slice(&0u32.to_be_bytes());
             bytes.extend(tail);
-            let magic = if big { 0x377f0683u32 } else { 0x377f0682u32 };
-            bytes[..4].copy_from_slice(&magic.to_be_bytes());
-            let mut sum = checksum(&bytes[..24], !big, (0, 0));
-            bytes[24..28].copy_from_slice(&sum.0.to_be_bytes());
-            bytes[28..32].copy_from_slice(&sum.1.to_be_bytes());
-            for frame in bytes[32..].chunks_exact_mut(frame_size) {
-                sum = checksum(&frame[..8], !big, sum);
-                sum = checksum(&frame[24..], !big, sum);
-                frame[16..20].copy_from_slice(&sum.0.to_be_bytes());
-                frame[20..24].copy_from_slice(&sum.1.to_be_bytes());
-            }
+            set_wal_checksum_order(&mut bytes, !big);
             fs::write(&wal, &bytes).unwrap();
             let before = fingerprints(&r.source_db).unwrap();
             transfer(r).unwrap();
@@ -1172,7 +1422,7 @@ mod tests {
         transfer(&fixture.request).unwrap();
     }
 
-    fn with_recycled_wal(fixture: &Fixture) {
+    fn with_recycled_wal(fixture: &Fixture, opposite_checksum_order: bool) {
         let live = fixture.root.0.join("recycled.db");
         copy_private(&fixture.request.source_db, &live).unwrap();
         let db = Connection::open(&live).unwrap();
@@ -1181,6 +1431,18 @@ mod tests {
              INSERT INTO settings VALUES ('wal-padding',hex(zeroblob(32768)));",
         )
         .unwrap();
+        let (live, db) = if opposite_checksum_order {
+            let resumed = fixture.root.0.join("resumed.db");
+            let mut bytes = fs::read(sidecar(&live, "-wal")).unwrap();
+            let little = bytes[3] == 0x82;
+            set_wal_checksum_order(&mut bytes, !little);
+            fs::copy(&live, &resumed).unwrap();
+            fs::write(sidecar(&resumed, "-wal"), bytes).unwrap();
+            let resumed_db = Connection::open(&resumed).unwrap();
+            (resumed, resumed_db)
+        } else {
+            (live, db)
+        };
         let checkpoint: (i64, i64, i64) = db
             .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1211,8 +1473,17 @@ mod tests {
 
     #[test]
     fn recycled_wal_keeps_latest_committed_edit_during_validation_and_transfer() {
+        assert_recycled_wal_transfer(false);
+    }
+
+    #[test]
+    fn recycled_wal_accepts_an_older_checksum_byte_order() {
+        assert_recycled_wal_transfer(true);
+    }
+
+    fn assert_recycled_wal_transfer(opposite_checksum_order: bool) {
         let fixture = Fixture::new();
-        with_recycled_wal(&fixture);
+        with_recycled_wal(&fixture, opposite_checksum_order);
         let r = &fixture.request;
         let before = fingerprints(&r.source_db).unwrap();
         let independent = fixture.root.0.join("sqlite-control.db");
@@ -1248,6 +1519,85 @@ mod tests {
     }
 
     #[test]
+    fn recycled_wal_without_a_new_commit_keeps_checkpointed_rows() {
+        let fixture = Fixture::new();
+        let r = &fixture.request;
+        let live = fixture.root.0.join("recycled-uncommitted.db");
+        copy_private(&r.source_db, &live).unwrap();
+        let db = Connection::open(&live).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100)
+             INSERT INTO settings SELECT 'padding-'||i, hex(zeroblob(2000)) FROM n;",
+        )
+        .unwrap();
+        let (busy, frames, checkpointed): (i64, i64, i64) = db
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(frames, checkpointed);
+        db.execute_batch(
+            "BEGIN;
+             UPDATE settings SET value=replace(value,'0','1')
+             WHERE key LIKE 'padding-%' AND CAST(substr(key,9) AS INTEGER)<=50;",
+        )
+        .unwrap();
+        db.cache_flush().unwrap();
+        let bytes = fs::read(sidecar(&live, "-wal")).unwrap();
+        let frame_size = 24 + u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let frames = bytes[32..].chunks_exact(frame_size);
+        let current: Vec<_> = frames
+            .clone()
+            .take_while(|frame| frame[8..16] == bytes[16..24])
+            .collect();
+        assert!(
+            current.len() > 1 && current.len() < frames.len(),
+            "expected spilled current frames and an old tail, got {} of {} frames",
+            current.len(),
+            frames.len()
+        );
+        assert!(current.iter().all(|frame| frame[4..8] == [0; 4]));
+        fs::copy(&live, &r.source_db).unwrap();
+        fs::write(sidecar(&r.source_db, "-wal"), &bytes).unwrap();
+        drop(db);
+
+        let check_rows = |path: &Path| {
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            validate_schema(&db).unwrap();
+            let counts: (i64, i64) = db
+                .query_row(
+                    "SELECT count(*), sum(value LIKE '%1%') FROM settings WHERE key LIKE 'padding-%'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (100, 0));
+        };
+        let control = fixture.root.0.join("sqlite-control.db");
+        fs::copy(&r.source_db, &control).unwrap();
+        fs::write(sidecar(&control, "-wal"), &bytes).unwrap();
+        check_rows(&control);
+
+        let wal = sidecar(&r.source_db, "-wal");
+        let stale = 32 + current.len() * frame_size;
+        let second = 32 + frame_size;
+        let mut corrupted = bytes[..32 + 2 * frame_size].to_vec();
+        corrupted[second + 8..second + 16].copy_from_slice(&bytes[stale + 8..stale + 16]);
+        fs::write(&wal, &corrupted).unwrap();
+        assert!(validate_database(&r.source_db).is_err());
+        fs::write(&wal, &bytes).unwrap();
+
+        let before = fingerprints(&r.source_db).unwrap();
+        validate_database(&r.source_db).unwrap();
+        transfer(r).unwrap();
+        check_rows(&r.backup_db);
+        check_rows(&r.destination.join("kurisu.db"));
+        assert_eq!(before, fingerprints(&r.source_db).unwrap());
+    }
+
+    #[test]
     fn recycled_wal_still_rejects_damaged_current_frames_and_mixed_tails() {
         for kind in [
             "current_checksum",
@@ -1257,7 +1607,7 @@ mod tests {
             "obsolete_checksum",
         ] {
             let fixture = Fixture::new();
-            with_recycled_wal(&fixture);
+            with_recycled_wal(&fixture, false);
             let r = &fixture.request;
             let wal = sidecar(&r.source_db, "-wal");
             let mut bytes = fs::read(&wal).unwrap();
@@ -1375,6 +1725,6 @@ mod tests {
             .is_symlink());
         let stage = Stage::new(&fixture.root.0).unwrap();
         fs::create_dir(&r.destination).unwrap();
-        assert!(publish_directory(&stage.0, &r.destination).is_err());
+        assert!(rename_no_replace(&stage.0, &r.destination).is_err());
     }
 }
