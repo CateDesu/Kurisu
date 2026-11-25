@@ -147,6 +147,93 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
 }
 
 #[gpui::test]
+fn escape_goes_back_one_route_from_sidebar_and_settings_input(tc: &mut TestAppContext) {
+    tc.update(bind_keys);
+    let fixture = Fixture::new(tc);
+    let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    cx.simulate_resize(gpui::size(px(1100.), px(1400.)));
+    shell.update_in(cx, |s, win, cx| s.navigate(Route::Stats, win, cx));
+    let select = |cx: &mut VisualTestContext, role, label, action| {
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == role && node.label() == Some(label))
+            .unwrap_or_else(|| panic!("missing {label} control"));
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *id,
+            data: None,
+        });
+        draw(cx);
+        assert_eq!(cx.take_accessibility_tree_update().unwrap().focus, *id);
+    };
+    let route = |cx: &mut VisualTestContext| shell.read_with(cx, |s, _| s.route.clone());
+    let hold_escape = |cx: &mut VisualTestContext| {
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("escape").unwrap(),
+            is_held: true,
+            prefer_character_input: false,
+        });
+    };
+
+    select(cx, Role::Button, "Settings", gpui::AccessibleAction::Click);
+    assert_eq!(route(cx), Route::Settings);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(route(cx), Route::Stats);
+    hold_escape(cx);
+    assert_eq!(route(cx), Route::Stats, "holding Escape skipped a route");
+
+    let workspace = fixture.load(&shell, cx);
+    assert!(!workspace.read_with(cx, |w, _| w.modal_open()));
+    select(
+        cx,
+        Role::TextInput,
+        "MPV socket path",
+        gpui::AccessibleAction::Focus,
+    );
+    cx.simulate_keystrokes("ctrl-escape");
+    assert_eq!(route(cx), Route::Settings);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(route(cx), Route::Stats);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(route(cx), Route::MyList);
+
+    workspace.update(cx, |w, cx| w.close_test_list(cx));
+    shell.update_in(cx, |s, win, cx| s.navigate(Route::Seasons, win, cx));
+    let combo = "Season";
+    select(cx, Role::ComboBox, combo, gpui::AccessibleAction::Click);
+    let expanded = |cx: &mut VisualTestContext| {
+        draw(cx);
+        cx.debug_bounds("season-choice-SPRING").is_some()
+    };
+    assert!(expanded(cx));
+    cx.simulate_keystrokes("ctrl-escape");
+    hold_escape(cx);
+    assert!(expanded(cx));
+    cx.simulate_keystrokes("escape");
+    assert!(!expanded(cx));
+    hold_escape(cx);
+    assert_eq!(route(cx), Route::Seasons);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(route(cx), Route::MyList);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(route(cx), Route::MyList);
+}
+
+#[gpui::test]
 fn rapid_modal_reopen_restores_the_last_selected_control(tc: &mut TestAppContext) {
     tc.update(bind_keys);
     let fixture = Fixture::new(tc);
@@ -211,7 +298,17 @@ fn rapid_modal_reopen_restores_the_last_selected_control(tc: &mut TestAppContext
         frame(cx);
         assert!(cx.update(|win, _| second.is_focused(win)));
         cx.simulate_keystrokes("escape");
-        shell.read_with(cx, |shell, _| assert_eq!(shell.modal_layer, None));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.modal_layer, None);
+            assert_eq!(shell.route, Route::Settings);
+        });
+        draw(cx);
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("escape").unwrap(),
+            is_held: true,
+            prefer_character_input: false,
+        });
+        shell.read_with(cx, |shell, _| assert_eq!(shell.route, Route::Settings));
         frame(cx);
         let expected = if change_focus {
             cx.simulate_keystrokes("tab");
@@ -385,6 +482,171 @@ fn pending_folder_picker_is_fenced_until_final_quit(tc: &mut TestAppContext) {
             .unwrap(),
         expected
     );
+}
+
+fn duplicate_launch_with_shell(tc: &mut TestAppContext, quitting: bool) {
+    let fixture = Fixture::new(tc);
+    let mut instance = InstanceGuard::acquire(&fixture.profile.path).unwrap();
+    instance.start_activation(&fixture.profile.path).unwrap();
+    let instance = Arc::new(instance);
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance.clone(),
+            win,
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.close_test_has_tray = true;
+        shell.hidden_to_tray = true;
+    });
+    cx.simulate_visibility_change(gpui::WindowVisibility::Hidden);
+    cx.run_until_parked();
+    std::thread::scope(|scope| {
+        let path = &fixture.profile.path;
+        let contender = scope.spawn(|| InstanceGuard::acquire(path));
+        instance.wait_for_pending_activations(1);
+        assert!(!contender.is_finished());
+        if quitting {
+            cx.executor().advance_clock(Duration::from_millis(180));
+            cx.run_until_parked();
+            assert!(shell.read_with(cx, |shell, _| shell.restore_activation));
+            let (release, gate) = tokio::sync::oneshot::channel();
+            shell.update(cx, |shell, cx| {
+                shell.close_test_gate = Some(gate);
+                shell.stop_and_quit(cx);
+            });
+            cx.simulate_visibility_change(gpui::WindowVisibility::Visible);
+            cx.executor().advance_clock(Duration::from_millis(180));
+            cx.run_until_parked();
+            assert!(matches!(
+                contender.join().unwrap(),
+                Err(crate::platform::InstanceError::Occupied)
+            ));
+            assert!(!instance.has_pending_activation());
+            release.send(()).unwrap();
+            fixture.wait(cx, |cx| {
+                shell.read_with(cx, |shell, _| shell.close_test_quit)
+            });
+        } else {
+            let second = scope.spawn(|| InstanceGuard::acquire(path));
+            instance.wait_for_pending_activations(2);
+            cx.executor().advance_clock(Duration::from_millis(180));
+            cx.run_until_parked();
+            assert!(!shell.read_with(cx, |shell, _| shell.hidden_to_tray));
+            assert!(shell.read_with(cx, |shell, _| shell.restore_activation));
+            assert!(instance.has_pending_activation());
+            cx.simulate_visibility_change(gpui::WindowVisibility::Visible);
+            for launch in [contender, second] {
+                assert!(matches!(
+                    launch.join().unwrap(),
+                    Err(crate::platform::InstanceError::Activated)
+                ));
+            }
+        }
+    });
+}
+
+#[gpui::test]
+fn duplicate_launch_is_acknowledged_after_shell_restores(tc: &mut TestAppContext) {
+    duplicate_launch_with_shell(tc, false);
+}
+
+#[gpui::test]
+fn stalled_window_restore_does_not_acknowledge_duplicate_launch(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let path = &fixture.profile.path;
+    let mut instance = InstanceGuard::acquire(path).unwrap();
+    instance.start_activation(path).unwrap();
+    let instance = Arc::new(instance);
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance.clone(),
+            win,
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.close_test_has_tray = true;
+        shell.hidden_to_tray = true;
+    });
+    cx.simulate_visibility_change(gpui::WindowVisibility::Hidden);
+    cx.run_until_parked();
+
+    std::thread::scope(|scope| {
+        let contender = scope.spawn(|| InstanceGuard::acquire(path));
+        instance.wait_for_pending_activations(1);
+        cx.executor().advance_clock(Duration::from_millis(180));
+        cx.run_until_parked();
+        assert!(!shell.read_with(cx, |shell, _| shell.hidden_to_tray));
+        assert!(matches!(
+            contender.join().unwrap(),
+            Err(crate::platform::InstanceError::Occupied)
+        ));
+    });
+    assert!(!instance.has_pending_activation());
+    cx.simulate_visibility_change(gpui::WindowVisibility::Visible);
+    assert!(!shell.read_with(cx, |shell, _| shell.restore_activation));
+}
+
+#[gpui::test]
+fn minimizing_cancels_a_pending_restore_without_blocking_the_next_launch(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let path = &fixture.profile.path;
+    let mut instance = InstanceGuard::acquire(path).unwrap();
+    instance.start_activation(path).unwrap();
+    let instance = Arc::new(instance);
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance.clone(),
+            win,
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.close_test_has_tray = true;
+        shell.hidden_to_tray = true;
+    });
+    cx.simulate_visibility_change(gpui::WindowVisibility::Hidden);
+    cx.run_until_parked();
+    std::thread::scope(|scope| {
+        let contender = scope.spawn(|| InstanceGuard::acquire(path));
+        instance.wait_for_pending_activations(1);
+        cx.executor().advance_clock(Duration::from_millis(180));
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.restore_activation));
+        shell.update_in(cx, |shell, window, cx| shell.minimize_window(window, cx));
+        assert!(matches!(
+            contender.join().unwrap(),
+            Err(crate::platform::InstanceError::Declined)
+        ));
+        assert!(!instance.has_pending_activation());
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.restore_activation);
+            assert!(shell.minimized_by_program);
+        });
+
+        let next = scope.spawn(|| InstanceGuard::acquire(path));
+        instance.wait_for_pending_activations(1);
+        cx.executor().advance_clock(Duration::from_millis(180));
+        cx.run_until_parked();
+        cx.simulate_visibility_change(gpui::WindowVisibility::Visible);
+        assert!(matches!(
+            next.join().unwrap(),
+            Err(crate::platform::InstanceError::Activated)
+        ));
+    });
+}
+
+#[gpui::test]
+fn queued_duplicate_launch_during_final_quit_is_not_acknowledged(tc: &mut TestAppContext) {
+    duplicate_launch_with_shell(tc, true);
 }
 
 #[gpui::test]

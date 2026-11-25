@@ -6,9 +6,9 @@ use kurisu_core::models::ListEntry;
 use std::sync::Arc;
 
 use super::Workspace;
-use super::state::{STATUSES, SortKey, status_label};
+use super::state::{STATUSES, SortKey, list_title, status_label};
 use crate::components::scrollbar::list_scrollbar;
-use crate::components::{button, eyebrow, select, tracked_mono};
+use crate::components::{button, eyebrow, select_with_disabled, tracked_mono};
 use crate::contracts::Route;
 use crate::theme::{
     ACCENT, BASE, BLUE, DIM, EDGE, ERROR, INK, OCHRE, PANEL, PANEL_2, RUST, SAGE, mono_font,
@@ -200,25 +200,39 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key != "escape" {
-                    return;
-                }
-                if this.modal_open() {
-                    this.escape_active_modal(window, cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                if this.route == Route::MyList && this.sort_open {
-                    this.sort_open = false;
-                    window.focus(&this.sort_menu_focus, cx);
-                    cx.stop_propagation();
-                    cx.notify();
-                    return;
-                }
-                this.back(window, cx);
-            }))
+            .on_key_down(cx.listener(Self::handle_escape))
             .into_any()
+    }
+
+    pub(crate) fn handle_escape(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
+            return;
+        }
+        cx.stop_propagation();
+        if self.close_ready || event.is_held {
+            return;
+        }
+        if self.modal_open() {
+            self.escape_active_modal(window, cx);
+        } else if self.route == Route::MyList && self.sort_open {
+            self.sort_open = false;
+            window.focus(&self.sort_menu_focus, cx);
+            cx.notify();
+        } else if self.route == Route::Torrents && self.torrents.dismiss_menu() {
+            cx.notify();
+        } else if self.route == Route::Seasons
+            && let Some(focus) = self.dismiss_season_menu()
+        {
+            window.focus(&focus, cx);
+            cx.notify();
+        } else {
+            self.back(window, cx);
+        }
     }
 
     fn render_editor_refresh_error(&self, cx: &mut gpui::Context<Self>) -> Option<AnyElement> {
@@ -393,15 +407,7 @@ impl Workspace {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_filter(status, window, cx)
-                    }))
-                    .on_key_down(cx.listener(
-                        move |this, event: &gpui::KeyDownEvent, window, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                cx.stop_propagation();
-                                this.select_filter(status, window, cx);
-                            }
-                        },
-                    )),
+                    })),
             );
         }
         let query_focus = self.list_query.read(cx).focus_handle(cx);
@@ -448,6 +454,7 @@ impl Workspace {
             .child(search);
         let sort = self.list.sort;
         let desc = self.list.desc;
+        let sort_disabled = !self.sort_preferences_loaded || self.edits_fenced();
         let mut sort_control =
             div()
                 .flex()
@@ -457,11 +464,10 @@ impl Workspace {
         if !compact {
             sort_control = sort_control.child(eyebrow("SORT BY"));
         }
-        let mut sort_select = select("sort-select", "Sort list")
+        let mut sort_select = select_with_disabled("sort-select", "Sort list", sort_disabled)
             .aria_value(sort.label())
             .aria_description(format!("Selected sort: {}", sort.label()))
             .relative()
-            .track_focus(&self.sort_menu_focus)
             .debug_selector(|| "sort-select".into())
             .aria_expanded(self.sort_open)
             .w(px(144.))
@@ -471,40 +477,44 @@ impl Workspace {
             .justify_between()
             .text_size(px(15.))
             .child(sort.label())
-            .child(div().text_color(rgb(DIM)).child("▾"))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
-                    "up" | "down" | "arrowup" | "arrowdown" => {
-                        cx.stop_propagation();
-                        let index = SortKey::ALL
-                            .iter()
-                            .position(|key| *key == this.list.sort)
-                            .unwrap_or(0);
-                        let next = if matches!(event.keystroke.key.as_str(), "up" | "arrowup") {
-                            index.saturating_sub(1)
-                        } else {
-                            (index + 1).min(SortKey::ALL.len() - 1)
-                        };
-                        this.select_sort(SortKey::ALL[next], window, cx);
+            .child(div().text_color(rgb(DIM)).child("▾"));
+        if !sort_disabled {
+            sort_select = sort_select
+                .track_focus(&self.sort_menu_focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    match event.keystroke.key.as_str() {
+                        "up" | "down" | "arrowup" | "arrowdown" => {
+                            cx.stop_propagation();
+                            let index = SortKey::ALL
+                                .iter()
+                                .position(|key| *key == this.list.sort)
+                                .unwrap_or(0);
+                            let next = if matches!(event.keystroke.key.as_str(), "up" | "arrowup") {
+                                index.saturating_sub(1)
+                            } else {
+                                (index + 1).min(SortKey::ALL.len() - 1)
+                            };
+                            this.select_sort(SortKey::ALL[next], window, cx);
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }))
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.sort_menu_focus_subscription.is_none() {
-                    let focus = this.sort_menu_focus.clone();
-                    this.sort_menu_focus_subscription =
-                        Some(cx.on_blur(&focus, window, |this, _, cx| {
-                            if this.sort_open {
-                                this.sort_open = false;
-                                cx.notify();
-                            }
-                        }));
-                }
-                this.sort_open = !this.sort_open;
-                cx.notify();
-            }));
-        if self.sort_open {
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.sort_menu_focus_subscription.is_none() {
+                        let focus = this.sort_menu_focus.clone();
+                        this.sort_menu_focus_subscription =
+                            Some(cx.on_blur(&focus, window, |this, _, cx| {
+                                if this.sort_open {
+                                    this.sort_open = false;
+                                    cx.notify();
+                                }
+                            }));
+                    }
+                    this.sort_open = !this.sort_open;
+                    cx.notify();
+                }));
+        }
+        if !sort_disabled && self.sort_open {
             let mut choices = div()
                 .id("sort-choices")
                 .role(gpui::Role::ListBox)
@@ -542,20 +552,24 @@ impl Workspace {
         toolbar = toolbar
             .child(sort_control)
             .child(
-                button("sort-direction", if desc { "↓" } else { "↑" }, false)
-                    .debug_selector(|| "sort-direction".into())
-                    .w(px(40.))
-                    .h(px(42.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgb(BASE))
-                    .aria_label(if desc {
-                        "Descending, click for ascending"
-                    } else {
-                        "Ascending, click for descending"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| this.flip_sort(window, cx))),
+                button(
+                    "sort-direction",
+                    if desc { "↓" } else { "↑" },
+                    sort_disabled,
+                )
+                .debug_selector(|| "sort-direction".into())
+                .w(px(40.))
+                .h(px(42.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(BASE))
+                .aria_label(if desc {
+                    "Descending, click for ascending"
+                } else {
+                    "Ascending, click for descending"
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.flip_sort(window, cx))),
             )
             .child(
                 button(
@@ -656,6 +670,42 @@ impl Workspace {
                     ),
             )
             .child(toolbar);
+        if !self.preference_read_errors.is_empty() {
+            let message = self
+                .preference_read_errors
+                .iter()
+                .map(|(key, error)| {
+                    format!(
+                        "Could not load the {}: {error}",
+                        super::preference_label(key)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            content = content.child(
+                div()
+                    .id("list-preference-read-error")
+                    .role(gpui::Role::Alert)
+                    .aria_label(message.clone())
+                    .text_color(rgb(ERROR))
+                    .mb(px(16.))
+                    .child(message)
+                    .child(
+                        button(
+                            "retry-list-preference-read",
+                            "Retry load",
+                            self.edits_fenced(),
+                        )
+                        .debug_selector(|| "retry-list-preference-read".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if !this.edits_fenced() {
+                                this.load_preferences(window, cx);
+                                cx.notify();
+                            }
+                        })),
+                    ),
+            );
+        }
         for error in [&self.list.error, &self.list.sync_error]
             .into_iter()
             .filter(|error| !error.is_empty())
@@ -715,7 +765,10 @@ impl Workspace {
                     "Episode update needs attention: {}",
                     self.list.step_error
                 ));
-            if let Some((id, remote)) = self.progress.first_review(self.generation) {
+            if let Some(review) = self.progress.first_review(self.generation) {
+                let id = review.id;
+                let remote = review.progress;
+                let keep_latest = review.clone();
                 let disabled = self.edits_fenced()
                     || self.modal_open()
                     || !self.list.loaded
@@ -747,7 +800,12 @@ impl Workspace {
                             .child(
                                 button(format!("keep-latest-{id}"), label, disabled).on_click(
                                     cx.listener(move |this, _, window, cx| {
-                                        this.resolve_progress_review(id, false, window, cx)
+                                        this.resolve_progress_review(
+                                            &keep_latest,
+                                            false,
+                                            window,
+                                            cx,
+                                        )
                                     }),
                                 ),
                             )
@@ -760,7 +818,7 @@ impl Workspace {
                                     )
                                     .on_click(cx.listener(
                                         move |this, _, window, cx| {
-                                            this.resolve_progress_review(id, true, window, cx)
+                                            this.resolve_progress_review(&review, true, window, cx)
                                         },
                                     )),
                                 )
@@ -919,9 +977,7 @@ fn render_list_row(
 ) -> AnyElement {
     let id = entry.media_id;
     let media = entry.media.as_ref();
-    let title = media
-        .map(|m| m.display_title())
-        .unwrap_or_else(|| format!("#{id}"));
+    let title = list_title(&entry);
     let mut meta = Vec::new();
     if let Some(format) = media.and_then(|m| m.format.as_ref()) {
         meta.push((format.replace('_', " "), DIM));
@@ -1339,6 +1395,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn status_tab_selects_once_with_plain_enter(cx: &mut TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.list.loaded = true;
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (tab, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Completed 0"))
+            .unwrap();
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *tab,
+            data: None,
+        });
+        let revision = |w: &Workspace| w.preference_revision("kurisu.list.filter");
+        let before = view.read_with(cx, |w, _| revision(w));
+        for key in ["ctrl-enter", "shift-enter", "alt-space"] {
+            press(cx, key);
+        }
+        assert_eq!(view.read_with(cx, |w, _| revision(w)), before);
+        press(cx, "enter");
+        view.read_with(cx, |w, _| {
+            assert_eq!(w.list.filter, "COMPLETED");
+            assert_eq!(revision(w), before + 1);
+        });
+    }
+
+    #[gpui::test]
     fn search_label_fills_toolbar_and_focuses_from_icon(cx: &mut TestAppContext) {
         let (core, _runtime, _dir) = fixture();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -1431,7 +1528,7 @@ mod tests {
 
     #[gpui::test]
     fn sort_is_between_query_and_direction_in_both_tab_directions(cx: &mut TestAppContext) {
-        let (core, _runtime, _dir) = fixture();
+        let (core, runtime, _dir) = fixture();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         workspace.update_in(cx, |workspace, _, cx| {
             workspace.profile = Some(User {
@@ -1441,7 +1538,7 @@ mod tests {
             workspace.list.loaded = true;
             cx.notify();
         });
-        cx.run_until_parked();
+        super::super::workspace_tests::settle(cx, &runtime);
         let query = workspace.read_with(cx, |workspace, _| workspace.list_query.clone());
         query.update_in(cx, |input, window, cx| {
             window.focus(&input.focus_handle(cx), cx)
@@ -1470,7 +1567,7 @@ mod tests {
 
     #[gpui::test]
     fn sort_select_keyboard_and_outside_pointer_have_one_activation_path(cx: &mut TestAppContext) {
-        let (core, _runtime, _dir) = fixture();
+        let (core, runtime, _dir) = fixture();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         workspace.update_in(cx, |workspace, _, cx| {
             workspace.profile = Some(User {
@@ -1481,7 +1578,7 @@ mod tests {
             workspace.route = Route::MyList;
             cx.notify();
         });
-        cx.run_until_parked();
+        super::super::workspace_tests::settle(cx, &runtime);
         let sort = cx.debug_bounds("sort-select").unwrap();
         cx.simulate_click(sort.center(), Modifiers::default());
         cx.update(|window, app| window.draw(app).clear(app));

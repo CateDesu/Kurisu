@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 pub use anilist::valid_account_id;
 pub use commands::{check_bridge_update, install_bridge_update, TrackingConfig};
 pub use db::Db;
-pub use library::LibraryBinding;
+pub use library::{library_binding_folder, LibraryBinding, LibraryBindingScope};
 pub use models::*;
 pub use playback::{NowPlaying, TrackingPrompt};
 pub use sync_queue::{PendingChange, WatchHistoryItem};
@@ -113,10 +113,8 @@ impl Core {
         channel: UpdateChannel,
     ) -> Self {
         let mut anilist = anilist::AniList::new();
-        if let Ok(Some(token)) = db.get_setting("anilist_token") {
-            if !token.is_empty() {
-                anilist.set_token(Some(token));
-            }
+        if let Ok(Some(token)) = db.saved_token() {
+            anilist.set_token(Some(token));
         }
         let matchers = if anilist.has_token() {
             recognize::build_matchers(&db)
@@ -283,6 +281,26 @@ impl Core {
             .db
             .get_setting(&db_key)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn get_list_sort_preferences(&self) -> [Result<Option<String>, String>; 2] {
+        self.state
+            .db
+            .get_list_sort_preferences()
+            .map(|value| value.map_err(|error| error.to_string()))
+    }
+
+    pub fn set_list_sort_preferences(&self, sort: &str, descending: bool) -> Result<(), String> {
+        self.state
+            .db
+            .set_settings(&[
+                ("native_preference:kurisu.list.sort", sort),
+                (
+                    "native_preference:kurisu.list.dir",
+                    if descending { "desc" } else { "asc" },
+                ),
+            ])
+            .map_err(|error| error.to_string())
     }
 
     pub async fn confirm_tracking_prompt(
@@ -644,8 +662,9 @@ impl Core {
         path: String,
         media_id: i64,
         episode_offset: Option<i64>,
+        scope: LibraryBindingScope,
     ) -> Result<(), String> {
-        commands::bind_library_path(path, media_id, episode_offset, &self.state).await
+        commands::bind_library_path(path, media_id, episode_offset, scope, &self.state).await
     }
     pub async fn library_binding_for(&self, path: String) -> Result<Option<i64>, String> {
         commands::library_binding_for(path, &self.state).await
@@ -885,7 +904,7 @@ mod core_tests {
                 "This show is no longer on your list"
             );
             assert_eq!(
-                core.bind_library_path("/anime".into(), 1, None)
+                core.bind_library_path("/anime".into(), 1, None, LibraryBindingScope::Folder)
                     .await
                     .unwrap_err(),
                 "only shows on your list can be linked"
@@ -1021,6 +1040,9 @@ mod core_tests {
             let core = logout_fixture(db);
             let state = &core.state;
             assert_eq!(state.matchers.lock()[0].display, "Fixture series");
+            let mut entry = state.db.get_entry(1).unwrap().unwrap();
+            entry.id = Some(22);
+            state.db.upsert_entry(&entry).unwrap();
             let (_, mut pending, _) = sync_queue::stage(
                 state,
                 1,
@@ -1165,7 +1187,7 @@ mod core_tests {
                 "This show is no longer on your list"
             );
             assert_eq!(
-                core.bind_library_path("/anime".into(), 1, None)
+                core.bind_library_path("/anime".into(), 1, None, LibraryBindingScope::Folder)
                     .await
                     .unwrap_err(),
                 "only shows on your list can be linked"
@@ -1247,7 +1269,7 @@ mod core_tests {
             None
         );
         assert_eq!(
-            core.bind_library_path("/anime".into(), 1, None)
+            core.bind_library_path("/anime".into(), 1, None, LibraryBindingScope::Folder)
                 .await
                 .unwrap_err(),
             "only shows on your list can be linked"
@@ -1377,6 +1399,158 @@ mod core_tests {
         assert!(core.current_user().await.unwrap().is_none());
         assert!(db.get_setting("anilist_token").unwrap().is_none());
         assert!(db.get_entry(1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_token_cleanup_handles_database_failures_across_restart() {
+        for (blank_blocked, marker_failure) in [
+            (false, None),
+            (true, None),
+            (true, Some("ABORT, 'fixture rejection marker failed'")),
+            (true, Some("IGNORE")),
+        ] {
+            let (core, dir) = open("rejected-token-cleanup");
+            let user = User {
+                id: 7,
+                name: "Fixture".into(),
+                ..Default::default()
+            };
+            let db = &core.state.db;
+            db.replace_account("test-session", &user).unwrap();
+            db.0.lock()
+                .execute_batch(
+                    "CREATE TRIGGER refuse_token_delete BEFORE DELETE ON settings
+                     WHEN OLD.key = 'anilist_token'
+                     BEGIN SELECT RAISE(ABORT, 'fixture delete failed'); END;",
+                )
+                .unwrap();
+            if blank_blocked {
+                db.0.lock()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_token_blank BEFORE INSERT ON settings
+                         WHEN NEW.key = 'anilist_token' AND NEW.value = ''
+                         BEGIN SELECT RAISE(ABORT, 'fixture blank failed'); END;",
+                    )
+                    .unwrap();
+            }
+            if let Some(failure) = marker_failure {
+                db.0.lock()
+                    .execute_batch(&format!(
+                        "CREATE TRIGGER refuse_token_marker BEFORE INSERT ON settings
+                         WHEN NEW.key = 'anilist_token_rejected'
+                         BEGIN SELECT RAISE({failure}); END;"
+                    ))
+                    .unwrap();
+            }
+            let (api, _) = anilist::mock_api(vec![(
+                401,
+                serde_json::json!({"errors":[{"message":"Invalid token"}]}),
+            )])
+            .await;
+            *core.state.anilist.lock() = api;
+            let result = core.refresh_current_user().await;
+            if marker_failure.is_some() {
+                assert!(result
+                    .unwrap_err()
+                    .contains("could not disable the saved token"));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+            assert!(!core.is_logged_in().await);
+            assert_eq!(
+                db.get_setting(db::TOKEN_KEY).unwrap().as_deref(),
+                Some(if blank_blocked { "test-session" } else { "" })
+            );
+            drop(core);
+
+            let reopen = || {
+                Core::open(
+                    dir.clone(),
+                    tokio::runtime::Handle::current(),
+                    Arc::new(TestPlatform),
+                    UpdateChannel::Native,
+                )
+                .unwrap()
+            };
+            let reopened = reopen();
+            assert_eq!(reopened.is_logged_in().await, marker_failure.is_some());
+            let viewer = (
+                200,
+                serde_json::json!({"data":{"Viewer":{"id":7,"name":"Fixture"}}}),
+            );
+            let rejected_token_retained = blank_blocked && marker_failure.is_none();
+            let (api, _) =
+                anilist::mock_api(vec![viewer; 1 + usize::from(rejected_token_retained)]).await;
+            *reopened.state.anilist.lock() = api;
+            if rejected_token_retained {
+                reopened
+                    .state
+                    .db
+                    .0
+                    .lock()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_marker_removal BEFORE DELETE ON settings
+                     WHEN OLD.key = 'anilist_token_rejected' BEGIN SELECT RAISE(IGNORE); END;",
+                    )
+                    .unwrap();
+                assert!(reopened
+                    .login_with_token("unsaved-session".into())
+                    .await
+                    .is_err());
+                assert_eq!(reopen().state.db.saved_token().unwrap(), None);
+                reopened
+                    .state
+                    .db
+                    .0
+                    .lock()
+                    .execute_batch("DROP TRIGGER refuse_marker_removal")
+                    .unwrap();
+            }
+            assert_eq!(
+                reopened
+                    .login_with_token("new-session".into())
+                    .await
+                    .unwrap()
+                    .id,
+                7
+            );
+            drop(reopened);
+            assert!(reopen().is_logged_in().await);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_disables_saved_token_before_settling_the_interrupted_write() {
+        let (core, dir) = open("rejected-token-before-settlement");
+        let state = &core.state;
+        let user = User {
+            id: 7,
+            name: "Fixture".into(),
+            ..Default::default()
+        };
+        state.db.replace_account("test-session", &user).unwrap();
+        let (api, _) = anilist::mock_api(vec![(
+            401,
+            serde_json::json!({"errors":[{"message":"Invalid token"}]}),
+        )])
+        .await;
+        let error = api.viewer().await.unwrap_err();
+        *state.anilist.lock() = api;
+        let token = state.anilist.lock().token();
+        let _remote = state.remote_lock.lock().await;
+        let _entry = state.entry_lock.lock().await;
+        commands::settle_write_error(state, state.origin(), &token, &error, |_| {
+            let reopened = Db::open(&dir.join("kurisu.db")).unwrap();
+            assert!(reopened.saved_token().unwrap().is_none());
+            assert_eq!(sync_queue::account_id(&state.db), Some(7));
+            Ok(())
+        })
+        .unwrap();
+        drop(_entry);
+        drop(_remote);
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -2260,6 +2434,44 @@ mod core_tests {
     }
 
     #[tokio::test]
+    async fn sort_preferences_roll_back_when_either_write_is_ignored() {
+        let (core, dir) = open("sort-preferences-ignored-write");
+        core.set_list_sort_preferences("title", false).unwrap();
+        for key in ["sort", "dir"] {
+            core.state
+                .db
+                .0
+                .lock()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER ignore_sort_write BEFORE INSERT ON settings
+                     WHEN NEW.key = 'native_preference:kurisu.list.{key}'
+                     BEGIN SELECT RAISE(IGNORE); END;"
+                ))
+                .unwrap();
+            let result = core.set_list_sort_preferences("score", true);
+            assert_eq!(
+                core.get_list_sort_preferences(),
+                [Ok(Some("title".into())), Ok(Some("asc".into()))]
+            );
+            assert!(result.is_err());
+            core.state
+                .db
+                .0
+                .lock()
+                .execute_batch("DROP TRIGGER ignore_sort_write")
+                .unwrap();
+        }
+        core.set_list_sort_preferences("score", true).unwrap();
+        drop(core);
+        let db = Db::open(&dir.join("kurisu.db")).unwrap();
+        let [sort, direction] = db.get_list_sort_preferences();
+        assert_eq!(sort.unwrap().as_deref(), Some("score"));
+        assert_eq!(direction.unwrap().as_deref(), Some("desc"));
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn set_preference_rejects_scoped_list_keys_without_modifying_db() {
         let (core, dir) = open("reject-scoped-set-preference");
         core.set_workspace_preference("kurisu.list.q".into(), Some("keep".into()), None)
@@ -2584,6 +2796,7 @@ mod core_tests {
                 repeat: 0,
                 updated_at: Some(100),
                 media: None,
+                queued_creation: None,
             })
             .unwrap();
         *core.state.user.lock() = Some(user);

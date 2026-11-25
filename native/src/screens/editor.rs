@@ -5,7 +5,7 @@ use gpui::{
     rgb,
 };
 use kurisu_core::Platform;
-use kurisu_core::models::{EntryDetails, FuzzyDate, ListEntry, Media};
+use kurisu_core::models::{EntryDetails, EntryEditTarget, FuzzyDate, ListEntry, Media};
 
 use super::covers::CoverOwner;
 use super::state::{EditorState, EntryPatch, STATUSES, status_label};
@@ -501,17 +501,35 @@ impl Workspace {
         self.replace_cover_region(CoverOwner::Editor, visible, Vec::new());
     }
 
+    pub(super) fn resume_editor_details(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.editor_details_open
+            && !self.edits_fenced()
+            && self.profile.is_some()
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.details_error.is_empty())
+        {
+            self.load_editor_details(window, cx);
+        }
+    }
+
     fn load_editor_details(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.stopping {
             return;
         }
-        let Some(editor) = self.editor.as_ref() else {
+        let Some(editor) = self.editor.as_mut() else {
             return;
         };
         if self.editor_details_loading || editor.details.is_some() {
             return;
         }
+        editor.details_error.clear();
         let id = editor.media_id;
+        let target = EntryEditTarget {
+            account_id: self.profile.as_ref().map(|user| user.id),
+            identity: editor.saved_identity(),
+        };
         let editor_input = self
             .editor_inputs
             .as_ref()
@@ -520,13 +538,18 @@ impl Workspace {
         self.editor_details_loading = true;
         let core = self.core.clone();
         let worker = core.clone();
-        let job = core.spawn(async move { worker.get_entry_details(id).await });
+        let job = core.spawn(async move { worker.get_editor_entry_details(id, target).await });
+        let job_id = job.id();
         self.replace_reads("editor-details", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
             let _ = this.update_in(cx, |this, _window, cx| {
                 if this.stopping
                     || generation != this.generation
+                    || this
+                        .read_aborts
+                        .get("editor-details")
+                        .is_none_or(|handles| handles[0].id() != job_id)
                     || this
                         .editor_inputs
                         .as_ref()
@@ -539,6 +562,7 @@ impl Workspace {
                 {
                     return;
                 }
+                this.cancel_reads("editor-details");
                 this.editor_details_loading = false;
                 match result {
                     Ok(details) => {
@@ -564,8 +588,12 @@ impl Workspace {
             return;
         }
         if let Some(editor) = self.editor.as_mut().filter(|editor| !editor.busy) {
+            let previous = editor.progress;
             editor.review_progress();
-            if let Some(inputs) = self.editor_inputs.as_ref() {
+            if editor.progress != previous
+                && let Some(inputs) = self.editor_inputs.as_ref()
+                && inputs.progress.read(cx).value().trim().parse::<i64>() == Ok(previous)
+            {
                 inputs.progress.update(cx, |input, cx| {
                     input.set_value(editor.progress.to_string(), cx)
                 });
@@ -719,6 +747,10 @@ impl Workspace {
         };
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
+        let target = EntryEditTarget {
+            account_id: account,
+            identity: editor.saved_identity(),
+        };
         let editor_input = self
             .editor_inputs
             .as_ref()
@@ -735,8 +767,9 @@ impl Workspace {
                     let mut saved_details = None;
                     if !details_patch.is_empty() {
                         match worker
-                            .update_entry_details(
+                            .update_editor_entry_details(
                                 id,
+                                target.clone(),
                                 details_patch.notes,
                                 details_patch.started_at,
                                 details_patch.completed_at,
@@ -752,13 +785,14 @@ impl Workspace {
                         Ok(None)
                     } else {
                         worker
-                            .update_entry_in_format(
+                            .update_editor_entry(
                                 id,
+                                target,
                                 basic_patch.status,
                                 basic_patch.progress,
                                 basic_patch.score,
                                 basic_patch.repeat,
-                                Some(expected_progress),
+                                expected_progress,
                                 displayed_format,
                             )
                             .await
@@ -858,8 +892,14 @@ impl Workspace {
                             }
                             Err(error) => {
                                 let editor = this.editor.as_mut().unwrap();
+                                if let Some(entry) = &current {
+                                    editor.adopt_queued_entry(entry);
+                                }
                                 editor.review_progress = current
-                                    .filter(|entry| entry.progress != editor.saved_progress())
+                                    .filter(|entry| {
+                                        editor.matches_entry(entry)
+                                            && entry.progress != editor.saved_progress()
+                                    })
                                     .map(|entry| entry.progress);
                                 editor.error = error;
                             }
@@ -938,6 +978,11 @@ impl Workspace {
         let id = editor.media_id;
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
+        let target = EntryEditTarget {
+            account_id: account,
+            identity: editor.saved_identity(),
+        };
+        let entry_revision = self.list.revision();
         let editor_input = self
             .editor_inputs
             .as_ref()
@@ -947,7 +992,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
             let result = joined(
-                core.spawn(async move { worker.delete_entry_cmd(id).await })
+                core.spawn(async move { worker.delete_editor_entry(id, target).await })
                     .await,
             );
             #[cfg(all(test, feature = "fixture-runtime"))]
@@ -1000,11 +1045,13 @@ impl Workspace {
                 this.editor.as_mut().unwrap().busy = false;
                 match result {
                     Ok(()) => {
-                        if generation == this.generation {
+                        if generation == this.generation && this.list.revision() == entry_revision {
                             let change = this.list.apply_scoped(&[id], vec![None], now_seconds());
                             this.apply_list_change(change);
                             this.discovery_list_changed();
                             this.reconcile_open_entries(Some(&[id]), cx);
+                        } else if generation == this.generation {
+                            this.queue_list_refresh(Some(vec![id]), window, cx);
                         }
                         this.close_editor(cx);
                     }
@@ -1075,7 +1122,10 @@ impl Workspace {
             return;
         };
         editor.choose_status(status);
-        if let Some(inputs) = self.editor_inputs.as_ref() {
+        if status == "COMPLETED"
+            && editor.total().is_some()
+            && let Some(inputs) = self.editor_inputs.as_ref()
+        {
             inputs.progress.update(cx, |input, cx| {
                 input.set_value(editor.progress.to_string(), cx)
             });
@@ -1118,14 +1168,6 @@ impl Workspace {
             .on_any_mouse_down(cx.listener(|this, _, _, cx| {
                 if this.editor_status_open {
                     this.editor_status_open = false;
-                    cx.notify();
-                }
-            }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && this.editor_status_open {
-                    this.editor_status_open = false;
-                    window.focus(&this.editor_status_focus, cx);
-                    cx.stop_propagation();
                     cx.notify();
                 }
             }));
@@ -1216,7 +1258,7 @@ impl Workspace {
             .justify_between()
             .child(status_label(&editor.status))
             .child("▾")
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if this.editor_controls_disabled() {
                     return;
                 }
@@ -1234,12 +1276,6 @@ impl Workspace {
                             (index + 1).min(STATUSES.len() - 1)
                         };
                         this.choose_editor_status(STATUSES[next], cx);
-                    }
-                    "escape" if this.editor_status_open => {
-                        this.editor_status_open = false;
-                        window.focus(&this.editor_status_focus, cx);
-                        cx.notify();
-                        cx.stop_propagation();
                     }
                     _ => {}
                 }
@@ -1711,6 +1747,8 @@ fn optional_score(value: Option<f64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fixture-runtime")]
+    use super::super::fixture_server::child_gate;
     use super::EditorState;
     use kurisu_core::models::{ListEntry, Media};
 
@@ -1800,6 +1838,223 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn editor_status_only_dismisses_on_plain_escape(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(vec![total_entry("CURRENT", 11)], 0);
+            w.open_editor(71, window, cx);
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(1000.)));
+        cx.update(|window, app| window.draw(app).clear(app));
+        let bounds = cx.debug_bounds("editor-status").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        workspace.update_in(cx, |w, window, cx| window.focus(&w.editor_status_focus, cx));
+        cx.update(|window, app| window.draw(app).clear(app));
+        assert!(workspace.read_with(cx, |w, _| w.editor_status_open));
+
+        let held_escape = |cx: &mut gpui::VisualTestContext| {
+            cx.simulate_event(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                is_held: true,
+                prefer_character_input: false,
+            });
+        };
+        cx.simulate_keystrokes("ctrl-escape");
+        held_escape(cx);
+        assert!(workspace.read_with(cx, |w, _| w.editor_status_open));
+        cx.simulate_keystrokes("escape");
+        workspace.update_in(cx, |w, window, _| {
+            assert!(!w.editor_status_open);
+            assert!(w.editor.is_some());
+            assert!(w.editor_status_focus.is_focused(window));
+        });
+        held_escape(cx);
+        assert!(workspace.read_with(cx, |w, _| w.editor.is_some()));
+        cx.simulate_keystrokes("escape");
+        assert!(workspace.read_with(cx, |w, _| w.editor.is_none()));
+    }
+
+    #[gpui::test]
+    fn editor_follows_reconciled_progress_without_resubmitting_it(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            for (status, progress) in [("CURRENT", 11), ("PAUSED", 12)] {
+                w.list.replace(vec![total_entry(status, progress)], 0);
+                w.open_editor(71, window, cx);
+                w.list.apply_one(total_entry("COMPLETED", 12), 0);
+                w.reconcile_open_entries(Some(&[71]), cx);
+                assert_eq!(w.editor.as_ref().unwrap().status, "COMPLETED");
+                assert_eq!(
+                    w.editor_inputs.as_ref().unwrap().progress.read(cx).value(),
+                    "12"
+                );
+                w.save_editor(window, cx);
+                assert!(w.editor.is_none());
+                assert_eq!(w.active_writes, 0);
+            }
+        });
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[gpui::test]
+    fn explicit_completion_fills_blank_progress_when_total_arrives(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            for progress in [5, 12] {
+                let after = total_entry("CURRENT", progress);
+                let mut before = after.clone();
+                before.media.as_mut().unwrap().episodes = None;
+                w.list.replace(vec![before], 0);
+                w.open_editor(71, window, cx);
+                let input = w.editor_inputs.as_ref().unwrap().progress.clone();
+                input.update(cx, |input, cx| input.set_value("", cx));
+                w.choose_editor_status("COMPLETED", cx);
+                assert_eq!(input.read(cx).value(), "");
+
+                w.list.apply_one(after, 0);
+                w.reconcile_open_entries(Some(&[71]), cx);
+                assert_eq!(input.read(cx).value(), "12");
+                let editor = w.editor.as_ref().unwrap();
+                assert_eq!((editor.status.as_str(), editor.progress), ("COMPLETED", 12));
+                let patch = w.editor_basic_patch(editor);
+                assert_eq!(patch.status.as_deref(), Some("COMPLETED"));
+                assert_eq!(patch.progress, Some(12));
+                w.dismiss_editor(cx);
+            }
+        });
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[gpui::test]
+    fn status_choice_preserves_manual_progress_until_completing(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (core, _runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.list.replace(vec![total_entry("CURRENT", 11)], 0);
+            w.open_editor(71, window, cx);
+            let progress = w.editor_inputs.as_ref().unwrap().progress.clone();
+            progress.update(cx, |input, cx| {
+                input.replace_text_in_range(Some(0..2), "-", window, cx)
+            });
+            w.choose_editor_status("PAUSED", cx);
+            assert_eq!(progress.read(cx).value(), "-");
+            assert_eq!(
+                w.read_editor_inputs(cx).unwrap_err(),
+                "Enter a valid episode progress."
+            );
+            w.choose_editor_status("COMPLETED", cx);
+            assert_eq!(progress.read(cx).value(), "12");
+            let patch = w.editor_basic_patch(w.editor.as_ref().unwrap());
+            assert_eq!(patch.status.as_deref(), Some("COMPLETED"));
+            assert_eq!(patch.progress, Some(12));
+        });
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[gpui::test]
+    fn format_switch_preserves_only_score_clear_and_other_drafts(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            for (format, input, clear, expected) in [
+                ("POINT_5", "", true, Some(0.0)),
+                ("POINT_100", "", false, Some(0.0)),
+                ("POINT_100", "0", false, Some(0.0)),
+                ("POINT_100", "5", true, None),
+                ("POINT_100", "4", false, None),
+            ] {
+                let user = kurisu_core::User {
+                    id: 47,
+                    score_format: Some(format.into()),
+                    ..Default::default()
+                };
+                w.profile = Some(user.clone());
+                w.list.replace(
+                    vec![ListEntry {
+                        score: Some(4.0),
+                        ..total_entry("CURRENT", 11)
+                    }],
+                    0,
+                );
+                w.open_editor(71, window, cx);
+                if clear {
+                    w.clear_editor_score(cx);
+                }
+                let inputs = w.editor_inputs.as_ref().unwrap();
+                inputs
+                    .score
+                    .update(cx, |field, cx| field.set_value(input, cx));
+                inputs
+                    .repeat
+                    .update(cx, |field, cx| field.set_value("3", cx));
+                w.capture_fenced_editor_inputs(cx);
+                w.update_busy = true;
+                w.set_editor_inputs_disabled(true, cx);
+                w.set_profile(
+                    Some(kurisu_core::User {
+                        score_format: Some("POINT_10_DECIMAL".into()),
+                        ..user
+                    }),
+                    window,
+                    cx,
+                );
+                assert_eq!(w.editor_inputs.as_ref().unwrap().score.read(cx).value(), "");
+                assert_eq!(w.fenced_editor_inputs.as_ref().unwrap()[1], "");
+                assert_eq!(w.fenced_editor_inputs.as_ref().unwrap()[2], "3");
+                w.update_busy = false;
+                w.read_editor_inputs(cx).unwrap();
+                let patch = w.editor_basic_patch(w.editor.as_ref().unwrap());
+                assert_eq!(patch.score, expected, "input {input:?}, clear {clear}");
+                assert_eq!(patch.repeat, Some(3));
+                assert_eq!(patch.progress, None);
+                assert_eq!(patch.status, None);
+                w.close_editor(cx);
+            }
+        });
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[test]
+    fn delayed_queued_save_keeps_the_confirmed_editor_id() {
+        let queued = ListEntry {
+            id: None,
+            queued_creation: Some("fixture-creation".into()),
+            ..total_entry("CURRENT", 1)
+        };
+        let mut editor = EditorState::new(queued.clone());
+        let submitted = editor.clone();
+        let replacement = ListEntry {
+            id: Some(33),
+            queued_creation: Some("different-creation".into()),
+            ..queued.clone()
+        };
+        editor.adopt_queued_entry(&replacement);
+        assert_eq!(editor.saved_identity(), queued.identity());
+        let confirmed = ListEntry {
+            id: Some(22),
+            ..queued.clone()
+        };
+        editor.adopt_queued_entry(&confirmed);
+        editor.accept_basic(&submitted, queued);
+        assert_eq!(editor.saved_identity(), confirmed.identity());
+    }
+
     #[cfg(feature = "fixture-runtime")]
     #[gpui::test]
     fn reselecting_pending_status_rechecks_the_fresh_total(cx: &mut gpui::TestAppContext) {
@@ -1807,7 +2062,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         const CHILD: &str = "KURISU_EDITOR_PENDING_STATUS_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if child_gate(CHILD).is_none() {
             let mut mutations = 0;
             run_graphql_fixture(
                 CHILD,
@@ -1962,6 +2217,272 @@ mod tests {
                 assert!(editor.basic_patch(true).is_empty());
             }
         });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(runtime);
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn queued_editor_adopts_confirmed_id_and_keeps_its_draft(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "KURISU_QUEUED_EDITOR_ID_CHILD";
+        if child_gate(CHILD).is_none() {
+            let mut lookups = 0;
+            let mut saves = 0;
+            run_graphql_response_fixture(
+                CHILD,
+                "screens::editor::tests::queued_editor_adopts_confirmed_id_and_keeps_its_draft",
+                |request| {
+                    let query = request["query"].as_str().unwrap();
+                    let data = if query.contains("SaveMediaListEntry") {
+                        saves += 1;
+                        let variables = if saves == 1 {
+                            json!({"mediaId":71,"status":"CURRENT","scoreFormat":"POINT_100"})
+                        } else {
+                            json!({"id":22,"repeat":5,"scoreFormat":"POINT_100"})
+                        };
+                        assert_eq!(request["variables"], variables);
+                        json!({"SaveMediaListEntry":{"id":22,"mediaId":71,"status":"CURRENT","progress":0,"repeat":if saves == 1 {0} else {5},"score":0}})
+                    } else if query.contains("recommendations") {
+                        json!({"Page":{"recommendations":[]}})
+                    } else if query.contains("Viewer") {
+                        json!({"Viewer":{"id":47,"name":"Fixture","mediaListOptions":{"scoreFormat":"POINT_100"}}})
+                    } else {
+                        assert_eq!(request["variables"]["mediaId"], 71);
+                        lookups += 1;
+                        if lookups == 1 {
+                            return (503, json!({"errors":[{"message":"Unavailable"}]}));
+                        }
+                        json!({"Media":{"id":71,"episodes":12,"mediaListEntry":null}})
+                    };
+                    (200, json!({"data":data}))
+                },
+            );
+            assert_eq!(lookups, 2);
+            assert_eq!(saves, 2);
+            return;
+        }
+        let (old_core, runtime, dir) = editor_fixture();
+        drop(old_core);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = kurisu_core::User {
+            id: 47,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        db.replace_account("synthetic-token", &user).unwrap();
+        db.upsert_media(total_entry("CURRENT", 0).media.as_ref().unwrap())
+            .unwrap();
+        let core = kurisu_core::Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let queued = runtime
+            .block_on(core.update_discovery_status(71, Some(47), None, "CURRENT".into()))
+            .unwrap();
+        assert!(matches!(
+            queued.identity(),
+            kurisu_core::EntryIdentity::Queued(_)
+        ));
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.last_sync_attempt = Some(Instant::now());
+            w.list.replace(vec![queued], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .repeat
+                .update(cx, |input, cx| input.set_value("5", cx));
+        });
+        assert!(
+            runtime
+                .block_on(core.sync_pending_changes())
+                .unwrap()
+                .is_empty()
+        );
+        workspace.update_in(cx, |w, window, cx| {
+            w.refresh_scoped(vec![71], 47, window, cx)
+        });
+        let wait = |cx: &mut gpui::VisualTestContext, ready: &dyn Fn(&Workspace) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !workspace.read_with(cx, |w, _| ready(w)) {
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                cx.run_until_parked();
+                assert!(Instant::now() < deadline, "Editor fixture timed out");
+            }
+        };
+        wait(cx, &|w| w.list.entry(71).unwrap().id == Some(22));
+        workspace.update_in(cx, |w, window, cx| {
+            assert_eq!(
+                w.editor.as_ref().unwrap().saved_identity(),
+                kurisu_core::EntryIdentity::Remote(22)
+            );
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().repeat.read(cx).value(),
+                "5"
+            );
+            w.save_editor(window, cx);
+        });
+        wait(cx, &|w| w.active_writes == 0);
+        assert!(workspace.read_with(cx, |w, _| w.editor.is_none()));
+        assert_eq!(db.get_entry(71).unwrap().unwrap().repeat, 5);
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn stale_editor_keeps_its_entry_id_after_replacement(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "KURISU_EDITOR_ENTRY_ID_CHILD";
+        if child_gate(CHILD).is_none() {
+            let mut lookups = 0;
+            let mut saves = 0;
+            run_graphql_fixture(
+                CHILD,
+                "screens::editor::tests::stale_editor_keeps_its_entry_id_after_replacement",
+                |request| {
+                    let query = request["query"].as_str().unwrap();
+                    if query.contains("SaveMediaListEntry") {
+                        saves += 1;
+                        assert_eq!(
+                            request["variables"],
+                            json!({"id":33,"repeat":5,"scoreFormat":"POINT_100"})
+                        );
+                        return json!({"SaveMediaListEntry":{"id":33,"mediaId":71,"status":"CURRENT","progress":3,"repeat":5,"score":70}});
+                    }
+                    if query.contains("customLists") {
+                        lookups += 1;
+                        let id = if lookups == 1 { 22 } else { 33 };
+                        return json!({"Media":{"mediaListEntry":{"id":id,"mediaId":71,"notes":"Opening note","startedAt":null,"completedAt":null,"customLists":{}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":[]}}}});
+                    }
+                    if query.contains("Viewer") {
+                        return json!({"Viewer":{"id":47,"name":"Fixture","mediaListOptions":{"scoreFormat":"POINT_100"}}});
+                    }
+                    if query.contains("recommendations") {
+                        return json!({"Page":{"recommendations":[]}});
+                    }
+                    panic!("Unexpected fixture query: {query}");
+                },
+            );
+            assert_eq!(lookups, 2);
+            assert_eq!(saves, 1);
+            return;
+        }
+        let (old_core, runtime, dir) = editor_fixture();
+        drop(old_core);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = kurisu_core::User {
+            id: 47,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        db.replace_account("synthetic-token", &user).unwrap();
+        let old = total_entry("CURRENT", 3);
+        db.upsert_media(old.media.as_ref().unwrap()).unwrap();
+        db.upsert_entry(&old).unwrap();
+        let core = kurisu_core::Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let wait = |cx: &mut gpui::VisualTestContext, ready: &dyn Fn(&Workspace) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !workspace.read_with(cx, |w, _| ready(w)) {
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                cx.run_until_parked();
+                assert!(Instant::now() < deadline, "Editor fixture timed out");
+            }
+        };
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.last_sync_attempt = Some(Instant::now());
+            w.list.replace(vec![old.clone()], 0);
+            w.open_editor(71, window, cx);
+            w.load_editor_details(window, cx);
+        });
+        wait(cx, &|w| !w.editor_details_loading);
+        workspace.update_in(cx, |w, window, cx| {
+            assert_eq!(w.editor.as_ref().unwrap().notes, "Opening note");
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .notes
+                .update(cx, |input, cx| input.set_value("Draft note", cx));
+            w.save_editor(window, cx);
+        });
+        wait(cx, &|w| w.active_writes == 0);
+        let replacement = ListEntry {
+            id: Some(33),
+            repeat: 1,
+            ..old
+        };
+        db.upsert_entry(&replacement).unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            let editor = w.editor.as_ref().unwrap();
+            assert_eq!(editor.notes, "Draft note");
+            assert!(editor.error.contains("reopen the editor"));
+            w.list.replace(vec![replacement], 0);
+            w.reconcile_open_entries(Some(&[71]), cx);
+            let inputs = w.editor_inputs.as_ref().unwrap();
+            inputs
+                .notes
+                .update(cx, |input, cx| input.set_value("Opening note", cx));
+            inputs
+                .repeat
+                .update(cx, |input, cx| input.set_value("5", cx));
+            w.save_editor(window, cx);
+        });
+        wait(cx, &|w| w.active_writes == 0);
+        workspace.update_in(cx, |w, window, cx| {
+            let editor = w.editor.as_ref().unwrap();
+            assert_eq!(
+                editor.saved_identity(),
+                kurisu_core::EntryIdentity::Remote(22)
+            );
+            assert_eq!(editor.repeat, 5);
+            assert_eq!(editor.review_progress, None);
+            assert!(editor.error.contains("reopen the editor"));
+            w.delete_editor(window, cx);
+            w.delete_editor(window, cx);
+        });
+        wait(cx, &|w| w.active_writes == 0);
+        workspace.update_in(cx, |w, window, cx| {
+            assert!(
+                w.editor
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .contains("reopen the editor")
+            );
+            assert_eq!(w.list.entry(71).unwrap().id, Some(33));
+            w.close_editor(cx);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .repeat
+                .update(cx, |input, cx| input.set_value("5", cx));
+            w.save_editor(window, cx);
+        });
+        wait(cx, &|w| w.active_writes == 0);
+        assert_eq!(db.get_entry(71).unwrap().unwrap().repeat, 5);
         cx.update(|window, _| window.remove_window());
         drop(workspace);
         drop(runtime);
@@ -2342,6 +2863,25 @@ mod tests {
                 w.close_editor(cx);
             });
         }
+        workspace.update_in(cx, |w, window, cx| {
+            for value in ["", "-"] {
+                w.list.replace(vec![total_entry("CURRENT", 5)], 0);
+                w.open_editor(71, window, cx);
+                let input = w.editor_inputs.as_ref().unwrap().progress.clone();
+                input.update(cx, |input, cx| {
+                    input.replace_text_in_range(Some(0..1), value, window, cx)
+                });
+                w.editor.as_mut().unwrap().review_progress = Some(6);
+                w.review_editor_progress(cx);
+                assert_eq!(w.editor.as_ref().unwrap().saved_progress(), 6);
+                assert_eq!(input.read(cx).value(), value);
+                assert_eq!(
+                    w.read_editor_inputs(cx).unwrap_err(),
+                    "Enter a valid episode progress."
+                );
+                w.close_editor(cx);
+            }
+        });
         cx.update(|window, _| window.remove_window());
         drop(workspace);
         drop(runtime);
@@ -2426,9 +2966,9 @@ mod tests {
                     ),
                 };
                 let editor = w.editor.as_mut().unwrap();
-                editor.refresh_score_format(Some("POINT_5".into()));
+                editor.refresh_score_format(Some("POINT_5".into()), None);
                 if round_trip {
-                    editor.refresh_score_format(Some("POINT_100".into()));
+                    editor.refresh_score_format(Some("POINT_100".into()), None);
                 }
                 let accepted = ListEntry {
                     score: Some(80.0),
@@ -3090,7 +3630,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         const CHILD: &str = "KURISU_EDITOR_RECOMMENDATION_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if child_gate(CHILD).is_none() {
             run_recommendation_fixture(CHILD);
             return;
         }
@@ -3247,7 +3787,7 @@ mod tests {
     fn editor_patch_preserves_core_completion_contract() {
         use serde_json::json;
         const CHILD: &str = "KURISU_EDITOR_COMPLETION_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if child_gate(CHILD).is_none() {
             let mut mutations = Vec::new();
             let mut statuses = ["REPEATING"; 7].into_iter().chain(["PAUSED"]);
             run_graphql_fixture(
@@ -3397,7 +3937,7 @@ mod tests {
                 "screens::editor::tests::restored_draft_removal_checks_remote_before_success",
             )
         };
-        if std::env::var_os(child).is_none() {
+        if child_gate(child).is_none() {
             let mut present = true;
             let mut lookups = 0;
             let mut deletes = 0;
@@ -3568,7 +4108,7 @@ mod tests {
                 let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
                 assert_eq!(payload["deleting"], true);
                 assert_eq!(payload["conflict"], true);
-                assert!(payload["deletion_id"].is_null());
+                assert_eq!(payload["deletion_id"], 22);
             }
         }
         assert!(workspace.read_with(cx, |w, _| w.editor.is_none()));
@@ -3770,7 +4310,7 @@ mod tests {
                 | SaveAckCase::BasicFormatInput
         );
         const CHILD: &str = "KURISU_DETAILS_ACK_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if child_gate(CHILD).is_none() {
             let mut remote_note = "remote v0".to_owned();
             let mut note_writes = 0;
             let mut first_failure = false;
@@ -4358,7 +4898,7 @@ mod tests {
             ReturnedValues::CompletionInputEdit | ReturnedValues::DatesInputEdit
         );
         const CHILD: &str = "KURISU_RETURNED_VALUES_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if child_gate(CHILD).is_none() {
             let mut entry = json!({"id":22,"mediaId":71,"status":if completion {"REPEATING"} else {"CURRENT"},"progress":if completion {11} else {3},"repeat":2,"score":70,"updatedAt":100,"media":null});
             let mut details = json!({"id":22,"mediaId":71,"notes":"old note","startedAt":null,"completedAt":null,"customLists":{}});
             let mut basic_writes = 0;
@@ -4833,7 +5373,7 @@ mod tests {
             matches!(case, StashedReplacement | StashedMedia | StashedAccount);
         let expire = !ordinary && !active_replacement;
         const CHILD: &str = "KURISU_DELETE_ACK_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        if child_gate(CHILD).is_none() {
             let mut present = true;
             let mut expired = false;
             let mut deletes = 0;
@@ -4901,7 +5441,7 @@ mod tests {
             );
             eprintln!("{name}: present={present}, deletes={deletes}, requests={trace:?}");
             assert!(!present);
-            assert_eq!(deletes, if failure { 2 } else { 1 });
+            assert_eq!(deletes, if matches!(case, FailedExpiry) { 2 } else { 1 });
             return;
         }
 
@@ -5214,84 +5754,14 @@ mod tests {
         test_name: &str,
         mut response: impl FnMut(serde_json::Value) -> (u16, serde_json::Value),
     ) {
-        use std::{
-            io::{BufRead, BufReader, Read, Write},
-            net::TcpListener,
-            process::{Command, Stdio},
-            time::{Duration, Instant},
-        };
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        // Isolate the fixture environment from parallel tests.
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
-            .env(child_flag, "1")
-            .env(
-                "KURISU_FIXTURE_GRAPHQL",
-                format!("http://{}", listener.local_addr().unwrap()),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            loop {
-                if child.try_wait().unwrap().is_some() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "Editor child timed out");
-                let (mut stream, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(error) => panic!("Fixture accept failed: {error}"),
-                };
-                // Windows inherits the listener's nonblocking mode.
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut length = None;
-                loop {
-                    let mut line = String::new();
-                    assert!(reader.read_line(&mut line).unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((key, value)) = line.split_once(':')
-                        && key.eq_ignore_ascii_case("content-length")
-                    {
-                        length = Some(value.trim().parse::<usize>().unwrap());
-                    }
-                }
-                let mut body = vec![0; length.unwrap()];
-                reader.read_exact(&mut body).unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let (status, body) = response(request);
-                let body = body.to_string();
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-            }
-        }));
-        if served.is_err() {
-            let _ = child.kill();
-        }
-        let output = child.wait_with_output().unwrap();
-        if let Err(error) = served {
-            std::panic::resume_unwind(error);
-        }
-        assert!(
-            output.status.success(),
-            "Editor child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        super::super::fixture_server::serve(
+            test_name,
+            child_flag,
+            "KURISU_FIXTURE_GRAPHQL",
+            |mut request, _| {
+                let (status, body) = response(request.json());
+                request.reply_json(status, body).unwrap();
+            },
         );
     }
 
@@ -5599,6 +6069,196 @@ mod tests {
         drop(workspace);
         drop(runtime);
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn restored_editor_reloads_expanded_details_after_edit_fence(tc: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            let user = kurisu_core::User {
+                id: 7,
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            };
+            w.profile = Some(user.clone());
+            w.list.replace(vec![total_entry("CURRENT", 3)], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .repeat
+                .update(cx, |input, cx| input.set_value("5", cx));
+            w.editor_details_open = true;
+            w.load_editor_details(window, cx);
+            assert!(w.editor_details_loading);
+
+            let generation = w.generation;
+            w.set_profile_at(None, generation, window, cx);
+            w.set_profile_at(
+                Some(kurisu_core::User {
+                    id: 8,
+                    ..Default::default()
+                }),
+                generation,
+                window,
+                cx,
+            );
+            assert!(w.editor.is_none());
+            assert!(w.editor_inputs.is_none());
+            assert!(w.editor_drafts.contains_key(&7));
+            assert!(!w.read_aborts.contains_key("editor-details"));
+            w.close_ready = true;
+            w.set_profile_at(Some(user), generation, window, cx);
+            assert!(w.editor_details_open);
+            assert!(!w.editor_details_loading);
+            assert!(!w.read_aborts.contains_key("editor-details"));
+        });
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, window, cx| {
+            assert!(w.editor.as_ref().unwrap().details_error.is_empty());
+            w.auth_busy = true;
+            w.resume_after_close(window, cx);
+            assert!(!w.editor_details_loading);
+            w.auth_busy = false;
+            w.update_busy = true;
+            w.resume_fenced_reads(true, window, cx);
+            assert!(!w.editor_details_loading);
+            w.update_busy = false;
+            w.resume_fenced_reads(true, window, cx);
+            assert!(w.editor_details_loading);
+            assert!(w.read_aborts.contains_key("editor-details"));
+            assert_eq!(
+                w.editor_inputs.as_ref().unwrap().repeat.read(cx).value(),
+                "5"
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.editor_details_loading) {
+            assert!(std::time::Instant::now() < deadline);
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+        }
+        workspace.read_with(cx, |w, _| {
+            assert!(w.editor_details_open);
+            let editor = w.editor.as_ref().unwrap();
+            assert!(!editor.details_error.is_empty());
+            assert_eq!(editor.repeat, 5);
+        });
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn reauth_retries_expanded_editor_details_after_expiry(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "KURISU_EDITOR_DETAILS_REAUTH_CHILD";
+        if child_gate(CHILD).is_none() {
+            let mut reads = 0;
+            run_graphql_response_fixture(
+                CHILD,
+                "screens::editor::tests::reauth_retries_expanded_editor_details_after_expiry",
+                |request| {
+                    let query = request["query"].as_str().unwrap();
+                    let data = if query.contains("mediaListEntry") && query.contains("notes") {
+                        reads += 1;
+                        if reads == 1 {
+                            return (
+                                401,
+                                json!({"errors":[{"message":"Invalid token","status":401}]}),
+                            );
+                        }
+                        json!({"Media":{"mediaListEntry":{"id":22,"mediaId":71,"notes":"Restored note","startedAt":{"year":2025,"month":4,"day":2},"completedAt":null,"customLists":{"Favorites":true}}},"Viewer":{"mediaListOptions":{"animeList":{"customLists":["Favorites"]}}}})
+                    } else if query.contains("Viewer") {
+                        json!({"Viewer":{"id":47,"name":"Fixture","mediaListOptions":{"scoreFormat":"POINT_100"}}})
+                    } else {
+                        assert!(query.contains("recommendations"), "{query}");
+                        json!({"Page":{"recommendations":[]}})
+                    };
+                    (200, json!({"data":data}))
+                },
+            );
+            assert_eq!(reads, 2);
+            return;
+        }
+        let (initial, runtime, dir) = editor_fixture();
+        drop(initial);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = kurisu_core::User {
+            id: 47,
+            score_format: Some("POINT_100".into()),
+            ..Default::default()
+        };
+        db.replace_account("synthetic-expiring-token", &user)
+            .unwrap();
+        let entry = total_entry("CURRENT", 3);
+        db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
+        db.upsert_entry(&entry).unwrap();
+        let core = kurisu_core::Core::from_db(
+            db,
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(Platform),
+            kurisu_core::UpdateChannel::Native,
+        );
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let wait = |cx: &mut gpui::VisualTestContext, ready: &dyn Fn(&Workspace) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !workspace.read_with(cx, |w, _| ready(w)) {
+                assert!(Instant::now() < deadline, "Editor fixture timed out");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                cx.run_until_parked();
+            }
+        };
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.last_account = Some(47);
+            w.last_sync_attempt = Some(Instant::now());
+            w.list.replace(vec![entry], 0);
+            w.open_editor(71, window, cx);
+            w.editor_inputs
+                .as_ref()
+                .unwrap()
+                .repeat
+                .update(cx, |input, cx| input.set_value("5", cx));
+            w.editor_details_open = true;
+            w.load_editor_details(window, cx);
+        });
+        wait(cx, &|w| w.profile.is_none());
+        workspace.update_in(cx, |w, window, cx| {
+            let draft = w.editor_drafts.get(&47).unwrap();
+            assert!(draft.details_open);
+            assert!(draft.editor.details.is_none());
+            assert!(
+                draft
+                    .editor
+                    .details_error
+                    .contains("Entry details are unavailable")
+            );
+            w.login(false, Some("synthetic-renewed-token".into()), window, cx);
+        });
+        wait(cx, &|w| {
+            w.profile.is_some() && !w.auth_busy && !w.editor_details_loading
+        });
+        workspace.read_with(cx, |w, app| {
+            assert!(w.editor_details_open);
+            let editor = w.editor.as_ref().unwrap();
+            assert!(editor.details_error.is_empty(), "{}", editor.details_error);
+            assert_eq!(editor.notes, "Restored note");
+            assert_eq!(editor.started_at.year, Some(2025));
+            assert_eq!(editor.custom_lists, ["Favorites"]);
+            assert_eq!(editor.repeat, 5);
+            let inputs = w.editor_inputs.as_ref().unwrap();
+            assert_eq!(inputs.repeat.read(app).value(), "5");
+            assert_eq!(inputs.notes.read(app).value(), "Restored note");
+        });
+        cx.update(|window, _| window.remove_window());
     }
 
     #[gpui::test]

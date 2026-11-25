@@ -1,3 +1,5 @@
+use std::sync::{Arc, Weak};
+
 use anyhow::{anyhow, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -7,7 +9,7 @@ use crate::models::FeedFailure;
 
 const FEEDS_KEY: &str = "rss_feeds";
 const DEFAULT_FEEDS: &[&str] = &["https://nyaa.si/?page=rss&c=1_2&f=0"];
-static FEEDS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static FEED_READS: parking_lot::Mutex<Vec<Weak<FeedRead>>> = parking_lot::Mutex::new(Vec::new());
 static HTTP_CLIENT: parking_lot::Mutex<Option<reqwest::Client>> = parking_lot::Mutex::new(None);
 #[cfg(feature = "test-support")]
 static FIXTURE_HTTP_CLIENT: parking_lot::Mutex<Option<reqwest::Client>> =
@@ -70,6 +72,29 @@ pub fn get_feeds(db: &Db) -> Result<Vec<String>> {
         .unwrap_or_else(|| DEFAULT_FEEDS.iter().map(|s| s.to_string()).collect()))
 }
 
+pub(crate) struct FeedRead {
+    db: Arc<Db>,
+    pub(crate) feeds: Vec<String>,
+}
+
+fn discard_feed_reads(reads: &mut Vec<Weak<FeedRead>>, db: &Db) {
+    reads.retain(|read| {
+        read.upgrade()
+            .is_some_and(|read| !std::ptr::eq(Arc::as_ref(&read.db), db))
+    });
+}
+
+pub(crate) fn read_feeds(db: &Arc<Db>) -> Result<Arc<FeedRead>> {
+    let mut reads = FEED_READS.lock();
+    let read = Arc::new(FeedRead {
+        db: db.clone(),
+        feeds: get_feeds(db)?,
+    });
+    discard_feed_reads(&mut reads, db);
+    reads.push(Arc::downgrade(&read));
+    Ok(read)
+}
+
 fn save_feeds(db: &Db, feeds: &[String]) -> Result<()> {
     db.set_setting(FEEDS_KEY, &serde_json::to_string(feeds)?)
 }
@@ -79,11 +104,12 @@ pub fn add_feed(db: &Db, url: &str) -> Result<Vec<String>> {
         .map_err(|_| anyhow!("feed URL must be a valid http:// or https:// URL"))?;
     validate_feed_url(&parsed)?;
     let url = parsed.as_str();
-    let _guard = FEEDS_LOCK.lock();
+    let mut reads = FEED_READS.lock();
     let mut feeds = get_feeds(db)?;
     if !feeds.iter().any(|f| f == url) {
         feeds.push(url.to_string());
         save_feeds(db, &feeds)?;
+        discard_feed_reads(&mut reads, db);
     }
     Ok(feeds)
 }
@@ -135,11 +161,25 @@ fn validate_redirect(previous: &[reqwest::Url], next: &reqwest::Url) -> Result<(
 }
 
 pub fn remove_feed(db: &Db, url: &str) -> Result<Vec<String>> {
-    let _guard = FEEDS_LOCK.lock();
+    let mut reads = FEED_READS.lock();
     let mut feeds = get_feeds(db)?;
     feeds.retain(|f| f != url);
     save_feeds(db, &feeds)?;
+    discard_feed_reads(&mut reads, db);
     Ok(feeds)
+}
+
+impl FeedRead {
+    pub(crate) fn prune_seen(&self, carried: &[String]) -> Result<()> {
+        let reads = FEED_READS.lock();
+        // An edit or a newer refresh can supersede this snapshot even with the same URLs.
+        if reads.iter().any(|read| std::ptr::eq(read.as_ptr(), self))
+            && get_feeds(&self.db)? == self.feeds
+        {
+            self.db.prune_rss_seen_keeping(60, carried)?;
+        }
+        Ok(())
+    }
 }
 
 const MAX_FEED_BYTES: u64 = 8 * 1024 * 1024;
@@ -225,20 +265,18 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 validate_feed_url(&reqwest::Url::parse(&feed)?)?;
                 let mut resp = http.get(&feed).send().await?;
                 let status = resp.status();
-                if !status.is_success() {
-                    return Err(anyhow!("{feed}: HTTP {status}"));
+                if !status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(anyhow!("HTTP {status}"));
                 }
                 if resp.content_length().unwrap_or(0) > MAX_FEED_BYTES {
-                    return Err(anyhow!(
-                        "{feed}: response larger than {MAX_FEED_BYTES} bytes"
-                    ));
+                    return Err(anyhow!("response larger than {MAX_FEED_BYTES} bytes"));
                 }
                 let mut body: Vec<u8> = Vec::new();
                 while let Some(chunk) = resp.chunk().await? {
                     body.extend_from_slice(&chunk);
                     // Enforce the cap even when Content-Length is missing or false.
                     if body.len() as u64 > MAX_FEED_BYTES {
-                        return Err(anyhow!("{feed}: response exceeded {MAX_FEED_BYTES} bytes"));
+                        return Err(anyhow!("response exceeded {MAX_FEED_BYTES} bytes"));
                     }
                 }
                 Ok(String::from_utf8_lossy(&body).into_owned())
@@ -259,8 +297,6 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
     let mut out: Vec<RawItem> = Vec::new();
     let mut seen_guids = std::collections::HashSet::new();
     let mut failures: Vec<FeedFailure> = Vec::new();
-    let mut first_err: Option<anyhow::Error> = None;
-    let mut ok = 0usize;
     for (feed, fetched) in results {
         match fetched {
             Ok(xml) => {
@@ -268,8 +304,11 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 let items = parsed.items;
                 // Distinguish an empty RSS feed from an error page returned with HTTP 200.
                 if !parsed.is_rss {
-                    let msg = format!("{feed}: response was not an RSS feed");
-                    log::warn!("{msg}");
+                    let msg = match parsed.error {
+                        Some(err) => format!("response was not an RSS feed: {err}"),
+                        None => "response was not an RSS feed".into(),
+                    };
+                    log::warn!("{feed}: {msg}");
                     failures.push(FeedFailure {
                         url: feed,
                         error: msg,
@@ -278,40 +317,44 @@ pub async fn fetch_all(feeds: &[String]) -> Result<FeedFetch> {
                 }
                 if let Some(err) = parsed.error {
                     let msg = format!(
-                        "{feed}: feed broke off mid parse, kept {} items recovered before the error: {err}",
+                        "feed broke off mid parse, kept {} items recovered before the error: {err}",
                         items.len()
                     );
-                    log::warn!("{msg}");
+                    log::warn!("{feed}: {msg}");
                     failures.push(FeedFailure {
                         url: feed.clone(),
                         error: msg,
                     });
                 }
-                ok += 1;
                 for mut item in items {
                     // Keep entries distinct when different feeds reuse a raw GUID.
                     item.guid = format!("{feed}\u{1}{}", item.guid);
-                    if seen_guids.insert(item.guid.clone()) {
+                    let hash = item
+                        .info_hash
+                        .as_deref()
+                        .and_then(info_hash_aliases)
+                        .map(|[hex, _]| hex);
+                    if seen_guids.insert((item.guid.clone(), hash)) {
                         out.push(item);
                     }
                 }
             }
             Err(e) => {
-                log::warn!("RSS fetch failed: {e}");
+                log::warn!("RSS fetch failed for {feed}: {e}");
                 failures.push(FeedFailure {
                     url: feed,
                     error: e.to_string(),
                 });
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
             }
         }
     }
-    if ok == 0 {
-        if let Some(e) = first_err {
-            return Err(e);
-        }
+    if out.is_empty() && !failures.is_empty() && failures.len() == feeds.len() {
+        let errors = failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.url, failure.error))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow!(errors));
     }
     Ok(FeedFetch {
         items: out,
@@ -347,7 +390,11 @@ pub async fn search(query: &str, category: &str, filter: &str) -> Result<Vec<Raw
     let url = search_url(query, category, filter)?;
     let fetched = fetch_all(&[url]).await?;
     if let Some(failure) = fetched.failures.first() {
-        return Err(anyhow!("Could not complete the search: {}", failure.error));
+        return Err(anyhow!(
+            "Could not complete the search: {}: {}",
+            failure.url,
+            failure.error
+        ));
     }
     Ok(fetched.items)
 }
@@ -368,7 +415,7 @@ pub async fn search_variants(
         })
         .collect::<Result<Vec<String>>>()?;
     let fetched = fetch_all(&urls).await?;
-    if fetched.items.is_empty() && fetched.failures.len() == urls.len() {
+    if urls.is_empty() {
         return Err(anyhow!("Could not search for this show. Please try again."));
     }
     Ok(fetched)
@@ -443,9 +490,19 @@ pub(crate) fn parse_rss_checked(xml: &str) -> ParsedFeed {
                 }
             }
             Ok(Event::Text(t)) => {
+                if document_depth == 0
+                    && !t.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    error = Some("text outside the XML root".into());
+                    break;
+                }
                 if item.is_some() && field.is_some() {
                     buf.push_str(&String::from_utf8_lossy(t.as_ref()));
                 }
+            }
+            Ok(Event::GeneralRef(_) | Event::CData(_)) if document_depth == 0 => {
+                error = Some("text outside the XML root".into());
+                break;
             }
             Ok(Event::GeneralRef(t)) => {
                 if item.is_some() && field.is_some() {
@@ -820,6 +877,20 @@ mod tests {
     }
 
     #[test]
+    fn only_the_latest_feed_read_can_prune_seen_marks() {
+        let db = Arc::new(Db::open(std::path::Path::new(":memory:")).unwrap());
+        db.0.lock()
+            .execute("INSERT INTO rss_seen VALUES ('older-mark',0)", [])
+            .unwrap();
+        let earlier = read_feeds(&db).unwrap();
+        let latest = read_feeds(&db).unwrap();
+        latest.prune_seen(&["older-mark".into()]).unwrap();
+        drop(latest);
+        earlier.prune_seen(&[]).unwrap();
+        assert!(db.rss_seen_set().unwrap().contains("older-mark"));
+    }
+
+    #[test]
     fn release_pages_are_derived_only_from_valid_nyaa_urls() {
         for (guid, link, expected) in [
             (
@@ -870,7 +941,7 @@ mod tests {
             let parsed = parse_rss_checked(&xml);
             assert_eq!(parsed.items.len(), 1);
             assert!(parsed.error.is_some());
-            let fetched = fetch_full(serve_body(&xml)).await;
+            let fetched = fetch_full(serve_body(&xml)).await.unwrap();
             assert_eq!(fetched.items.len(), 1);
             assert_eq!(fetched.failures.len(), 1);
         }
@@ -1167,29 +1238,19 @@ mod tests {
     async fn fetch_with_server(
         respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
     ) -> Result<Vec<RawItem>> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            respond(&mut stream);
-        });
-        fetch_all(&[format!("http://127.0.0.1:{port}/rss")])
-            .await
-            .map(|f| f.items)
+        fetch_full(respond).await.map(|f| f.items)
     }
 
     async fn fetch_full(
         respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
-    ) -> FeedFetch {
+    ) -> Result<FeedFetch> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             respond(&mut stream);
         });
-        fetch_all(&[format!("http://127.0.0.1:{port}/rss")])
-            .await
-            .expect("one feed failure must not fail the whole fetch")
+        fetch_all(&[format!("http://127.0.0.1:{port}/rss")]).await
     }
 
     fn serve_body(body: &str) -> impl FnOnce(&mut std::net::TcpStream) + Send + 'static {
@@ -1763,7 +1824,8 @@ mod tests {
         let f = fetch_full(serve_body(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rss version=\"2.0\"><channel><title>Nyaa - Search</title></channel></rss>",
         ))
-        .await;
+        .await
+        .unwrap();
         assert!(f.items.is_empty());
         assert!(
             f.failures.is_empty(),
@@ -1773,10 +1835,44 @@ mod tests {
 
     #[tokio::test]
     async fn non_rss_response_is_still_a_failure() {
-        let f = fetch_full(serve_body("<html><body>moved</body></html>")).await;
-        assert!(f.items.is_empty());
-        assert_eq!(f.failures.len(), 1);
-        assert!(f.failures[0].error.contains("not an RSS feed"));
+        let error = fetch_full(serve_body("<html><body>moved</body></html>"))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("/rss: response was not an RSS feed"));
+    }
+
+    #[tokio::test]
+    async fn rss_with_text_outside_the_root_is_not_an_empty_feed() {
+        for body in [
+            "Unavailable\n<rss><channel/></rss>",
+            "<rss><channel/></rss>\nUnavailable",
+        ] {
+            let error = fetch_with_server(serve_body(body)).await.unwrap_err();
+            assert!(error.to_string().contains("text outside the XML root"));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_http_response_is_not_an_empty_feed() {
+        use std::io::{Read, Write};
+
+        let error = fetch_with_server(|stream| {
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let body = "<rss><channel/></rss>";
+            write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/200\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() - 1,
+                body.len(),
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("206 Partial Content"));
     }
 
     #[tokio::test]
@@ -1786,18 +1882,14 @@ mod tests {
             "<rssError>Feed unavailable</rssError>",
             "<channelError>Feed unavailable</channelError>",
         ] {
-            let fetched = fetch_full(serve_body(body)).await;
-            assert_eq!(fetched.failures.len(), 1, "{body}");
-            assert!(fetched.items.is_empty());
+            assert!(fetch_full(serve_body(body)).await.is_err(), "{body}");
         }
     }
 
     #[tokio::test]
     async fn non_feed_items_are_not_downloads() {
         let body = "<html><body><item><title>Error</title><link>https://example.com/error</link></item></body></html>";
-        let fetched = fetch_full(serve_body(body)).await;
-        assert_eq!(fetched.failures.len(), 1);
-        assert!(fetched.items.is_empty());
+        assert!(fetch_full(serve_body(body)).await.is_err());
     }
 
     #[test]
@@ -1892,7 +1984,7 @@ mod tests {
               <link>https://example.com/2.torrent</link>
             </item>
         </channel></rss>";
-        let f = fetch_full(serve_body(body)).await;
+        let f = fetch_full(serve_body(body)).await.unwrap();
         assert_eq!(f.items.len(), 1, "the recovered item rides along");
         assert_eq!(f.failures.len(), 1);
         assert!(
@@ -1927,6 +2019,34 @@ mod tests {
         assert_eq!(f.items.len(), 2, "both feeds' items survive");
         assert!(f.failures.is_empty());
         assert_ne!(f.items[0].guid, f.items[1].guid);
+    }
+
+    #[tokio::test]
+    async fn shared_download_link_keeps_distinct_hashes_and_deduplicates_hash_aliases() {
+        let item = |title, hash| {
+            format!(
+                "<item><title>{title}</title><link>https://example.invalid/shared</link>\
+                <nyaa:infoHash>{hash}</nyaa:infoHash></item>"
+            )
+        };
+        let first = "abcdef0123456789abcdef0123456789abcdef01";
+        let [_, base32] = super::info_hash_aliases(first).unwrap();
+        let second = "0123456789abcdef0123456789abcdef01234567";
+        let feed = format!(
+            "<rss xmlns:nyaa=\"https://nyaa.si/xmlns/nyaa\"><channel>{}{}{}</channel></rss>",
+            item("First", first),
+            item("Alias", &base32),
+            item("Second", second),
+        );
+        let fetched = fetch_full(serve_body(&feed)).await.unwrap();
+        let titles: Vec<_> = fetched
+            .items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect();
+        assert_eq!(titles, ["First", "Second"]);
+        assert_eq!(fetched.items[0].guid, fetched.items[1].guid);
+        assert!(fetched.failures.is_empty());
     }
 
     fn responder2(stream: &mut std::net::TcpStream, body: &str) {

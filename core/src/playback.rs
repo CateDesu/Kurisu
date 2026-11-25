@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -118,7 +118,7 @@ pub struct TrackingPrompt {
 
 enum ProgressOutcome {
     Rejected,
-    Accepted { history_recorded: bool },
+    Accepted,
 }
 
 type ProgressTask = tokio::task::JoinHandle<Result<ProgressOutcome, String>>;
@@ -128,12 +128,13 @@ struct ActiveTrack {
     accumulated: Duration,
     last_tick: Instant,
     was_playing: bool,
-    prompted: bool,
+    eof_after_playing: bool,
+    prompt_watch: Option<PromptWatch>,
     incremented: bool,
     asked: bool,
     fail_count: u32,
     retry_at: Option<Instant>,
-    history_recorded: bool,
+    history_recorded: Arc<AtomicBool>,
     push: Option<ProgressTask>,
     work: PlaybackWork,
 }
@@ -153,24 +154,170 @@ impl ActiveTrack {
             accumulated: Duration::ZERO,
             last_tick: Instant::now(),
             was_playing: false,
-            prompted: false,
+            eof_after_playing: false,
+            prompt_watch: None,
             incremented: false,
             asked: false,
             fail_count: 0,
             retry_at: None,
-            history_recorded: false,
+            history_recorded: Arc::default(),
             push: None,
             work,
         }
     }
+
+    fn watched_episode(&self) -> WatchedEpisode {
+        WatchedEpisode {
+            key: self.key.clone(),
+            recorded: self.history_recorded.clone(),
+        }
+    }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct TrackKey {
-    source: String,
+    source: TrackSource,
+    player: Option<String>,
+    track_id: Option<String>,
+    mpv_endpoint: Option<String>,
+    process_id: Option<u32>,
+    mpv_entry_id: Option<u64>,
     media_id: Option<i64>,
     episode: Option<i64>,
     session: Option<String>,
+}
+
+impl TrackKey {
+    fn same_mpv_instance(&self, next: &Self) -> bool {
+        (self.process_id.is_some() && self.process_id == next.process_id)
+            || (self.mpv_endpoint.is_some() && self.mpv_endpoint == next.mpv_endpoint)
+    }
+
+    fn continues_with(&self, next: &mut Self) -> bool {
+        let processes = self.process_id.zip(next.process_id);
+        if self.media_id != next.media_id
+            || self.episode != next.episode
+            || self.session != next.session
+            || processes.is_some_and(|(previous, current)| previous != current)
+            || self
+                .player
+                .as_ref()
+                .zip(next.player.as_ref())
+                .is_some_and(|(previous, current)| previous != current)
+        {
+            return false;
+        }
+        if let (Some(previous), Some(current)) = (&self.mpv_endpoint, &next.mpv_endpoint) {
+            if previous != current
+                || self
+                    .mpv_entry_id
+                    .zip(next.mpv_entry_id)
+                    .is_some_and(|(previous, current)| previous != current)
+            {
+                return false;
+            }
+        }
+        let same_process = processes.is_some_and(|(previous, current)| previous == current);
+        let same_session = self.player.is_some() && self.player == next.player;
+        if self.mpv_endpoint.is_some() != next.mpv_endpoint.is_some()
+            && !same_process
+            && !same_session
+        {
+            return false;
+        }
+        let same_player = self.player == next.player || same_process;
+        let same_file = matches!((&self.source, &next.source),
+            (TrackSource::File(previous), TrackSource::File(current)) if previous == current);
+        let same_title_track = matches!(
+            (&self.source, &next.source),
+            (TrackSource::Title(_), TrackSource::Title(_))
+        ) && self.track_id.is_some()
+            && self.track_id == next.track_id;
+        if !(same_file || same_player && (self.source == next.source || same_title_track)) {
+            return false;
+        }
+        if same_player
+            && self.track_id.is_some()
+            && next.track_id.is_some()
+            && self.track_id != next.track_id
+        {
+            return false;
+        }
+        if let (TrackSource::File(previous), TrackSource::File(current)) =
+            (&self.source, &mut next.source)
+        {
+            if (current.reported == current.resolved || current.reported.to_str().is_none())
+                && previous.reported != previous.resolved
+                && previous.reported.to_str().is_some()
+            {
+                current.reported.clone_from(&previous.reported);
+            }
+        }
+        if next.player.is_none() {
+            next.player.clone_from(&self.player);
+        }
+        if self.player == next.player && next.track_id.is_none() {
+            next.track_id.clone_from(&self.track_id);
+        }
+        if next.mpv_endpoint.is_none() {
+            next.mpv_endpoint.clone_from(&self.mpv_endpoint);
+        }
+        if same_player || next.mpv_endpoint.is_some() {
+            next.process_id = next.process_id.or(self.process_id);
+        }
+        if next.mpv_endpoint.is_some() {
+            next.mpv_entry_id = next.mpv_entry_id.or(self.mpv_entry_id);
+        }
+        true
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TrackSource {
+    File(PlaybackFile),
+    Location(String),
+    Title(String),
+}
+
+#[derive(Clone)]
+struct PlaybackFile {
+    reported: std::path::PathBuf,
+    resolved: std::path::PathBuf,
+    identity: Option<library::FileIdentity>,
+}
+
+impl PartialEq for PlaybackFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.resolved == other.resolved && self.identity == other.identity
+    }
+}
+
+impl Eq for PlaybackFile {}
+
+impl PlaybackFile {
+    fn history_path(&self) -> Option<&str> {
+        let identity = self.identity?;
+        [&self.reported, &self.resolved]
+            .into_iter()
+            .find_map(|path| {
+                path.to_str()
+                    .filter(|_| library::file_identity(path) == Some(identity))
+            })
+    }
+}
+
+pub(crate) struct WatchedEpisode {
+    key: TrackKey,
+    recorded: Arc<AtomicBool>,
+}
+
+// A sent confirmation can outlive the active track and its prompt.
+pub(crate) type PromptWatch = Arc<Mutex<Option<WatchedEpisode>>>;
+
+impl WatchedEpisode {
+    pub(crate) fn record(&self, state: &AppState, origin: EventOrigin) {
+        record_history(state, origin, &self.key, &self.recorded);
+    }
 }
 
 const MAX_AUTO_PUSH_FAILURES: u32 = 4;
@@ -187,6 +334,7 @@ fn auto_push_backoff(fail_count: u32) -> Duration {
 struct AutoGate {
     incremented: bool,
     was_playing_before: bool,
+    eof_after_playing: bool,
     accumulated: Duration,
     fail_count: u32,
     retry_due: bool,
@@ -199,10 +347,13 @@ struct AutoGate {
 
 impl AutoGate {
     fn pct(&self) -> f64 {
-        if self.length_us > 0 {
-            (self.position_us as f64 / self.length_us as f64) * 100.0
-        } else {
+        if self.length_us <= 0 {
             0.0
+        } else if self.eof_after_playing {
+            // At EOF MPV can still report the start time of the final frame.
+            100.0
+        } else {
+            (self.position_us as f64 / self.length_us as f64) * 100.0
         }
     }
 
@@ -437,8 +588,14 @@ pub(crate) fn spawn(app: Core) -> PlaybackTask {
 #[derive(Clone)]
 struct TickInfo {
     playing: bool,
+    eof_reached: bool,
     player: String,
-    trackid: String,
+    player_id: Option<String>,
+    player_track_id: Option<String>,
+    mpv_endpoint: Option<String>,
+    process_id: Option<u32>,
+    mpv_entry_id: Option<u64>,
+    location: String,
     title: String,
     length_us: i64,
     position_us: i64,
@@ -449,14 +606,30 @@ struct TickInfo {
 
 impl TickInfo {
     fn key(&self, session: Option<String>) -> TrackKey {
+        let source = if let Some(reported) = video_path(&self.location) {
+            let resolved = reported.canonicalize().unwrap_or_else(|_| reported.clone());
+            let identity = library::file_identity(&resolved);
+            TrackSource::File(PlaybackFile {
+                reported,
+                resolved,
+                identity,
+            })
+        } else if !self.location.is_empty() {
+            TrackSource::Location(self.location.clone())
+        } else {
+            TrackSource::Title(self.title.clone())
+        };
+        let player = self.player_id.clone().or_else(|| {
+            (self.mpv_endpoint.is_none() && !matches!(source, TrackSource::File(_)))
+                .then(|| self.player.clone())
+        });
         TrackKey {
-            source: if self.trackid.is_empty() {
-                self.title.clone()
-            } else {
-                video_path(&self.trackid)
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| self.trackid.clone())
-            },
+            source,
+            player,
+            track_id: self.player_track_id.clone(),
+            mpv_endpoint: self.mpv_endpoint.clone(),
+            process_id: self.process_id,
+            mpv_entry_id: self.mpv_entry_id,
             media_id: self.media_id,
             episode: self.episode,
             session,
@@ -473,20 +646,31 @@ async fn tick(
     let state = app.state();
     let origin = state.origin();
     let expected_token = state.anilist.lock().token();
+    let probe_token = expected_token.clone();
     let app_for_blocking = app.clone();
+    let previous = active
+        .as_ref()
+        .filter(|track| track.was_playing)
+        .map(|track| (track.key.clone(), track.accumulated));
     let mut cache = std::mem::take(recognition);
-    let (cache, info) = work
+    let (cache, sample) = work
         .spawn_blocking(move || {
+            let identify = |info: TickInfo| {
+                let key = info.key(probe_token);
+                (info, key)
+            };
             #[cfg(test)]
             if let Some(info) = cache.probe_result.take() {
-                return (cache, Ok(Some(info)));
+                return (cache, Ok(info.map(identify)));
             }
-            let info = read_now(&app_for_blocking, &mut cache);
-            (cache, info)
+            let previous = previous.as_ref().map(|(key, elapsed)| (key, *elapsed));
+            let sample =
+                read_now(&app_for_blocking, &mut cache, previous).map(|info| info.map(identify));
+            (cache, sample)
         })
         .await?;
     *recognition = cache;
-    let info = info?;
+    let sample = sample?;
     let _session_guard = state.entry_lock.lock().await;
     if state.anilist.lock().token() != expected_token || !state.origin_is_current(origin) {
         *active = None;
@@ -494,7 +678,7 @@ async fn tick(
         return Ok(());
     }
 
-    let Some(info) = info else {
+    let Some((info, mut key)) = sample else {
         if active.is_some() {
             state.emit_from(origin, EventKind::NowPlaying(idle()));
             *active = None;
@@ -503,6 +687,20 @@ async fn tick(
         return Ok(());
     };
 
+    let same_mpv_eof = info.eof_reached
+        && active
+            .as_ref()
+            .is_some_and(|track| track.key.same_mpv_instance(&key));
+    let track = if let Some(track) = active
+        .as_mut()
+        .filter(|track| track.key.continues_with(&mut key))
+    {
+        track.key = key;
+        track
+    } else {
+        state.clear_tracking_prompt_from(origin);
+        active.insert(ActiveTrack::new(key, work.clone()))
+    };
     state.emit_from(
         origin,
         EventKind::NowPlaying(NowPlaying {
@@ -517,19 +715,12 @@ async fn tick(
         }),
     );
 
-    let key = info.key(expected_token.clone());
-    if active.as_ref().map(|t| &t.key) != Some(&key) {
-        state.clear_tracking_prompt_from(origin);
-        *active = Some(ActiveTrack::new(key, work.clone()));
-    }
-    let Some(track) = active.as_mut() else {
-        return Ok(());
-    };
     // Credit only intervals playing at both ends. Pauses between samples are invisible.
     let was_playing_before = track.was_playing;
     if info.playing && track.was_playing {
         track.accumulated += track.last_tick.elapsed().min(TICK * 2);
     }
+    track.eof_after_playing = same_mpv_eof && (was_playing_before || track.eof_after_playing);
     track.was_playing = info.playing;
     track.last_tick = Instant::now();
 
@@ -597,8 +788,7 @@ async fn tick(
         && track.accumulated >= AUTO_ASK_DELAY
     {
         track.asked = true;
-        track.prompted = true;
-        state.emit_from(
+        state.emit_tracking_offer(
             origin,
             EventKind::TrackingAsk(TrackingPrompt {
                 media_id,
@@ -610,6 +800,10 @@ async fn tick(
                 raw_title: info.title.clone(),
                 progress,
             }),
+            track
+                .prompt_watch
+                .get_or_insert_with(PromptWatch::default)
+                .clone(),
         );
     }
 
@@ -622,9 +816,8 @@ async fn tick(
             .unwrap_or_else(|error| Err(error.to_string()));
         match result {
             Ok(ProgressOutcome::Rejected) => {}
-            Ok(ProgressOutcome::Accepted { history_recorded }) => {
+            Ok(ProgressOutcome::Accepted) => {
                 track.incremented = true;
-                track.history_recorded |= history_recorded;
                 if state
                     .db
                     .get_entry(media_id)
@@ -632,7 +825,7 @@ async fn tick(
                     .flatten()
                     .is_some_and(|entry| entry.progress >= episode)
                 {
-                    record_history(state, origin, track, &info, expected_token.as_deref());
+                    record_history(state, origin, &track.key, &track.history_recorded);
                 }
             }
             Err(e) => {
@@ -655,7 +848,8 @@ async fn tick(
 
     let gate = AutoGate {
         incremented: track.incremented,
-        was_playing_before,
+        was_playing_before: was_playing_before || track.eof_after_playing,
+        eof_after_playing: track.eof_after_playing,
         accumulated: track.accumulated,
         fail_count: track.fail_count,
         retry_due: track.retry_at.map(|t| Instant::now() >= t).unwrap_or(true),
@@ -665,14 +859,17 @@ async fn tick(
         episode,
         progress,
     };
-    if info.playing && progress >= episode && gate.watched_enough() {
-        record_history(state, origin, track, &info, expected_token.as_deref());
+    let eligible_sample = info.playing || track.eof_after_playing;
+    let watched_enough = eligible_sample && gate.watched_enough();
+    if watched_enough && progress >= episode {
+        record_history(state, origin, &track.key, &track.history_recorded);
     }
     match cfg.mode.as_str() {
-        "prompt" if info.playing => {
-            if !track.prompted && track.accumulated >= Duration::from_secs(cfg.prompt_seconds) {
-                track.prompted = true;
-                state.emit_from(
+        "prompt" if info.playing && episode > progress => {
+            if track.prompt_watch.is_none()
+                && track.accumulated >= Duration::from_secs(cfg.prompt_seconds)
+            {
+                state.emit_tracking_offer(
                     origin,
                     EventKind::TrackingPrompt(TrackingPrompt {
                         media_id,
@@ -684,13 +881,13 @@ async fn tick(
                         raw_title: info.title.clone(),
                         progress,
                     }),
+                    track.prompt_watch.insert(PromptWatch::default()).clone(),
                 );
             }
         }
-        "auto" if info.playing && gate.should_push() && track.push.is_none() => {
+        "auto" if eligible_sample && gate.should_push() && track.push.is_none() => {
             let handle = app.clone();
-            let watched = info.clone();
-            let history_recorded = track.history_recorded;
+            let watched = track.watched_episode();
             track.push = Some(work.spawn(async move {
                 let state = handle.state();
                 let result = commands::watcher_set_progress_from(
@@ -716,14 +913,18 @@ async fn tick(
                     .ok()
                     .flatten()
                     .is_some_and(|entry| entry.progress >= episode);
-                Ok(ProgressOutcome::Accepted {
-                    history_recorded: history_recorded
-                        || (progress_reached
-                            && save_history(state, origin, &watched, expected_token.as_deref())),
-                })
+                if progress_reached {
+                    watched.record(state, origin);
+                }
+                Ok(ProgressOutcome::Accepted)
             }));
         }
         _ => {}
+    }
+    if watched_enough && progress < episode && matches!(track.key.source, TrackSource::File(_)) {
+        if let Some(watched) = &track.prompt_watch {
+            *watched.lock() = Some(track.watched_episode());
+        }
     }
 
     Ok(())
@@ -755,52 +956,31 @@ fn video_path(source: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-fn local_video_path(source: &str) -> Option<String> {
-    let path = video_path(source)?;
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
-    path.to_str().map(str::to_string)
-}
-
-fn record_history(
-    state: &AppState,
-    origin: EventOrigin,
-    track: &mut ActiveTrack,
-    info: &TickInfo,
-    expected_token: Option<&str>,
-) {
-    if !track.history_recorded {
-        track.history_recorded = save_history(state, origin, info, expected_token);
+// Callers hold entry_lock while checking and recording the episode.
+fn record_history(state: &AppState, origin: EventOrigin, key: &TrackKey, recorded: &AtomicBool) {
+    if !recorded.load(Ordering::Relaxed) && save_history(state, origin, key) {
+        recorded.store(true, Ordering::Relaxed);
     }
 }
 
-fn save_history(
-    state: &AppState,
-    origin: EventOrigin,
-    info: &TickInfo,
-    expected_token: Option<&str>,
-) -> bool {
-    if expected_token.is_none()
-        || state.anilist.lock().token().as_deref() != expected_token
-        || !state.origin_is_current(origin)
-    {
-        return false;
-    }
-    let (Some(media_id), Some(episode), Some(path)) =
-        (info.media_id, info.episode, local_video_path(&info.trackid))
+fn save_history(state: &AppState, origin: EventOrigin, watched: &TrackKey) -> bool {
+    let (Some(media_id), Some(episode), TrackSource::File(path)) =
+        (watched.media_id, watched.episode, &watched.source)
     else {
         return false;
     };
-    let Some(account_id) = state
-        .db
-        .get_setting("anilist_user_id")
-        .ok()
-        .flatten()
-        .and_then(|id| id.parse::<i64>().ok())
-        .filter(|id| *id > 0)
-    else {
+    let Some(path) = path.history_path() else {
         return false;
     };
-    match state.db.record_watch(account_id, &path, media_id, episode) {
+    let Some(account_id) = origin.account_id else {
+        return false;
+    };
+    let Ok(intent) = commands::write_origin_guard(state, origin, &watched.session) else {
+        return false;
+    };
+    let result = state.db.record_watch(account_id, path, media_id, episode);
+    drop(intent);
+    match result {
         Ok(()) => {
             state.emit_from(origin, EventKind::WatchHistoryUpdated(media_id));
             true
@@ -826,13 +1006,12 @@ pub(crate) fn idle() -> NowPlaying {
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-fn probe_mpv(app: &Core, matches: &PlaybackMatches<'_>) -> Option<TickInfo> {
+fn probe_mpv(app: &Core, matches: &PlaybackMatches<'_>) -> Vec<TickInfo> {
     let paths = mpv_socket_paths(&app.state().db);
-    preferred_source(
-        mpvipc::probe(&paths)
-            .iter()
-            .map(|s| mpv_snapshot_info(matches, s)),
-    )
+    mpvipc::probe(&paths)
+        .iter()
+        .map(|s| mpv_snapshot_info(matches, s))
+        .collect()
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -873,8 +1052,14 @@ fn mpv_snapshot_info(matches: &PlaybackMatches<'_>, snap: &mpvipc::MpvSnapshot) 
     let episode = matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
     TickInfo {
         playing: snap.playing,
+        eof_reached: snap.eof_reached,
         player: "mpv".into(),
-        trackid: snap.path.clone(),
+        player_id: None,
+        player_track_id: None,
+        mpv_endpoint: snap.endpoint.clone(),
+        process_id: snap.process_id,
+        mpv_entry_id: snap.playlist_entry_id,
+        location: snap.path.clone(),
         title,
         length_us: snap.duration_us,
         position_us: snap.position_us,
@@ -894,7 +1079,7 @@ struct RecognitionCache {
     #[cfg(test)]
     recognitions: usize,
     #[cfg(test)]
-    probe_result: Option<TickInfo>,
+    probe_result: Option<Option<TickInfo>>,
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -1035,23 +1220,61 @@ fn playing_episode(
     library::resolve_bound_episode(matched, &candidates, binding)
 }
 
-fn preferred_source(sources: impl IntoIterator<Item = TickInfo>) -> Option<TickInfo> {
+fn preferred_source(
+    sources: impl IntoIterator<Item = TickInfo>,
+    previous: Option<(&TrackKey, Duration)>,
+) -> Option<TickInfo> {
     let rank = |info: &TickInfo| {
+        // Give an eligible final frame one tick before another player takes over.
+        let finishing = info.eof_reached
+            && info.episode.is_some()
+            && info.length_us > 0
+            && previous.is_some_and(|(key, elapsed)| {
+                if elapsed < min_watch_time(info.length_us) {
+                    return false;
+                }
+                let mut next = info.key(key.session.clone());
+                key.same_mpv_instance(&next) && key.continues_with(&mut next)
+            });
         (
+            finishing,
             info.playing,
             info.media_id.is_some(),
             info.episode.is_some(),
             info.length_us > 0 && info.position_us >= 0,
-            video_path(&info.trackid).is_some(),
+            video_path(&info.location).is_some(),
         )
     };
-    sources.into_iter().reduce(|best, next| {
-        if rank(&next) > rank(&best) {
-            next
-        } else {
-            best
-        }
-    })
+    sources
+        .into_iter()
+        .map(|info| (rank(&info), info))
+        .reduce(|(best_rank, best), (next_rank, next)| {
+            let same_paused_track_at_eof = next_rank == best_rank
+                && next.eof_reached
+                && !best.eof_reached
+                && best.player_id.is_none()
+                && best.mpv_endpoint.is_none()
+                && next.media_id == best.media_id
+                && next.episode == best.episode
+                && same_playback_location(&next.location, &best.location);
+            if next_rank > best_rank || same_paused_track_at_eof {
+                (next_rank, next)
+            } else {
+                (best_rank, best)
+            }
+        })
+        .map(|(_, info)| info)
+}
+
+fn same_playback_location(a: &str, b: &str) -> bool {
+    !a.is_empty() && a == b
+        || video_path(a).zip(video_path(b)).is_some_and(|(a, b)| {
+            a == b
+                || a.canonicalize()
+                    .ok()
+                    .zip(b.canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b)
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1076,7 +1299,94 @@ fn mpris_timeline(player: &mpris::Player, metadata: &mpris::Metadata) -> (i64, i
 }
 
 #[cfg(target_os = "linux")]
-fn read_now(app: &Core, cache: &mut RecognitionCache) -> anyhow::Result<Option<TickInfo>> {
+fn mpris_process_id(player: &mpris::Player) -> Option<u32> {
+    if player.bus_name_trimmed().split('.').next() != Some("mpv") {
+        return None;
+    }
+    const DBUS: &str = "org.freedesktop.DBus";
+    let (pid,): (u32,) = dbus::blocking::Connection::new_session()
+        .ok()?
+        .with_proxy(DBUS, "/org/freedesktop/DBus", Duration::from_millis(500))
+        .method_call(DBUS, "GetConnectionUnixProcessID", (player.unique_name(),))
+        .ok()?;
+    (pid != 0).then_some(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn mpris_source(player: &mpris::Player, matches: &PlaybackMatches<'_>, playing: bool) -> TickInfo {
+    let md = player.get_metadata().unwrap_or_default();
+    let title = md.title().unwrap_or_default();
+    let url = md.url().unwrap_or_default();
+    let matched = matches.match_playing(title, url);
+    let base = basename(url);
+    let episode = matched.and_then(|(m, binding)| playing_episode(m, title, &base, binding));
+    let (length_us, position_us) = mpris_timeline(player, &md);
+    TickInfo {
+        playing,
+        eof_reached: false,
+        player: player.identity().to_string(),
+        player_id: Some(format!("{} {}", player.bus_name(), player.unique_name())),
+        player_track_id: md
+            .track_id()
+            .filter(|id| *id != mpris::TrackID::no_track())
+            .map(String::from),
+        mpv_endpoint: None,
+        process_id: mpris_process_id(player),
+        mpv_entry_id: None,
+        location: url.to_string(),
+        title: title.to_string(),
+        length_us,
+        position_us,
+        media_id: matched.map(|(m, _)| m.media_id),
+        matched_title: matched.map(|(m, _)| m.display.clone()),
+        episode,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn preferred_linux_source(
+    mut sessions: Vec<TickInfo>,
+    mut ipc: Vec<TickInfo>,
+    previous: Option<(&TrackKey, Duration)>,
+) -> Option<TickInfo> {
+    // MPV reports the opened path and EOF over IPC even when MPRIS reports a canonical URL.
+    for session in &mut sessions {
+        let Some(index) = ipc.iter().position(|snapshot| {
+            snapshot.process_id.is_some()
+                && snapshot.process_id == session.process_id
+                && (session.location.is_empty()
+                    || same_playback_location(&snapshot.location, &session.location))
+        }) else {
+            continue;
+        };
+        let mut snapshot = ipc.remove(index);
+        snapshot.player = std::mem::take(&mut session.player);
+        snapshot.player_id = session.player_id.take();
+        snapshot.player_track_id = session.player_track_id.take();
+        if snapshot.media_id.is_none()
+            && session.media_id.is_some()
+            && !is_audio_url(&snapshot.location)
+        {
+            snapshot.title = std::mem::take(&mut session.title);
+            snapshot.media_id = session.media_id;
+            snapshot.matched_title = session.matched_title.take();
+            snapshot.episode = session.episode;
+        }
+        if snapshot.length_us <= 0 || snapshot.position_us < 0 {
+            snapshot.length_us = session.length_us;
+            snapshot.position_us = session.position_us;
+        }
+        *session = snapshot;
+    }
+    preferred_source(sessions.into_iter().chain(ipc), previous)
+}
+
+#[cfg(target_os = "linux")]
+fn read_now(
+    app: &Core,
+    cache: &mut RecognitionCache,
+    previous: Option<(&TrackKey, Duration)>,
+) -> anyhow::Result<Option<TickInfo>> {
     let state = app.state();
     let matchers = state.matchers.lock().clone();
     let matches = PlaybackMatches::new(&state.db, &matchers, cache);
@@ -1091,29 +1401,14 @@ fn read_now(app: &Core, cache: &mut RecognitionCache) -> anyhow::Result<Option<T
                 Ok(PlaybackStatus::Paused) => false,
                 _ => continue,
             };
-            let md = player.get_metadata().unwrap_or_default();
-            let title = md.title().map(|t| t.to_string()).unwrap_or_default();
-            let url = md.url().map(|u| u.to_string()).unwrap_or_default();
-            let matched = matches.match_playing(&title, &url);
-            let base = basename(&url);
-            let episode =
-                matched.and_then(|(m, binding)| playing_episode(m, &title, &base, binding));
-            let (length_us, position_us) = mpris_timeline(&player, &md);
-            sources.push(TickInfo {
-                playing,
-                player: player.identity().to_string(),
-                trackid: if url.is_empty() { title.clone() } else { url },
-                title,
-                length_us,
-                position_us,
-                media_id: matched.map(|(m, _)| m.media_id),
-                matched_title: matched.map(|(m, _)| m.display.clone()),
-                episode,
-            });
+            sources.push(mpris_source(&player, &matches, playing));
         }
     }
-    sources.extend(probe_mpv(app, &matches));
-    Ok(preferred_source(sources))
+    Ok(preferred_linux_source(
+        sources,
+        probe_mpv(app, &matches),
+        previous,
+    ))
 }
 
 fn read_config(app: &Core) -> Result<TrackingConfig, String> {
@@ -1271,7 +1566,11 @@ fn windows_video_session(
 }
 
 #[cfg(windows)]
-fn read_now(app: &Core, cache: &mut RecognitionCache) -> anyhow::Result<Option<TickInfo>> {
+fn read_now(
+    app: &Core,
+    cache: &mut RecognitionCache,
+    previous: Option<(&TrackKey, Duration)>,
+) -> anyhow::Result<Option<TickInfo>> {
     use windows::Media::Control::{
         GlobalSystemMediaTransportControlsSessionManager as SessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
@@ -1350,8 +1649,14 @@ fn read_now(app: &Core, cache: &mut RecognitionCache) -> anyhow::Result<Option<T
                 matched.and_then(|m| library::resolve_bound_episode(m, &[title.as_str()], None));
             sources.push(TickInfo {
                 playing,
+                eof_reached: false,
                 player,
-                trackid: String::new(),
+                player_id: None,
+                player_track_id: None,
+                mpv_endpoint: None,
+                process_id: None,
+                mpv_entry_id: None,
+                location: String::new(),
                 title,
                 length_us,
                 position_us,
@@ -1362,11 +1667,15 @@ fn read_now(app: &Core, cache: &mut RecognitionCache) -> anyhow::Result<Option<T
         }
     }
     sources.extend(probe_mpv(app, &matches));
-    Ok(preferred_source(sources))
+    Ok(preferred_source(sources, previous))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn read_now(_app: &Core, _cache: &mut RecognitionCache) -> anyhow::Result<Option<TickInfo>> {
+fn read_now(
+    _app: &Core,
+    _cache: &mut RecognitionCache,
+    _previous: Option<(&TrackKey, Duration)>,
+) -> anyhow::Result<Option<TickInfo>> {
     Ok(None)
 }
 
@@ -1374,28 +1683,28 @@ fn read_now(_app: &Core, _cache: &mut RecognitionCache) -> anyhow::Result<Option
 mod tests {
     use super::*;
 
+    struct NoPlatform;
+    impl crate::Platform for NoPlatform {
+        fn open_url(&self, _: &str) -> Result<(), String> {
+            panic!("unexpected platform call")
+        }
+        fn open_path(&self, _: &std::path::Path) -> Result<(), String> {
+            panic!("unexpected platform call")
+        }
+        fn reveal_path(&self, _: &std::path::Path) -> Result<(), String> {
+            panic!("unexpected platform call")
+        }
+    }
+
     async fn assert_tick_progress_origin(
         cancel_before_tick: bool,
         cancel_after_spawn: bool,
         already_pending: bool,
         local_history: bool,
     ) {
-        use crate::{anilist, Db, ListEntry, Platform, UpdateChannel, User};
+        use crate::{anilist, Db, ListEntry, UpdateChannel, User};
         use serde_json::json;
         use std::path::Path;
-
-        struct NoPlatform;
-        impl Platform for NoPlatform {
-            fn open_url(&self, _: &str) -> Result<(), String> {
-                panic!("unexpected platform call")
-            }
-            fn open_path(&self, _: &Path) -> Result<(), String> {
-                panic!("unexpected platform call")
-            }
-            fn reveal_path(&self, _: &Path) -> Result<(), String> {
-                panic!("unexpected platform call")
-            }
-        }
 
         let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
         let (mut api, mut requests) = anilist::mock_api(vec![
@@ -1455,9 +1764,14 @@ mod tests {
         }
         let origin = state.origin();
         assert_eq!(origin.generation, u64::from(cancel_before_tick));
+        let folder_label =
+            format!("origin-{cancel_before_tick}-{cancel_after_spawn}-{already_pending}");
+        let folder = local_history.then(|| BindingFolder::new(&folder_label));
         let info = TickInfo {
-            trackid: if local_history {
-                core.data_dir.join("episode05.mkv").to_str().unwrap().into()
+            location: if let Some(folder) = &folder {
+                let path = folder.0.join("episode05.mkv");
+                std::fs::write(&path, []).unwrap();
+                path.to_str().unwrap().into()
             } else {
                 "https://example.org/episode05.m3u8".into()
             },
@@ -1471,7 +1785,7 @@ mod tests {
         track.accumulated = Duration::from_secs(60);
         let mut active = Some(track);
         let mut recognition = RecognitionCache {
-            probe_result: Some(info.clone()),
+            probe_result: Some(Some(info.clone())),
             ..Default::default()
         };
         tick(&core, &work, &mut active, &mut recognition)
@@ -1527,7 +1841,7 @@ mod tests {
         }
         // Joining the task here would bypass tick's recovery state.
         for _ in 0..3 {
-            recognition.probe_result = Some(info.clone());
+            recognition.probe_result = Some(Some(info.clone()));
             tick(&core, &work, &mut active, &mut recognition)
                 .await
                 .unwrap();
@@ -1547,7 +1861,10 @@ mod tests {
         assert!(track.push.is_none());
         assert_eq!(track.fail_count, 0);
         assert!(track.retry_at.is_none());
-        assert_eq!(track.history_recorded, local_history);
+        assert_eq!(
+            track.history_recorded.load(Ordering::Relaxed),
+            local_history
+        );
         assert_eq!(
             state.db.watch_history(7, 10, None).unwrap().len(),
             usize::from(local_history)
@@ -1731,7 +2048,12 @@ mod tests {
         let recorded = completed.clone();
         let mut track = ActiveTrack::new(
             TrackKey {
-                source: "synthetic player".into(),
+                source: TrackSource::Title("synthetic player".into()),
+                player: None,
+                track_id: None,
+                mpv_endpoint: None,
+                process_id: None,
+                mpv_entry_id: None,
                 media_id: Some(1),
                 episode: Some(3),
                 session: Some("synthetic session".into()),
@@ -1742,9 +2064,7 @@ mod tests {
             let _ = entered.send(());
             let _ = released.await;
             recorded.fetch_add(1, Ordering::SeqCst);
-            Ok(ProgressOutcome::Accepted {
-                history_recorded: true,
-            })
+            Ok(ProgressOutcome::Accepted)
         }));
         started.await.unwrap();
         drop(track);
@@ -1874,7 +2194,11 @@ mod tests {
             ]
             .map(|(title, media_id, episode)| {
                 let snapshot = mpvipc::MpvSnapshot {
+                    endpoint: None,
+                    process_id: None,
+                    playlist_entry_id: None,
                     playing: poll % 2 == 1 && media_id == Some(2),
+                    eof_reached: false,
                     path: format!("/videos/{title}.mkv"),
                     media_title: title.into(),
                     filename: format!("{title}.mkv"),
@@ -1889,7 +2213,7 @@ mod tests {
                 info
             });
             assert_eq!(
-                preferred_source(sources).unwrap().media_id,
+                preferred_source(sources, None).unwrap().media_id,
                 Some(if poll % 2 == 0 { 1 } else { 2 })
             );
             assert_eq!(cache.recognitions, 3);
@@ -2112,6 +2436,10 @@ mod tests {
         let service_position = position.clone();
         let length = Arc::new(AtomicI64::new(1_200_000_000));
         let service_length = length.clone();
+        let include_url = Arc::new(AtomicBool::new(true));
+        let service_include_url = include_url.clone();
+        let track_id = Arc::new(AtomicI64::new(1));
+        let service_track_id = track_id.clone();
         let service_address = address.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
@@ -2147,25 +2475,38 @@ mod tests {
                             .method_return()
                             .append1(Variant(service_position.load(Ordering::SeqCst))),
                         "Metadata" => {
-                            let metadata: dbus::arg::PropMap = std::collections::HashMap::from([
-                                (
-                                    "mpris:length".into(),
-                                    Variant(Box::new(service_length.load(Ordering::SeqCst))
-                                        as Box<dyn dbus::arg::RefArg>),
-                                ),
-                                (
-                                    "xesam:title".into(),
-                                    Variant(Box::new("Some Show - 03".to_string())
-                                        as Box<dyn dbus::arg::RefArg>),
-                                ),
-                                (
+                            let mut metadata: dbus::arg::PropMap =
+                                std::collections::HashMap::from([
+                                    (
+                                        "mpris:length".into(),
+                                        Variant(Box::new(service_length.load(Ordering::SeqCst))
+                                            as Box<dyn dbus::arg::RefArg>),
+                                    ),
+                                    (
+                                        "xesam:title".into(),
+                                        Variant(Box::new("Some Show - 03".to_string())
+                                            as Box<dyn dbus::arg::RefArg>),
+                                    ),
+                                    (
+                                        "mpris:trackid".into(),
+                                        Variant(Box::new(
+                                            dbus::Path::new(format!(
+                                                "/fixture/{}",
+                                                service_track_id.load(Ordering::SeqCst)
+                                            ))
+                                            .unwrap(),
+                                        )
+                                            as Box<dyn dbus::arg::RefArg>),
+                                    ),
+                                ]);
+                            if service_include_url.load(Ordering::SeqCst) {
+                                metadata.insert(
                                     "xesam:url".into(),
                                     Variant(Box::new(
                                         "file:///anime/Some%20Show%20-%2003.mkv".to_string(),
-                                    )
-                                        as Box<dyn dbus::arg::RefArg>),
-                                ),
-                            ]);
+                                    )),
+                                );
+                            }
                             message.method_return().append1(Variant(metadata))
                         }
                         _ => message.error(
@@ -2217,6 +2558,23 @@ mod tests {
             length.store(invalid, Ordering::SeqCst);
             timeline()
         });
+        let db = playback_binding_db();
+        let matchers = Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let matches = PlaybackMatches::new(&db, &matchers, &mut cache);
+        let local_sources: Vec<_> = players
+            .iter()
+            .map(|p| mpris_source(p, &matches, true))
+            .collect();
+        include_url.store(false, Ordering::SeqCst);
+        let title_only: Vec<_> = players
+            .iter()
+            .map(|p| mpris_source(p, &matches, true))
+            .collect();
+        track_id.store(2, Ordering::SeqCst);
+        let next_track = mpris_source(&players[0], &matches, true);
+        include_url.store(true, Ordering::SeqCst);
+        let next_local_track = mpris_source(&players[0], &matches, true);
         stop_tx.send(()).unwrap();
         service.join().unwrap();
 
@@ -2232,6 +2590,19 @@ mod tests {
         assert_eq!(valid_timeline, (1_200_000_000, 42_000_000));
         assert_eq!(invalid_positions, [(0, 0); 2]);
         assert_eq!(invalid_lengths, [(0, 42_000_000); 2]);
+        assert!(!local_sources[0]
+            .key(None)
+            .continues_with(&mut local_sources[1].key(None)));
+        assert_eq!(title_only[0].player, title_only[1].player);
+        assert_eq!(title_only[0].title, title_only[1].title);
+        assert_eq!(title_only[0].media_id, Some(1));
+        assert_eq!(title_only[0].episode, Some(3));
+        assert!(title_only[0].key(None) != title_only[1].key(None));
+        assert!(title_only[0].key(None) != next_track.key(None));
+        assert!(!local_sources[0]
+            .key(None)
+            .continues_with(&mut next_local_track.key(None)));
+        assert!(video_path(&title_only[0].location).is_none());
     }
 
     #[test]
@@ -2297,7 +2668,11 @@ mod tests {
                 let info = mpv_snapshot_info(
                     &PlaybackMatches::new(&db, &matchers, &mut cache),
                     &mpvipc::MpvSnapshot {
+                        endpoint: None,
+                        process_id: None,
+                        playlist_entry_id: None,
                         playing: true,
+                        eof_reached: false,
                         path: file.path.clone(),
                         media_title: title.into(),
                         filename: filename.into(),
@@ -2334,6 +2709,7 @@ mod tests {
         let binding = Some(library::LibraryBinding {
             media_id: 1,
             episode_offset: -12,
+            scope: None,
         });
         for title in ["Some Show - Episode 1", "Some Show - Episode 24"] {
             assert_eq!(
@@ -2417,7 +2793,11 @@ mod tests {
         let path = folder.0.join("ep13.mkv");
         std::fs::write(&path, []).unwrap();
         let snapshot = mpvipc::MpvSnapshot {
+            endpoint: None,
+            process_id: None,
+            playlist_entry_id: None,
             playing: false,
+            eof_reached: false,
             path: path.to_str().unwrap().into(),
             media_title: "Other Show - 03".into(),
             filename: "ep13.mkv".into(),
@@ -2430,6 +2810,7 @@ mod tests {
                 library::LibraryBinding {
                     media_id: 1,
                     episode_offset: offset,
+                    scope: None,
                 },
             )]);
             db.set_setting(
@@ -2487,6 +2868,43 @@ mod tests {
             (Some(2), Some(3))
         );
         assert_eq!(cache.recognitions, 2);
+    }
+
+    #[test]
+    fn playback_uses_saved_scope_after_library_path_changes_type() {
+        use library::LibraryBindingScope::{File, Folder};
+
+        let db = playback_binding_db();
+        let matchers = Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let folder = BindingFolder::new("path-type");
+        let path = folder.0.join("Other Show - 03.mkv");
+        let url = reqwest::Url::from_file_path(&path).unwrap();
+        let descendant = path.join("Other Show - 04.mkv");
+        let child_url = reqwest::Url::from_file_path(&descendant).unwrap();
+        let mut playback = |url: &reqwest::Url| {
+            let matches = PlaybackMatches::new(&db, &matchers, &mut cache);
+            let (matched, binding) = matches.match_playing("", url.as_str()).unwrap();
+            (
+                matched.media_id,
+                playing_episode(matched, "", &basename(url.as_str()), binding),
+            )
+        };
+
+        std::fs::write(&path, []).unwrap();
+        library::bind_scoped_path(&db, url.as_str(), File, 1, 2).unwrap();
+        assert_eq!(playback(&url), (1, Some(5)));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(&descendant, []).unwrap();
+        assert_eq!(playback(&child_url), (2, Some(4)));
+        library::bind_scoped_path(&db, url.as_str(), Folder, 1, 2).unwrap();
+        assert_eq!(playback(&child_url), (1, Some(6)));
+
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(playback(&url), (2, Some(3)));
     }
 
     #[cfg(unix)]
@@ -2553,8 +2971,14 @@ mod tests {
     ) -> TickInfo {
         TickInfo {
             playing,
+            eof_reached: false,
             player: player.into(),
-            trackid: String::new(),
+            player_id: None,
+            player_track_id: None,
+            mpv_endpoint: None,
+            process_id: None,
+            mpv_entry_id: None,
+            location: String::new(),
             title: "Title".into(),
             length_us: 0,
             position_us: 0,
@@ -2694,6 +3118,7 @@ mod tests {
                 ]
                 .into_iter()
                 .filter(filter),
+                None,
             )
             .unwrap();
             assert_eq!(selected.player, "VLC", "{client}");
@@ -2703,7 +3128,8 @@ mod tests {
             clients
                 .into_iter()
                 .map(|client| source(client, true, Some(1), Some(3)))
-                .filter(filter)
+                .filter(filter),
+            None
         )
         .is_none());
     }
@@ -2871,7 +3297,7 @@ mod tests {
                 [Some(SessionMediaType::Video), Some(SessionMediaType::Video)],
             )
         });
-        let selected = preferred_source(accepted).unwrap();
+        let selected = preferred_source(accepted, None).unwrap();
         assert_eq!(selected.player, "VLC");
         assert!(!selected.playing);
         assert!(preferred_source(
@@ -2886,31 +3312,41 @@ mod tests {
                 &info.player,
                 &info.title,
                 [None, None]
-            ))
+            )),
+            None
         )
         .is_none());
     }
 
     #[test]
     fn recognized_playing_sources_outrank_unrelated_media_sessions() {
-        let selected = preferred_source([
-            source("vlc", true, None, None),
-            source("mpv-ipc", true, Some(1), Some(3)),
-            source("other", true, None, None),
-        ])
+        let selected = preferred_source(
+            [
+                source("vlc", true, None, None),
+                source("mpv-ipc", true, Some(1), Some(3)),
+                source("other", true, None, None),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(selected.player, "mpv-ipc");
-        let selected = preferred_source([
-            source("matched-paused", false, Some(1), Some(3)),
-            source("playing", true, None, None),
-        ])
+        let selected = preferred_source(
+            [
+                source("matched-paused", false, Some(1), Some(3)),
+                source("playing", true, None, None),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(selected.player, "playing");
-        let selected = preferred_source([
-            source("unknown-episode", true, Some(1), None),
-            source("known-episode", true, Some(1), Some(3)),
-            source("same-rank", true, Some(2), Some(4)),
-        ])
+        let selected = preferred_source(
+            [
+                source("unknown-episode", true, Some(1), None),
+                source("known-episode", true, Some(1), Some(3)),
+                source("same-rank", true, Some(2), Some(4)),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(selected.player, "known-episode");
     }
@@ -2919,21 +3355,15 @@ mod tests {
     fn watch_history_accepts_local_video_paths_but_not_stream_urls_or_titles() {
         let file = std::env::temp_dir().join("kurisu history episode 03.mkv");
         let url = reqwest::Url::from_file_path(&file).unwrap();
-        assert_eq!(
-            local_video_path(url.as_str()),
-            Some(file.to_str().unwrap().into())
-        );
-        assert_eq!(
-            local_video_path(file.to_str().unwrap()),
-            Some(file.to_str().unwrap().into())
-        );
+        assert_eq!(video_path(url.as_str()), Some(file.clone()));
+        assert_eq!(video_path(file.to_str().unwrap()), Some(file));
         for source in [
             "https://example.org/episode.mkv",
             "Some Show - 03",
             "relative.mkv",
             "file:///tmp/song.flac",
         ] {
-            assert_eq!(local_video_path(source), None, "{source}");
+            assert_eq!(video_path(source), None, "{source}");
         }
     }
 
@@ -2941,51 +3371,484 @@ mod tests {
     fn a_local_path_breaks_equal_player_ties_for_watch_history() {
         let session = source("media-session", true, Some(1), Some(3));
         let mut mpv = source("mpv-ipc", true, Some(1), Some(3));
-        mpv.trackid = std::env::temp_dir()
+        mpv.location = std::env::temp_dir()
             .join("episode.mkv")
             .to_str()
             .unwrap()
             .into();
-        assert_eq!(preferred_source([session, mpv]).unwrap().player, "mpv-ipc");
+        assert_eq!(
+            preferred_source([session, mpv], None).unwrap().player,
+            "mpv-ipc"
+        );
+    }
+
+    #[test]
+    fn timed_mpv_eof_outranks_a_paused_session_for_the_same_file() {
+        let file = std::env::temp_dir().join("episode.mkv");
+        let mut paused = source("media-session", false, Some(1), Some(3));
+        paused.location = reqwest::Url::from_file_path(&file).unwrap().into();
+        paused.length_us = 100_000_000;
+        paused.position_us = 78_000_000;
+        let mut eof = paused.clone();
+        eof.player = "mpv-ipc".into();
+        eof.location = file.to_str().unwrap().into();
+        eof.position_us = 99_000_000;
+        eof.eof_reached = true;
+        let selected = preferred_source([paused.clone(), eof.clone()], None).unwrap();
+        assert!(selected.eof_reached);
+        let mut other = paused.clone();
+        other.location = file.with_file_name("other.mkv").to_str().unwrap().into();
+        let selected = preferred_source([other, eof.clone()], None).unwrap();
+        assert!(!selected.eof_reached);
+        paused.playing = true;
+        assert!(preferred_source([paused, eof], None).unwrap().playing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paired_mpv_sources_use_the_ipc_alias_binding() {
+        use std::os::unix::fs::symlink;
+
+        let folder = BindingFolder::new("paired-mpv");
+        let route = folder.0.join("route");
+        let storage = folder.0.join("storage");
+        std::fs::create_dir(&route).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        let target = storage.join("Episode 03.mkv");
+        let alias = route.join("Episode 03.mkv");
+        std::fs::write(&target, []).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let db = playback_binding_db();
+        library::bind_path(&db, route.to_str().unwrap(), 1, 0).unwrap();
+        library::bind_path(&db, storage.to_str().unwrap(), 2, 1).unwrap();
+        let matchers = Arc::new(crate::recognize::build_matchers(&db));
+        let mut cache = RecognitionCache::default();
+        let matches = PlaybackMatches::new(&db, &matchers, &mut cache);
+        let mut session = source("mpv", true, None, None);
+        session.location = reqwest::Url::from_file_path(&target).unwrap().into();
+        session.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+        session.process_id = Some(8);
+        let (matched, binding) = matches.match_playing("", &session.location).unwrap();
+        session.media_id = Some(matched.media_id);
+        session.episode = playing_episode(matched, "", &basename(&session.location), binding);
+        assert_eq!((session.media_id, session.episode), (Some(2), Some(4)));
+
+        let ipc = mpv_snapshot_info(
+            &matches,
+            &mpvipc::MpvSnapshot {
+                endpoint: Some("fixture-socket".into()),
+                process_id: Some(8),
+                playlist_entry_id: Some(1),
+                playing: true,
+                eof_reached: false,
+                path: alias.to_str().unwrap().into(),
+                media_title: String::new(),
+                filename: "Episode 03.mkv".into(),
+                duration_us: 100_000_000,
+                position_us: 90_000_000,
+            },
+        );
+        let selected = preferred_linux_source(vec![session], vec![ipc], None).unwrap();
+        assert_eq!((selected.media_id, selected.episode), (Some(1), Some(3)));
+        assert_eq!(selected.location, alias.to_str().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unmatched_ipc_keeps_paired_mpris_recognition_and_eof() {
+        let mut session = source("mpv", true, Some(1), Some(3));
+        session.title = "Some Show - 03".into();
+        session.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+        session.player_track_id = Some("/fixture/3".into());
+        session.process_id = Some(8);
+        let mut ipc = source("mpv", true, None, None);
+        ipc.location = "/fixture/episode03.mkv".into();
+        ipc.process_id = Some(8);
+        ipc.mpv_endpoint = Some("fixture-socket".into());
+        ipc.mpv_entry_id = Some(1);
+        ipc.length_us = 100_000_000;
+        ipc.position_us = 99_000_000;
+
+        for location in ["", "file:///fixture/episode03.mkv"] {
+            session.location = location.into();
+            for eof in [false, true] {
+                ipc.eof_reached = eof;
+                ipc.playing = !eof;
+                let selected =
+                    preferred_linux_source(vec![session.clone()], vec![ipc.clone()], None).unwrap();
+                assert_eq!((selected.media_id, selected.episode), (Some(1), Some(3)));
+                assert_eq!(selected.title, session.title);
+                assert_eq!(selected.player_track_id, session.player_track_id);
+                assert_eq!(selected.location, ipc.location);
+                assert_eq!(selected.position_us, ipc.position_us);
+                assert_eq!((selected.playing, selected.eof_reached), (!eof, eof));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipc_eof_suppresses_only_the_matching_mpris_sample() {
+        let file = std::env::temp_dir().join("episode.mkv");
+        let mut session = source("mpv", true, Some(1), Some(3));
+        session.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+        session.process_id = Some(8);
+        session.location = reqwest::Url::from_file_path(&file).unwrap().into();
+        let mut eof = source("mpv", false, Some(1), Some(3));
+        eof.mpv_endpoint = Some("fixture-socket".into());
+        eof.process_id = Some(8);
+        eof.location = file.to_str().unwrap().into();
+        eof.eof_reached = true;
+        let selected =
+            preferred_linux_source(vec![session.clone()], vec![eof.clone()], None).unwrap();
+        assert!(selected.eof_reached && !selected.playing);
+
+        let mut no_location = session.clone();
+        no_location.location.clear();
+        let selected = preferred_linux_source(vec![no_location], vec![eof.clone()], None).unwrap();
+        assert!(selected.eof_reached && !selected.playing);
+
+        for (pid, location) in [
+            (Some(9), session.location.clone()),
+            (None, session.location.clone()),
+            (Some(8), "file:///other.mkv".into()),
+            (Some(9), String::new()),
+        ] {
+            let other = TickInfo {
+                process_id: pid,
+                location,
+                ..session.clone()
+            };
+            let selected =
+                preferred_linux_source(vec![session.clone(), other], vec![eof.clone()], None)
+                    .unwrap();
+            assert!(selected.playing && !selected.eof_reached);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpv_reload_resets_watch_time_even_when_mpris_reuses_its_track_id() {
+        for location in ["file:///fixture/episode03.mkv", "http://localhost/stream"] {
+            let mut mpris = source("mpv", true, Some(1), Some(3));
+            mpris.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+            mpris.player_track_id = Some("/mpv/mpris/Track/0".into());
+            mpris.process_id = Some(8);
+            mpris.location = location.into();
+            let mut mpv = mpris.clone();
+            mpv.player_id = None;
+            mpv.player_track_id = None;
+            mpv.mpv_endpoint = Some("fixture-socket".into());
+            mpv.mpv_entry_id = Some(1);
+
+            let key = preferred_linux_source(vec![mpris.clone()], vec![mpv.clone()], None)
+                .unwrap()
+                .key(None);
+            assert_eq!(key.track_id, mpris.player_track_id);
+            assert_eq!(key.mpv_entry_id, Some(1));
+            let mut during_ipc_loss = mpris.key(None);
+            assert!(key.continues_with(&mut during_ipc_loss));
+            assert!(during_ipc_loss.continues_with(&mut mpv.key(None)));
+
+            mpv.mpv_entry_id = Some(2);
+            let next = preferred_linux_source(vec![mpris], vec![mpv], None).unwrap();
+            assert_eq!(next.player_track_id, key.track_id);
+            assert!(!during_ipc_loss.continues_with(&mut next.key(None)));
+        }
+    }
+
+    #[test]
+    fn an_eligible_mpv_eof_gets_one_tick_before_a_parallel_player_takes_over() {
+        let mut playing = source("mpv", true, Some(1), Some(3));
+        playing.location = "https://example.invalid/episode03.mkv".into();
+        playing.mpv_endpoint = Some("fixture-socket".into());
+        playing.mpv_entry_id = Some(1);
+        let key = playing.key(None);
+        let mut eof = playing;
+        eof.playing = false;
+        eof.eof_reached = true;
+        eof.length_us = 100_000_000;
+        eof.position_us = 99_000_000;
+        let parallel = source("VLC", true, None, None);
+
+        for (previous_seconds, expected_eof) in [(None, false), (Some(24), false), (Some(25), true)]
+        {
+            let previous = previous_seconds.map(|seconds| (&key, Duration::from_secs(seconds)));
+            let chosen = preferred_source([parallel.clone(), eof.clone()], previous).unwrap();
+            assert_eq!(chosen.eof_reached, expected_eof);
+        }
+        eof.mpv_entry_id = Some(2);
+        let previous = Some((&key, Duration::from_secs(25)));
+        assert!(preferred_source([parallel, eof], previous).unwrap().playing);
     }
 
     #[test]
     fn switching_file_url_and_ipc_sources_preserves_watch_time() {
         let file = std::env::temp_dir().join("kurisu episode 03.mkv");
-        let mut session = source("media-session", true, Some(1), Some(3));
-        session.trackid = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        let mut session = source("mpv", true, Some(1), Some(3));
+        session.location = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        session.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+        session.process_id = Some(8);
         let mut ipc = source("mpv-ipc", true, Some(1), Some(3));
-        ipc.trackid = file.to_str().unwrap().into();
+        ipc.location = file.to_str().unwrap().into();
+        ipc.mpv_endpoint = Some("fixture-socket".into());
+        ipc.process_id = session.process_id;
         let account = Some("account-token".into());
-        let work = PlaybackWork::default();
-        let mut track = ActiveTrack::new(session.key(account.clone()), work.clone());
-        track.accumulated = Duration::from_secs(55);
-        if track.key != ipc.key(account.clone()) {
-            track = ActiveTrack::new(ipc.key(account.clone()), work);
-        }
-        assert_eq!(track.accumulated, Duration::from_secs(55));
-        assert!(session.key(account.clone()) != ipc.key(Some("other-account".into())));
+        let key = session.key(account.clone());
+        assert!(key.continues_with(&mut ipc.key(account.clone())));
+        assert!(ipc
+            .key(account.clone())
+            .continues_with(&mut session.key(account.clone())));
+        assert!(!key.continues_with(&mut ipc.key(Some("other-account".into()))));
         ipc.episode = Some(4);
-        assert!(session.key(account.clone()) != ipc.key(account.clone()));
+        assert!(!key.continues_with(&mut ipc.key(account.clone())));
         ipc.episode = Some(3);
-        ipc.trackid = std::env::temp_dir()
+        ipc.location = std::env::temp_dir()
             .join("another release 03.mkv")
             .to_str()
             .unwrap()
             .into();
-        assert!(session.key(account.clone()) != ipc.key(account));
+        assert!(!key.continues_with(&mut ipc.key(account)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_key_follows_the_canonical_mapping_at_each_sample() {
+        use std::os::unix::fs::symlink;
+
+        let folder = BindingFolder::new("file-key");
+        let watched = folder.0.join("watched.mkv");
+        let replacement = folder.0.join("replacement.mkv");
+        let alias = folder.0.join("Episode 03.mkv");
+        std::fs::write(&watched, []).unwrap();
+        std::fs::write(&replacement, []).unwrap();
+        symlink(&watched, &alias).unwrap();
+
+        let mut session = source("vlc", true, Some(1), Some(3));
+        session.location = reqwest::Url::from_file_path(&alias).unwrap().into();
+        let key = session.key(None);
+        let mut ipc = source("mpv", true, Some(1), Some(3));
+        ipc.location = watched.to_str().unwrap().into();
+        assert!(key == ipc.key(None));
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        assert!(key == ipc.key(None));
+        assert!(key != session.key(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_history_rejects_a_replacement_at_the_sampled_canonical_path() {
+        use std::os::unix::fs::symlink;
+
+        let folder = BindingFolder::new("history-replaced-file");
+        let original = folder.0.join("original.mkv");
+        let alias = folder.0.join("episode03.mkv");
+        std::fs::write(&original, []).unwrap();
+        symlink(&original, &alias).unwrap();
+        let mut sample = source("mpv", true, Some(1), Some(3));
+        sample.location = alias.to_str().unwrap().into();
+        let before = sample.key(None);
+        let TrackSource::File(file) = &before.source else {
+            panic!()
+        };
+        assert_eq!(file.history_path(), alias.to_str());
+
+        std::fs::rename(&original, folder.0.join("moved.mkv")).unwrap();
+        std::fs::write(&original, []).unwrap();
+        assert!(file.history_path().is_none());
+        assert!(!before.continues_with(&mut sample.key(None)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_history_keeps_a_utf8_alias_when_the_next_source_reports_the_target() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+        let folder = BindingFolder::new("history-source-alias");
+        let target = folder
+            .0
+            .join(std::ffi::OsStr::from_bytes(b"video-\xff.mkv"));
+        let alias = folder.0.join("episode03.mkv");
+        std::fs::write(&target, []).unwrap();
+        symlink(&target, &alias).unwrap();
+        let mut sample = source("mpv", true, Some(1), Some(3));
+        sample.location = alias.to_str().unwrap().into();
+        let before = sample.key(None);
+        sample.location = reqwest::Url::from_file_path(target).unwrap().into();
+        let mut after = sample.key(None);
+        assert!(before.continues_with(&mut after));
+        let TrackSource::File(file) = &after.source else {
+            panic!()
+        };
+        assert_eq!(file.history_path(), alias.to_str());
+    }
+
+    #[test]
+    fn a_stream_key_keeps_known_track_ids_when_metadata_is_incomplete() {
+        let mut info = source("vlc", true, Some(1), Some(3));
+        info.player_id = Some("org.mpris.MediaPlayer2.vlc :1.8".into());
+        info.location = "https://example.invalid/shared.m3u8".into();
+        let initial = info.key(None);
+        info.player_track_id = Some("/fixture/1".into());
+        let mut enriched = info.key(None);
+        assert!(initial.continues_with(&mut enriched));
+
+        info.player_track_id = None;
+        let mut incomplete = info.key(None);
+        assert!(enriched.continues_with(&mut incomplete));
+        assert!(incomplete == enriched);
+
+        info.player_track_id = Some("/fixture/2".into());
+        assert!(!incomplete.continues_with(&mut info.key(None)));
+        info.player_track_id = None;
+        info.player_id = Some("org.mpris.MediaPlayer2.vlc :1.9".into());
+        assert!(!incomplete.continues_with(&mut info.key(None)));
+    }
+
+    #[test]
+    fn mpv_stream_handoffs_require_a_shared_process_and_keep_endpoint_identity() {
+        let mut session = source("mpv", true, Some(1), Some(3));
+        session.location = "https://example.invalid/episode.m3u8".into();
+        session.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+        session.player_track_id = Some("/fixture/1".into());
+        session.process_id = Some(8);
+        let mut ipc = session.clone();
+        ipc.player_id = None;
+        ipc.player_track_id = None;
+        ipc.mpv_endpoint = Some("fixture-endpoint-1".into());
+        let mut lost_pid = session.clone();
+        lost_pid.process_id = None;
+        let mut same_session = lost_pid.key(None);
+        assert!(session.key(None).continues_with(&mut same_session));
+        assert!(same_session.continues_with(&mut ipc.key(None)));
+
+        let mut handoff = ipc.key(None);
+        assert!(session.key(None).continues_with(&mut handoff));
+        assert_eq!(handoff.track_id, session.player_track_id);
+        assert!(handoff.continues_with(&mut ipc.key(None)));
+        assert!(ipc.key(None).continues_with(&mut session.key(None)));
+        assert!(handoff.continues_with(&mut session.key(None)));
+
+        session.player_track_id = Some("/fixture/2".into());
+        assert!(!handoff.continues_with(&mut session.key(None)));
+        ipc.mpv_endpoint = Some("fixture-endpoint-2".into());
+        assert!(!handoff.continues_with(&mut ipc.key(None)));
+        for pid in [None, Some(9)] {
+            ipc.process_id = pid;
+            assert!(!session.key(None).continues_with(&mut ipc.key(None)));
+        }
+    }
+
+    #[test]
+    fn a_title_only_session_keeps_watch_time_when_the_track_id_appears() {
+        let mut info = source("vlc", true, Some(1), Some(3));
+        let initial = info.key(None);
+        info.player_track_id = Some("/fixture/1".into());
+        let mut enriched = info.key(None);
+        assert!(initial.continues_with(&mut enriched));
+
+        info.player_track_id = None;
+        let mut incomplete = info.key(None);
+        assert!(enriched.continues_with(&mut incomplete));
+        info.player_track_id = Some("/fixture/2".into());
+        assert!(!incomplete.continues_with(&mut info.key(None)));
+    }
+
+    #[test]
+    fn two_mpv_endpoints_do_not_share_watch_time_for_the_same_file() {
+        let mut info = source("mpv", true, Some(1), Some(3));
+        let file = std::env::temp_dir().join("episode.mkv");
+        info.location = file.to_str().unwrap().into();
+        info.mpv_endpoint = Some("fixture-endpoint-1".into());
+        info.process_id = Some(8);
+        let first = info.key(None);
+        let mut session = source("mpv", true, Some(1), Some(3));
+        session.location = reqwest::Url::from_file_path(&file).unwrap().into();
+        session.player_id = Some("org.mpris.MediaPlayer2.mpv :1.8".into());
+        session.process_id = info.process_id;
+        let mut handoff = session.key(None);
+        assert!(first.continues_with(&mut handoff));
+
+        info.process_id = Some(9);
+        assert!(!handoff.continues_with(&mut info.key(None)));
+        info.mpv_endpoint = Some("fixture-endpoint-2".into());
+        assert!(!first.continues_with(&mut info.key(None)));
+        assert!(!handoff.continues_with(&mut info.key(None)));
+    }
+
+    #[tokio::test]
+    async fn switching_title_only_players_restarts_watch_time_before_auto_progress() {
+        use crate::{anilist, Db, ListEntry, UpdateChannel, User};
+
+        let (mut api, _requests) = anilist::mock_api(vec![]).await;
+        api.record_viewer(7);
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.replace_account(
+            "test-session",
+            &User {
+                id: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            id: Some(22),
+            media_id: 1,
+            status: "CURRENT".into(),
+            progress: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_setting("tracking_mode", "auto").unwrap();
+        let core = Core::from_db(
+            db,
+            std::env::temp_dir().join("kurisu-playback-source-fixture"),
+            tokio::runtime::Handle::current(),
+            Arc::new(NoPlatform),
+            UpdateChannel::Native,
+        );
+        *core.state().anilist.lock() = api;
+        let mut info = source("VLC", true, Some(1), Some(4));
+        info.length_us = 100_000_000;
+        info.position_us = 70_000_000;
+        let work = PlaybackWork::default();
+        let mut active = None;
+        let mut recognition = RecognitionCache {
+            probe_result: Some(Some(info.clone())),
+            ..Default::default()
+        };
+        tick(&core, &work, &mut active, &mut recognition)
+            .await
+            .unwrap();
+        active.as_mut().unwrap().accumulated = Duration::from_secs(60);
+        info.player = "MPV".into();
+        info.position_us = 95_000_000;
+        recognition.probe_result = Some(Some(info));
+        tick(&core, &work, &mut active, &mut recognition)
+            .await
+            .unwrap();
+        let track = active.unwrap();
+        assert!(
+            track.push.is_none(),
+            "the new player inherited automatic progress eligibility"
+        );
+        assert_eq!(track.accumulated, Duration::ZERO);
+        assert_eq!(core.state().db.get_entry(1).unwrap().unwrap().progress, 3);
     }
 
     #[test]
     fn usable_timing_breaks_recognized_player_ties_for_tracking() {
         let file = std::env::temp_dir().join("episode.mkv");
         let mut session = source("media-session", true, Some(1), Some(3));
-        session.trackid = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        session.location = reqwest::Url::from_file_path(&file).unwrap().to_string();
         let mut mpv = source("mpv-ipc", true, Some(1), Some(3));
-        mpv.trackid = file.to_str().unwrap().into();
+        mpv.location = file.to_str().unwrap().into();
         mpv.length_us = 1_200_000_000;
         mpv.position_us = 1_080_000_000;
-        let selected = preferred_source([session, mpv]).unwrap();
+        let selected = preferred_source([session, mpv], None).unwrap();
         let gate = AutoGate {
             length_us: selected.length_us,
             position_us: selected.position_us,
@@ -3007,7 +3870,7 @@ mod tests {
             timed.position_us = 1_080_000_000;
             let recognized = source("recognized", true, Some(1), Some(3));
             assert_eq!(
-                preferred_source([timed, recognized]).unwrap().player,
+                preferred_source([timed, recognized], None).unwrap().player,
                 "recognized"
             );
         }
@@ -3016,7 +3879,7 @@ mod tests {
         paused.position_us = 1_080_000_000;
         let playing = source("playing", true, Some(1), Some(3));
         assert_eq!(
-            preferred_source([paused, playing]).unwrap().player,
+            preferred_source([paused, playing], None).unwrap().player,
             "playing"
         );
         let mut invalid = source("invalid-position", true, Some(1), Some(3));
@@ -3024,7 +3887,10 @@ mod tests {
         invalid.position_us = -1;
         let mut valid = source("valid", true, Some(1), Some(3));
         valid.length_us = 1_200_000_000;
-        assert_eq!(preferred_source([invalid, valid]).unwrap().player, "valid");
+        assert_eq!(
+            preferred_source([invalid, valid], None).unwrap().player,
+            "valid"
+        );
     }
 
     #[test]
@@ -3047,6 +3913,7 @@ mod tests {
         AutoGate {
             incremented: false,
             was_playing_before: true,
+            eof_after_playing: false,
             accumulated: Duration::from_secs(600),
             fail_count: 0,
             retry_due: true,
@@ -3062,8 +3929,14 @@ mod tests {
     fn stream_episodes_and_sessions_reset_tracking_state() {
         let mut info = TickInfo {
             playing: true,
+            eof_reached: false,
             player: "mpv".into(),
-            trackid: "https://example.org/stream.m3u8".into(),
+            player_id: None,
+            player_track_id: None,
+            mpv_endpoint: None,
+            process_id: None,
+            mpv_entry_id: None,
+            location: "https://example.org/stream.m3u8".into(),
             title: "Some Show - 05".into(),
             length_us: 1_440_000_000,
             position_us: 0,
@@ -3084,6 +3957,25 @@ mod tests {
     #[test]
     fn auto_push_fires_for_a_genuinely_watched_episode() {
         assert!(watched().should_push());
+    }
+
+    #[test]
+    fn confirmed_final_frame_counts_as_complete_after_earning_minimum_watch_time() {
+        let mut gate = AutoGate {
+            length_us: 3_000_000,
+            position_us: 2_960_000,
+            accumulated: Duration::from_millis(750),
+            auto_percent: 100,
+            ..watched()
+        };
+        assert!(!gate.should_push());
+        gate.eof_after_playing = true;
+        assert!(gate.should_push());
+        gate.accumulated = Duration::from_millis(749);
+        assert!(!gate.should_push());
+        gate.accumulated = Duration::from_millis(750);
+        gate.length_us = 0;
+        assert!(!gate.should_push());
     }
 
     #[test]
@@ -3287,7 +4179,11 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("kurisu-audio-only-{}", std::process::id()));
         library::bind_path(&db, folder.to_str().unwrap(), 1, -12).unwrap();
         let snapshot = |path: String, filename: String| mpvipc::MpvSnapshot {
+            endpoint: None,
+            process_id: None,
+            playlist_entry_id: None,
             playing: true,
+            eof_reached: false,
             path,
             filename,
             media_title: title.into(),

@@ -4,6 +4,8 @@ mod cover_layout_tests;
 mod covers;
 mod detail;
 mod editor;
+#[cfg(all(test, feature = "fixture-runtime"))]
+mod fixture_server;
 mod library;
 mod my_list;
 mod notifications;
@@ -19,6 +21,7 @@ mod watching;
 mod workspace_tests;
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -66,24 +69,48 @@ fn same_prompt(left: &Event, right: &Event) -> bool {
 }
 
 const CLOCK_INTERVAL_SECONDS: i64 = 30;
-const PREFERENCE_KEYS: [&str; 8] = [
+const PREFERENCE_KEYS: [&str; 7] = [
     "kurisu.list.filter",
     "kurisu.list.sort",
-    "kurisu.list.dir",
     "kurisu.list.synced",
     "kurisu.cal.mine",
     "kurisu.torrents.new",
     "kurisu.torrents.statuses",
     "kurisu.torrents.filters",
 ];
+const SCOPED_LIST_PREFERENCE_KEYS: [&str; 3] =
+    ["kurisu.list.filter", "kurisu.list.q", "kurisu.list.synced"];
+const LIST_SORT_KEYS: [&str; 2] = ["kurisu.list.sort", "kurisu.list.dir"];
+
+fn preference_label(key: &str) -> &'static str {
+    match key {
+        "kurisu.list.filter" => "list filter",
+        "kurisu.list.q" => "list search",
+        "kurisu.list.sort" => "list sort",
+        "kurisu.list.dir" => "sort direction",
+        "kurisu.list.synced" => "last sync time",
+        "kurisu.cal.mine" => "calendar filter",
+        "kurisu.torrents.new" => "torrent new-release filter",
+        "kurisu.torrents.statuses" => "torrent status sections",
+        "kurisu.torrents.filters" => "torrent search filters",
+        _ => unreachable!(),
+    }
+}
 
 #[derive(Default)]
 struct PreferenceWrite {
-    pending: Option<QueuedPreference>,
+    pending: Option<PreferenceEdit>,
     error: Option<String>,
     revision: u64,
 }
 
+#[derive(Clone)]
+enum PreferenceEdit {
+    Setting(QueuedPreference),
+    Sort { key: SortKey, descending: bool },
+}
+
+#[derive(Clone)]
 struct QueuedPreference {
     value: Option<String>,
     account: Option<i64>,
@@ -301,6 +328,8 @@ pub struct Workspace {
     read_lifetime: Arc<std::sync::Mutex<HashMap<&'static str, Vec<tokio::task::AbortHandle>>>>,
     event_stop: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     list_epoch: u64,
+    #[cfg(test)]
+    list_response_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     // A sync keeps the local read scope until it can replace or replay it.
     list_read: Option<ListReadScope>,
     list_scope: Option<HashSet<i64>>,
@@ -312,6 +341,8 @@ pub struct Workspace {
     list_sync_flash: Option<u64>,
     clock_at: i64,
     preferences_loaded: bool,
+    sort_preferences_loaded: bool,
+    preference_read_errors: Vec<(&'static str, String)>,
     preference_reset: u64,
     preference_writes: HashMap<&'static str, PreferenceWrite>,
     preference_active: Option<&'static str>,
@@ -524,6 +555,8 @@ impl Workspace {
             read_lifetime: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stop: Arc::new(std::sync::Mutex::new(None)),
             list_epoch: 0,
+            #[cfg(test)]
+            list_response_gate: None,
             list_read: None,
             list_scope: None,
             list_refresh_queued: false,
@@ -534,6 +567,8 @@ impl Workspace {
             list_sync_flash: None,
             clock_at: now_seconds(),
             preferences_loaded: false,
+            sort_preferences_loaded: false,
+            preference_read_errors: Vec::new(),
             preference_reset: 0,
             preference_writes: HashMap::new(),
             preference_active: None,
@@ -761,7 +796,6 @@ impl Workspace {
         if self.stopping || self.modal_open() || route == self.route {
             return;
         }
-        self.remember_scroll();
         self.back_stack.push(self.route.clone());
         self.switch_route(route, window, cx);
     }
@@ -776,6 +810,9 @@ impl Workspace {
     }
 
     fn switch_route(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
+        if route != self.route {
+            self.remember_scroll();
+        }
         if self
             .pending_editor
             .as_ref()
@@ -1231,6 +1268,9 @@ impl Workspace {
         }
         match kind {
             EventKind::EpisodeUpdated(entry) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.adopt_queued_entry(&entry);
+                }
                 self.queue_list_refresh(Some(vec![entry.media_id]), window, cx);
                 if self.route == Route::Now {
                     self.refresh_watching_list(window, cx);
@@ -1253,7 +1293,6 @@ impl Workspace {
                 let can_navigate = matches!(kind, EventKind::TrackingAsk(_)) && !self.modal_open();
                 if self.show_prompt(event) {
                     if can_navigate && self.route != Route::Now {
-                        self.remember_scroll();
                         self.back_stack.push(self.route.clone());
                         self.switch_route(Route::Now, window, cx);
                     }
@@ -1790,7 +1829,9 @@ impl Workspace {
                 != user.as_ref().and_then(|u| u.score_format.as_ref());
         self.profile = user;
         if format_changed {
-            self.list.clear_scores();
+            let change = self.list.clear_scores(now_seconds());
+            self.apply_list_change(change);
+            self.watching.clear_scores();
             if let Some(entry) = self.detail.entry.as_mut() {
                 entry.score = None;
             }
@@ -1798,9 +1839,12 @@ impl Workspace {
         }
         if changed
             && let Some(account) = list_owner
-            && let Some(draft) = self.editor_drafts.remove(&account)
+            && let Some(mut draft) = self.editor_drafts.remove(&account)
         {
             restored_drafts = true;
+            if draft.details_open && draft.editor.details.is_none() {
+                draft.editor.details_error.clear();
+            }
             self.editor = Some(draft.editor);
             self.editor_inputs = draft.inputs;
             self.editor_subscriptions = draft.subscriptions;
@@ -1812,13 +1856,18 @@ impl Workspace {
             if self.edits_fenced() {
                 self.capture_fenced_editor_inputs(cx);
             }
+            self.resume_editor_details(window, cx);
         }
         if let Some(editor) = self.editor.as_mut() {
             let format = self
                 .profile
                 .as_ref()
                 .and_then(|user| user.score_format.clone());
-            if editor.refresh_score_format(format)
+            let score_input = self
+                .editor_inputs
+                .as_ref()
+                .map(|inputs| inputs.score.read(cx).value());
+            if editor.refresh_score_format(format, score_input)
                 && let Some(inputs) = self.editor_inputs.as_ref()
             {
                 inputs.score.update(cx, |input, cx| input.set_value("", cx));
@@ -1877,79 +1926,116 @@ impl Workspace {
     }
 
     fn load_preferences(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let errors = std::mem::take(&mut self.preference_read_errors);
+        let should_read =
+            |key| !self.preferences_loaded || errors.iter().any(|(failed, _)| *failed == key);
+        let read_scoped = SCOPED_LIST_PREFERENCE_KEYS.map(should_read);
+        let read_sort = LIST_SORT_KEYS.into_iter().any(should_read);
+        if !read_sort && !read_scoped.contains(&true) {
+            return;
+        }
         let core = self.core.clone();
         let auth_intent = self.auth_intent;
         let reset = self.preference_reset;
         let query_request = self.query_request;
         let filter_revision = self.preference_revision("kurisu.list.filter");
-        let sort_revision = self.preference_revision("kurisu.list.sort");
-        let dir_revision = self.preference_revision("kurisu.list.dir");
         let synced_revision = self.preference_revision("kurisu.list.synced");
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
             let result = joined(
                 core.spawn(async move {
                     let mut values = Vec::new();
-                    for key in [
-                        "kurisu.list.filter",
-                        "kurisu.list.q",
-                        "kurisu.list.sort",
-                        "kurisu.list.dir",
-                        "kurisu.list.synced",
-                    ] {
-                        values.push(worker.get_preference(key.into()).await?);
+                    for (key, read) in SCOPED_LIST_PREFERENCE_KEYS.into_iter().zip(read_scoped) {
+                        if read {
+                            values.push((key, worker.get_preference(key.into()).await));
+                        }
+                    }
+                    if read_sort {
+                        values.extend(
+                            LIST_SORT_KEYS
+                                .into_iter()
+                                .zip(worker.get_list_sort_preferences()),
+                        );
                     }
                     Ok(values)
                 })
                 .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
+                let initial_load = !this.preferences_loaded;
                 this.preferences_loaded = true;
-                let Ok(values) = result else {
-                    if this.preference_reset == reset
-                        && this.list.loaded
-                        && !this.offline
-                        && this.sync_due()
-                    {
-                        this.sync_list(window, cx);
+                let values = result.unwrap_or_else(|error| {
+                    SCOPED_LIST_PREFERENCE_KEYS
+                        .into_iter()
+                        .zip(read_scoped)
+                        .chain(LIST_SORT_KEYS.into_iter().zip([read_sort; 2]))
+                        .filter(|(_, read)| *read)
+                        .map(|(key, _)| (key, Err(error.clone())))
+                        .collect()
+                });
+                if read_sort {
+                    this.sort_preferences_loaded = true;
+                }
+                let same_scope = this.preference_reset == reset;
+                for (key, value) in values {
+                    let current = match key {
+                        "kurisu.list.filter" => {
+                            same_scope && this.preference_revision(key) == filter_revision
+                        }
+                        "kurisu.list.q" => same_scope && this.query_request == query_request,
+                        "kurisu.list.synced" => {
+                            same_scope
+                                && this.auth_intent == auth_intent
+                                && this.preference_revision(key) == synced_revision
+                        }
+                        _ => true,
+                    };
+                    if !current {
+                        continue;
                     }
-                    return;
-                };
-                if this.preference_reset == reset
-                    && this.preference_revision("kurisu.list.filter") == filter_revision
-                    && let Some(filter) = values[0].as_deref()
-                {
-                    this.list.set_filter(filter, now_seconds());
-                }
-                if this.preference_reset == reset
-                    && this.query_request == query_request
-                    && let Some(query) = values[1].as_ref()
-                {
-                    this.list.set_query(query.clone(), now_seconds());
-                    this.list_query
-                        .update(cx, |input, cx| input.set_value(query.clone(), cx));
-                }
-                if this.preference_revision("kurisu.list.sort") == sort_revision
-                    && let Some(sort) = values[2]
-                        .as_deref()
-                        .and_then(|value| SortKey::try_from(value).ok())
-                {
-                    this.list.sort = sort;
-                }
-                if this.preference_revision("kurisu.list.dir") == dir_revision {
-                    this.list.desc = values[3]
-                        .as_deref()
-                        .map_or(this.list.sort.default_desc(), |value| value == "desc");
-                }
-                if this.preference_reset == reset
-                    && this.auth_intent == auth_intent
-                    && this.preference_revision("kurisu.list.synced") == synced_revision
-                {
-                    this.list.synced_at = values[4].as_deref().and_then(|value| value.parse().ok());
+                    match (key, value) {
+                        ("kurisu.list.filter", Ok(Some(filter)))
+                            if state::STATUSES.contains(&filter.as_str()) =>
+                        {
+                            this.list.filter = filter;
+                        }
+                        ("kurisu.list.q", Ok(Some(query))) => {
+                            this.list.query.clone_from(&query);
+                            this.list_query
+                                .update(cx, |input, cx| input.set_value(query, cx));
+                        }
+                        ("kurisu.list.sort", Ok(sort)) => {
+                            let sort = sort
+                                .as_deref()
+                                .and_then(|sort| SortKey::try_from(sort).ok())
+                                .unwrap_or_default();
+                            if sort != this.list.sort {
+                                this.list.sort = sort;
+                                this.list.desc = sort.default_desc();
+                            }
+                        }
+                        ("kurisu.list.dir", Ok(direction)) => {
+                            this.list.desc = match direction.as_deref() {
+                                Some("asc") => false,
+                                Some("desc") => true,
+                                _ => this.list.sort.default_desc(),
+                            };
+                        }
+                        ("kurisu.list.synced", Ok(value)) => {
+                            this.list.synced_at = value.and_then(|value| value.parse().ok());
+                        }
+                        (key, Err(error)) => {
+                            if LIST_SORT_KEYS.contains(&key) {
+                                this.sort_preferences_loaded = false;
+                            }
+                            this.preference_read_errors.push((key, error));
+                        }
+                        _ => {}
+                    }
                 }
                 this.list.rebuild(now_seconds());
                 this.reset_list_widget();
-                if this.list.loaded && !this.offline && this.sync_due() {
+                if initial_load && this.list.loaded && !this.offline && this.sync_due() {
                     this.sync_list(window, cx);
                 }
                 cx.notify();
@@ -1969,6 +2055,8 @@ impl Workspace {
         if self.close_ready {
             return;
         }
+        self.preference_read_errors
+            .retain(|(key, _)| *key != "kurisu.list.q");
         self.query_request += 1;
         self.query_pending = Some(QueuedPreference {
             value,
@@ -2033,17 +2121,7 @@ impl Workspace {
 
     fn preference_error_message(&self) -> Option<String> {
         self.preference_error().map(|(key, error)| {
-            let label = match key {
-                "kurisu.list.filter" => "list filter",
-                "kurisu.list.sort" => "list sort",
-                "kurisu.list.dir" => "sort direction",
-                "kurisu.list.synced" => "last sync time",
-                "kurisu.cal.mine" => "calendar filter",
-                "kurisu.torrents.new" => "torrent new-release filter",
-                "kurisu.torrents.statuses" => "torrent status sections",
-                "kurisu.torrents.filters" => "torrent search filters",
-                _ => unreachable!(),
-            };
+            let label = preference_label(key);
             format!("Could not save the {label}: {error}. Retry the save.")
         })
     }
@@ -2076,16 +2154,33 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        self.enqueue_preference(
+            key,
+            PreferenceEdit::Setting(QueuedPreference {
+                value,
+                account: self.profile.as_ref().map(|user| user.id),
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn enqueue_preference(
+        &mut self,
+        key: &'static str,
+        edit: PreferenceEdit,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.close_ready {
             return;
         }
         assert!(PREFERENCE_KEYS.contains(&key));
+        self.preference_read_errors
+            .retain(|(failed, _)| *failed != key);
         let write = self.preference_writes.entry(key).or_default();
         write.revision = write.revision.wrapping_add(1);
-        write.pending = Some(QueuedPreference {
-            value,
-            account: self.profile.as_ref().map(|user| user.id),
-        });
+        write.pending = Some(edit);
         write.error = None;
         self.preference_alert_dismissed = false;
         self.save_preferences(window, cx);
@@ -2114,13 +2209,19 @@ impl Workspace {
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
-            let saved = edit.value.clone();
-            let account = edit.account;
+            let saved = edit.clone();
             let result = joined(
                 core.spawn(async move {
-                    worker
-                        .set_workspace_preference(key.into(), saved, account)
-                        .await
+                    match saved {
+                        PreferenceEdit::Setting(edit) => {
+                            worker
+                                .set_workspace_preference(key.into(), edit.value, edit.account)
+                                .await
+                        }
+                        PreferenceEdit::Sort { key, descending } => {
+                            worker.set_list_sort_preferences(key.key(), descending)
+                        }
+                    }
                 })
                 .await,
             );
@@ -2174,35 +2275,34 @@ impl Workspace {
     }
 
     fn select_sort(&mut self, sort: SortKey, window: &Window, cx: &mut Context<Self>) {
-        if self.edits_fenced() {
+        if !self.sort_preferences_loaded || self.edits_fenced() {
             return;
         }
         self.list.set_sort(sort, now_seconds());
         self.sort_open = false;
         self.reset_list_widget();
-        self.persist_preference("kurisu.list.sort", Some(sort.key().into()), window, cx);
-        self.persist_preference(
-            "kurisu.list.dir",
-            Some(if self.list.desc { "desc" } else { "asc" }.into()),
-            window,
-            cx,
-        );
-        cx.notify();
+        self.save_list_sort(window, cx);
     }
 
     fn flip_sort(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.edits_fenced() {
+        if !self.sort_preferences_loaded || self.edits_fenced() {
             return;
         }
         self.list.set_desc(!self.list.desc, now_seconds());
         self.reset_list_widget();
-        self.persist_preference(
-            "kurisu.list.dir",
-            Some(if self.list.desc { "desc" } else { "asc" }.into()),
+        self.save_list_sort(window, cx);
+    }
+
+    fn save_list_sort(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.enqueue_preference(
+            "kurisu.list.sort",
+            PreferenceEdit::Sort {
+                key: self.list.sort,
+                descending: self.list.desc,
+            },
             window,
             cx,
         );
-        cx.notify();
     }
 
     fn load_list(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -2231,6 +2331,7 @@ impl Workspace {
         let request = self.list_request;
         let generation = self.generation;
         let epoch = self.list_epoch;
+        let watching_revision = self.watching.row_revision();
         self.list.loading = true;
         self.list.error.clear();
         cx.notify();
@@ -2238,14 +2339,22 @@ impl Workspace {
         let worker = core.clone();
         let job = core.spawn(async move { worker.local_entries().await });
         self.replace_reads("list", vec![job.abort_handle()]);
+        #[cfg(test)]
+        let gate = self.list_response_gate.take();
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.stopping || generation != this.generation || request != this.list_request {
                     return;
                 }
                 this.list.loading = false;
-                if epoch != this.list_epoch {
+                if epoch != this.list_epoch
+                    || (result.is_ok() && watching_revision != this.watching.row_revision())
+                {
                     if this.close_ready {
                         this.list_refresh_deferred = true;
                         cx.notify();
@@ -2348,6 +2457,7 @@ impl Workspace {
         let request = self.sync_request;
         let generation = self.generation;
         let epoch = self.list_epoch;
+        let watching_revision = self.watching.row_revision();
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
@@ -2364,7 +2474,9 @@ impl Workspace {
                 if let Err(error) = &result {
                     this.list.sync_error = error.clone();
                 }
-                if epoch != this.list_epoch {
+                if epoch != this.list_epoch
+                    || (result.is_ok() && watching_revision != this.watching.row_revision())
+                {
                     if result.is_ok() {
                         this.mark_list_synced(window, cx);
                     }
@@ -2506,13 +2618,20 @@ impl Workspace {
         let request = self.list_request;
         let generation = self.generation;
         let epoch = self.list_epoch;
+        let watching_revision = self.watching.row_revision();
         let core = self.core.clone();
         let worker = core.clone();
         let read_ids = ids.clone();
         let job = core.spawn(async move { worker.local_entry_updates(read_ids, account).await });
         self.replace_reads("list", vec![job.abort_handle()]);
+        #[cfg(test)]
+        let gate = self.list_response_gate.take();
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.stopping || generation != this.generation || request != this.list_request {
                     return;
@@ -2520,12 +2639,27 @@ impl Workspace {
                 if epoch != this.list_epoch {
                     return;
                 }
+                if result.is_ok() && watching_revision != this.watching.row_revision() {
+                    if this.close_ready {
+                        this.list_refresh_deferred = true;
+                    } else if !this.list_refresh_queued {
+                        this.refresh_scoped(ids, account, window, cx);
+                    }
+                    return;
+                }
                 this.list_read = None;
                 match result {
                     Ok(values) => {
+                        let episode_ids = ids
+                            .iter()
+                            .copied()
+                            .zip(&values)
+                            .filter_map(|(id, entry)| entry.as_ref()?.media.as_ref().map(|_| id))
+                            .collect::<Vec<_>>();
                         let change = this.list.apply_scoped(&ids, values, now_seconds());
-                        this.progress.reconcile_entries(generation, &this.list);
-                        this.reconcile_open_entries(Some(&ids), cx);
+                        this.progress
+                            .reconcile_scoped_entries(generation, &this.list, &ids);
+                        this.reconcile_open_entries_with_totals(Some(&ids), Some(&episode_ids), cx);
                         this.list.step_error = this
                             .progress
                             .first_error(generation)
@@ -2578,7 +2712,18 @@ impl Workspace {
     }
 
     fn reconcile_open_entries(&mut self, scope: Option<&[i64]>, cx: &mut Context<Self>) {
+        self.reconcile_open_entries_with_totals(scope, scope, cx);
+    }
+
+    fn reconcile_open_entries_with_totals(
+        &mut self,
+        scope: Option<&[i64]>,
+        episode_scope: Option<&[i64]>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconcile_watching_entries(scope);
         let includes = |id: &i64| scope.is_none_or(|ids| ids.contains(id));
+        let includes_total = |id: &i64| episode_scope.is_none_or(|ids| ids.contains(id));
         if let Some(prompt) = self.prompt.as_ref().filter(|p| includes(&p.media_id)) {
             self.cached_prompt_target = self.core.cached_tracking_target(prompt);
         }
@@ -2593,21 +2738,22 @@ impl Workspace {
             .chain(&mut self.seasons.media)
             .chain(self.calendar.items.iter_mut().map(|item| &mut item.media))
         {
-            if includes(&media.id)
+            if includes_total(&media.id)
                 && let Some(total) = self
                     .list
                     .entry(media.id)
-                    .and_then(|entry| entry.media.as_ref()?.episodes)
+                    .and_then(|entry| entry.media.as_ref().map(|media| media.episodes))
             {
-                media.episodes = Some(total);
+                media.episodes = total;
             }
         }
         if let Some(id) = self.detail.media_id.filter(includes) {
             let entry = self.list.entry(id);
-            if let Some(total) = entry.and_then(|entry| entry.media.as_ref()?.episodes)
+            if includes_total(&id)
+                && let Some(media) = entry.and_then(|entry| entry.media.as_ref())
                 && let Some(detail) = self.detail.detail.as_mut()
             {
-                detail.media.episodes = Some(total);
+                detail.media.episodes = media.episodes;
             }
             self.detail.reconcile_entry(entry.cloned());
         }
@@ -2621,8 +2767,7 @@ impl Workspace {
             let input_current = self.editor_inputs.as_ref().is_none_or(|inputs| {
                 inputs.progress.read(cx).value().trim().parse::<i64>() == Ok(previous)
             });
-            editor.refresh_episode_total(entry, input_current);
-            if editor.progress != previous
+            if editor.refresh_entry_progress(entry, input_current)
                 && let Some(inputs) = &self.editor_inputs
             {
                 inputs.progress.update(cx, |input, cx| {
@@ -2657,6 +2802,19 @@ impl Workspace {
     }
 
     fn step_progress(&mut self, id: i64, delta: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(entry) = self.entry_for_edit(id) {
+            self.step_entry_progress(&entry, delta, window, cx);
+        }
+    }
+
+    fn step_entry_progress(
+        &mut self,
+        entry: &ListEntry,
+        delta: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = entry.media_id;
         if self.edits_fenced() || self.modal_open() || self.progress.busy(self.generation, id) {
             return;
         }
@@ -2667,16 +2825,13 @@ impl Workspace {
         {
             return;
         }
-        let Some(entry) = self.entry_for_edit(id) else {
-            return;
-        };
-        let edit = self.progress.entry(self.generation, &entry);
+        let edit = self.progress.entry(self.generation, entry);
         if !edit.step(delta, Instant::now()) {
             self.update_step_error();
             cx.notify();
             return;
         }
-        let reopens_completed = edit.reopens_completed(&entry);
+        let reopens_completed = edit.reopens_completed(entry);
         let due = edit.due.filter(|_| edit.dirty());
         self.update_step_error();
         let Some(due) = due else {
@@ -2742,10 +2897,16 @@ impl Workspace {
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         let entry_revision = self.list.revision();
-        let Some((value, expected)) = self
-            .progress
-            .edit_mut(generation, id)
-            .and_then(|edit| edit.begin_save())
+        let list_baseline = move |list: &state::ListState| {
+            list.entry(id)
+                .map(|entry| (entry.identity(), entry.progress))
+        };
+        let prior_baseline = list_baseline(&self.list);
+        let Some((value, expected, identity)) =
+            self.progress.edit_mut(generation, id).and_then(|edit| {
+                let (value, expected) = edit.begin_save()?;
+                Some((value, expected, edit.identity.clone()))
+            })
         else {
             return;
         };
@@ -2756,8 +2917,12 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
             let result = joined(
-                core.spawn(async move { worker.set_progress(id, value, Some(expected)).await })
-                    .await,
+                core.spawn(async move {
+                    worker
+                        .set_list_progress(id, value, expected, account, identity)
+                        .await
+                })
+                .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
                 this.active_writes = this.active_writes.saturating_sub(1);
@@ -2767,29 +2932,45 @@ impl Workspace {
                     this.check_barrier(window, cx);
                     return;
                 }
-                let outcome = result
-                    .as_ref()
-                    .map(|entry| entry.progress)
-                    .map_err(Clone::clone);
                 let superseded = this.list.revision() != entry_revision;
+                let conflict = matches!(&result, Ok(ControlFlow::Break(_)));
                 if let Some(edit) = this.progress.edit_mut(generation, id) {
-                    match outcome {
-                        Ok(progress) if superseded => edit.finish_superseded_save(value, progress),
-                        outcome => edit.finish_save(outcome),
+                    match &result {
+                        Ok(ControlFlow::Continue(entry)) if superseded => {
+                            edit.finish_superseded_save(value, entry.progress);
+                        }
+                        Ok(ControlFlow::Continue(entry)) => edit.finish_save(Ok(entry.progress)),
+                        Ok(ControlFlow::Break(entry)) => edit.finish_conflicted_save(entry),
+                        Err(error) => edit.finish_save(Err(error.clone())),
                     }
                 }
-                if superseded && this.list.loaded {
-                    this.progress.reconcile_entries(generation, &this.list);
+                if superseded
+                    && !conflict
+                    && this.list.loaded
+                    && list_baseline(&this.list) != prior_baseline
+                {
+                    this.progress
+                        .reconcile_scoped_entries(generation, &this.list, &[id]);
                 }
-                if let Ok(entry) = result {
-                    if superseded {
-                        this.queue_list_refresh(Some(vec![id]), window, cx);
+                if superseded || result.is_err() {
+                    this.queue_list_refresh(Some(vec![id]), window, cx);
+                }
+                if let Ok(ControlFlow::Continue(entry) | ControlFlow::Break(entry)) = result {
+                    if !superseded {
+                        this.progress.reconcile_entry(generation, &entry);
+                        let change = this.list.apply_one(entry, now_seconds());
+                        this.apply_list_change(change);
+                        this.discovery_list_changed();
+                        this.reconcile_open_entries(Some(&[id]), cx);
+                    }
+                    if !conflict {
                         // An unchanged baseline may belong to an earlier read of this entry.
-                        if this.list.loaded
-                            && this
-                                .list
-                                .entry(id)
-                                .is_none_or(|entry| entry.progress != expected)
+                        if !superseded
+                            || this.list.loaded
+                                && this
+                                    .list
+                                    .entry(id)
+                                    .is_none_or(|entry| entry.progress != expected)
                         {
                             this.finish_pending_editor_refresh(Some(&[id]), None, window, cx);
                         } else {
@@ -2803,12 +2984,6 @@ impl Workspace {
                                 pending.auto_open &= auto_open;
                             }
                         }
-                    } else {
-                        let change = this.list.apply_one(entry, now_seconds());
-                        this.apply_list_change(change);
-                        this.discovery_list_changed();
-                        this.reconcile_open_entries(Some(&[id]), cx);
-                        this.finish_pending_editor_refresh(Some(&[id]), None, window, cx);
                     }
                 }
                 this.update_step_error();
@@ -2821,24 +2996,31 @@ impl Workspace {
 
     fn resolve_progress_review(
         &mut self,
-        id: i64,
+        review: &state::ProgressReview,
         keep_local: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.edits_fenced() || self.modal_open() || !self.list.loaded {
+        if review.generation != self.generation
+            || self.edits_fenced()
+            || self.modal_open()
+            || !self.list.loaded
+        {
             return;
         }
+        let id = review.id;
         if self.progress.busy(self.generation, id) {
             return;
         }
-        let latest = self.list.entry(id).map(|entry| entry.progress);
-        let recorded = self
-            .progress
-            .edit(self.generation, id)
-            .and_then(|edit| edit.remote_progress);
-        if latest != recorded {
-            self.progress.reconcile_entries(self.generation, &self.list);
+        let entry = self.list.entry(id);
+        let latest = entry.map(|entry| entry.progress);
+        let latest_identity = entry.map(ListEntry::identity);
+        if latest != review.progress
+            || latest_identity != review.identity
+            || self.progress.review(self.generation, id).as_ref() != Some(review)
+        {
+            self.progress
+                .reconcile_scoped_entries(self.generation, &self.list, &[id]);
             self.list.step_error = self
                 .progress
                 .first_error(self.generation)
@@ -2938,47 +3120,19 @@ impl Workspace {
                 {
                     return;
                 }
-                this.ensure_cover_scale(window.scale_factor());
-                if let Ok(detail) = &result {
-                    if let Some(url) = detail
-                        .media
-                        .cover_large
-                        .as_deref()
-                        .or(detail.media.cover_medium.as_deref())
-                    {
-                        this.request_cover(id, url, 128, 184);
-                    }
-                    if let Some(url) = detail.media.banner_image.as_deref() {
-                        this.request_cover(id, url, 800, 192);
-                    }
-                    for relation in &detail.relations {
-                        if let Some(url) = relation.media.cover_medium.as_deref() {
-                            this.request_cover(relation.media.id, url, 112, 160);
-                        }
-                    }
-                    for (index, character) in detail.characters.iter().enumerate() {
-                        if let Some(url) = character.image.as_deref() {
-                            this.request_cover(-1 - index as i64, url, 112, 160);
-                        }
-                    }
-                    for (index, person) in detail.staff.iter().enumerate() {
-                        if let Some(url) = person.image.as_deref() {
-                            this.request_cover(-200_001 - index as i64, url, 112, 160);
-                        }
-                    }
-                }
                 if let Ok(detail) = &mut result
                     && let Some(entry) = this.list.entry(id)
-                    && let Some(total) = entry.media.as_ref().and_then(|media| media.episodes)
-                    && detail.media.episodes != Some(total)
+                    && let Some(media) = entry.media.as_ref()
+                    && detail.media.episodes != media.episodes
                 {
                     // Resolve overlapping detail and list reads from the local cache.
                     if this.list.revision() != entry_revision {
-                        detail.media.episodes = Some(total);
+                        detail.media.episodes = media.episodes;
                     }
                     this.queue_list_refresh(Some(vec![id]), window, cx);
                 }
                 this.detail.finish_detail(id, request, result);
+                this.refresh_detail_covers(window.scale_factor());
                 cx.notify();
             });
         })
@@ -3007,15 +3161,8 @@ impl Workspace {
                 {
                     return;
                 }
-                this.ensure_cover_scale(window.scale_factor());
-                if let Ok(items) = &result {
-                    for media in items {
-                        if let Some(url) = media.cover_medium.as_deref() {
-                            this.request_cover(media.id, url, 112, 160);
-                        }
-                    }
-                }
                 this.detail.finish_recommendations(id, request, result);
+                this.refresh_detail_covers(window.scale_factor());
                 cx.notify();
             });
         })
@@ -3062,7 +3209,7 @@ impl Workspace {
                         Some(entry) => Ok(entry),
                         None => {
                             worker
-                                .update_entry(id, Some(status.into()), None, None, None)
+                                .update_discovery_status(id, account, None, status.into())
                                 .await
                         }
                     }
@@ -3092,7 +3239,10 @@ impl Workspace {
                         }
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
-                    Err(error) => this.global_error = error,
+                    Err(error) => {
+                        this.global_error = error;
+                        this.queue_list_refresh(Some(vec![id]), window, cx);
+                    }
                 }
                 this.check_barrier(window, cx);
                 cx.notify();
@@ -3436,7 +3586,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn capture_fenced_inputs(&mut self, cx: &gpui::App) {
+    fn capture_fenced_inputs(&mut self, cx: &mut gpui::App) {
         self.capture_fenced_editor_inputs(cx);
         self.settings.capture_fenced_inputs(cx);
         self.library_screen.capture_fenced_inputs(cx);
@@ -3561,6 +3711,7 @@ impl Workspace {
         let completed_list = std::mem::take(&mut self.list_completed_while_closing);
         let replay_pending = std::mem::take(&mut self.pending_refresh_deferred);
         let replay_prompts = std::mem::take(&mut self.recovery_prompts_deferred);
+        self.resume_editor_details(window, cx);
         self.resume_route_reads(replay_list, window, cx);
         if replay_list && self.profile.is_some() {
             self.list_refresh_ticket += 1;
@@ -4043,6 +4194,9 @@ impl Workspace {
                 match result {
                     Err(error) => {
                         this.update_failed = error;
+                        if kurisu_core::updater::update_applied() {
+                            this.note_restart_pending();
+                        }
                         this.check_barrier(window, cx);
                         this.resume_fenced_reads(window.is_visible(), window, cx);
                     }

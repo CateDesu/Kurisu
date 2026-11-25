@@ -17,7 +17,10 @@ const IDX_FILENAME: usize = 4;
 const IDX_DURATION: usize = 5;
 const IDX_POSITION: usize = 6;
 const IDX_WORKING_DIR: usize = 7;
-const PROPS: [(&str, usize); 7] = [
+const IDX_EOF: usize = 8;
+const IDX_PLAYLIST: usize = 9;
+const IDX_FINAL_PATH: usize = 10;
+const PROPS: [(&str, usize); 10] = [
     ("pause", IDX_PAUSE),
     ("path", IDX_PATH),
     ("media-title", IDX_TITLE),
@@ -25,10 +28,17 @@ const PROPS: [(&str, usize); 7] = [
     ("duration", IDX_DURATION),
     ("time-pos", IDX_POSITION),
     ("working-directory", IDX_WORKING_DIR),
+    ("eof-reached", IDX_EOF),
+    ("playlist", IDX_PLAYLIST),
+    ("path", IDX_FINAL_PATH),
 ];
 
 pub(crate) struct MpvSnapshot {
+    pub endpoint: Option<String>,
+    pub process_id: Option<u32>,
+    pub playlist_entry_id: Option<u64>,
     pub playing: bool,
+    pub eof_reached: bool,
     pub path: String,
     pub media_title: String,
     pub filename: String,
@@ -43,8 +53,9 @@ pub(crate) fn probe(paths: &[String]) -> Vec<MpvSnapshot> {
         if std::fs::metadata(p).is_err() {
             continue;
         }
-        if let Some(s) = probe_one(p) {
-            snapshots.push(s);
+        if let Some(mut snapshot) = probe_one(p) {
+            snapshot.endpoint = Some(p.clone());
+            snapshots.push(snapshot);
         }
     }
     snapshots
@@ -62,11 +73,39 @@ fn probe_one(path: &str) -> Option<MpvSnapshot> {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let writer = stream.try_clone().ok()?;
+    #[cfg(target_os = "linux")]
+    let process_id = {
+        use std::os::fd::AsRawFd;
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+        // SAFETY: The buffer and its length match the kernel's ucred result.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        (result == 0 && len as usize == std::mem::size_of_val(&credentials) && credentials.pid > 0)
+            .then_some(credentials.pid as u32)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let process_id = None;
     query(
         BufReader::new(stream),
         writer,
         std::time::Instant::now() + QUERY_DEADLINE,
     )
+    .map(|snapshot| MpvSnapshot {
+        process_id,
+        ..snapshot
+    })
 }
 
 #[cfg(windows)]
@@ -186,24 +225,22 @@ fn query<R: BufRead, W: Write>(
     writer.write_all(out.as_bytes()).ok()?;
     writer.flush().ok()?;
 
-    let mut vals: Vec<Option<serde_json::Value>> = vec![None; PROPS.len() + 1];
+    let mut vals = [const { None }; PROPS.len() + 1];
     let mut received = [false; PROPS.len() + 1];
     let mut answered = 0;
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        let Some(line) = read_reply(&mut reader, deadline) else {
-            // Allow sockets that answer the six core playback properties before closing.
-            if (IDX_PAUSE..=IDX_POSITION).all(|id| received[id]) {
-                return build_snapshot(&vals);
-            }
-            return None;
-        };
+    while let Some(line) = read_reply(&mut reader, deadline) {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
-        if v.get("event").is_some() {
+        if let Some(event) = v.get("event") {
+            if answered > 0
+                && matches!(
+                    event.as_str(),
+                    Some("start-file" | "end-file" | "file-loaded")
+                )
+            {
+                return None;
+            }
             continue;
         }
         let Some(rid) = v.get("request_id").and_then(|x| x.as_u64()) else {
@@ -217,9 +254,17 @@ fn query<R: BufRead, W: Write>(
         vals[rid as usize] = ok.then(|| v.get("data").cloned()).flatten();
         answered += 1;
         if answered == PROPS.len() {
-            return build_snapshot(&vals);
+            break;
         }
     }
+    if received[IDX_FINAL_PATH] && vals[IDX_PATH] != vals[IDX_FINAL_PATH] {
+        return None;
+    }
+    // Older peers may omit the optional properties.
+    if (IDX_PAUSE..=IDX_POSITION).all(|id| received[id]) {
+        return build_snapshot(&vals);
+    }
+    None
 }
 
 fn read_reply(reader: &mut impl BufRead, deadline: std::time::Instant) -> Option<Vec<u8>> {
@@ -245,8 +290,9 @@ fn read_reply(reader: &mut impl BufRead, deadline: std::time::Instant) -> Option
     }
 }
 
-fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
+fn build_snapshot(vals: &[Option<serde_json::Value>; PROPS.len() + 1]) -> Option<MpvSnapshot> {
     let paused = vals[IDX_PAUSE].as_ref().and_then(|v| v.as_bool())?;
+    let eof_reached = vals[IDX_EOF].as_ref().and_then(|v| v.as_bool()) == Some(true);
     let path = vals[IDX_PATH].as_ref().and_then(|v| v.as_str())?;
     if path.is_empty() {
         return None;
@@ -262,8 +308,9 @@ fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
         vals[i]
             .as_ref()
             .and_then(|v| v.as_f64())
-            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-            .map(|s| (s * 1_000_000.0).round() as i64)
+            .map(|seconds| seconds * 1_000_000.0)
+            .filter(|micros| (0.0..i64::MAX as f64).contains(micros))
+            .map(|micros| micros.round() as i64)
     };
     let working_dir = str_at(IDX_WORKING_DIR);
     let resolved_path = if !path.contains("://")
@@ -278,8 +325,22 @@ fn build_snapshot(vals: &[Option<serde_json::Value>]) -> Option<MpvSnapshot> {
         path.to_string()
     };
     let position = secs_to_us(IDX_POSITION);
+    let playlist_entry_id = vals[IDX_PLAYLIST]
+        .as_ref()
+        .and_then(|playlist| playlist.as_array())
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("playing").and_then(|playing| playing.as_bool()) == Some(true)
+            })
+        })
+        .and_then(|entry| entry.get("id"))
+        .and_then(|id| id.as_u64());
     Some(MpvSnapshot {
-        playing: !paused,
+        endpoint: None,
+        process_id: None,
+        playlist_entry_id,
+        playing: !paused && !eof_reached,
+        eof_reached,
         path: resolved_path,
         media_title: str_at(IDX_TITLE),
         filename: str_at(IDX_FILENAME),
@@ -622,6 +683,31 @@ mod tests {
     }
 
     #[test]
+    fn a_file_change_during_the_query_invalidates_the_sample() {
+        let start = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, r#""/anime/episode03.mkv""#),
+        ]
+        .concat();
+        let tail = [
+            ok(IDX_TITLE, r#""Some Show - 04""#),
+            ok(IDX_FILENAME, r#""episode04.mkv""#),
+            ok(IDX_DURATION, "1200"),
+            ok(IDX_POSITION, "1100"),
+        ]
+        .concat();
+        for event in ["start-file", "end-file", "file-loaded"] {
+            let event = format!("{{\"event\":\"{event}\"}}\n");
+            assert!(query_lines(&format!("{start}{event}{tail}")).0.is_none());
+            assert!(query_lines(&format!("{event}{start}{tail}")).0.is_some());
+        }
+        let stable = ok(IDX_FINAL_PATH, r#""/anime/episode03.mkv""#);
+        let changed = ok(IDX_FINAL_PATH, r#""/anime/episode04.mkv""#);
+        assert!(query_lines(&format!("{start}{tail}{stable}")).0.is_some());
+        assert!(query_lines(&format!("{start}{tail}{changed}")).0.is_none());
+    }
+
+    #[test]
     fn failed_properties_degrade_instead_of_sinking_the_snapshot() {
         let lines = [
             ok(IDX_PAUSE, "true"),
@@ -668,6 +754,24 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_times_cannot_make_an_eof_snapshot_look_complete() {
+        let lines = [
+            ok(IDX_PAUSE, "true"),
+            ok(IDX_PATH, "\"/anime/episode03.mkv\""),
+            ok(IDX_TITLE, "\"Some Show - 03\""),
+            ok(IDX_FILENAME, "\"episode03.mkv\""),
+            ok(IDX_DURATION, "1e20"),
+            ok(IDX_POSITION, "1e15"),
+            ok(IDX_EOF, "true"),
+        ]
+        .concat();
+        let (snapshot, _) = query_lines(&lines);
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.eof_reached);
+        assert_eq!((snapshot.duration_us, snapshot.position_us), (0, 0));
+    }
+
+    #[test]
     fn an_idle_mpv_with_no_file_is_not_a_track() {
         let lines = [
             ok(IDX_PAUSE, "false"),
@@ -680,6 +784,25 @@ mod tests {
         .concat();
         let (snap, _) = query_lines(&lines);
         assert!(snap.is_none());
+    }
+
+    #[test]
+    fn keep_open_at_eof_is_not_playing_even_when_pause_is_false() {
+        let lines = [
+            ok(IDX_PAUSE, "false"),
+            ok(IDX_PATH, "\"/anime/episode03.mkv\""),
+            ok(IDX_TITLE, "\"Some Show - 03\""),
+            ok(IDX_FILENAME, "\"episode03.mkv\""),
+            ok(IDX_DURATION, "1200"),
+            ok(IDX_POSITION, "1199"),
+            ok(IDX_WORKING_DIR, "\"/anime\""),
+            ok(IDX_EOF, "true"),
+        ]
+        .concat();
+        let (snapshot, _) = query_lines(&lines);
+        let snapshot = snapshot.unwrap();
+        assert!(!snapshot.playing);
+        assert!(snapshot.eof_reached);
     }
 
     #[test]
@@ -849,6 +972,9 @@ mod tests {
             result.unwrap();
         }
         assert_eq!(snapshots.len(), 2);
+        for (snapshot, path) in snapshots.iter().zip(&paths) {
+            assert_eq!(snapshot.endpoint.as_ref(), Some(path));
+        }
         assert!(!snapshots[0].playing);
         assert!(snapshots[1].playing);
     }
@@ -897,6 +1023,7 @@ mod tests {
         ipc_arg.push(&sock);
         cmd.arg("--no-config")
             .arg("--load-scripts=no")
+            .arg("--no-resume-playback")
             .arg("--vo=null")
             .arg("--ao=null")
             .arg("--loop-file=inf")
@@ -933,11 +1060,37 @@ mod tests {
         assert!(snap.playing);
         assert!(snap.path.ends_with("t.wav"));
         assert_eq!(snap.duration_us, 5_000_000);
+        #[cfg(target_os = "linux")]
+        assert_eq!(snap.process_id, Some(player.child.id()));
+
+        let first_entry = snap.playlist_entry_id.unwrap();
+        let mut controller = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        writeln!(
+            controller,
+            "{}",
+            serde_json::json!({"command": ["loadfile", wav.to_str().unwrap(), "replace"]})
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(reloaded) = probe_one(sock.to_str().unwrap()) {
+                if reloaded
+                    .playlist_entry_id
+                    .is_some_and(|id| id != first_entry)
+                {
+                    assert_eq!(reloaded.path, snap.path);
+                    assert_eq!(reloaded.process_id, snap.process_id);
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "MPV did not reload");
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[test]
     fn relative_path_resolves_against_working_directory() {
-        let mut vals = [None, None, None, None, None, None, None, None];
+        let mut vals = [const { None }; PROPS.len() + 1];
         vals[IDX_PAUSE] = Some(serde_json::json!(false));
         vals[IDX_PATH] = Some(serde_json::json!("Show - 03.mkv"));
         vals[IDX_TITLE] = Some(serde_json::json!("Show - 03.mkv"));

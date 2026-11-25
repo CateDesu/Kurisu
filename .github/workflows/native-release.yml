@@ -13,6 +13,7 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -53,6 +54,7 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +66,8 @@ jobs:
           node-version-file: '.node-version'
       - uses: actions/download-artifact@v4
         with:
-          pattern: kurisu-native-*
+          artifact-ids: ${{ needs.build.outputs.linux-artifact-id }},${{ needs.build.outputs.windows-artifact-id }}
+          github-token: ${{ github.token }}
           merge-multiple: true
           path: downloaded-assets
       - name: Stage both native platforms

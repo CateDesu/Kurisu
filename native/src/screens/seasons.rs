@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use chrono::Datelike;
 use gpui::{
-    AnyElement, Context, Entity, ListAlignment, ListState, Subscription, Window, deferred, div,
-    list, prelude::*, px, rgb,
+    AnyElement, Context, Entity, FocusHandle, ListAlignment, ListState, Subscription, Window,
+    deferred, div, list, prelude::*, px, rgb,
 };
 use kurisu_core::models::Media;
 
@@ -175,6 +175,21 @@ impl SeasonsState {
 }
 
 impl Workspace {
+    pub(super) fn dismiss_season_menu(&mut self) -> Option<FocusHandle> {
+        let season_open = std::mem::take(&mut self.seasons.season_open);
+        let format_open = std::mem::take(&mut self.seasons.format_open);
+        let list_open = std::mem::take(&mut self.seasons.list_open);
+        if season_open {
+            Some(self.season_jump_focus.clone())
+        } else if format_open {
+            Some(self.season_format_focus.clone())
+        } else if list_open {
+            Some(self.season_status_focus.clone())
+        } else {
+            None
+        }
+    }
+
     pub(super) fn enter_seasons(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.seasons.year_input.is_none() {
             let year = self.seasons.selected_year.clone();
@@ -220,12 +235,6 @@ impl Workspace {
         if self.seasons.rows.is_none() {
             let rows = ListState::new(0, ListAlignment::Top, px(290.))
                 .with_uniform_item_height(px(CARD_ROW_HEIGHT));
-            let weak = cx.weak_entity();
-            rows.set_scroll_handler(move |event, _window, app| {
-                let _ = weak.update(app, |this, _| {
-                    this.prefetch_season_covers(event.visible_range.clone())
-                });
-            });
             self.seasons.rows = Some(rows);
             self.seasons.columns = card_columns(window.bounds().size.width.into());
         }
@@ -382,8 +391,7 @@ impl Workspace {
 
     pub(super) fn refresh_seasons_covers(&mut self) {
         if let Some(rows) = self.seasons.rows.as_ref() {
-            let first = rows.logical_scroll_top().item_ix;
-            self.prefetch_season_covers(first..first.saturating_add(9));
+            self.prefetch_season_covers(super::covers::visible_card_rows(rows));
         }
     }
 
@@ -427,10 +435,6 @@ impl Workspace {
                 );
             }
             self.seasons.columns = columns;
-            cx.spawn_in(window, async move |this, cx| {
-                let _ = this.update_in(cx, |this, _, _| this.refresh_seasons_covers());
-            })
-            .detach();
         }
         let actions = div()
             .flex()
@@ -454,7 +458,8 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| this.shift_season(1, window, cx))),
             )
             .into_any();
-        let mut page = div()
+        let mut page = self
+            .reconcile_card_covers_on_layout(div(), Route::Seasons, cx)
             .id("seasons-page")
             .debug_selector(|| "seasons-page".into())
             .flex_1()
@@ -468,30 +473,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .on_any_mouse_down(cx.listener(|this, _, _, cx| {
-                if this.seasons.season_open || this.seasons.format_open || this.seasons.list_open {
-                    this.seasons.season_open = false;
-                    this.seasons.format_open = false;
-                    this.seasons.list_open = false;
-                    cx.notify();
-                }
-            }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape"
-                    && (this.seasons.season_open
-                        || this.seasons.format_open
-                        || this.seasons.list_open)
-                {
-                    if this.seasons.season_open {
-                        window.focus(&this.season_jump_focus, cx);
-                    } else if this.seasons.format_open {
-                        window.focus(&this.season_format_focus, cx);
-                    } else if this.seasons.list_open {
-                        window.focus(&this.season_status_focus, cx);
-                    }
-                    this.seasons.season_open = false;
-                    this.seasons.format_open = false;
-                    this.seasons.list_open = false;
-                    cx.stop_propagation();
+                if this.dismiss_season_menu().is_some() {
                     cx.notify();
                 }
             }))
@@ -513,24 +495,16 @@ impl Workspace {
             .debug_selector(|| "season-jump".into())
             .w_full()
             .child(format!("{} ▾", season_name(&self.seasons.selected_season)))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
-                    "escape" if this.seasons.season_open => {
-                        this.seasons.season_open = false;
-                        window.focus(&this.season_jump_focus, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                    key => {
-                        if let Some(value) =
-                            arrow_choice(&this.seasons.selected_season, &SEASONS, key)
-                        {
-                            cx.stop_propagation();
-                            this.seasons.selected_season = value.into();
-                            this.seasons.season_open = false;
-                            cx.notify();
-                        }
-                    }
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if let Some(value) = arrow_choice(
+                    &this.seasons.selected_season,
+                    &SEASONS,
+                    &event.keystroke.key,
+                ) {
+                    cx.stop_propagation();
+                    this.seasons.selected_season = value.into();
+                    this.seasons.season_open = false;
+                    cx.notify();
                 }
             }))
             .on_click(cx.listener(|this, _, window, cx| {
@@ -775,28 +749,18 @@ impl Workspace {
             .debug_selector(|| "season-format".into())
             .w_full()
             .child(format!("{label} ▾"))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
-                    "escape" if this.seasons.format_open => {
-                        this.seasons.format_open = false;
-                        window.focus(&this.season_format_focus, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                    key => {
-                        let options = [
-                            "ALL", "TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC",
-                        ];
-                        if let Some(value) =
-                            arrow_choice(&this.seasons.format_filter, &options, key)
-                        {
-                            cx.stop_propagation();
-                            this.seasons.format_filter = value.into();
-                            this.seasons.format_open = false;
-                            this.refresh_season_visible();
-                            cx.notify();
-                        }
-                    }
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                let options = [
+                    "ALL", "TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC",
+                ];
+                if let Some(value) =
+                    arrow_choice(&this.seasons.format_filter, &options, &event.keystroke.key)
+                {
+                    cx.stop_propagation();
+                    this.seasons.format_filter = value.into();
+                    this.seasons.format_open = false;
+                    this.refresh_season_visible();
+                    cx.notify();
                 }
             }))
             .on_click(cx.listener(|this, _, window, cx| {
@@ -871,34 +835,25 @@ impl Workspace {
             .debug_selector(|| "season-list-status".into())
             .w_full()
             .child(format!("{label} ▾"))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
-                    "escape" if this.seasons.list_open => {
-                        this.seasons.list_open = false;
-                        window.focus(&this.season_status_focus, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                    key => {
-                        let options = [
-                            "ALL",
-                            "UNLISTED",
-                            "CURRENT",
-                            "PLANNING",
-                            "COMPLETED",
-                            "PAUSED",
-                            "DROPPED",
-                            "REPEATING",
-                        ];
-                        if let Some(value) = arrow_choice(&this.seasons.list_filter, &options, key)
-                        {
-                            cx.stop_propagation();
-                            this.seasons.list_filter = value.into();
-                            this.seasons.list_open = false;
-                            this.refresh_season_visible();
-                            cx.notify();
-                        }
-                    }
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                let options = [
+                    "ALL",
+                    "UNLISTED",
+                    "CURRENT",
+                    "PLANNING",
+                    "COMPLETED",
+                    "PAUSED",
+                    "DROPPED",
+                    "REPEATING",
+                ];
+                if let Some(value) =
+                    arrow_choice(&this.seasons.list_filter, &options, &event.keystroke.key)
+                {
+                    cx.stop_propagation();
+                    this.seasons.list_filter = value.into();
+                    this.seasons.list_open = false;
+                    this.refresh_season_visible();
+                    cx.notify();
                 }
             }))
             .on_click(cx.listener(|this, _, window, cx| {

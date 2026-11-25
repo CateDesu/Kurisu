@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -499,12 +500,8 @@ impl AniList {
                 )
                 .into());
             };
-            let reported_status = error
-                .and_then(|e| e.get("status"))
-                .and_then(|s| s.as_u64())
-                .and_then(|s| u16::try_from(s).ok())
-                .and_then(|s| reqwest::StatusCode::from_u16(s).ok())
-                .filter(|s| s.is_client_error() || s.is_server_error());
+            let transport_success = status.is_success();
+            let reported_status = error.and_then(graphql_error_status);
             // A transport 404 can carry a more specific account or service error.
             let status = if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                 reported_status.unwrap_or(status)
@@ -520,6 +517,45 @@ impl AniList {
                         .is_some_and(|path| path.len() > 1))
             {
                 failure.kind = ApiErrorKind::Partial;
+            }
+            if transport_success
+                && graphql_field_errors(
+                    errs,
+                    |path| matches!(path, [root, _, ..] if root.as_str() == Some("SaveMediaListEntry")),
+                )
+            {
+                failure.kind = ApiErrorKind::PartialEntryWrite;
+            }
+            if transport_success
+                && body
+                    .pointer("/data/Media/id")
+                    .and_then(|id| id.as_i64())
+                    .is_some_and(|id| {
+                        id > 0 && vars.get("mediaId").and_then(|value| value.as_i64()) == Some(id)
+                    })
+                && graphql_field_errors(errs, |path| {
+                    matches!(path, [root, field, ..]
+                        if root.as_str() == Some("Media") && field.as_str() == Some("mediaListEntry"))
+                })
+            {
+                failure.kind = ApiErrorKind::PartialEntryLookup;
+            }
+            if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                && errs.as_array().is_some_and(|errors| {
+                    errors.iter().all(|error| {
+                        graphql_error_status(error).is_none_or(|status| {
+                            status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                        }) && error
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|message| {
+                                !message.trim().is_empty()
+                                    && ApiErrorKind::from_message(message) == ApiErrorKind::Other
+                            })
+                    })
+                })
+            {
+                failure.kind = ApiErrorKind::EntryServer;
             }
             return Err(failure.into());
         }
@@ -637,16 +673,24 @@ impl AniList {
                 serde_json::json!({ "search": query, "page": page, "perPage": per_page }),
             )
             .await?;
+        let has_next_page = r.page.page_info.has_next_page;
+        let expected_items = has_next_page || !r.page.media.is_empty();
+        let items: Vec<_> = r
+            .page
+            .media
+            .into_iter()
+            .flatten()
+            .filter(|media| media.id > 0)
+            .map(Media::from)
+            .collect();
+        anyhow::ensure!(
+            !expected_items || !items.is_empty(),
+            "AniList returned an incomplete search page. Try again later."
+        );
         Ok(SearchPage {
-            items: r
-                .page
-                .media
-                .into_iter()
-                .flatten()
-                .map(Media::from)
-                .collect(),
+            items,
             page,
-            has_next_page: r.page.page_info.has_next_page,
+            has_next_page,
         })
     }
 
@@ -679,6 +723,7 @@ impl AniList {
             }
         }";
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         let mut has_next = true;
         for page in 1..=20 {
             if page > 1 {
@@ -694,21 +739,22 @@ impl AniList {
                 .page
                 .media
                 .ok_or_else(|| anyhow!("AniList returned unavailable season media"))?;
-            let got = media.len();
-            for m in media.into_iter().flatten() {
-                out.push(Media::from(m));
-            }
-            // An empty page after hasNextPage must not pass as a complete season.
-            if page > 1 && got == 0 {
-                anyhow::bail!(
-                    "AniList stopped returning entries partway through this season while claiming more pages; its API is degraded right now, try again later"
-                );
-            }
             has_next = r
                 .page
                 .page_info
                 .and_then(|p| p.has_next_page)
                 .ok_or_else(|| anyhow!("AniList returned a null pageInfo.hasNextPage"))?;
+            let mut media = media.into_iter().flatten().peekable();
+            if media.peek().is_none() && (page > 1 || has_next) {
+                anyhow::bail!(
+                    "AniList stopped returning entries during this season. Try again later."
+                );
+            }
+            for m in media {
+                if seen.insert(m.id) {
+                    out.push(Media::from(m));
+                }
+            }
             if !has_next {
                 break;
             }
@@ -779,6 +825,8 @@ impl AniList {
     }
 
     pub async fn media_detail(&self, id: i64) -> Result<MediaDetail> {
+        type Connection = serde_json::Map<String, serde_json::Value>;
+
         #[derive(Deserialize)]
         struct R {
             #[serde(rename = "Media")]
@@ -797,61 +845,106 @@ impl AniList {
             source: Option<String>,
             #[serde(deserialize_with = "Option::deserialize")]
             studios: Option<AniStudios>,
-            relations: Option<Relations>,
-            characters: Option<CharConn>,
-            staff: Option<StaffConn>,
+            relations: Option<Connection>,
+            characters: Option<Connection>,
+            staff: Option<Connection>,
             #[serde(flatten)]
             media: AniMedia,
         }
         #[derive(Deserialize)]
-        struct Relations {
-            edges: Option<Vec<Option<RelEdge>>>,
-        }
-        #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct RelEdge {
+            #[serde(deserialize_with = "Option::deserialize")]
             relation_type: Option<String>,
             node: Option<RelNode>,
         }
         #[derive(Deserialize)]
         struct RelNode {
             #[serde(rename = "type")]
-            kind: Option<String>,
+            kind: Option<MediaKind>,
             #[serde(flatten)]
             media: AniMedia,
         }
         #[derive(Deserialize)]
-        struct CharConn {
-            edges: Option<Vec<Option<CharEdge>>>,
+        #[serde(rename_all = "UPPERCASE")]
+        enum MediaKind {
+            Anime,
+            Manga,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct CharEdge {
-            role: Option<String>,
+            #[serde(default, deserialize_with = "selected")]
+            role: Option<Option<String>>,
             node: Option<NamedNode>,
-            voice_actors: Option<Vec<Option<NamedNode>>>,
-        }
-        #[derive(Deserialize)]
-        struct StaffConn {
-            edges: Option<Vec<Option<StaffEdge>>>,
+            #[serde(default, deserialize_with = "selected")]
+            voice_actors: Option<Option<Vec<Option<NamedNode>>>>,
         }
         #[derive(Deserialize)]
         struct StaffEdge {
-            role: Option<String>,
+            #[serde(default, deserialize_with = "selected")]
+            role: Option<Option<String>>,
             node: Option<NamedNode>,
         }
         #[derive(Deserialize)]
         struct NamedNode {
-            name: Option<NodeName>,
-            image: Option<NodeImage>,
+            #[serde(default, deserialize_with = "selected")]
+            name: Option<Option<NodeName>>,
+            #[serde(default, deserialize_with = "selected")]
+            image: Option<Option<NodeImage>>,
+        }
+        impl NamedNode {
+            fn fields(self) -> Option<(Option<String>, Option<String>)> {
+                let name = match self.name? {
+                    Some(name) => name.full?,
+                    None => None,
+                };
+                let image = match self.image? {
+                    Some(image) => image.medium?,
+                    None => None,
+                };
+                Some((name, image))
+            }
         }
         #[derive(Deserialize)]
         struct NodeName {
-            full: Option<String>,
+            #[serde(default, deserialize_with = "selected")]
+            full: Option<Option<String>>,
         }
         #[derive(Deserialize)]
         struct NodeImage {
-            medium: Option<String>,
+            #[serde(default, deserialize_with = "selected")]
+            medium: Option<Option<String>>,
+        }
+        fn selected<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+            value: D,
+        ) -> Result<Option<Option<T>>, D::Error> {
+            Option::deserialize(value).map(Some)
+        }
+        fn section<T: serde::de::DeserializeOwned, U>(
+            connection: Option<Connection>,
+            name: &str,
+            unavailable: &mut Vec<String>,
+            convert: impl Fn(T) -> Option<U>,
+        ) -> Result<Vec<U>> {
+            let edges = connection
+                .and_then(|mut connection| connection.remove("edges"))
+                .map(serde_json::from_value::<Option<Vec<Option<T>>>>)
+                .transpose()
+                .map_err(|error| {
+                    ApiError::new(
+                        reqwest::StatusCode::OK,
+                        false,
+                        format!("AniList returned unusable {name}: {error}"),
+                    )
+                })?
+                .flatten();
+            Ok(edges
+                .and_then(|edges| edges.into_iter().map(|edge| convert(edge?)).collect())
+                .unwrap_or_else(|| {
+                    unavailable.push(name.to_owned());
+                    Vec::new()
+                }))
         }
         let q = "query ($id: Int!) {
             Media(id: $id, type: ANIME) {
@@ -889,93 +982,58 @@ impl AniList {
             .await??;
         require_media_id(id, r.media.media.id)?;
         let mut unavailable_sections = Vec::new();
-        if r.media
-            .relations
-            .as_ref()
-            .and_then(|v| v.edges.as_ref())
-            .is_none()
-        {
-            unavailable_sections.push("relations".to_string());
-        }
-        if r.media
-            .characters
-            .as_ref()
-            .and_then(|v| v.edges.as_ref())
-            .is_none()
-        {
-            unavailable_sections.push("characters".to_string());
-        }
-        if r.media
-            .staff
-            .as_ref()
-            .and_then(|v| v.edges.as_ref())
-            .is_none()
-        {
-            unavailable_sections.push("staff".to_string());
-        }
-        let relations = r
-            .media
-            .relations
-            .and_then(|rel| rel.edges)
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let node = e.node?;
-                if node.kind.as_deref() != Some("ANIME") {
+        let relations = section(
+            r.media.relations,
+            "relations",
+            &mut unavailable_sections,
+            |edge: RelEdge| {
+                let node = edge.node?;
+                Some((node.kind?, node.media, edge.relation_type))
+            },
+        )?
+        .into_iter()
+        .filter(|(kind, _, _)| matches!(kind, MediaKind::Anime))
+        .map(|(_, media, relation)| MediaRelation {
+            relation: relation.unwrap_or_else(|| "OTHER".to_string()),
+            media: media.into(),
+        })
+        .collect();
+        let characters = section(
+            r.media.characters,
+            "characters",
+            &mut unavailable_sections,
+            |edge: CharEdge| {
+                let (name, image) = edge.node?.fields()?;
+                let actors = edge.voice_actors?.unwrap_or_default();
+                if actors.iter().any(Option::is_none) {
                     return None;
                 }
-                Some(MediaRelation {
-                    relation: e.relation_type.unwrap_or_else(|| "OTHER".to_string()),
-                    media: node.media.into(),
-                })
-            })
-            .collect();
-        let characters = r
-            .media
-            .characters
-            .and_then(|c| c.edges)
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let node = e.node?;
-                let name = node.name.and_then(|n| n.full)?;
-                let va = e
-                    .voice_actors
-                    .unwrap_or_default()
-                    .into_iter()
-                    .flatten()
-                    .next();
+                let (va_name, va_image) = match actors.into_iter().next().flatten() {
+                    Some(actor) => actor.fields()?,
+                    None => (None, None),
+                };
                 Some(MediaCharacter {
-                    role: e.role,
-                    name,
-                    image: node.image.and_then(|i| i.medium),
-                    va_name: va
-                        .as_ref()
-                        .and_then(|v| v.name.as_ref())
-                        .and_then(|n| n.full.clone()),
-                    va_image: va.and_then(|v| v.image).and_then(|i| i.medium),
+                    role: edge.role?,
+                    name: name?,
+                    image,
+                    va_name,
+                    va_image,
                 })
-            })
-            .collect();
-        let staff = r
-            .media
-            .staff
-            .and_then(|s| s.edges)
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let node = e.node?;
-                let name = node.name.and_then(|n| n.full)?;
+            },
+        )?;
+        let staff = section(
+            r.media.staff,
+            "staff",
+            &mut unavailable_sections,
+            |edge: StaffEdge| {
+                let (name, image) = edge.node?.fields()?;
                 Some(MediaStaff {
-                    role: e.role,
-                    name,
-                    image: node.image.and_then(|i| i.medium),
+                    role: edge.role?,
+                    name: name?,
+                    image,
                 })
-            })
-            .collect();
+            },
+        )?;
         let media = Media {
             banner_image: r.media.banner_image,
             genres: r
@@ -1181,7 +1239,14 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct PageInfo {
+            #[serde(default, deserialize_with = "present_page")]
+            current_page: Option<i64>,
             has_next_page: Option<bool>,
+        }
+        fn present_page<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<i64>, D::Error> {
+            i64::deserialize(deserializer).map(Some)
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -1193,6 +1258,7 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct SchedMedia {
+            #[serde(deserialize_with = "Option::deserialize")]
             is_adult: Option<bool>,
             #[serde(flatten)]
             media: AniMedia,
@@ -1201,7 +1267,7 @@ impl AniList {
         let start_exclusive = start.saturating_sub(1);
         let q = "query ($startExclusive: Int!, $end: Int!, $page: Int!) {
             Page(page: $page, perPage: 50) {
-                pageInfo { hasNextPage }
+                pageInfo { currentPage hasNextPage }
                 airingSchedules(airingAt_greater: $startExclusive, airingAt_lesser: $end, sort: TIME) {
                     airingAt episode
                     media {
@@ -1215,10 +1281,12 @@ impl AniList {
             }
         }";
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         let mut has_next = true;
         for page in 1..=12 {
             if page > 1 {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.until_replaced(tokio::time::sleep(Duration::from_millis(300)))
+                    .await?;
             }
             let r: R = self
                 .gql(
@@ -1230,28 +1298,50 @@ impl AniList {
                 .page
                 .airing_schedules
                 .ok_or_else(|| anyhow!("AniList returned unavailable airing schedules"))?;
-            let got = scheds.len();
-            for s in scheds.into_iter().flatten() {
-                let Some(m) = s.media else { continue };
-                if m.is_adult == Some(true) {
+            let page_info = r
+                .page
+                .page_info
+                .ok_or_else(|| anyhow!("AniList returned unavailable airing schedule page info"))?;
+            has_next = page_info
+                .has_next_page
+                .ok_or_else(|| anyhow!("AniList returned a null pageInfo.hasNextPage"))?;
+            if page_info.current_page != Some(page)
+                && (page > 1 || has_next || page_info.current_page.is_some())
+            {
+                anyhow::bail!(
+                    "AniList returned an invalid airing schedule page number. Try again later."
+                );
+            }
+            if scheds.is_empty() && (page > 1 || has_next) {
+                anyhow::bail!("AniList skipped an airing schedule page. Try again later.");
+            }
+            let previous_count = seen.len();
+            for s in scheds {
+                let Some(Sched {
+                    airing_at,
+                    episode,
+                    media: Some(media),
+                }) = s
+                else {
+                    anyhow::bail!("AniList returned an incomplete airing schedule page");
+                };
+                if !(start..end).contains(&airing_at) || episode < 0 || media.media.id <= 0 {
+                    anyhow::bail!("AniList returned an invalid airing schedule row");
+                }
+                if !seen.insert((media.media.id, episode, airing_at))
+                    || media.is_adult == Some(true)
+                {
                     continue;
                 }
                 out.push(AiringItem {
-                    airing_at: s.airing_at,
-                    episode: s.episode,
-                    media: m.media.into(),
+                    airing_at,
+                    episode,
+                    media: media.media.into(),
                 });
             }
-            if page > 1 && got == 0 {
-                anyhow::bail!(
-                    "AniList stopped returning entries partway through this week while claiming more pages; its API is degraded right now, try again later"
-                );
+            if page > 1 && previous_count == seen.len() {
+                anyhow::bail!("AniList repeated an airing schedule page. Try again later.");
             }
-            has_next = r
-                .page
-                .page_info
-                .and_then(|p| p.has_next_page)
-                .ok_or_else(|| anyhow!("AniList returned a null pageInfo.hasNextPage"))?;
             if !has_next {
                 break;
             }
@@ -1319,7 +1409,9 @@ impl AniList {
                 }
             }
         }";
-        let mut out = Vec::new();
+        let mut out: Vec<ListEntry> = Vec::new();
+        let mut positions = HashMap::<i64, (usize, f64)>::new();
+        let mut entry_ids = HashSet::new();
         for chunk in 1..=200 {
             let r: R = self
                 .gql(
@@ -1344,10 +1436,52 @@ impl AniList {
                         anyhow!("AniList returned a null entry, refusing to sync a partial list")
                     })?;
                     require_entry_id(e.id, None)?;
+                    anyhow::ensure!(
+                        e.media_id > 0,
+                        "AniList returned an invalid anime ID {}",
+                        e.media_id
+                    );
                     if let Some(media) = &e.media {
                         require_media_id(e.media_id, media.id)?;
                     }
+                    let media = e.media.map(Media::from);
+                    let score = e.score.unwrap_or(0.0);
+                    // Status and custom groups can share an entry within one chunk.
+                    if let Some(&(index, previous_score)) = positions.get(&e.media_id) {
+                        anyhow::ensure!(
+                            index >= before,
+                            "AniList returned an overlapping chunk, refusing to sync a partial list"
+                        );
+                        let duplicate = &mut out[index];
+                        require_entry_id(e.id, duplicate.id)?;
+                        anyhow::ensure!(
+                            (
+                                duplicate.status.as_str(),
+                                duplicate.progress,
+                                previous_score,
+                                duplicate.repeat,
+                                duplicate.updated_at
+                            ) == (e.status.as_str(), e.progress, score, e.repeat, e.updated_at)
+                                && duplicate
+                                    .media
+                                    .as_ref()
+                                    .zip(media.as_ref())
+                                    .is_none_or(|(a, b)| a == b),
+                            "AniList returned inconsistent copies of entry {}",
+                            e.id
+                        );
+                        if duplicate.media.is_none() {
+                            duplicate.media = media;
+                        }
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        entry_ids.insert(e.id),
+                        "AniList returned entry {} for multiple anime",
+                        e.id
+                    );
                     // Keep null media entries so AniList merges cannot trigger local deletion.
+                    positions.insert(e.media_id, (out.len(), score));
                     out.push(ListEntry {
                         id: Some(e.id),
                         media_id: e.media_id,
@@ -1356,7 +1490,8 @@ impl AniList {
                         score: score_in_format(e.score, score_format),
                         repeat: e.repeat,
                         updated_at: e.updated_at,
-                        media: e.media.map(Media::from),
+                        media,
+                        queued_creation: None,
                     });
                 }
             }
@@ -1416,8 +1551,13 @@ impl AniList {
             id: i64,
             #[serde(default, deserialize_with = "reported_episodes")]
             episodes: ReportedEpisodes,
-            #[serde(rename = "mediaListEntry", deserialize_with = "Option::deserialize")]
-            entry: Option<SavedEntry>,
+            #[serde(default, rename = "mediaListEntry", deserialize_with = "present_value")]
+            entry: Option<serde_json::Value>,
+        }
+        fn present_value<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+            serde_json::Value::deserialize(deserializer).map(Some)
         }
         let q = "query ($mediaId: Int!, $scoreFormat: ScoreFormat) {
             Media(id: $mediaId, type: ANIME) {
@@ -1432,10 +1572,16 @@ impl AniList {
             )
             .await?;
         require_media_id(media_id, r.media.id)?;
-        if let Some(entry) = &r.media.entry {
+        let raw = r
+            .media
+            .entry
+            .ok_or_else(|| IncompleteEntryLookup("missing field `mediaListEntry`".into()))?;
+        let entry: Option<SavedEntry> = serde_json::from_value(raw)
+            .map_err(|error| IncompleteEntryLookup(error.to_string()))?;
+        if let Some(entry) = &entry {
             entry.check_identity(media_id, None)?;
         }
-        Ok((r.media.entry, r.media.episodes))
+        Ok((entry, r.media.episodes))
     }
 
     /// Omitted fields stay unchanged on AniList.
@@ -1449,6 +1595,7 @@ impl AniList {
         score: Option<f64>,
         repeat: Option<i64>,
         score_format: Option<&str>,
+        allow_adjusted_completion: bool,
     ) -> Result<(SavedEntry, Option<i64>)> {
         #[derive(Deserialize)]
         struct R {
@@ -1476,7 +1623,16 @@ impl AniList {
         if let Some(r) = repeat {
             vars["repeat"] = r.into();
         }
-        let r: R = self.gql_request(q, vars).await?;
+        let r: R = self.gql_request(q, vars).await.map_err(|error| {
+            if error
+                .downcast_ref::<ApiError>()
+                .is_some_and(|api| api.kind == ApiErrorKind::PartialEntryWrite)
+            {
+                error.context(UnconfirmedEntryWrite(None))
+            } else {
+                error
+            }
+        })?;
         let mut entry = r.entry;
         entry.check_identity(media_id, entry_id)?;
         let requested_status = status.map(ListStatus::as_str);
@@ -1498,8 +1654,10 @@ impl AniList {
             entry = remote;
             confirmed_total = total;
         }
+        let confirmed_adjustment =
+            allow_adjusted_completion && confirmed_total.flatten() == Some(entry.progress);
         let status_or_progress_changed =
-            status_changed || progress_changed && confirmed_total.flatten() != Some(entry.progress);
+            status_changed || progress_changed && !confirmed_adjustment;
         let score_or_repeat_changed = score
             .is_some_and(|score| entry.score.unwrap_or(0.0) != score)
             || repeat.is_some_and(|repeat| entry.repeat != repeat);
@@ -1551,22 +1709,35 @@ impl AniList {
         }
     }
 
-    pub async fn entry_details(&self, media_id: i64) -> Result<EntryDetails> {
-        self.entry_details_with_id(media_id)
-            .await
-            .map(|(_, details)| details)
-    }
-
-    pub(crate) async fn entry_details_with_id(&self, media_id: i64) -> Result<(i64, EntryDetails)> {
+    pub(crate) async fn entry_details_with_id(
+        &self,
+        media_id: i64,
+    ) -> Result<Option<(i64, EntryDetails)>> {
         let q = "query ($id: Int!) {
-            Media(id: $id, type: ANIME) { mediaListEntry { id mediaId notes startedAt { year month day } completedAt { year month day } customLists } }
+            Media(id: $id, type: ANIME) { id mediaListEntry { id mediaId notes startedAt { year month day } completedAt { year month day } customLists } }
             Viewer { mediaListOptions { animeList { customLists } } }
         }";
         let r: serde_json::Value = self.gql(q, serde_json::json!({"id": media_id})).await?;
-        let raw = r
-            .pointer("/Media/mediaListEntry")
-            .filter(|v| !v.is_null())
-            .ok_or_else(|| anyhow!("This show has no saved AniList entry yet"))?;
+        let media = r
+            .get("Media")
+            .ok_or_else(|| anyhow!("AniList did not return the requested anime"))?;
+        if media.is_null() {
+            return Ok(None);
+        }
+        let returned_media_id = media.get("id").and_then(|value| value.as_i64());
+        if let Some(id) = returned_media_id {
+            require_media_id(media_id, id)?;
+        }
+        let raw = media
+            .get("mediaListEntry")
+            .ok_or_else(|| anyhow!("AniList did not return entry details"))?;
+        if raw.is_null() {
+            anyhow::ensure!(
+                returned_media_id.is_some(),
+                "AniList did not confirm the anime ID"
+            );
+            return Ok(None);
+        }
         let (entry_id, mut details) = parse_entry_details(raw, media_id, None)?;
         details.available_custom_lists = r
             .pointer("/Viewer/mediaListOptions/animeList/customLists")
@@ -1580,7 +1751,7 @@ impl AniList {
                 details.available_custom_lists.push(name.clone());
             }
         }
-        Ok((entry_id, details))
+        Ok(Some((entry_id, details)))
     }
 
     pub async fn save_entry_details(
@@ -1614,10 +1785,27 @@ impl AniList {
         let (_, details) = parse_entry_details(
             r.get("SaveMediaListEntry")
                 .filter(|v| !v.is_null())
-                .ok_or_else(|| anyhow!("AniList did not return the saved entry"))?,
+                .ok_or(UnconfirmedEntryDetailsWrite)?,
             media_id,
             Some(entry_id),
-        )?;
+        )
+        .map_err(|e| e.context(UnconfirmedEntryDetailsWrite))?;
+        let empty_date = FuzzyDate::default();
+        anyhow::ensure!(
+            notes.is_none_or(|notes| details.notes == notes)
+                && started_at.is_none_or(|date| {
+                    details.started_at.as_ref().unwrap_or(&empty_date) == date
+                })
+                && completed_at.is_none_or(|date| {
+                    details.completed_at.as_ref().unwrap_or(&empty_date) == date
+                })
+                && custom_lists.is_none_or(|lists| {
+                    use std::collections::BTreeSet;
+                    lists.iter().collect::<BTreeSet<_>>()
+                        == details.custom_lists.iter().collect::<BTreeSet<_>>()
+                }),
+            UnconfirmedEntryDetailsWrite
+        );
         Ok(details)
     }
 
@@ -1630,7 +1818,12 @@ impl AniList {
         #[derive(Deserialize)]
         struct ReadPage {
             #[serde(rename = "notifications")]
-            _notifications: Vec<serde_json::Value>,
+            _notifications: Vec<Option<ReadNotification>>,
+        }
+        #[derive(Deserialize)]
+        struct ReadNotification {
+            #[serde(rename = "id")]
+            _id: Option<i32>,
         }
         let _: Response = self.gql_request("query { Page(page: 1, perPage: 1) { notifications(resetNotificationCount: true) { ... on AiringNotification { id } } } }", serde_json::json!({})).await?;
         Ok(())
@@ -1648,7 +1841,7 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Viewer {
-            unread_notification_count: Option<i64>,
+            unread_notification_count: Option<i32>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -1659,6 +1852,7 @@ impl AniList {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct PageInfo {
+            current_page: i64,
             has_next_page: bool,
         }
         #[derive(Deserialize)]
@@ -1669,13 +1863,15 @@ impl AniList {
         #[derive(Deserialize, Default)]
         #[serde(default, rename_all = "camelCase")]
         struct Raw {
-            id: Option<i64>,
+            #[serde(rename = "__typename")]
+            typename: Option<String>,
+            id: Option<i32>,
             #[serde(rename = "type")]
             kind: Option<String>,
             context: Option<String>,
             // Airing notifications use a list of contexts.
             contexts: Option<Vec<Option<String>>>,
-            created_at: Option<i64>,
+            created_at: Option<i32>,
             media: Option<MediaRef>,
             episode: Option<i64>,
             activity_id: Option<i64>,
@@ -1718,7 +1914,8 @@ impl AniList {
         struct AvatarRef {
             large: Option<String>,
         }
-        let q = "query ($page: Int!) { Viewer { unreadNotificationCount } Page(page: $page, perPage: 50) { pageInfo { hasNextPage } notifications(resetNotificationCount: false) {
+        let q = "query ($page: Int!) { Viewer { unreadNotificationCount } Page(page: $page, perPage: 50) { pageInfo { currentPage hasNextPage } notifications(resetNotificationCount: false) {
+            __typename
             ... on AiringNotification { id type createdAt media { id title { userPreferred } coverImage { medium } } episode contexts }
             ... on FollowingNotification { id type createdAt context user { id name avatar { large } } }
             ... on ActivityLikeNotification { id type createdAt context activityId user { name avatar { large } } }
@@ -1738,14 +1935,40 @@ impl AniList {
             ... on MediaDeletionNotification { id type createdAt context deletedMediaTitle reason }
         } } }";
         let r: R = self.gql(q, serde_json::json!({ "page": page })).await?;
-        let items = r
+        if r.page.page_info.current_page != page {
+            anyhow::bail!("AniList returned the wrong notifications page. Try again later.");
+        }
+        if r.page.page_info.has_next_page && r.page.notifications.is_empty() {
+            anyhow::bail!("AniList returned an empty notifications page. Try again later.");
+        }
+        let unread_count = r.viewer.unread_notification_count.map(i64::from);
+        anyhow::ensure!(
+            unread_count.is_none_or(|count| count >= 0),
+            "AniList returned an invalid unread notification count"
+        );
+        let had_rows = !r.page.notifications.is_empty();
+        let mut has_unrecognized_type = false;
+        for row in r.page.notifications.iter().flatten() {
+            match (row.kind.as_deref(), row.id) {
+                (None, None) => {
+                    // New union members return only their GraphQL type name.
+                    has_unrecognized_type |=
+                        row.typename.as_deref().is_some_and(|name| !name.is_empty());
+                }
+                (Some(kind), Some(id)) if id > 0 && !kind.trim().is_empty() => {}
+                _ => anyhow::bail!(
+                    "AniList returned an incomplete notifications page. Try again later."
+                ),
+            }
+        }
+        let items: Vec<_> = r
             .page
             .notifications
             .into_iter()
             .flatten()
             .filter_map(|n| {
-                let id = n.id?;
-                let kind = n.kind.filter(|kind| !kind.is_empty())?;
+                let id = i64::from(n.id?);
+                let kind = n.kind?;
                 Some(Notification {
                     id,
                     kind,
@@ -1758,7 +1981,7 @@ impl AniList {
                             .collect::<Vec<_>>();
                         (!parts.is_empty()).then(|| parts.join(" "))
                     }),
-                    created_at: n.created_at,
+                    created_at: n.created_at.map(i64::from),
                     media_id: n.media.as_ref().and_then(|m| m.id),
                     media_title: n
                         .media
@@ -1786,11 +2009,14 @@ impl AniList {
                 })
             })
             .collect();
+        if had_rows && items.is_empty() && !has_unrecognized_type {
+            anyhow::bail!("AniList returned an incomplete notifications page. Try again later.");
+        }
         Ok(NotificationPage {
             items,
             page,
             has_next_page: r.page.page_info.has_next_page,
-            unread_count: r.viewer.unread_notification_count,
+            unread_count,
         })
     }
 }
@@ -1805,6 +2031,42 @@ fn require_media_id(expected: i64, actual: i64) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+fn graphql_error_status(error: &serde_json::Value) -> Option<reqwest::StatusCode> {
+    error
+        .get("status")
+        .and_then(|status| status.as_u64())
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error())
+}
+
+fn graphql_field_errors(
+    errors: &serde_json::Value,
+    matches_path: impl Fn(&[serde_json::Value]) -> bool,
+) -> bool {
+    errors.as_array().is_some_and(|errors| {
+        errors.iter().all(|error| {
+            error
+                .get("status")
+                .is_none_or(|status| matches!(status.as_u64(), Some(200..=299 | 404)))
+                && error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|message| {
+                        !message.trim().is_empty()
+                            && matches!(
+                                ApiErrorKind::from_message(message),
+                                ApiErrorKind::Other | ApiErrorKind::Missing
+                            )
+                    })
+                && error
+                    .get("path")
+                    .and_then(|path| path.as_array())
+                    .is_some_and(|path| matches_path(path))
+        })
+    })
 }
 
 fn require_entry_id(id: i64, expected: Option<i64>) -> Result<()> {
@@ -1894,37 +2156,51 @@ enum ApiErrorKind {
     Other,
     Missing,
     Partial,
+    PartialEntryLookup,
     Rejected,
     Disabled,
+    EntryServer,
+    PartialEntryWrite,
+}
+
+impl ApiErrorKind {
+    fn from_message(message: &str) -> Self {
+        if message == "Not Found" {
+            Self::Missing
+        } else if message.eq_ignore_ascii_case("Invalid Token") {
+            Self::Rejected
+        } else if message
+            .to_ascii_lowercase()
+            .starts_with("the anilist api has been temporarily disabled")
+        {
+            Self::Disabled
+        } else {
+            Self::Other
+        }
+    }
 }
 
 impl ApiError {
     fn not_found(&self) -> bool {
         self.from_json
-            && !matches!(self.kind, ApiErrorKind::Rejected | ApiErrorKind::Partial)
+            && !matches!(
+                self.kind,
+                ApiErrorKind::Rejected
+                    | ApiErrorKind::Partial
+                    | ApiErrorKind::PartialEntryLookup
+                    | ApiErrorKind::PartialEntryWrite
+            )
             && (self.status == reqwest::StatusCode::NOT_FOUND
                 || self.status.is_success() && self.kind == ApiErrorKind::Missing)
     }
 
     fn new(status: reqwest::StatusCode, from_json: bool, message: String) -> Self {
         // Classify before redacting diagnostic text.
-        let kind = if message == "Not Found" {
-            ApiErrorKind::Missing
-        } else if message.eq_ignore_ascii_case("Invalid Token") {
-            ApiErrorKind::Rejected
-        } else if message
-            .to_ascii_lowercase()
-            .starts_with("the anilist api has been temporarily disabled")
-        {
-            ApiErrorKind::Disabled
-        } else {
-            ApiErrorKind::Other
-        };
         Self {
             status,
             from_json,
+            kind: ApiErrorKind::from_message(&message),
             message,
-            kind,
         }
     }
 }
@@ -1959,6 +2235,28 @@ impl std::fmt::Display for UnconfirmedEntryWrite {
 }
 
 impl std::error::Error for UnconfirmedEntryWrite {}
+
+#[derive(Debug)]
+struct IncompleteEntryLookup(String);
+
+impl std::fmt::Display for IncompleteEntryLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AniList returned unusable entry data: {}", self.0)
+    }
+}
+
+impl std::error::Error for IncompleteEntryLookup {}
+
+#[derive(Debug)]
+pub(crate) struct UnconfirmedEntryDetailsWrite;
+
+impl std::fmt::Display for UnconfirmedEntryDetailsWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AniList did not confirm the requested entry details. Reload the entry before trying again.")
+    }
+}
+
+impl std::error::Error for UnconfirmedEntryDetailsWrite {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IncompatibleEntryWrite {
@@ -2022,6 +2320,9 @@ fn is_not_found(e: &anyhow::Error) -> bool {
 }
 
 pub fn is_retryable(error: &anyhow::Error) -> bool {
+    if error.is::<IncompleteEntryLookup>() {
+        return true;
+    }
     if error.is::<UnconfirmedEntryWrite>() {
         return !is_auth_rejection(error);
     }
@@ -2030,7 +2331,10 @@ pub fn is_retryable(error: &anyhow::Error) -> bool {
             return false;
         }
         return !api.from_json
-            || api.kind == ApiErrorKind::Partial
+            || matches!(
+                api.kind,
+                ApiErrorKind::Partial | ApiErrorKind::PartialEntryLookup
+            )
             || api.status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || api.status == reqwest::StatusCode::REQUEST_TIMEOUT
             || (api.status == reqwest::StatusCode::FORBIDDEN
@@ -2040,6 +2344,19 @@ pub fn is_retryable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_body() || e.is_request())
+}
+
+pub(crate) fn is_entry_retry_error(error: &anyhow::Error) -> bool {
+    error.is::<IncompleteEntryLookup>()
+        || error.root_cause().is::<UnconfirmedEntryWrite>()
+        || error.downcast_ref::<ApiError>().is_some_and(|api| {
+            matches!(
+                api.kind,
+                ApiErrorKind::EntryServer
+                    | ApiErrorKind::PartialEntryLookup
+                    | ApiErrorKind::PartialEntryWrite
+            )
+        })
 }
 
 pub fn media_not_found(e: &anyhow::Error) -> bool {
@@ -2789,7 +3106,7 @@ mod regression_tests {
                     expected
                 );
                 assert_eq!(
-                    api.save_entry(1, Some(22), None, Some(4), None, None, format)
+                    api.save_entry(1, Some(22), None, Some(4), None, None, format, false)
                         .await
                         .unwrap()
                         .0
@@ -2840,6 +3157,93 @@ mod regression_tests {
             (200, json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": [{"entries": [{"id": 22, "mediaId": 1, "status": "CURRENT", "progress": 0, "repeat": 0, "score": 0}]}], "hasNextChunk": true}}})),
             (200, json!({"data": {"MediaListCollection": {"user":{"id":7},"lists": [], "hasNextChunk": false}}})),
         ]).await;
+        assert!(api.user_list(7, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_chunks_allow_entries_shared_by_groups_in_the_same_chunk() {
+        let entry =
+            json!({"id":22,"mediaId":1,"status":"CURRENT","progress":0,"repeat":0,"score":0});
+        let mut custom_entry = entry.clone();
+        custom_entry["media"] = mock_media(1);
+        let mut next_entry = entry.clone();
+        next_entry["id"] = json!(23);
+        next_entry["mediaId"] = json!(2);
+        let (api, _) = mock_api(vec![
+            (
+                200,
+                json!({"data":{"MediaListCollection":{
+                    "user":{"id":7},"hasNextChunk":true,
+                    "lists":[{"entries":[entry]},{"entries":[custom_entry]}]
+                }}}),
+            ),
+            (
+                200,
+                json!({"data":{"MediaListCollection":{
+                    "user":{"id":7},"hasNextChunk":false,"lists":[{"entries":[next_entry]}]
+                }}}),
+            ),
+        ])
+        .await;
+        let entries = api.user_list(7, None).await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.media_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(entries[0].media.as_ref().unwrap().id, 1);
+    }
+
+    #[tokio::test]
+    async fn inconsistent_list_group_entries_are_rejected_in_either_order() {
+        let first = json!({"id":22,"mediaId":1,"status":"CURRENT","progress":4,"repeat":0,"score":70,
+            "updatedAt":10,"media":mock_media(1)});
+        let mut different_media = mock_media(1);
+        different_media["episodes"] = json!(24);
+        for (field, value) in [
+            ("id", json!(23)),
+            ("mediaId", json!(2)),
+            ("status", json!("PAUSED")),
+            ("progress", json!(3)),
+            ("repeat", json!(1)),
+            ("score", json!(80)),
+            ("updatedAt", json!(11)),
+            ("media", different_media),
+        ] {
+            let mut other = first.clone();
+            if field == "mediaId" {
+                other["media"] = mock_media(2);
+            }
+            other[field] = value;
+            for entries in [[first.clone(), other.clone()], [other, first.clone()]] {
+                let lists = entries.map(|entry| json!({"entries":[entry]}));
+                let (api, _) = mock_api(vec![(
+                    200,
+                    json!({"data":{"MediaListCollection":{
+                        "user":{"id":7},"hasNextChunk":false,"lists":lists
+                    }}}),
+                )])
+                .await;
+                assert!(
+                    api.user_list(7, Some("POINT_100")).await.is_err(),
+                    "{field}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn null_media_does_not_excuse_an_invalid_list_media_id() {
+        let entry = json!({"id":22,"mediaId":0,"status":"CURRENT","progress":4,"repeat":0,"score":0,"media":null});
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"MediaListCollection":{
+                "user":{"id":7},"hasNextChunk":false,"lists":[{"entries":[entry]}]
+            }}}),
+        )])
+        .await;
         assert!(api.user_list(7, None).await.is_err());
     }
 
@@ -3060,6 +3464,86 @@ mod feature_tests {
     }
 
     #[tokio::test]
+    async fn season_keeps_unique_entries_across_overlapping_pages() {
+        let page = |ids: &[i64], more| {
+            let media = ids.iter().copied().map(mock_media).collect::<Vec<_>>();
+            (
+                200,
+                json!({"data":{"Page":{"pageInfo":{"hasNextPage":more},"media":media}}}),
+            )
+        };
+        let (api, mut requests) = mock_api(vec![
+            page(&[10, 11], true),
+            page(&[11, 12], true),
+            page(&[11, 12], true),
+            page(&[12, 13], false),
+        ])
+        .await;
+        let items = api.season_all("FALL", 2026).await.unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [10, 11, 12, 13]
+        );
+        for expected in 1..=4 {
+            assert_eq!(requests.try_recv().unwrap()["variables"]["page"], expected);
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn season_rejects_pages_without_usable_media_during_a_walk() {
+        let page = |media, more| {
+            (
+                200,
+                json!({"data":{"Page":{"pageInfo":{"hasNextPage":more},"media":media}}}),
+            )
+        };
+        for pages in [
+            vec![page(json!([]), true)],
+            vec![
+                page(json!([mock_media(10)]), true),
+                page(json!([null]), false),
+            ],
+        ] {
+            let (api, _) = mock_api(pages).await;
+            assert!(api
+                .season_all("FALL", 2026)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stopped returning entries"));
+        }
+    }
+
+    #[tokio::test]
+    async fn season_requires_the_walk_to_finish_at_or_before_page_twenty() {
+        for complete in [true, false] {
+            let pages = (1..=20)
+                .map(|id| {
+                    let more = id < 20 || !complete;
+                    (200, json!({"data":{"Page":{"pageInfo":{"hasNextPage":more},"media":[mock_media(1),mock_media(id)]}}}))
+                })
+                .collect();
+            let (api, mut requests) = mock_api(pages).await;
+            let result = api.season_all("FALL", 2026).await;
+            if complete {
+                let ids = result
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("20 pages"));
+            }
+            for page in 1..=20 {
+                assert_eq!(requests.try_recv().unwrap()["variables"]["page"], page);
+            }
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn unavailable_calendar_is_not_an_empty_calendar() {
         for page in [
             json!({"pageInfo":{"hasNextPage":false}}),
@@ -3079,6 +3563,101 @@ mod feature_tests {
     }
 
     #[tokio::test]
+    async fn calendar_rejects_a_missing_first_page_before_a_valid_later_page() {
+        let (api, mut requests) = mock_api(vec![
+            (
+                200,
+                json!({"data":{"Page":{
+                    "pageInfo":{"currentPage":1,"hasNextPage":true},"airingSchedules":[]
+                }}}),
+            ),
+            (
+                200,
+                json!({"data":{"Page":{
+                    "pageInfo":{"hasNextPage":false},
+                    "airingSchedules":[{"airingAt":180,"episode":2,"media":mock_media(26)}]
+                }}}),
+            ),
+        ])
+        .await;
+        assert!(api.airing_schedule(100, 200).await.is_err());
+        assert_eq!(requests.recv().await.unwrap()["variables"]["page"], 1);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn calendar_requires_new_rows_and_matching_page_numbers() {
+        let row = |id, airing_at, adult| {
+            let mut media = mock_media(id);
+            media["isAdult"] = json!(adult);
+            json!({"airingAt":airing_at,"episode":1,"media":media})
+        };
+        let first = row(1, 110, false);
+        let second = row(2, 120, true);
+        let third = row(3, 130, false);
+        let response = |info, rows| {
+            (
+                200,
+                json!({"data":{"Page":{"pageInfo":info,"airingSchedules":rows}}}),
+            )
+        };
+        let first_response = |rows| response(json!({"currentPage":1,"hasNextPage":true}), rows);
+        for (info, rows) in [
+            (
+                json!({"currentPage":2,"hasNextPage":false}),
+                vec![second.clone(), first.clone()],
+            ),
+            (
+                json!({"currentPage":1,"hasNextPage":false}),
+                vec![third.clone()],
+            ),
+            (
+                json!({"currentPage":null,"hasNextPage":false}),
+                vec![third.clone()],
+            ),
+            (json!({"hasNextPage":false}), vec![third.clone()]),
+        ] {
+            let (api, mut requests) = mock_api(vec![
+                first_response(vec![first.clone(), second.clone()]),
+                response(info.clone(), rows),
+            ])
+            .await;
+            assert!(api.airing_schedule(100, 200).await.is_err(), "{info}");
+            for page in 1..=2 {
+                assert_eq!(requests.try_recv().unwrap()["variables"]["page"], page);
+            }
+        }
+        for info in [
+            json!({"currentPage":2,"hasNextPage":false}),
+            json!({"currentPage":null,"hasNextPage":false}),
+            json!({"hasNextPage":true}),
+        ] {
+            let (api, mut requests) =
+                mock_api(vec![response(info.clone(), vec![first.clone()])]).await;
+            assert!(api.airing_schedule(100, 200).await.is_err(), "{info}");
+            assert_eq!(requests.try_recv().unwrap()["variables"]["page"], 1);
+            assert!(requests.try_recv().is_err());
+        }
+        let (api, _) = mock_api(vec![
+            first_response(vec![first.clone()]),
+            response(
+                json!({"currentPage":2,"hasNextPage":true}),
+                vec![first.clone(), second],
+            ),
+            response(
+                json!({"currentPage":3,"hasNextPage":false}),
+                vec![first, third],
+            ),
+        ])
+        .await;
+        let items = api.airing_schedule(100, 200).await.unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.media.id).collect::<Vec<_>>(),
+            [1, 3]
+        );
+    }
+
+    #[tokio::test]
     async fn search_returns_page_boundaries_from_anilist() {
         let (api, mut requests) = mock_api(vec![(
             200,
@@ -3093,13 +3672,38 @@ mod feature_tests {
     }
 
     #[tokio::test]
+    async fn search_rejects_unusable_pages_and_accepts_empty_results() {
+        for (media, more, valid) in [
+            (json!([null]), false, false),
+            (json!([mock_media(0)]), true, false),
+            (json!([]), true, false),
+            (json!([]), false, true),
+            (json!([null, mock_media(1)]), true, true),
+        ] {
+            let (api, _) = mock_api(vec![(
+                200,
+                json!({"data":{"Page":{"pageInfo":{"hasNextPage":more},"media":media}}}),
+            )])
+            .await;
+            assert_eq!(api.search_page("Show", 1, 25).await.is_ok(), valid);
+        }
+    }
+
+    #[tokio::test]
     async fn notification_pages_require_the_collection_and_page_boundary() {
         for page in [
-            json!({"pageInfo":{"hasNextPage":false}}),
-            json!({"pageInfo":{"hasNextPage":false},"notifications":null}),
+            json!({"pageInfo":{"currentPage":2,"hasNextPage":false}}),
+            json!({"pageInfo":{"currentPage":2,"hasNextPage":false},"notifications":null}),
             json!({"notifications":[]}),
-            json!({"notifications":[],"pageInfo":{}}),
-            json!({"notifications":[],"pageInfo":{"hasNextPage":null}}),
+            json!({"notifications":[],"pageInfo":{"currentPage":2}}),
+            json!({"notifications":[],"pageInfo":{"currentPage":2,"hasNextPage":null}}),
+            json!({"notifications":[],"pageInfo":{"hasNextPage":false}}),
+            json!({"notifications":[],"pageInfo":{"currentPage":null,"hasNextPage":false}}),
+            json!({"notifications":[],"pageInfo":{"currentPage":2,"hasNextPage":true}}),
+            json!({"notifications":[null,{}],"pageInfo":{"currentPage":2,"hasNextPage":false}}),
+            json!({"notifications":[{"id":1,"type":"AIRING"},{"id":2}],"pageInfo":{"currentPage":2,"hasNextPage":false}}),
+            json!({"notifications":[{"id":0,"type":"AIRING"}],"pageInfo":{"currentPage":2,"hasNextPage":false}}),
+            json!({"notifications":[{"id":1,"type":"AIRING","createdAt":i64::MIN}],"pageInfo":{"currentPage":2,"hasNextPage":false}}),
         ] {
             let (api, _) = mock_api(vec![(
                 200,
@@ -3108,24 +3712,52 @@ mod feature_tests {
             .await;
             assert!(api.notifications_page(2).await.is_err(), "{page}");
         }
+        let response = |count| {
+            (
+                200,
+                json!({"data":{"Viewer":{"unreadNotificationCount":count},"Page":{
+                    "pageInfo":{"currentPage":2,"hasNextPage":false},"notifications":[]
+                }}}),
+            )
+        };
+        let (api, _) = mock_api(vec![response(-1), response(0)]).await;
+        assert!(api.notifications_page(2).await.is_err());
+        let page = api.notifications_page(2).await.unwrap();
+        assert!(page.items.is_empty());
+        assert!(!page.has_next_page);
+        assert_eq!(page.unread_count, Some(0));
     }
 
     #[tokio::test]
     async fn notifications_keep_the_unread_count_and_comment_permalink() {
-        let (api, mut requests) = mock_api(vec![(200, json!({"data":{"Viewer":{"unreadNotificationCount":4},"Page":{"pageInfo":{"hasNextPage":true},"notifications":[{"id":8,"type":"THREAD_COMMENT_REPLY","commentId":22,"comment":{"siteUrl":"https://anilist.co/forum/thread/1/comment/22"}}]}}}))]).await;
+        let response = |current_page| {
+            (
+                200,
+                json!({"data":{"Viewer":{"unreadNotificationCount":4},"Page":{"pageInfo":{"currentPage":current_page,"hasNextPage":true},"notifications":[{"id":8,"type":"THREAD_COMMENT_REPLY","commentId":22,"comment":{"siteUrl":"https://anilist.co/forum/thread/1/comment/22"}}]}}}),
+            )
+        };
+        let (api, mut requests) = mock_api(vec![response(1), response(2)]).await;
+        assert!(api
+            .notifications_page(2)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("wrong notifications page"));
         let page = api.notifications_page(2).await.unwrap();
+        assert_eq!(page.page, 2);
         assert_eq!(page.unread_count, Some(4));
         assert!(page.has_next_page);
         assert_eq!(
             page.items[0].comment_url.as_deref(),
             Some("https://anilist.co/forum/thread/1/comment/22")
         );
-        let request = requests.recv().await.unwrap();
-        assert_eq!(request["variables"]["page"], 2);
-        assert!(request["query"]
-            .as_str()
-            .unwrap()
-            .contains("resetNotificationCount: false"));
+        for _ in 0..2 {
+            let request = requests.recv().await.unwrap();
+            assert_eq!(request["variables"]["page"], 2);
+            let query = request["query"].as_str().unwrap();
+            assert!(query.contains("currentPage"));
+            assert!(query.contains("resetNotificationCount: false"));
+        }
     }
 
     #[tokio::test]
@@ -3151,6 +3783,7 @@ mod feature_tests {
             json!({"data":{"Page":null}}),
             json!({"data":{"Page":{}}}),
             json!({"data":{"Page":{"notifications":null}}}),
+            json!({"data":{"Page":{"notifications":[123]}}}),
         ] {
             let (api, _) = mock_api(vec![(200, reply)]).await;
             let error = api
@@ -3361,17 +3994,59 @@ mod feature_tests {
             (200, json!({"data":{"SaveMediaListEntry":empty}})),
         ])
         .await;
+        let (entry_id, fetched) = api.entry_details_with_id(1).await.unwrap().unwrap();
+        assert_eq!(entry_id, 22);
         for details in [
-            api.entry_details(1).await.unwrap(),
-            api.save_entry_details(1, 22, Some(""), None, None, None)
-                .await
-                .unwrap(),
+            fetched,
+            api.save_entry_details(
+                1,
+                22,
+                Some(""),
+                Some(&FuzzyDate::default()),
+                Some(&FuzzyDate::default()),
+                Some(&[]),
+            )
+            .await
+            .unwrap(),
         ] {
             assert!(details.notes.is_empty());
             assert!(details.started_at.is_none());
             assert!(details.completed_at.is_none());
             assert!(details.custom_lists.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn details_save_requires_confirmation_of_each_requested_field() {
+        let reply = json!({"data":{"SaveMediaListEntry":{
+            "id":22,"mediaId":1,"notes":"Saved note",
+            "startedAt":{"year":2024,"month":null,"day":null},"completedAt":null,
+            "customLists":{"Favorites":true,"Rewatch":true,"Other":false}
+        }}});
+        let (api, _) = mock_api(vec![(200, reply); 5]).await;
+        let year = FuzzyDate {
+            year: Some(2024),
+            ..FuzzyDate::default()
+        };
+        let other_year = FuzzyDate {
+            year: Some(2025),
+            ..FuzzyDate::default()
+        };
+        let lists = ["Rewatch".into(), "Favorites".into()];
+        for (notes, started, completed, lists) in [
+            (Some("New note"), None, None, None),
+            (None, Some(&other_year), None, None),
+            (None, None, Some(&year), None),
+            (None, None, None, Some(&[][..])),
+        ] {
+            let result = api
+                .save_entry_details(1, 22, notes, started, completed, lists)
+                .await;
+            assert!(result.unwrap_err().is::<UnconfirmedEntryDetailsWrite>());
+        }
+        api.save_entry_details(1, 22, Some("Saved note"), Some(&year), None, Some(&lists))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

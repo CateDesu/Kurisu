@@ -635,6 +635,170 @@ fn time_ago(timestamp: Option<i64>) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn notification_retry_keeps_rows_and_unread_until_correct_page(tc: &mut gpui::TestAppContext) {
+        use std::time::{Duration, Instant};
+
+        use kurisu_core::{Core, Db, UpdateChannel, User};
+        use serde_json::json;
+
+        use crate::screens::fixture_server::{child_gate, serve};
+        use crate::screens::workspace_tests::{TestPlatform, fixture};
+
+        const CHILD: &str = "KURISU_NOTIFICATIONS_TEST_CHILD";
+        if child_gate(CHILD).is_none() {
+            let mut pages = Vec::new();
+            let mut resets = 0;
+            let thread = std::thread::current();
+            serve(
+                thread.name().unwrap(),
+                CHILD,
+                "KURISU_FIXTURE_GRAPHQL",
+                |mut http, _| {
+                    let request = http.json();
+                    let query = request["query"].as_str().unwrap();
+                    let (status, data) = if query.contains("resetNotificationCount: true") {
+                        resets += 1;
+                        if resets == 1 {
+                            (503, json!({"errors":[{"message":"Unavailable"}]}))
+                        } else {
+                            (200, json!({"data":{"Page":{"notifications":[{}]}}}))
+                        }
+                    } else if query.contains("resetNotificationCount: false") {
+                        assert!(query.contains("currentPage"));
+                        let page = request["variables"]["page"].as_i64().unwrap();
+                        pages.push(page);
+                        let (current, more, unread, items) = match pages.len() {
+                            1 => (1, true, 4, json!([{"id":5,"type":"FOLLOWING"}])),
+                            2 => (1, false, 0, json!([{"id":99,"type":"FOLLOWING"}])),
+                            3 => (2, true, 0, json!([])),
+                            4 => (2, true, 0, json!([null, {}])),
+                            5 => (2, true, 4, json!([{"__typename":"NewNotificationType"}])),
+                            6 => (
+                                3,
+                                false,
+                                3,
+                                json!([null, {}, {"id":5,"type":"FOLLOWING"},
+                                                      {"id":4,"type":"AIRING"}]),
+                            ),
+                            _ => panic!("unexpected notification page {page}"),
+                        };
+                        (
+                            200,
+                            json!({"data":{"Page":{"pageInfo":{"currentPage":current,"hasNextPage":more},
+                            "notifications":items},"Viewer":{"unreadNotificationCount":unread}}}),
+                        )
+                    } else {
+                        assert!(query.contains("Viewer"));
+                        (200, json!({"data":{"Viewer":{"id":7,"name":"Fixture"}}}))
+                    };
+                    http.reply_json(status, data).unwrap();
+                },
+            );
+            assert_eq!(pages, [1, 2, 2, 2, 2, 3]);
+            assert_eq!(resets, 2);
+            return;
+        }
+
+        let (seed, runtime, dir) = fixture();
+        drop(seed);
+        let db = Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = User {
+            id: 7,
+            name: "Fixture".into(),
+            ..Default::default()
+        };
+        db.replace_account("fixture-token", &user).unwrap();
+        let core = Core::from_db(
+            db,
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        );
+        let (view, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let wait = |cx: &mut gpui::TestAppContext| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                cx.run_until_parked();
+                if view.read_with(cx, |w, _| {
+                    !w.notifications.loading && !w.notifications.marking
+                }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "notification request timed out");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            }
+        };
+        let check = |cx: &mut gpui::TestAppContext, page, has_more, unread, ids: &[i64]| {
+            view.read_with(cx, |w, _| {
+                let state = &w.notifications;
+                assert!(state.loaded, "{}", state.error);
+                assert_eq!(
+                    (state.page, state.has_more, state.unread),
+                    (page, has_more, Some(unread))
+                );
+                assert_eq!(
+                    state.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+                    ids
+                );
+                assert_eq!(state.widget.as_ref().unwrap().item_count(), ids.len());
+            });
+        };
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.route = Route::Notifications;
+            w.enter_notifications(window, cx);
+        });
+        wait(cx);
+        check(cx, 1, true, 4, &[5]);
+
+        view.update_in(cx, |w, window, cx| w.load_notifications(true, window, cx));
+        wait(cx);
+        check(cx, 1, true, 4, &[5]);
+        view.read_with(cx, |w, _| {
+            assert!(w.notifications.error.contains("wrong notifications page"))
+        });
+        view.update_in(cx, |w, window, cx| w.load_notifications(true, window, cx));
+        wait(cx);
+        check(cx, 1, true, 4, &[5]);
+        view.read_with(cx, |w, _| {
+            assert!(w.notifications.error.contains("empty notifications page"))
+        });
+        view.update_in(cx, |w, window, cx| w.load_notifications(true, window, cx));
+        wait(cx);
+        check(cx, 1, true, 4, &[5]);
+        view.read_with(cx, |w, _| {
+            assert!(
+                w.notifications
+                    .error
+                    .contains("incomplete notifications page")
+            )
+        });
+        view.update_in(cx, |w, window, cx| w.load_notifications(true, window, cx));
+        wait(cx);
+        check(cx, 2, true, 4, &[5]);
+        view.read_with(cx, |w, _| assert!(w.notifications.error.is_empty()));
+        view.update_in(cx, |w, window, cx| w.load_notifications(true, window, cx));
+        wait(cx);
+        check(cx, 3, false, 3, &[5, 4]);
+        view.read_with(cx, |w, _| assert!(w.notifications.error.is_empty()));
+
+        view.update_in(cx, |w, window, cx| w.mark_notifications_read(window, cx));
+        wait(cx);
+        check(cx, 3, false, 3, &[5, 4]);
+        view.read_with(cx, |w, _| {
+            assert!(w.notifications.error.contains("Unavailable"))
+        });
+        view.update_in(cx, |w, window, cx| w.mark_notifications_read(window, cx));
+        wait(cx);
+        check(cx, 3, false, 0, &[5, 4]);
+        view.read_with(cx, |w, _| assert!(w.notifications.error.is_empty()));
+    }
+
     #[test]
     fn end_request_survives_paging_before_layout() {
         let rows = ListState::new(0, ListAlignment::Top, px(0.));

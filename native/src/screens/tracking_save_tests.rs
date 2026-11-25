@@ -12,6 +12,61 @@ mod tracking_read_tests;
 
 static NEXT_PROFILE: AtomicU64 = AtomicU64::new(0);
 
+#[gpui::test]
+fn tracking_threshold_accessibility_keeps_names_units_and_values(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let (workspace, cx) =
+        tc.add_window_view(|win, cx| Workspace::new(fixture.core.clone(), win, cx));
+    cx.simulate_resize(gpui::size(px(1100.), px(1400.)));
+    fixture.load(&workspace, cx);
+    for (mode, label, value, draft) in [
+        (
+            "prompt",
+            "Ask after this many seconds of playback",
+            "120",
+            "91",
+        ),
+        (
+            "auto",
+            "Update progress at this percentage watched",
+            "80",
+            "77",
+        ),
+    ] {
+        workspace.update_in(cx, |w, _, cx| w.edit_tracking_mode(mode, cx));
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (id, input) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::TextInput && node.label() == Some(label))
+            .unwrap_or_else(|| panic!("missing {label} input"));
+        assert_eq!(input.value(), Some(value));
+        assert_eq!(input.placeholder(), Some(value));
+        assert!(!input.is_disabled());
+        assert!(input.supports_action(gpui::AccessibleAction::SetValue));
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::SetValue,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *id,
+            data: Some(gpui::accesskit::ActionData::Value(draft.into())),
+        });
+        assert_eq!(published_control(cx, label).value(), Some(draft));
+
+        workspace.update_in(cx, |w, win, cx| {
+            w.request_close(CloseIntent::Window, win, cx)
+        });
+        let input = published_control(cx, label);
+        assert!(input.is_disabled(), "{label} remains editable during close");
+        assert_eq!(input.value(), Some(draft));
+        workspace.update_in(cx, |w, win, cx| w.resume_after_close(win, cx));
+        let input = published_control(cx, label);
+        assert!(!input.is_disabled());
+        assert_eq!(input.value(), Some(draft));
+    }
+}
+
 struct LocalPlatform;
 
 impl Platform for LocalPlatform {

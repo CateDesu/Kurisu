@@ -5,6 +5,7 @@ use gpui::{
     AnyElement, Context, Entity, FontWeight, ListAlignment, ListState, RenderImage, Subscription,
     WeakEntity, Window, div, img, list, prelude::*, px, rgb, svg,
 };
+use kurisu_core::EntryIdentity;
 use kurisu_core::models::{ListEntry, Media, SearchPage};
 
 use super::covers::CoverOwner;
@@ -217,18 +218,13 @@ impl Workspace {
         if self.search.rows.is_none() {
             let rows = ListState::new(0, ListAlignment::Top, px(290.))
                 .with_uniform_item_height(px(CARD_ROW_HEIGHT));
-            let weak = cx.weak_entity();
-            rows.set_scroll_handler(move |event, _window, app| {
-                let _ = weak.update(app, |this, _| {
-                    this.prefetch_search_covers(event.visible_range.clone())
-                });
-            });
             self.search.rows = Some(rows);
             self.search.columns = card_columns(window.bounds().size.width.into());
             self.reset_search_rows();
         }
         if !self.stopping
             && !self.writes_fenced()
+            && !self.search.searching
             && let Some((term, more)) = self.search.resume.take()
         {
             self.load_search_page(term, more, window, cx);
@@ -237,9 +233,6 @@ impl Workspace {
     }
 
     pub(super) fn leave_search(&mut self) {
-        if self.search.searching {
-            self.search.resume = Some((self.search.submitted.clone(), self.search.page > 0));
-        }
         self.search.request += 1;
         self.search.searching = false;
         self.cancel_reads("search");
@@ -285,16 +278,8 @@ impl Workspace {
         self.search.request += 1;
         let request = self.search.request;
         self.search.searching = true;
-        self.search.submitted = term.clone();
-        self.search.resume = None;
+        self.search.resume = Some((term.clone(), more));
         self.search.error.clear();
-        if !more {
-            self.search.results.clear();
-            self.search.page = 0;
-            self.search.has_more = false;
-            self.search.searched = false;
-            self.reset_search_rows();
-        }
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
@@ -309,20 +294,24 @@ impl Workspace {
                     || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
                     || this.search.request != request
-                    || this.search.submitted != term
                 {
                     return;
                 }
                 this.search.searching = false;
+                this.search.resume = None;
                 match result {
                     Ok(found) => {
                         let (results, page, has_more) =
                             merge_search_page(&this.search.results, found, more);
                         this.search.results = results;
+                        this.search.submitted = term;
                         this.search.page = page;
                         this.search.has_more = has_more;
                         this.search.searched = true;
                         this.reset_search_rows();
+                        if !more && let Some(rows) = &this.search.rows {
+                            rows.scroll_to(gpui::ListOffset::default());
+                        }
                         this.refresh_search_covers();
                     }
                     Err(error) => this.search.error = error,
@@ -359,8 +348,7 @@ impl Workspace {
 
     pub(super) fn refresh_search_covers(&mut self) {
         if let Some(rows) = self.search.rows.as_ref() {
-            let first = rows.logical_scroll_top().item_ix;
-            self.prefetch_search_covers(first..first.saturating_add(9));
+            self.prefetch_search_covers(super::covers::visible_card_rows(rows));
         }
     }
 
@@ -380,10 +368,6 @@ impl Workspace {
                 );
             }
             self.search.columns = columns;
-            cx.spawn_in(window, async move |this, cx| {
-                let _ = this.update_in(cx, |this, _, _| this.refresh_search_covers());
-            })
-            .detach();
         }
         let actions = self.search.input.clone().map(|input| {
             div()
@@ -416,7 +400,8 @@ impl Workspace {
                 )
                 .into_any()
         });
-        let mut page = div()
+        let mut page = self
+            .reconcile_card_covers_on_layout(div(), Route::Search, cx)
             .flex_1()
             .min_h_0()
             .px(px(if f32::from(window.viewport_size().width) <= 960. {
@@ -545,6 +530,7 @@ impl Workspace {
     pub(super) fn change_discovery_status(
         &mut self,
         media: Media,
+        identity: Option<EntryIdentity>,
         status: &'static str,
         origin: Route,
         window: &Window,
@@ -570,7 +556,7 @@ impl Workspace {
             let result = joined(
                 core.spawn(async move {
                     worker
-                        .update_entry(id, Some(status.into()), None, None, None)
+                        .update_discovery_status(id, account, identity, status.into())
                         .await
                 })
                 .await,
@@ -600,11 +586,14 @@ impl Workspace {
                         }
                         this.queue_list_refresh(Some(vec![id]), window, cx);
                     }
-                    Err(error) => match origin {
-                        Route::Search => this.search.action_error = error,
-                        Route::Seasons => this.seasons.action_error = error,
-                        _ => this.global_error = error,
-                    },
+                    Err(error) => {
+                        match origin {
+                            Route::Search => this.search.action_error = error,
+                            Route::Seasons => this.seasons.action_error = error,
+                            _ => this.global_error = error,
+                        }
+                        this.queue_list_refresh(Some(vec![id]), window, cx);
+                    }
                 }
                 this.check_barrier(window, cx);
                 cx.notify();
@@ -688,11 +677,17 @@ pub(super) fn media_card(
                 .overflow_hidden()
                 .border_b_1()
                 .border_color(rgb(EDGE))
-                .on_key_down({
+                .capture_key_down({
                     let weak = weak.clone();
                     move |event: &gpui::KeyDownEvent, window, app| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                        let stroke = &event.keystroke;
+                        if !stroke.modifiers.modified()
+                            && matches!(stroke.key.as_str(), "enter" | "space" | " ")
+                        {
                             app.stop_propagation();
+                            if event.is_held {
+                                return;
+                            }
                             let _ = weak.update(app, |this, cx| {
                                 this.navigate(Route::Anime(id), window, cx)
                             });
@@ -716,11 +711,17 @@ pub(super) fn media_card(
                 .focusable()
                 .tab_stop(true)
                 .cursor_pointer()
-                .on_key_down({
+                .capture_key_down({
                     let weak = weak.clone();
                     move |event: &gpui::KeyDownEvent, window, app| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                        let stroke = &event.keystroke;
+                        if !stroke.modifiers.modified()
+                            && matches!(stroke.key.as_str(), "enter" | "space" | " ")
+                        {
                             app.stop_propagation();
+                            if event.is_held {
+                                return;
+                            }
                             let _ = weak.update(app, |this, cx| {
                                 this.navigate(Route::Anime(id), window, cx)
                             });
@@ -768,6 +769,7 @@ pub(super) fn media_card(
             ("COMPLETED", "Completed"),
         ] {
             let selected = entry.as_ref().is_some_and(|entry| entry.status == status);
+            let identity = entry.as_ref().map(ListEntry::identity);
             let media = media.clone();
             let weak = weak.clone();
             let origin = origin.clone();
@@ -780,16 +782,24 @@ pub(super) fn media_card(
                     .px(px(8.))
                     .py(px(4.))
                     .rounded(px(3.))
-                    .on_key_down({
+                    .capture_key_down({
                         let weak = weak.clone();
                         let media = media.clone();
+                        let identity = identity.clone();
                         let origin = origin.clone();
                         move |event: &gpui::KeyDownEvent, window, app| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                            let stroke = &event.keystroke;
+                            if !stroke.modifiers.modified()
+                                && matches!(stroke.key.as_str(), "enter" | "space" | " ")
+                            {
                                 app.stop_propagation();
+                                if event.is_held {
+                                    return;
+                                }
                                 let _ = weak.update(app, |this, cx| {
                                     this.change_discovery_status(
                                         media.clone(),
+                                        identity.clone(),
                                         status,
                                         origin.clone(),
                                         window,
@@ -803,6 +813,7 @@ pub(super) fn media_card(
                         let _ = weak.update(app, |this, cx| {
                             this.change_discovery_status(
                                 media.clone(),
+                                identity.clone(),
                                 status,
                                 origin.clone(),
                                 window,
@@ -822,6 +833,97 @@ pub(super) fn media_card(
 mod tests {
     use super::*;
     use gpui::{Render, TestAppContext};
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn malformed_search_pages_preserve_results_and_retry_position(tc: &mut TestAppContext) {
+        use super::super::fixture_server::{child_gate, serve};
+        use super::super::workspace_tests::{prompt_restore_tests::signed_in_fixture, settle};
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "KURISU_MALFORMED_SEARCH_CHILD";
+        if child_gate(CHILD).is_none() {
+            let mut requests = [
+                ("Original", 1, Some(9), true),
+                ("Original", 2, None, true),
+                ("Original", 2, Some(10), false),
+                ("Replacement", 1, None, false),
+                ("Replacement", 1, Some(11), false),
+            ]
+            .into_iter();
+            serve(
+                std::thread::current().name().unwrap(),
+                CHILD,
+                "KURISU_FIXTURE_GRAPHQL",
+                |mut http, _| {
+                    let (term, page, id, more) = requests.next().expect("unexpected search");
+                    let request = http.json();
+                    assert_eq!(request["variables"]["search"], term);
+                    assert_eq!(request["variables"]["page"], page);
+                    let media = id.map(|id| {
+                        json!({
+                            "id": id, "idMal": null,
+                            "title": {"romaji": term, "english": null, "native": null},
+                            "coverImage": null, "episodes": 12, "format": null,
+                            "status": null, "averageScore": null, "season": null, "seasonYear": null,
+                            "description": null, "nextAiringEpisode": null
+                        })
+                    });
+                    http.reply_json(
+                        200,
+                        json!({"data":{"Page":{"media":[media],"pageInfo":{"hasNextPage":more}}}}),
+                    )
+                    .unwrap();
+                },
+            );
+            assert!(requests.next().is_none());
+            return;
+        }
+
+        let (core, runtime, user) = signed_in_fixture(None);
+        let (workspace, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.route = Route::Search;
+            w.enter_search(window, cx);
+        });
+        for (term, more, failed, page, has_more, expected_ids) in [
+            ("Original", false, false, 1, true, &[9][..]),
+            ("Original", true, true, 1, true, &[9][..]),
+            ("Original", true, false, 2, false, &[9, 10][..]),
+            ("Replacement", false, true, 2, false, &[9, 10][..]),
+            ("Replacement", false, false, 1, false, &[11][..]),
+        ] {
+            workspace.update_in(cx, |w, window, cx| {
+                w.search.query = term.into();
+                w.run_search(more, window, cx);
+                assert!(w.search.searching);
+            });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while workspace.read_with(cx, |w, _| w.search.searching) {
+                assert!(Instant::now() < deadline, "search did not finish");
+                settle(cx, &runtime);
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            }
+            workspace.read_with(cx, |w, _| {
+                assert_eq!(!w.search.error.is_empty(), failed, "{}", w.search.error);
+                assert_eq!(w.search.page, page);
+                assert_eq!(w.search.has_more, has_more);
+                assert_eq!(
+                    w.search
+                        .results
+                        .iter()
+                        .map(|media| media.id)
+                        .collect::<Vec<_>>(),
+                    expected_ids
+                );
+                assert_eq!(w.search.submitted, if failed { "Original" } else { term });
+            });
+        }
+    }
 
     #[test]
     fn end_request_survives_paging_and_reflow_before_layout() {

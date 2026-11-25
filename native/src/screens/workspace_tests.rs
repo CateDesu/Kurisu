@@ -10,8 +10,8 @@ use super::covers::CoverOwner;
 use super::my_list::MyListSlot;
 use super::same_prompt;
 use super::{
-    BarrierAction, CloseIntent, EditorInputs, ProgressEdit, QueuedPreference, Route, SortKey,
-    Workspace, freshness_plan, now_seconds,
+    BarrierAction, CloseIntent, EditorInputs, PreferenceEdit, ProgressEdit, QueuedPreference,
+    Route, SortKey, Workspace, freshness_plan, now_seconds,
 };
 use crate::components::input::TextInput;
 
@@ -24,6 +24,74 @@ fn my_list_slots_translate_header_media_and_footer_without_id_sentinels() {
     assert_eq!(MyListSlot::at(4, 3), MyListSlot::Footer);
     assert_eq!(MyListSlot::media_range(0..5, 3), 0..3);
     assert_eq!(MyListSlot::media_range(4..5, 3), 3..3);
+}
+
+#[gpui::test]
+fn score_format_change_updates_visible_score_order_before_refresh(cx: &mut TestAppContext) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    workspace.update_in(cx, |w, window, cx| {
+        let user = User {
+            id: 47,
+            score_format: Some("POINT_10_DECIMAL".into()),
+            ..Default::default()
+        };
+        w.profile = Some(user.clone());
+        let entry = |id, title: &str, status: &str, score| ListEntry {
+            media_id: id,
+            status: status.into(),
+            score,
+            media: Some(Media {
+                id,
+                title_english: Some(title.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        w.list.set_filter("PAUSED", 0);
+        w.list.set_query(" show ".into(), 0);
+        w.list.set_sort(SortKey::Score, 0);
+        w.list.replace(
+            vec![
+                entry(1, "Show 10", "PAUSED", Some(8.4)),
+                entry(2, "Show 2", "PAUSED", Some(8.4)),
+                entry(3, "Show 30", "PAUSED", Some(8.6)),
+                entry(4, "Show 1", "PAUSED", Some(0.0)),
+                entry(5, "Show 0", "CURRENT", Some(9.9)),
+                entry(6, "Other", "PAUSED", Some(9.8)),
+                entry(7, "Show 3", "PAUSED", None),
+            ],
+            0,
+        );
+        assert_eq!(w.list.visible(), &[3, 2, 1, 4, 7]);
+        w.list.set_desc(false, 0);
+        w.reset_list_widget();
+        assert_eq!(w.visible_ids.as_slice(), &[2, 1, 3, 4, 7]);
+        let inset = gpui::px(13.);
+        w.list_widget.scroll_to(gpui::ListOffset {
+            item_ix: MyListSlot::item_ix(2),
+            offset_in_item: inset,
+        });
+        w.set_profile(
+            Some(User {
+                score_format: Some("POINT_5".into()),
+                ..user
+            }),
+            window,
+            cx,
+        );
+        assert_eq!(w.visible_ids.as_slice(), &[4, 2, 7, 1, 3]);
+        assert_eq!(w.list.filter, "PAUSED");
+        assert_eq!(w.list.query, " show ");
+        assert_eq!(w.list.sort, SortKey::Score);
+        assert!(!w.list.desc);
+        let top = w.list_widget.logical_scroll_top();
+        assert_eq!(top.item_ix, MyListSlot::item_ix(4));
+        assert_eq!(top.offset_in_item, inset);
+        assert!(w.list_refresh_queued);
+    });
+    cx.update(|window, _| window.remove_window());
 }
 
 #[path = "auth_tests.rs"]
@@ -312,6 +380,13 @@ fn queued_value(edit: &Option<QueuedPreference>) -> Option<Option<&str>> {
     edit.as_ref().map(|edit| edit.value.as_deref())
 }
 
+fn queued_setting_value(edit: &Option<PreferenceEdit>) -> Option<Option<&str>> {
+    match edit {
+        Some(PreferenceEdit::Setting(edit)) => Some(edit.value.as_deref()),
+        _ => None,
+    }
+}
+
 #[gpui::test]
 fn quick_close_flushes_latest_query_before_the_debounce(cx: &mut TestAppContext) {
     let (core, runtime, _dir) = fixture();
@@ -474,14 +549,17 @@ fn query_write_failure_blocks_close_until_retry(cx: &mut TestAppContext) {
 fn nonquery_failure_retains_latest_intent_and_blocks_close(cx: &mut TestAppContext) {
     let (core, runtime, dir) = fixture();
     let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
-    db.0.lock().execute_batch("CREATE TABLE preference_attempts (key TEXT, value TEXT);
-        CREATE TRIGGER fail_preferences BEFORE INSERT ON settings
-        WHEN NEW.key IN ('native_preference:kurisu.list.filter', 'native_preference:kurisu.list.sort', 'native_preference:kurisu.list.dir')
-        BEGIN
-          INSERT INTO preference_attempts VALUES (NEW.key, NEW.value);
-          SELECT RAISE(FAIL, 'preference storage failure');
-        END;").unwrap();
+    db.set_setting("native_preference:kurisu.list.sort", "title")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.dir", "desc")
+        .unwrap();
+    db.0.lock().execute_batch(
+        "CREATE TRIGGER fail_preferences BEFORE INSERT ON settings
+        WHEN NEW.key IN ('native_preference:kurisu.list.filter', 'native_preference:kurisu.list.dir')
+        BEGIN SELECT RAISE(FAIL, 'preference storage failure'); END;"
+    ).unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    settle(cx, &runtime);
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.select_filter("COMPLETED", window, cx);
         workspace.select_sort(SortKey::Score, window, cx);
@@ -504,35 +582,22 @@ fn nonquery_failure_retains_latest_intent_and_blocks_close(cx: &mut TestAppConte
                 .is_some_and(|err| err.contains("preference storage failure"))
         );
         assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
+            queued_setting_value(&workspace.preference_writes["kurisu.list.filter"].pending),
             Some(Some("COMPLETED"))
         );
-        assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.sort"].pending),
-            Some(Some("score"))
-        );
-        assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.dir"].pending),
-            Some(Some("asc"))
-        );
-    });
-    let attempts: i64 =
-        db.0.lock()
-            .query_row("SELECT COUNT(*) FROM preference_attempts", [], |row| {
-                row.get(0)
+        let sort = &workspace.preference_writes["kurisu.list.sort"];
+        assert!(sort.error.is_some());
+        assert!(matches!(
+            sort.pending,
+            Some(PreferenceEdit::Sort {
+                key: SortKey::Score,
+                descending: false,
             })
-            .unwrap();
-    assert_eq!(attempts, 2);
-    let attempted_direction: String = db
-        .0
-        .lock()
-        .query_row(
-            "SELECT value FROM preference_attempts WHERE key = 'native_preference:kurisu.list.dir'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(attempted_direction, "asc");
+        ));
+    });
+    let [sort, direction] = core.get_list_sort_preferences();
+    assert_eq!(sort.unwrap().as_deref(), Some("title"));
+    assert_eq!(direction.unwrap().as_deref(), Some("desc"));
     cx.update(|window, app| window.draw(app).clear(app));
     assert!(cx.debug_bounds("retry-barrier").is_some());
 
@@ -660,6 +725,7 @@ fn torrent_preference_failures_block_transitions_until_explicit_retry(cx: &mut T
 fn nonquery_close_waits_for_locked_sqlite_writer(cx: &mut TestAppContext) {
     let (core, runtime, dir) = fixture();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    settle(cx, &runtime);
     let lock_db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
     lock_db.0.lock().execute_batch("BEGIN IMMEDIATE;").unwrap();
     workspace.update_in(cx, |workspace, window, cx| {
@@ -741,11 +807,11 @@ fn nonquery_reset_deletion_settles_after_older_value(cx: &mut TestAppContext) {
             cx,
         );
         assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
+            queued_setting_value(&workspace.preference_writes["kurisu.list.filter"].pending),
             Some(None)
         );
         assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.synced"].pending),
+            queued_setting_value(&workspace.preference_writes["kurisu.list.synced"].pending),
             Some(None)
         );
     });
@@ -826,12 +892,12 @@ fn nonquery_selection_after_reset_supersedes_pending_delete(cx: &mut TestAppCont
             cx,
         );
         assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
+            queued_setting_value(&workspace.preference_writes["kurisu.list.filter"].pending),
             Some(None)
         );
         workspace.select_filter("PLANNING", window, cx);
         assert_eq!(
-            queued_value(&workspace.preference_writes["kurisu.list.filter"].pending),
+            queued_setting_value(&workspace.preference_writes["kurisu.list.filter"].pending),
             Some(Some("PLANNING"))
         );
     });
@@ -856,8 +922,7 @@ fn nonquery_superseded_failure_saves_newer_value(cx: &mut TestAppContext) {
     let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
     db.0.lock()
         .execute_batch(
-            "CREATE TABLE old_sort_attempts (value TEXT);
-        CREATE TRIGGER fail_old_filter BEFORE INSERT ON settings
+            "CREATE TRIGGER fail_old_filter BEFORE INSERT ON settings
         WHEN NEW.key = 'native_preference:kurisu.list.filter' AND NEW.value = 'PLANNING'
         BEGIN
           SELECT RAISE(FAIL, 'old value rejected');
@@ -865,14 +930,15 @@ fn nonquery_superseded_failure_saves_newer_value(cx: &mut TestAppContext) {
         CREATE TRIGGER fail_old_sort BEFORE INSERT ON settings
         WHEN NEW.key = 'native_preference:kurisu.list.sort' AND NEW.value = 'title'
         BEGIN
-          INSERT INTO old_sort_attempts VALUES (NEW.value);
           SELECT RAISE(FAIL, 'old sort rejected');
         END;",
         )
         .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    settle(cx, &runtime);
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.select_sort(SortKey::Title, window, cx);
+        assert_eq!(workspace.preference_active, Some("kurisu.list.sort"));
         workspace.select_sort(SortKey::Score, window, cx);
         workspace.select_filter("PLANNING", window, cx);
         workspace.select_filter("COMPLETED", window, cx);
@@ -885,13 +951,6 @@ fn nonquery_superseded_failure_saves_newer_value(cx: &mut TestAppContext) {
         assert!(workspace.preference_error().is_none());
         assert!(!workspace.preference_has_work());
     });
-    let old_attempts: i64 =
-        db.0.lock()
-            .query_row("SELECT COUNT(*) FROM old_sort_attempts", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-    assert_eq!(old_attempts, 1);
     assert_eq!(
         runtime
             .block_on(core.get_preference("kurisu.list.filter".into()))
@@ -948,7 +1007,6 @@ fn late_preference_read_preserves_new_local_selection(cx: &mut TestAppContext) {
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.select_filter("COMPLETED", window, cx);
-        workspace.select_sort(SortKey::Score, window, cx);
         workspace.list.synced_at = Some(456);
         workspace.persist_preference("kurisu.list.synced", Some("456".into()), window, cx);
     });
@@ -956,14 +1014,14 @@ fn late_preference_read_preserves_new_local_selection(cx: &mut TestAppContext) {
     workspace.read_with(cx, |workspace, _| {
         assert!(workspace.preferences_loaded);
         assert_eq!(workspace.list.filter, "COMPLETED");
-        assert_eq!(workspace.list.sort, SortKey::Score);
-        assert!(workspace.list.desc);
+        assert_eq!(
+            (workspace.list.sort, workspace.list.desc),
+            (SortKey::Title, false)
+        );
         assert_eq!(workspace.list.synced_at, Some(456));
     });
     for (key, expected) in [
         ("kurisu.list.filter", "COMPLETED"),
-        ("kurisu.list.sort", "score"),
-        ("kurisu.list.dir", "desc"),
         ("kurisu.list.synced", "456"),
     ] {
         assert_eq!(
@@ -974,6 +1032,221 @@ fn late_preference_read_preserves_new_local_selection(cx: &mut TestAppContext) {
             Some(expected)
         );
     }
+}
+
+#[gpui::test]
+fn unreadable_list_preferences_leave_other_values_and_can_reload(cx: &mut TestAppContext) {
+    let (core, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.set_setting("native_preference:kurisu.list.filter", "COMPLETED")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.sort", "score")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.synced", "123")
+        .unwrap();
+    db.0.lock()
+        .execute_batch(
+            "INSERT INTO settings(key, value) VALUES
+         ('native_preference:kurisu.list.q', X'FF'),
+         ('native_preference:kurisu.list.dir', X'FF');",
+        )
+        .unwrap();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    view.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        w.list.loaded = true;
+        cx.notify();
+    });
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert!(w.preferences_loaded);
+        assert!(!w.sort_preferences_loaded);
+        assert_eq!(w.list.filter, "COMPLETED");
+        assert_eq!(w.list.sort, SortKey::Score);
+        assert_eq!(w.list.synced_at, Some(123));
+        assert_eq!(w.preference_read_errors.len(), 2);
+    });
+    cx.simulate_accessibility_activation();
+    cx.update(|window, app| window.draw(app).clear(app));
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    assert!(tree.nodes.iter().any(|(_, node)| {
+        node.role() == gpui::Role::Alert
+            && node.label().is_some_and(|label| {
+                label.contains("Could not load the list search") && label.contains("sort direction")
+            })
+    }));
+
+    view.update_in(cx, |w, window, cx| w.select_filter("PLANNING", window, cx));
+    db.set_setting("native_preference:kurisu.list.q", "Synthetic")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.dir", "asc")
+        .unwrap();
+    let retry = cx.debug_bounds("retry-list-preference-read").unwrap();
+    cx.simulate_click(retry.center(), gpui::Modifiers::default());
+    settle(cx, &runtime);
+    view.read_with(cx, |w, app| {
+        assert!(w.preference_read_errors.is_empty());
+        assert!(w.sort_preferences_loaded);
+        assert_eq!(w.list.filter, "PLANNING");
+        assert_eq!(w.list.query, "Synthetic");
+        assert_eq!(w.list_query.read(app).value(), "Synthetic");
+        assert_eq!((w.list.sort, w.list.desc), (SortKey::Score, false));
+    });
+}
+
+#[gpui::test]
+fn retry_list_preferences_preserves_debounced_search(cx: &mut TestAppContext) {
+    let (core, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.0.lock()
+        .execute_batch(
+            "INSERT INTO settings(key, value) VALUES
+             ('native_preference:kurisu.list.q', X'FF'),
+             ('native_preference:kurisu.list.dir', X'FF');",
+        )
+        .unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
+    view.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        w.list.replace(
+            vec![
+                ListEntry {
+                    media_id: 7,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                },
+                ListEntry {
+                    media_id: 8,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        );
+        w.reset_list_widget();
+        cx.notify();
+    });
+    settle(cx, &runtime);
+    assert_eq!(view.read_with(cx, |w, _| w.preference_read_errors.len()), 2);
+    view.update_in(cx, |w, window, cx| {
+        w.list_query.update(cx, |input, cx| {
+            input.replace_text_in_range(None, "#7", window, cx);
+        });
+    });
+    db.set_setting("native_preference:kurisu.list.q", "#8")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.dir", "asc")
+        .unwrap();
+    cx.update(|window, app| window.draw(app).clear(app));
+    let retry = cx.debug_bounds("retry-list-preference-read").unwrap();
+    cx.simulate_click(retry.center(), gpui::Modifiers::default());
+    settle(cx, &runtime);
+    view.read_with(cx, |w, app| {
+        assert!(w.sort_preferences_loaded);
+        assert!(w.preference_read_errors.is_empty());
+        assert_eq!(w.list.query, "#7");
+        assert_eq!(w.list_query.read(app).value(), "#7");
+        assert_eq!(w.visible_ids.as_slice(), &[7]);
+    });
+    view.update_in(cx, |w, window, cx| w.save_query(window, cx));
+    settle(cx, &runtime);
+    assert_eq!(
+        runtime.block_on(core.get_preference("kurisu.list.q".into())),
+        Ok(Some("#7".into()))
+    );
+}
+
+#[gpui::test]
+fn retry_list_sort_uses_defaults_for_removed_settings(cx: &mut TestAppContext) {
+    let (core, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.0.lock()
+        .execute_batch(
+            "INSERT INTO settings(key, value) VALUES
+             ('native_preference:kurisu.list.sort', 'score'),
+             ('native_preference:kurisu.list.dir', X'FF');",
+        )
+        .unwrap();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert!(!w.sort_preferences_loaded);
+        assert_eq!((w.list.sort, w.list.desc), (SortKey::Score, true));
+    });
+    db.delete_setting("native_preference:kurisu.list.sort")
+        .unwrap();
+    db.delete_setting("native_preference:kurisu.list.dir")
+        .unwrap();
+    view.update_in(cx, |w, window, cx| w.load_preferences(window, cx));
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert!(w.sort_preferences_loaded);
+        assert_eq!((w.list.sort, w.list.desc), (SortKey::Title, false));
+    });
+}
+
+#[gpui::test]
+fn sort_controls_are_disabled_until_preferences_restore(cx: &mut TestAppContext) {
+    let (core, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    db.set_setting("native_preference:kurisu.list.sort", "score")
+        .unwrap();
+    db.set_setting("native_preference:kurisu.list.dir", "asc")
+        .unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new_with_session_restore(core.clone(), window, cx, false)
+    });
+    view.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        w.list.loaded = true;
+        cx.notify();
+    });
+    cx.simulate_accessibility_activation();
+    cx.run_until_parked();
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    for (selector, label) in [
+        ("sort-select", "Sort list"),
+        ("sort-direction", "Ascending, click for descending"),
+    ] {
+        let (_, node) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .unwrap();
+        assert!(node.is_disabled());
+        assert!(!node.supports_action(gpui::AccessibleAction::Click));
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    }
+    view.read_with(cx, |w, _| {
+        assert!(!w.sort_open && !w.preference_has_work());
+        assert_eq!((w.list.sort, w.list.desc), (SortKey::Title, false));
+    });
+    settle(cx, &runtime);
+    view.read_with(cx, |w, _| {
+        assert!(w.sort_preferences_loaded);
+        assert_eq!((w.list.sort, w.list.desc), (SortKey::Score, false));
+    });
+    let [_, direction] = core.get_list_sort_preferences();
+    assert_eq!(direction.unwrap().as_deref(), Some("asc"));
 }
 
 #[gpui::test]
@@ -1101,6 +1374,19 @@ fn calendar_choice_survives_account_reset(cx: &mut TestAppContext, reject: bool)
     db.set_setting("native_preference:kurisu.cal.mine", "1")
         .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
+    let wait_for_preferences = |cx: &mut gpui::VisualTestContext| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| {
+            w.preference_has_work() && w.preference_error().is_none()
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "Preference writes did not settle"
+            );
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            cx.run_until_parked();
+        }
+    };
     settle(cx, &runtime);
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.set_profile(
@@ -1128,7 +1414,7 @@ fn calendar_choice_survives_account_reset(cx: &mut TestAppContext, reject: bool)
         assert!(workspace.preference_has_work());
     });
     if reject {
-        settle(cx, &runtime);
+        wait_for_preferences(cx);
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.preference_error().is_some());
         });
@@ -1163,7 +1449,6 @@ fn calendar_choice_survives_account_reset(cx: &mut TestAppContext, reject: bool)
         assert!(workspace.barrier.is_some());
         workspace.cancel_barrier(window, cx);
     });
-    settle(cx, &runtime);
     if reject {
         assert_eq!(
             db.get_setting("native_preference:kurisu.cal.mine")
@@ -1177,10 +1462,15 @@ fn calendar_choice_survives_account_reset(cx: &mut TestAppContext, reject: bool)
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.retry_preferences(window, cx);
         });
-        settle(cx, &runtime);
     }
+    wait_for_preferences(cx);
     workspace.update_in(cx, |workspace, window, cx| {
-        assert!(!workspace.preference_has_work());
+        assert!(
+            !workspace.preference_has_work(),
+            "Active preference: {:?}, save error: {:?}",
+            workspace.preference_active,
+            workspace.preference_error(),
+        );
         assert!(workspace.preference_error().is_none());
         workspace.navigate(Route::MyList, window, cx);
         workspace.navigate(Route::Calendar, window, cx);
@@ -1599,12 +1889,12 @@ fn discovery_status_waits_for_progress_review_and_modal_dismissal(cx: &mut TestA
             w.route = route.clone();
             w.progress.entry(w.generation, &row).requires_review = true;
             assert!(w.discovery_status_blocked(9));
-            w.change_discovery_status(media.clone(), "PLANNING", route.clone(), window, cx);
+            w.change_discovery_status(media.clone(), None, "PLANNING", route.clone(), window, cx);
             w.progress.entry(w.generation, &row).requires_review = false;
             assert!(!w.discovery_status_blocked(9));
             w.update = Some(update_fixture());
             assert!(w.discovery_status_blocked(9));
-            w.change_discovery_status(media.clone(), "PLANNING", route, window, cx);
+            w.change_discovery_status(media.clone(), None, "PLANNING", route, window, cx);
             w.add_media(9, "PLANNING", None, window, cx);
             w.update = None;
             assert!(!w.editor_adding.contains(&9));
@@ -1939,6 +2229,74 @@ fn my_list_header_rows_and_footer_share_one_measured_scroll(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn my_list_progress_conflict_keeps_the_two_buffered_steps(cx: &mut TestAppContext) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    let user = User {
+        id: 7,
+        offline: true,
+        ..Default::default()
+    };
+    db.replace_account("synthetic-token", &user).unwrap();
+    let media = Media {
+        id: 9,
+        episodes: Some(12),
+        ..Default::default()
+    };
+    let before = ListEntry {
+        id: Some(21),
+        media_id: 9,
+        status: "CURRENT".into(),
+        progress: 5,
+        media: Some(media.clone()),
+        ..Default::default()
+    };
+    db.upsert_media(&media).unwrap();
+    db.upsert_entry(&before).unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    workspace.update_in(cx, |w, window, cx| {
+        w.profile = Some(user);
+        w.offline = true;
+        w.list.replace(vec![before.clone()], 0);
+        w.step_progress(9, 1, window, cx);
+        w.step_progress(9, 1, window, cx);
+        db.upsert_entry(&ListEntry {
+            progress: 6,
+            ..before
+        })
+        .unwrap();
+        w.save_progress(9, window, cx);
+    });
+    settle(cx, &runtime);
+    workspace.update_in(cx, |w, window, cx| {
+        let edit = w.progress.edit(w.generation, 9).unwrap();
+        assert!(!edit.in_flight && edit.requires_review);
+        assert_eq!(
+            (edit.saved, edit.pending, edit.remote_progress),
+            (5, 7, Some(6))
+        );
+        assert_eq!(w.list.entry(9).unwrap().progress, 6);
+        assert!(!w.can_retry_progress_errors());
+        let review = w.progress.review(w.generation, 9).unwrap();
+        w.resolve_progress_review(&review, false, window, cx);
+        let edit = w.progress.edit(w.generation, 9).unwrap();
+        assert_eq!((edit.saved, edit.pending), (6, 6));
+        assert!(!edit.requires_review);
+    });
+    assert_eq!(db.get_entry(9).unwrap().unwrap().progress, 6);
+    cx.update(|window, _| window.remove_window());
+}
+
+#[gpui::test]
 fn episode_event_reconciles_open_views_from_the_current_account_cache(cx: &mut TestAppContext) {
     let (first, runtime, dir) = fixture();
     let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
@@ -2048,6 +2406,123 @@ fn episode_event_reconciles_open_views_from_the_current_account_cache(cx: &mut T
         assert_eq!(inputs.progress.read(app).value(), "14");
         assert_eq!(inputs.notes.read(app).value(), "Keep this draft");
         assert!(!w.read_aborts.contains_key("detail"));
+    });
+}
+
+#[gpui::test]
+fn scoped_episode_total_clear_updates_discovery_and_unblocks_detail_progress(
+    tc: &mut TestAppContext,
+) {
+    let (first, runtime, dir) = fixture();
+    let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+    let user = User {
+        id: 7,
+        offline: true,
+        ..Default::default()
+    };
+    db.replace_account("synthetic-token", &user).unwrap();
+    drop(first);
+    let core = Core::open(
+        dir.0.clone(),
+        runtime.handle().clone(),
+        Arc::new(TestPlatform),
+        UpdateChannel::Native,
+    )
+    .unwrap();
+    let media = Media {
+        id: 9,
+        title_english: Some("Episode total fixture".into()),
+        episodes: Some(12),
+        ..Default::default()
+    };
+    let entry = ListEntry {
+        id: Some(90),
+        media_id: media.id,
+        status: "CURRENT".into(),
+        progress: 12,
+        media: Some(media.clone()),
+        ..Default::default()
+    };
+    db.upsert_entry(&entry).unwrap();
+    let (workspace, cx) = tc
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    workspace.update_in(cx, |w, _, _| {
+        w.offline = user.offline;
+        w.last_reconnect_attempt = Some(Instant::now());
+        w.profile = Some(user);
+        w.route = Route::Anime(media.id);
+        w.list.replace(vec![entry], 0);
+        let request = w.detail.start(media.id);
+        w.detail.finish_detail(
+            media.id,
+            request,
+            Ok(kurisu_core::models::MediaDetail {
+                media: media.clone(),
+                relations: vec![],
+                characters: vec![],
+                staff: vec![],
+                cached_at: None,
+                warning: None,
+                unavailable_sections: vec![],
+            }),
+        );
+        w.search.results.push(media.clone());
+        w.search.results[0].episodes = Some(13);
+        w.seasons.media.push(media.clone());
+    });
+    let refresh = |cx: &mut gpui::VisualTestContext| {
+        let read = workspace.update_in(cx, |w, window, cx| {
+            assert!(!w.list.syncing);
+            w.refresh_scoped(vec![media.id], 7, window, cx);
+            w.read_aborts["list"][0].clone()
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !read.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert!(w.list_read.is_none());
+            assert!(w.list.error.is_empty(), "{}", w.list.error);
+        });
+    };
+    let assert_total = |w: &Workspace, expected| {
+        assert_eq!(w.detail.detail.as_ref().unwrap().media.episodes, expected);
+        assert_eq!(w.seasons.media[0].episodes, expected);
+    };
+    refresh(cx);
+    workspace.read_with(cx, |w, _| {
+        assert_total(w, Some(12));
+        assert_eq!(w.search.results[0].episodes, Some(13));
+    });
+
+    db.upsert_media(&media).unwrap();
+    refresh(cx);
+    workspace.read_with(cx, |w, _| {
+        assert_total(w, Some(12));
+        assert_eq!(w.search.results[0].episodes, Some(12));
+    });
+
+    db.upsert_media(&Media {
+        episodes: None,
+        ..media.clone()
+    })
+    .unwrap();
+    refresh(cx);
+    workspace.update_in(cx, |w, window, cx| {
+        assert_total(w, None);
+        assert_eq!(w.search.results[0].episodes, None);
+        assert_eq!(
+            w.list.entry(9).unwrap().media.as_ref().unwrap().episodes,
+            None
+        );
+        w.step_progress(9, 1, window, cx);
+        assert_eq!(w.progress.edit(w.generation, 9).unwrap().pending, 13);
     });
 }
 
@@ -2534,13 +3009,9 @@ fn my_list_navigation_restores_header_and_media_anchors(cx: &mut TestAppContext)
             item_ix: 0,
             offset_in_item: gpui::px(35.),
         });
-        workspace.remember_scroll();
-        workspace.route = Route::Search;
-        workspace.list_widget.scroll_to(gpui::ListOffset {
-            item_ix: 0,
-            offset_in_item: gpui::px(0.),
-        });
-        workspace.switch_route(Route::MyList, window, cx);
+        workspace.navigate(Route::Search, window, cx);
+        workspace.list_widget.scroll_to(gpui::ListOffset::default());
+        workspace.back(window, cx);
         assert_eq!(workspace.list_widget.logical_scroll_top().item_ix, 0);
         assert_eq!(
             workspace.list_widget.logical_scroll_top().offset_in_item,
@@ -2551,16 +3022,106 @@ fn my_list_navigation_restores_header_and_media_anchors(cx: &mut TestAppContext)
             item_ix: MyListSlot::item_ix(12),
             offset_in_item: gpui::px(9.),
         });
-        workspace.remember_scroll();
-        workspace.route = Route::Search;
-        workspace.list_widget.scroll_to(gpui::ListOffset {
-            item_ix: 0,
-            offset_in_item: gpui::px(0.),
-        });
-        workspace.switch_route(Route::MyList, window, cx);
+        workspace.navigate(Route::Search, window, cx);
+        workspace.list_widget.scroll_to(gpui::ListOffset::default());
+        workspace.back(window, cx);
         let top = workspace.list_widget.logical_scroll_top();
         assert_eq!(workspace.list.visible()[top.item_ix - 1], 13);
         assert_eq!(top.offset_in_item, gpui::px(9.));
+    });
+}
+
+#[gpui::test]
+fn my_list_back_restores_latest_media_anchor(cx: &mut TestAppContext) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    workspace.update_in(cx, |w, window, cx| {
+        w.profile = Some(User {
+            id: 47,
+            offline: true,
+            ..Default::default()
+        });
+        w.offline = true;
+        w.list.replace(
+            (1..=40)
+                .map(|id| ListEntry {
+                    media_id: id,
+                    status: "CURRENT".into(),
+                    media: Some(Media {
+                        id,
+                        title_english: Some(format!("Show {id:02}")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            100,
+        );
+        w.reset_list_widget();
+        w.navigate(Route::Settings, window, cx);
+        w.navigate(Route::MyList, window, cx);
+        w.list_widget.scroll_to(gpui::ListOffset {
+            item_ix: MyListSlot::item_ix(20),
+            offset_in_item: gpui::px(7.),
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    workspace.update_in(cx, |w, window, cx| {
+        let before = w.list_widget.logical_scroll_top();
+        assert_eq!(before.item_ix, 21);
+        let media = w.list.visible()[before.item_ix - 1];
+        w.back(window, cx);
+        assert_eq!(w.route, Route::Settings);
+        w.list.desc = !w.list.desc;
+        w.list.rebuild(now_seconds());
+        w.reset_list_widget();
+        w.back(window, cx);
+        assert_eq!(w.route, Route::MyList);
+        let after = w.list_widget.logical_scroll_top();
+        assert_ne!(after.item_ix, before.item_ix);
+        assert_eq!(w.list.visible()[after.item_ix - 1], media);
+        assert_eq!(after.offset_in_item, before.offset_in_item);
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |w, _| {
+        let top = w.list_widget.logical_scroll_top();
+        assert_eq!(w.list.visible()[top.item_ix - 1], 21);
+        assert_eq!(top.offset_in_item, gpui::px(7.));
+    });
+}
+
+#[gpui::test]
+fn my_list_renders_episode_totals_above_i64_max(cx: &mut TestAppContext) {
+    let (core, _runtime, _dir) = fixture();
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    workspace.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 47,
+            offline: true,
+            ..Default::default()
+        });
+        w.list.replace(
+            [(1, i64::MAX), (2, 2)]
+                .into_iter()
+                .map(|(media_id, progress)| ListEntry {
+                    media_id,
+                    progress,
+                    status: "CURRENT".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            0,
+        );
+        w.reset_list_widget();
+        cx.notify();
+    });
+    cx.update(|window, app| window.draw(app).clear(app));
+    assert!(cx.debug_bounds("my-list-heading").is_some());
+    workspace.read_with(cx, |w, _| {
+        assert_eq!(w.list.tracked_episodes(), i128::from(i64::MAX) + 2);
     });
 }
 
@@ -3366,6 +3927,7 @@ fn library_add_folder_and_watching_update_button_respect_busy_and_close_fences(
     })
     .unwrap();
     db.upsert_entry(&ListEntry {
+        id: Some(90),
         media_id: 9,
         status: "CURRENT".into(),
         progress: 2,
@@ -3778,9 +4340,9 @@ fn discard_barrier_clears_failed_progress_behind_inflight_closes_dirty_editor_an
         w.stage_query(Some("unsubmitted".into()));
         w.query_error = "query failed".into();
         let pref = w.preference_writes.entry("kurisu.list.sort").or_default();
-        pref.pending = Some(QueuedPreference {
-            value: Some("score".into()),
-            account: Some(47),
+        pref.pending = Some(PreferenceEdit::Sort {
+            key: SortKey::Score,
+            descending: true,
         });
 
         w.request_close(CloseIntent::Window, win, cx);

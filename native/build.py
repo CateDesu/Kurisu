@@ -2,12 +2,15 @@
 """Build Kurisu without installing or publishing it."""
 
 import argparse
+from contextlib import contextmanager
+import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -170,9 +173,51 @@ def write_sidecar(path):
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
-    path.with_name(path.name + ".sha256").write_text(
-        f"{digest.hexdigest()}  {path.name}\n", encoding="utf-8"
-    )
+    sidecar = path.with_name(path.name + ".sha256")
+    sidecar.write_text(f"{digest.hexdigest()}  {path.name}\n", encoding="utf-8")
+    return sidecar
+
+
+@contextmanager
+def stage_artifact(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(dir=path.parent, prefix=".packaging-"))
+    keep_temporary = False
+    try:
+        staged = temporary / path.name
+        yield staged
+        metadata = staged.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or not metadata.st_size:
+            raise ValueError(f"Expected a nonempty artifact: {path.name}")
+        sidecar = write_sidecar(staged)
+        previous = temporary / "previous"
+        try:
+            existing = path.lstat()
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISREG(existing.st_mode):
+                raise ValueError(f"Expected a regular artifact: {path}")
+            shutil.copy2(path, previous)
+        staged.replace(path)
+        try:
+            sidecar.replace(path.with_name(sidecar.name))
+        except OSError:
+            try:
+                if existing is None:
+                    path.unlink()
+                else:
+                    previous.replace(path)
+            except OSError as error:
+                keep_temporary = True
+                raise OSError(f"Could not restore {path}: {error}. Recovery files are in {temporary}") from error
+            raise
+    finally:
+        if not keep_temporary:
+            try:
+                shutil.rmtree(temporary)
+            except OSError as error:
+                print(f"Could not clean packaging stage {temporary}: {error}", file=sys.stderr)
 
 
 def package_windows(version, binary):
@@ -184,24 +229,27 @@ def package_windows(version, binary):
     if compiler is None:
         raise ValueError("NSIS 3 is required for --installer")
     bundle = ROOT / "target/release/bundle"
-    bundle.mkdir(parents=True, exist_ok=True)
     installer = bundle / f"Kurisu-Native_{version}_x64-install.exe"
     windows_version = ".".join((version.split(".") + ["0"] * 4)[:4])
-    subprocess.run(
-        [compiler, f"/DVERSION={version}", f"/DWINDOWS_VERSION={windows_version}",
-         f"/DBINARY={binary}", f"/DNOTICES={binary.parent / 'THIRD_PARTY_NOTICES.txt'}",
-         f"/DOUTPUT={installer}", str(ROOT / "packaging/windows.nsi")],
-        check=True,
-    )
-    write_sidecar(installer)
+    with stage_artifact(installer) as staged:
+        subprocess.run(
+            [compiler, f"/DVERSION={version}", f"/DWINDOWS_VERSION={windows_version}",
+             f"/DBINARY={binary}", f"/DNOTICES={binary.parent / 'THIRD_PARTY_NOTICES.txt'}",
+             f"/DOUTPUT={staged}", str(ROOT / "packaging/windows.nsi")],
+            check=True,
+        )
     print(installer)
 
 
 def package_linux(version, binary):
     bundle = ROOT / "target/release/bundle"
-    bundle.mkdir(parents=True, exist_ok=True)
     archive = bundle / f"Kurisu_{version}_linux-x64.tar.gz"
-    with tarfile.open(archive, "w:gz") as output:
+    with (
+        stage_artifact(archive) as staged,
+        staged.open("wb") as compressed,
+        gzip.GzipFile(filename="", mode="wb", fileobj=compressed, mtime=0) as stream,
+        tarfile.open(fileobj=stream, mode="w") as output,
+    ):
         for source, name in [
             (binary, "kurisu"),
             (binary.parent / "LICENSE", "LICENSE"),
@@ -211,10 +259,14 @@ def package_linux(version, binary):
             (ROOT / "packaging/kurisu.desktop", "kurisu.desktop"),
         ]:
             entry = output.gettarinfo(source, arcname=f"Kurisu/{name}")
+            if entry is None or not entry.isfile() or not entry.size:
+                raise ValueError(f"Expected a nonempty bundle input: {source}")
             entry.mode = 0o755 if name == "kurisu" else 0o644
+            entry.mtime = 0
+            entry.uid = entry.gid = 0
+            entry.uname = entry.gname = ""
             with source.open("rb") as content:
                 output.addfile(entry, content)
-    write_sidecar(archive)
     return archive
 
 
@@ -257,19 +309,11 @@ def main(argv=None):
                     environment.get("RUSTFLAGS", "") + " -C target-feature=+crt-static"
                 ).strip()
         subprocess.run(command, check=True, env=environment)
-        if compiled != binary:
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=binary.parent, prefix=f".{binary.name}-", delete=False) as temporary:
-                staged = Path(temporary.name)
-            try:
-                shutil.copy2(compiled, staged)
-                staged.replace(binary)
-            finally:
-                staged.unlink(missing_ok=True)
-        actual = subprocess.run([str(binary), "--version"], check=True, capture_output=True, encoding="utf-8")
-        if actual.stdout.strip() != f"kurisu-native {version}":
-            raise ValueError("The built executable does not report the requested version")
-        write_sidecar(binary)
+        with stage_artifact(binary) as staged:
+            shutil.copy2(compiled, staged)
+            actual = subprocess.run([str(staged), "--version"], check=True, capture_output=True, encoding="utf-8")
+            if actual.stdout.strip() != f"kurisu-native {version}":
+                raise ValueError("The built executable does not report the requested version")
         for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
             shutil.copyfile(notice_dir / name, binary.parent / name)
         shutil.copyfile(ROOT / "PROFILE_TRANSFER.md", binary.parent / "PROFILE_TRANSFER.md")
