@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -26,7 +23,7 @@ use crate::{
     theme::{ACCENT, BASE, DIM, EDGE, ERROR, INK, PANEL_2, mono_font, sans_font},
 };
 
-actions!(kurisu_shell, [TabForward, TabBackward, Quit, Escape]);
+actions!(kurisu_shell, [TabForward, TabBackward, Quit]);
 
 const RESIZE_BORDER: f32 = 12.;
 const RESIZE_CORNER: f32 = 20.;
@@ -37,7 +34,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", TabForward, None),
         KeyBinding::new("shift-tab", TabBackward, None),
         KeyBinding::new("ctrl-q", Quit, None),
-        KeyBinding::new("escape", Escape, None),
     ]);
 }
 
@@ -176,7 +172,7 @@ pub struct Shell {
     hidden_to_tray: bool,
     minimized_by_program: bool,
     tray_clicks: TrayClickFilter,
-    restore_activation: Arc<AtomicBool>,
+    restore_activation: bool,
     services: Arc<Mutex<Option<Services>>>,
     tray: Option<Tray>,
     instance: Arc<InstanceGuard>,
@@ -287,18 +283,19 @@ impl Shell {
                 }
             });
         });
-        let restore_activation = Arc::new(AtomicBool::new(false));
-        let visibility_flag = restore_activation.clone();
         let visibility_weak = cx.entity().downgrade();
         let visibility_subscription =
             window.observe_window_visibility(move |visibility, window, cx| {
                 if visibility.is_visible() {
                     let _ = visibility_weak.update(cx, |this, _| {
                         this.minimized_by_program = false;
+                        if std::mem::take(&mut this.restore_activation) && !this.stopping {
+                            window.activate_window();
+                            if !this.closing {
+                                this.instance.acknowledge_activations();
+                            }
+                        }
                     });
-                    if visibility_flag.swap(false, Ordering::AcqRel) {
-                        window.activate_window();
-                    }
                 }
             });
         let weak = cx.entity().downgrade();
@@ -347,7 +344,7 @@ impl Shell {
             hidden_to_tray: false,
             minimized_by_program: false,
             tray_clicks: TrayClickFilter::default(),
-            restore_activation,
+            restore_activation: false,
             services,
             tray,
             instance,
@@ -368,8 +365,8 @@ impl Shell {
                     .timer(Duration::from_millis(180))
                     .await;
                 let alive = this.update_in(cx, |this, window, cx| {
-                    if this.instance.take_activation() {
-                        this.show_from_tray(window, cx);
+                    if this.stopping {
+                        return;
                     }
                     while let Ok(event) = MenuEvent::receiver().try_recv() {
                         if let Some(tray) = &this.tray {
@@ -381,6 +378,7 @@ impl Shell {
                             }
                         }
                     }
+                    this.accept_instance_activation(window, cx);
                     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
                         let activate = this
                             .tray
@@ -397,6 +395,19 @@ impl Shell {
             }
         })
         .detach();
+    }
+
+    fn accept_instance_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stopping
+            || self.closing
+            || self.restore_activation
+            || !self.instance.has_pending_activation()
+        {
+            return;
+        }
+        if self.show_from_tray(window, cx) && !self.restore_activation {
+            self.instance.acknowledge_activations();
+        }
     }
 
     fn on_workspace_event(
@@ -535,7 +546,7 @@ impl Shell {
         result?;
         self.hidden_to_tray = true;
         self.minimized_by_program = false;
-        self.restore_activation.store(false, Ordering::Release);
+        self.restore_activation = false;
         self.workspace
             .update(cx, |workspace, cx| workspace.set_tray_error(None, cx));
         cx.notify();
@@ -550,7 +561,10 @@ impl Shell {
             self.closing,
         ) {
             TrayWindowAction::Hide => match self.hide_window_to_tray(window, cx) {
-                Ok(()) => true,
+                Ok(()) => {
+                    self.instance.decline_activations();
+                    true
+                }
                 Err(error) => {
                     self.tray_failed("hide", error, cx);
                     false
@@ -572,15 +586,12 @@ impl Shell {
             && !self.hidden_to_tray
             && self.minimized_by_program
             && platform_minimized.is_none()
+            && let Err(error) = self.hide_window_to_tray(window, cx)
         {
-            if let Err(error) = hide_to_tray(window, cx) {
-                self.tray_failed("restore", error, cx);
-                return false;
-            }
-            self.hidden_to_tray = true;
+            self.tray_failed("restore", error, cx);
+            return false;
         }
         if needs_show {
-            self.restore_activation.store(true, Ordering::Release);
             #[cfg(test)]
             let result = if self.close_test_has_tray {
                 Ok(())
@@ -590,17 +601,19 @@ impl Shell {
             #[cfg(not(test))]
             let result = show_from_tray(window, cx);
             if let Err(error) = result {
-                self.restore_activation.store(false, Ordering::Release);
                 self.tray_failed("show", error, cx);
                 return false;
             }
             self.hidden_to_tray = false;
+            self.restore_activation = !window.is_visible();
         }
         self.minimized_by_program = false;
         self.workspace
             .update(cx, |workspace, cx| workspace.set_tray_error(None, cx));
         cx.activate(true);
-        window.activate_window();
+        if !cfg!(windows) || !self.restore_activation {
+            window.activate_window();
+        }
         cx.notify();
         true
     }
@@ -621,10 +634,18 @@ impl Shell {
         cx.notify();
     }
 
-    fn minimize_window(&mut self, window: &mut Window) {
-        // A queued launch must not override this later Minimize click.
-        self.instance.take_activation();
+    fn minimize_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || self.stopping {
+            return;
+        }
+        self.accept_instance_activation(window, cx);
+        self.restore_activation = false;
+        self.instance.decline_activations();
         self.minimized_by_program = true;
+        #[cfg(test)]
+        if self.close_test_has_tray {
+            return;
+        }
         window.minimize_window();
     }
 
@@ -632,6 +653,8 @@ impl Shell {
         if self.stopping {
             return;
         }
+        self.instance.stop_activation();
+        self.restore_activation = false;
         self.stopping = true;
         self.workspace
             .update(cx, |workspace, _| workspace.cancel_reads_for_quit());
@@ -815,7 +838,9 @@ impl Shell {
                             "minimize",
                             self.modal_layer.is_none(),
                         )
-                        .on_click(cx.listener(|this, _, window, _| this.minimize_window(window))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.minimize_window(window, cx)),
+                        ),
                     )
                     .child(
                         Self::title_button(
@@ -1359,6 +1384,13 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &Quit, window, cx| {
                 this.request_close(CloseIntent::Quit, window, cx)
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.workspace.update(cx, |workspace, cx| {
+                        workspace.handle_escape(event, window, cx)
+                    });
+                }
             }))
             .child(self.titlebar(window, cx))
             .child(

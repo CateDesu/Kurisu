@@ -162,7 +162,7 @@ impl SettingsState {
         }
     }
 
-    pub(super) fn capture_fenced_inputs(&mut self, cx: &gpui::App) {
+    pub(super) fn capture_fenced_inputs(&mut self, cx: &mut gpui::App) {
         if self.fenced_inputs.is_none()
             && let (Some(seconds), Some(percent), Some(socket)) =
                 (&self.seconds, &self.percent, &self.socket)
@@ -172,6 +172,9 @@ impl SettingsState {
                 percent.read(cx).value().to_owned(),
                 socket.read(cx).value().to_owned(),
             ]);
+            for field in [seconds, percent, socket] {
+                field.update(cx, |input, cx| input.set_disabled(true, cx));
+            }
         }
     }
 
@@ -247,11 +250,13 @@ impl Workspace {
         if self.settings.seconds.is_none() {
             let seconds = cx.new(|cx| {
                 let mut input = TextInput::new("120", "120", window, cx);
+                input.set_accessible_label("Ask after this many seconds of playback", cx);
                 input.set_disabled(true, cx);
                 input
             });
             let percent = cx.new(|cx| {
                 let mut input = TextInput::new("80", "80", window, cx);
+                input.set_accessible_label("Update progress at this percentage watched", cx);
                 input.set_disabled(true, cx);
                 input
             });
@@ -1366,7 +1371,7 @@ impl Workspace {
     }
 
     pub(crate) fn close_test_preference(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.persist_preference("kurisu.list.dir", Some("desc".into()), window, cx);
+        self.flip_sort(window, cx);
     }
 
     pub(crate) fn close_test_preference_work(&self) -> bool {

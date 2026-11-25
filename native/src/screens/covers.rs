@@ -32,7 +32,60 @@ impl CoverRegion {
 
 const AVATAR_KEY: CoverKey = (i64::MIN, 36, 36);
 
+pub(super) fn visible_card_rows(rows: &gpui::ListState) -> std::ops::Range<usize> {
+    let viewport = rows.viewport_bounds();
+    let first = rows.logical_scroll_top().item_ix;
+    if viewport.size.height <= px(0.) {
+        return first..first;
+    }
+    let mut visible = (first..rows.item_count())
+        .map_while(|index| rows.bounds_for_item(index).map(|bounds| (index, bounds)))
+        .skip_while(|(_, bounds)| bounds.bottom() <= viewport.top())
+        .take_while(|(_, bounds)| bounds.top() < viewport.bottom())
+        .map(|(index, _)| index);
+    let Some(start) = visible.next() else {
+        return first..first;
+    };
+    start..visible.last().unwrap_or(start) + 1
+}
+
 impl Workspace {
+    pub(super) fn reconcile_card_covers_on_layout(
+        &self,
+        page: gpui::Div,
+        route: Route,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let weak = cx.weak_entity();
+        let generation = self.generation;
+        page.on_children_prepainted(move |_, window, app| {
+            let weak = weak.clone();
+            let route = route.clone();
+            window.defer(app, move |_, app| {
+                let _ = weak.update(app, |this, cx| {
+                    if this.route != route || this.generation != generation {
+                        return;
+                    }
+                    let owner = CoverOwner::Route(route.clone());
+                    let before = this
+                        .cover_regions
+                        .get(&owner)
+                        .map(|region| region.visible.clone());
+                    match route {
+                        Route::Search => this.refresh_search_covers(),
+                        Route::Seasons => this.refresh_seasons_covers(),
+                        _ => return,
+                    }
+                    if before.as_ref()
+                        != this.cover_regions.get(&owner).map(|region| &region.visible)
+                    {
+                        cx.notify();
+                    }
+                });
+            });
+        })
+    }
+
     pub(super) fn mark_list_cover_refresh(&mut self) {
         self.list_cover_revision = self.list_cover_revision.wrapping_add(1);
     }
@@ -144,7 +197,8 @@ impl Workspace {
         changed
     }
 
-    pub(super) fn request_cover(&mut self, id: i64, url: &str, width: u32, height: u32) {
+    #[cfg(test)]
+    fn request_cover(&mut self, id: i64, url: &str, width: u32, height: u32) {
         self.request_cover_for(
             CoverOwner::Route(self.route.clone()),
             (id, width, height),
@@ -273,9 +327,9 @@ impl Workspace {
         }
     }
 
-    pub(super) fn ensure_cover_scale(&mut self, scale: f32) {
-        if (self.cover_scale - scale).abs() < 0.01 {
-            return;
+    pub(super) fn ensure_cover_scale(&mut self, scale: f32) -> bool {
+        if self.cover_scale == scale {
+            return false;
         }
         self.cover_scale = scale;
         self.covers.clear();
@@ -288,6 +342,10 @@ impl Workspace {
         if self.route == Route::Now {
             self.refresh_playback_cover();
         }
+        if matches!(self.route, Route::Anime(_)) {
+            self.requeue_detail_covers();
+        }
+        true
     }
 
     pub(super) fn prefetch_covers(
@@ -411,8 +469,8 @@ impl Workspace {
                 }
                 if this
                     .update_in(cx, |this, window, cx| {
-                        if (this.cover_scale - window.scale_factor()).abs() >= 0.01 {
-                            this.ensure_cover_scale(window.scale_factor());
+                        let mut changed = this.ensure_cover_scale(window.scale_factor());
+                        if changed {
                             if this.route == Route::MyList {
                                 let start = this.list_widget.logical_scroll_top().item_ix;
                                 let range = MyListSlot::media_range(
@@ -422,8 +480,6 @@ impl Workspace {
                                 this.prefetch_covers(range, window, cx);
                                 this.mark_list_cover_refresh();
                                 this.schedule_list_cover_refresh(window, cx);
-                            } else if matches!(this.route, Route::Anime(_)) {
-                                this.requeue_detail_covers();
                             } else {
                                 this.refresh_route_covers();
                             }
@@ -437,7 +493,6 @@ impl Workspace {
                         }
                         this.refresh_avatar_cover();
                         let ready = this.covers.poll();
-                        let mut changed = false;
                         for item in ready {
                             let keys: Vec<_> = this
                                 .cover_tickets
@@ -470,42 +525,57 @@ impl Workspace {
         .detach();
     }
 
+    pub(super) fn refresh_detail_covers(&mut self, scale: f32) {
+        if !self.ensure_cover_scale(scale) {
+            self.requeue_detail_covers();
+        }
+    }
+
     pub(super) fn requeue_detail_covers(&mut self) {
-        if let Some(detail) = self.detail.detail.clone() {
-            let id = detail.media.id;
+        let Route::Anime(id) = self.route else {
+            return;
+        };
+        if self.detail.media_id != Some(id) {
+            return;
+        }
+        let mut visible = Vec::new();
+        if let Some(detail) = &self.detail.detail {
             if let Some(url) = detail
                 .media
                 .cover_large
                 .as_deref()
                 .or(detail.media.cover_medium.as_deref())
             {
-                self.request_cover(id, url, 128, 184);
+                visible.push(((id, 128, 184), url.to_owned()));
             }
             if let Some(url) = detail.media.banner_image.as_deref() {
-                self.request_cover(id, url, 800, 192);
-            }
-            for relation in &detail.relations {
-                if let Some(url) = relation.media.cover_medium.as_deref() {
-                    self.request_cover(relation.media.id, url, 112, 160);
-                }
+                visible.push(((id, 800, 192), url.to_owned()));
             }
             for (index, character) in detail.characters.iter().enumerate() {
                 if let Some(url) = character.image.as_deref() {
-                    self.request_cover(-1 - index as i64, url, 112, 160);
+                    visible.push(((-1 - index as i64, 112, 160), url.to_owned()));
                 }
             }
             for (index, person) in detail.staff.iter().enumerate() {
                 if let Some(url) = person.image.as_deref() {
-                    self.request_cover(-200_001 - index as i64, url, 112, 160);
+                    visible.push(((-200_001 - index as i64, 112, 160), url.to_owned()));
                 }
             }
         }
-        let recs = self.detail.recommendations.clone();
-        for media in recs {
-            if let Some(url) = media.cover_medium.as_deref() {
-                self.request_cover(media.id, url, 112, 160);
+        let related = self
+            .detail
+            .detail
+            .iter()
+            .flat_map(|detail| detail.relations.iter().map(|relation| &relation.media));
+        let mut thumbnails = HashSet::new();
+        for media in self.detail.recommendations.iter().chain(related) {
+            if let Some(url) = media.cover_medium.as_ref().or(media.cover_large.as_ref())
+                && thumbnails.insert(media.id)
+            {
+                visible.push(((media.id, 112, 160), url.clone()));
             }
         }
+        self.replace_cover_region(CoverOwner::Route(Route::Anime(id)), visible, vec![]);
     }
 }
 
@@ -665,6 +735,76 @@ mod tests {
             assert!(!w.cover_tickets.contains_key(&(1, 46, 63)));
             assert!(!w.cover_tickets.contains_key(&(2, 46, 63)));
             assert!(w.cover_tickets.contains_key(&AVATAR_KEY));
+        });
+    }
+
+    #[gpui::test]
+    fn recommendation_cover_preference_survives_scale_refresh(cx: &mut TestAppContext) {
+        use kurisu_core::models::{MediaDetail, MediaRelation};
+
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, _, _| {
+            w.route = Route::Anime(9);
+            w.ensure_cover_scale(1.);
+            let request = w.detail.start(9);
+            let items = vec![
+                Media {
+                    id: 10,
+                    cover_medium: Some("preferred-medium".into()),
+                    cover_large: Some("unused-large".into()),
+                    ..Default::default()
+                },
+                Media {
+                    id: 11,
+                    cover_large: Some("only-large".into()),
+                    ..Default::default()
+                },
+                Media {
+                    id: 12,
+                    ..Default::default()
+                },
+            ];
+            w.detail.finish_recommendations(9, request, Ok(items));
+            w.refresh_detail_covers(1.);
+
+            let first = w.cover_tickets.clone();
+            w.detail.finish_detail(
+                9,
+                request,
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 9,
+                        ..Default::default()
+                    },
+                    relations: vec![MediaRelation {
+                        media: Media {
+                            id: 11,
+                            cover_medium: Some("related-medium".into()),
+                            ..Default::default()
+                        },
+                        relation: "SEQUEL".into(),
+                    }],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            w.requeue_detail_covers();
+            assert_eq!(w.cover_tickets, first);
+            assert!(w.ensure_cover_scale(2.));
+            for (id, url) in [(10, "preferred-medium"), (11, "only-large")] {
+                let key = (id, 112, 160);
+                let refreshed = w.cover_tickets[&key].clone();
+                assert_ne!(refreshed, first[&key]);
+                w.request_cover(id, url, 112, 160);
+                assert_eq!(w.cover_tickets[&key], refreshed);
+            }
+            assert!(!w.cover_tickets.contains_key(&(12, 112, 160)));
         });
     }
 

@@ -90,6 +90,7 @@ pub(super) struct CalendarState {
     pub error: String,
     pub request: u64,
     pub rows: Option<ListState>,
+    loaded_range: Option<(i64, i64)>,
 }
 
 impl Default for CalendarState {
@@ -108,11 +109,17 @@ impl Default for CalendarState {
             error: String::new(),
             request: 0,
             rows: None,
+            loaded_range: None,
         }
     }
 }
 
 impl CalendarState {
+    fn range(&self) -> (i64, i64) {
+        let (start, end) = week_dates(self.anchor, self.offset);
+        (midnight(start), midnight(end))
+    }
+
     fn replace_visible(&mut self, visible: Vec<usize>) {
         if let Some(rows) = &self.rows {
             if self.visible.as_ref() == &visible {
@@ -248,11 +255,12 @@ impl Workspace {
         let request = self.calendar.request;
         self.calendar.loading = true;
         self.calendar.error.clear();
-        let anchor = self.calendar.scroll_anchor();
-        self.calendar.items.clear();
-        self.refresh_calendar_visible();
-        let (start, end) = week_dates(self.calendar.anchor, self.calendar.offset);
-        let (start, end) = (midnight(start), midnight(end));
+        let (start, end) = self.calendar.range();
+        if self.calendar.loaded_range != Some((start, end)) {
+            self.calendar.items.clear();
+            self.calendar.loaded_range = None;
+            self.refresh_calendar_visible();
+        }
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
@@ -261,7 +269,7 @@ impl Workspace {
         self.replace_reads("calendar", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
-            let _ = this.update_in(cx, |this, _window, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 if this.stopping
                     || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
@@ -270,10 +278,24 @@ impl Workspace {
                     return;
                 }
                 this.calendar.loading = false;
+                if this.calendar.range() != (start, end) {
+                    this.calendar.loaded_once = false;
+                    if this.writes_fenced() {
+                        this.calendar.items.clear();
+                        this.calendar.loaded_range = None;
+                        this.refresh_calendar_visible();
+                        cx.notify();
+                    } else {
+                        this.load_calendar(window, cx);
+                    }
+                    return;
+                }
                 this.calendar.loaded_once = true;
                 match result {
                     Ok(items) => {
+                        let anchor = this.calendar.scroll_anchor();
                         this.calendar.items = items;
+                        this.calendar.loaded_range = Some((start, end));
                         this.refresh_calendar_visible();
                         this.calendar.restore_anchor(anchor);
                         this.refresh_calendar_covers();
@@ -681,15 +703,19 @@ impl Workspace {
                             .aria_label(format!("Open details for {title}"))
                             .focusable()
                             .tab_stop(true)
+                            .focus_visible(|style| style.border_color(rgb(ACCENT)))
                             .cursor_pointer()
-                            .on_key_down({
+                            .capture_key_down({
                                 let weak = weak.clone();
                                 move |event: &gpui::KeyDownEvent, window, app| {
-                                    if matches!(
-                                        event.keystroke.key.as_str(),
-                                        "enter" | "space" | " "
-                                    ) {
+                                    let stroke = &event.keystroke;
+                                    if !stroke.modifiers.modified()
+                                        && matches!(stroke.key.as_str(), "enter" | "space" | " ")
+                                    {
                                         app.stop_propagation();
+                                        if event.is_held {
+                                            return;
+                                        }
                                         let _ = weak.update(app, |this, cx| {
                                             this.navigate(Route::Anime(id), window, cx)
                                         });
@@ -746,8 +772,243 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace_tests::{fixture, settle};
     use super::*;
-    use kurisu_core::models::Media;
+    use kurisu_core::models::{Media, User};
+
+    #[gpui::test]
+    fn calendar_card_opens_only_with_plain_enter(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Calendar;
+            w.calendar.preference_loaded = true;
+            w.calendar.watching_only = false;
+            w.calendar.loaded_once = true;
+            w.calendar.items.push(AiringItem {
+                media: Media {
+                    id: 9,
+                    title_english: Some("Calendar fixture".into()),
+                    ..Default::default()
+                },
+                episode: 3,
+                airing_at: w.calendar.range().0,
+            });
+            w.enter_calendar(window, cx);
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (card, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Open details for Calendar fixture"))
+            .unwrap();
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Focus,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *card,
+            data: None,
+        });
+        cx.simulate_keystrokes("ctrl-enter shift-enter alt-space");
+        assert_eq!(view.read_with(cx, |w, _| w.route.clone()), Route::Calendar);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(view.read_with(cx, |w, _| w.route.clone()), Route::Anime(9));
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn calendar_reloads_a_changed_range_and_keeps_newer_requests_fenced(
+        tc: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::prompt_restore_tests::{
+            fixture_server, signed_in_fixture,
+        };
+        use std::time::Duration as StdDuration;
+
+        let Some(gate) = fixture_server("calendar-range") else {
+            return;
+        };
+        let (core, runtime, user) = signed_in_fixture(None);
+        let (view, cx) = tc.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let await_job = |job: tokio::task::AbortHandle| {
+            runtime.block_on(async {
+                tokio::time::timeout(StdDuration::from_secs(3), async {
+                    while !job.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        };
+        let first = view.update_in(cx, |w, window, cx| {
+            w.profile = Some(user);
+            w.route = Route::Calendar;
+            w.calendar.preference_loaded = true;
+            w.calendar.watching_only = false;
+            w.enter_calendar(window, cx);
+            w.read_aborts["calendar"][0].clone()
+        });
+        await_job(first);
+        let retry = view.update_in(cx, |w, _, _| {
+            w.calendar.anchor += Duration::days(1);
+            assert!(w.calendar.loading);
+            w.calendar.request + 1
+        });
+        cx.run_until_parked();
+        let replacement = view.read_with(cx, |w, _| {
+            assert_eq!(w.calendar.request, retry);
+            assert!(w.calendar.loading && w.calendar.items.is_empty());
+            w.read_aborts["calendar"][0].clone()
+        });
+        await_job(replacement);
+        let superseding = view.update_in(cx, |w, window, cx| {
+            w.switch_route(Route::MyList, window, cx);
+            w.calendar.anchor += Duration::days(1);
+            w.switch_route(Route::Calendar, window, cx);
+            w.read_aborts["calendar"][0].clone()
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |w, _| {
+            assert_eq!(w.calendar.request, retry + 2);
+            assert!(w.calendar.loading && w.calendar.items.is_empty());
+        });
+        await_job(superseding);
+        cx.run_until_parked();
+        let overlapping = view.update_in(cx, |w, window, cx| {
+            assert!(!w.calendar.loading);
+            assert!(w.calendar.error.is_empty(), "{}", w.calendar.error);
+            assert_eq!(w.calendar.items[0].airing_at, w.calendar.range().0);
+            std::fs::write(gate.with_extension("calendar"), "overlap").unwrap();
+            w.load_calendar(window, cx);
+            w.read_aborts["calendar"][0].clone()
+        });
+        await_job(overlapping);
+        cx.run_until_parked();
+        let (repeated, visible) = view.update_in(cx, |w, window, cx| {
+            assert!(w.calendar.error.is_empty(), "{}", w.calendar.error);
+            assert_eq!(
+                w.calendar
+                    .items
+                    .iter()
+                    .map(|item| item.episode)
+                    .collect::<Vec<_>>(),
+                [3, 4]
+            );
+            std::fs::write(gate.with_extension("calendar"), "repeated").unwrap();
+            w.load_calendar(window, cx);
+            (
+                w.read_aborts["calendar"][0].clone(),
+                w.calendar.visible.clone(),
+            )
+        });
+        await_job(repeated);
+        cx.run_until_parked();
+        let failed = view.update_in(cx, |w, window, cx| {
+            assert!(
+                w.calendar
+                    .error
+                    .contains("repeated an airing schedule page")
+            );
+            assert_eq!(w.calendar.items[1].episode, 4);
+            assert!(Arc::ptr_eq(&w.calendar.visible, &visible));
+            std::fs::write(gate.with_extension("calendar"), "unavailable").unwrap();
+            w.load_calendar(window, cx);
+            assert_eq!(w.calendar.rows.as_ref().unwrap().item_count(), 2);
+            w.read_aborts["calendar"][0].clone()
+        });
+        await_job(failed);
+        cx.run_until_parked();
+        let empty = view.update_in(cx, |w, window, cx| {
+            assert!(w.calendar.error.contains("unavailable airing schedules"));
+            assert_eq!(w.calendar.items[0].airing_at, w.calendar.range().0);
+            std::fs::write(gate.with_extension("calendar"), "empty").unwrap();
+            w.load_calendar(window, cx);
+            w.read_aborts["calendar"][0].clone()
+        });
+        await_job(empty);
+        cx.run_until_parked();
+        let old_account = view.update_in(cx, |w, window, cx| {
+            assert!(w.calendar.error.is_empty());
+            assert!(w.calendar.items.is_empty());
+            assert_eq!(w.calendar.rows.as_ref().unwrap().item_count(), 0);
+            std::fs::remove_file(gate.with_extension("calendar")).unwrap();
+            let offset = w.calendar.offset;
+            w.shift_calendar(1, window, cx);
+            assert_eq!(w.calendar.offset, offset + 1);
+            w.read_aborts["calendar"][0].clone()
+        });
+        await_job(old_account);
+        view.update_in(cx, |w, window, cx| w.set_profile(None, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |w, _| {
+            assert!(w.profile.is_none());
+            assert!(w.calendar.items.is_empty());
+            assert!(!w.calendar.loaded_once && !w.calendar.loading);
+            assert!(w.calendar.preference_loaded && !w.calendar.watching_only);
+        });
+    }
+
+    #[gpui::test]
+    fn calendar_refresh_failure_keeps_only_the_current_week(cx: &mut gpui::TestAppContext) {
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Calendar;
+            w.calendar.preference_loaded = true;
+            w.calendar.watching_only = false;
+            w.calendar.loaded_once = true;
+            let range = w.calendar.range();
+            w.calendar.loaded_range = Some(range);
+            w.calendar.items.push(AiringItem {
+                media: Media {
+                    id: 9,
+                    ..Default::default()
+                },
+                episode: 3,
+                airing_at: range.0 + 3600,
+            });
+            w.enter_calendar(window, cx);
+            w.load_calendar(window, cx);
+            assert_eq!(w.calendar.visible.as_slice(), &[0]);
+            w.read_aborts["calendar"][0].abort();
+        });
+        settle(cx, &runtime);
+        view.update_in(cx, |w, window, cx| {
+            assert!(!w.calendar.error.is_empty());
+            assert_eq!(w.calendar.items[0].media.id, 9);
+            assert_eq!(w.calendar.visible.as_slice(), &[0]);
+            assert_eq!(w.calendar.rows.as_ref().unwrap().item_count(), 1);
+
+            w.shift_calendar(1, window, cx);
+            assert!(w.calendar.items.is_empty());
+            assert!(w.calendar.visible.is_empty());
+            assert_eq!(w.calendar.rows.as_ref().unwrap().item_count(), 0);
+            w.read_aborts["calendar"][0].abort();
+        });
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(!w.calendar.error.is_empty());
+            assert!(w.calendar.items.is_empty());
+        });
+    }
+
     #[test]
     fn refresh_restores_the_airing_identity_after_reordering() {
         let item = |id, episode, airing_at| AiringItem {

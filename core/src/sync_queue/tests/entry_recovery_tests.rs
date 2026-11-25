@@ -18,6 +18,327 @@ fn entry(status: &str, progress: i64) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn a_finale_merged_into_a_pending_score_restores_the_newer_rewatch() {
+    for (prior_status, prior_progress) in [("REPEATING", 11), ("COMPLETED", 12)] {
+        for cold in [false, true] {
+            assert_finale_after_score_uses_the_latest_rewatch(cold, prior_status, prior_progress)
+                .await;
+        }
+    }
+}
+
+async fn assert_finale_after_score_uses_the_latest_rewatch(
+    cold: bool,
+    prior_status: &str,
+    prior_progress: i64,
+) {
+    let mut snapshot = entry("REPEATING", 11);
+    snapshot["repeat"] = json!(4);
+    snapshot["updatedAt"] = json!(101);
+    let mut replies = vec![(503, json!({"errors":[{"message":"Offline"}]}))];
+    if cold {
+        replies.push(lookup(Some(12), snapshot.clone()));
+    } else {
+        replies.extend([
+            (
+                500,
+                json!({"errors":[{"status":500,"message":"Entry temporarily unavailable"}]}),
+            ),
+            (
+                200,
+                json!({"data":{"MediaListCollection":{"user":{"id":7},
+                    "hasNextChunk":false,"lists":[{"entries":[snapshot]}]}}}),
+            ),
+            (200, viewer("POINT_100")),
+        ]);
+    }
+    replies.push(lookup(Some(13), snapshot));
+    let (api, mut requests) = anilist::mock_api(replies).await;
+    let state = Arc::new(state(api, Db::open(Path::new(":memory:")).unwrap()));
+    seed(&state);
+    let mut base = state.db.get_entry(1).unwrap().unwrap();
+    base.status = prior_status.into();
+    base.progress = prior_progress;
+    base.repeat = 2;
+    base.updated_at = Some(100);
+    state.db.upsert_entry(&base).unwrap();
+    crate::commands::save_entry_inner(&state, 1, None, None, Some(0.0), None)
+        .await
+        .unwrap();
+    let saved = if cold {
+        state.db.clear_entries().unwrap();
+        crate::commands::save_entry_inner(&state, 1, None, Some(12), None, None).await
+    } else {
+        let entries = crate::commands::sync_my_list(&state).await.unwrap();
+        assert_eq!((entries[0].repeat, entries[0].updated_at), (4, Some(101)));
+        crate::commands::set_progress_inner(&state, 1, 12, Some(11)).await
+    }
+    .unwrap();
+    assert_eq!((saved.status.as_str(), saved.repeat), ("COMPLETED", 5));
+    state.db.cache_episode_total(1, Some(13)).unwrap();
+    let saved = crate::commands::get_entry(1, &state)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (saved.status.as_str(), saved.progress, saved.repeat),
+        ("REPEATING", 12, 4),
+        "cold={cold}, prior_status={prior_status}"
+    );
+
+    let pending = sync_pending_changes(&state).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].conflict);
+    assert_eq!(pending[0].progress, Some(12));
+    let queries = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(queries.len(), if cold { 3 } else { 5 });
+    assert!(queries[0]["query"]
+        .as_str()
+        .unwrap()
+        .starts_with("mutation"));
+    assert!(queries[1..]
+        .iter()
+        .all(|request| request["query"].as_str().unwrap().starts_with("query")));
+}
+
+#[test]
+fn list_snapshot_rolls_back_if_a_completion_baseline_cannot_be_updated() {
+    for (remove_entry, failure) in [
+        (false, "FAIL, 'fixture baseline write failure'"),
+        (false, "IGNORE"),
+        (true, "FAIL, 'fixture baseline write failure'"),
+        (true, "IGNORE"),
+    ] {
+        let state = state(
+            anilist::AniList::new(),
+            Db::open(Path::new(":memory:")).unwrap(),
+        );
+        seed(&state);
+        stage(
+            &state,
+            1,
+            Patch {
+                status: Some("COMPLETED".into()),
+                progress: Some(12),
+                automatic_completion: Some(AutomaticCompletion::default()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut remote = state.db.get_entry(1).unwrap().unwrap();
+        remote.status = "REPEATING".into();
+        remote.updated_at = Some(101);
+        remote.repeat = 2;
+        state.db.replace_list_snapshot(&[remote.clone()]).unwrap();
+        overlay(&state).unwrap();
+        let before = serde_json::to_value(state.db.pending(7).unwrap()).unwrap();
+        assert_eq!(before[0]["patch"]["completion_baseline"]["repeat"], 2);
+
+        remote.updated_at = Some(102);
+        remote.repeat = 4;
+        remote.media.as_mut().unwrap().episodes = Some(13);
+        let entries = if remove_entry { vec![] } else { vec![remote] };
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER reject_baseline BEFORE UPDATE ON pending_change
+                 BEGIN SELECT RAISE({failure}); END;"
+            ))
+            .unwrap();
+        assert!(
+            state.db.replace_list_snapshot(&entries).is_err(),
+            "{failure}"
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.pending(7).unwrap()).unwrap(),
+            before
+        );
+        let restored = state.db.get_entry(1).unwrap().unwrap();
+        assert_eq!(
+            (restored.status.as_str(), restored.updated_at),
+            ("COMPLETED", Some(101))
+        );
+        assert_eq!(state.db.episode_total(1).unwrap(), Some(12));
+
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch("DROP TRIGGER reject_baseline")
+            .unwrap();
+        state.db.replace_list_snapshot(&entries).unwrap();
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert_eq!(
+            pending
+                .patch
+                .completion_baseline
+                .map(|base| (base.updated_at, base.repeat)),
+            (!remove_entry).then_some((Some(102), 4))
+        );
+        assert_eq!(state.db.get_entry(1).unwrap().is_none(), remove_entry);
+        assert_eq!(pending.patch.progress, Some(12));
+    }
+}
+
+#[tokio::test]
+async fn partial_entry_lookup_retries_without_blocking_the_next_edit() {
+    for (message, status) in [("Progress unavailable", None), ("Not Found", Some(404))] {
+        let mut failure = json!({"message":message,"path":["Media","mediaListEntry","progress"]});
+        if let Some(status) = status {
+            failure["status"] = json!(status);
+        }
+        let mut replies = vec![(
+            200,
+            json!({
+                "data":{"Media":{"id":1,"mediaListEntry":null}},
+                "errors":[failure]
+            }),
+        )];
+        replies.extend(batch_replies(2).into_iter().skip(2));
+        let (api, mut requests) = anilist::mock_api(replies).await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed_pending_batch(&state, 2);
+
+        assert!(flush_background(&state)
+            .await
+            .unwrap_err()
+            .contains(message));
+        assert_eq!(retry_after(&state.db, 7).unwrap(), Some(1));
+        let pending = state.db.pending(7).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].patch.progress, Some(4));
+        assert!(!pending[0].conflict);
+        assert_eq!(state.db.get_entry(2).unwrap().unwrap().progress, 4);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 2);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 23);
+        assert!(requests.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn a_nested_mutation_error_without_data_keeps_the_dispatched_edit() {
+    let mut confirmed = remote(4);
+    confirmed["updatedAt"] = json!(120);
+    let (api, mut requests) = anilist::mock_api(vec![
+        (200, json!({
+            "data":null,
+            "errors":[{"message":"Progress unavailable","path":["SaveMediaListEntry","progress"]}]
+        })),
+        lookup(Some(12), confirmed),
+    ]).await;
+    let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+    seed(&state);
+
+    let saved = crate::commands::save_entry_inner(&state, 1, None, Some(4), None, None)
+        .await
+        .unwrap();
+    assert_eq!(saved.progress, 4);
+    assert!(!state.db.pending_change(7, 1).unwrap().unwrap().conflict);
+    flush_background(&state).await.unwrap();
+    assert!(state.db.pending_change(7, 1).unwrap().is_none());
+    assert_eq!(
+        state.db.get_entry(1).unwrap().unwrap().updated_at,
+        Some(120)
+    );
+    assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 22);
+    assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn an_adjusted_finale_requires_review_for_episode_based_progress() {
+    for (replay, playback) in [(false, false), (true, false), (false, true), (true, true)] {
+        let before = entry("CURRENT", 11);
+        let adjusted = entry("COMPLETED", 13);
+        let mut replies = Vec::new();
+        if replay {
+            replies.push((503, json!({"errors":[{"message":"Offline"}]})));
+        }
+        if replay || playback {
+            replies.push(lookup(Some(12), before));
+        }
+        replies.extend([mutation(adjusted.clone()), lookup(Some(13), adjusted)]);
+        let (api, mut requests) = anilist::mock_api(replies).await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        let mut base = state.db.get_entry(1).unwrap().unwrap();
+        base.progress = 11;
+        state.db.upsert_entry(&base).unwrap();
+
+        let saved = if playback {
+            crate::commands::watcher_set_progress(&state, 1, 12, Some("test-session"))
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            crate::commands::save_entry_inner(&state, 1, None, Some(12), None, None)
+                .await
+                .unwrap()
+        };
+        assert_eq!(saved.progress, 12, "replay={replay}, playback={playback}");
+        if replay {
+            flush_background(&state).await.unwrap();
+        }
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.conflict);
+        assert_eq!(pending.patch.progress, Some(12));
+        assert_eq!(state.db.episode_total(1).unwrap(), Some(13));
+        assert_eq!(current_entry(&state, 1).unwrap().unwrap().progress, 12);
+        let requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(requests[requests.len() - 2]["variables"]["progress"], 12);
+        assert_eq!(requests.last().unwrap()["variables"]["mediaId"], 1);
+    }
+}
+
+#[tokio::test]
+async fn a_disagreeing_completion_readback_allows_the_next_queued_edit() {
+    let mut replies = vec![
+        lookup(Some(12), remote(3)),
+        mutation(entry("COMPLETED", 13)),
+        lookup(Some(13), entry("COMPLETED", 12)),
+    ];
+    replies.extend(batch_replies(2).into_iter().skip(2));
+    let (api, mut requests) = anilist::mock_api(replies).await;
+    let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+    seed_pending_batch(&state, 2);
+    stage(
+        &state,
+        1,
+        Patch {
+            progress: Some(12),
+            status: Some("COMPLETED".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(flush_background(&state)
+        .await
+        .unwrap_err()
+        .contains("did not confirm"));
+    assert_eq!(retry_after(&state.db, 7).unwrap(), Some(1));
+    assert_eq!(state.db.episode_total(1).unwrap(), Some(13));
+    let pending = state.db.pending(7).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].patch.progress, Some(12));
+    assert!(!pending[0].conflict);
+    assert_eq!(state.db.get_entry(2).unwrap().unwrap().progress, 4);
+    for (field, id) in [
+        ("mediaId", 1),
+        ("id", 22),
+        ("mediaId", 1),
+        ("mediaId", 2),
+        ("id", 23),
+    ] {
+        assert_eq!(requests.try_recv().unwrap()["variables"][field], id);
+    }
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn queued_rewatch_treats_explicit_null_differently_from_an_omitted_total() {
     for total_cleared in [false, true] {
         let mut base = entry("REPEATING", 11);
@@ -135,10 +456,13 @@ async fn merged_playback_and_offline_confirmation_only_replay_the_watched_episod
         );
 
         assert!(sync_pending_changes(&state).await.unwrap().is_empty());
-        assert_eq!(
-            requests.try_recv().unwrap()["variables"]["progress"],
-            if confirm { 12 } else { 11 }
-        );
+        let first = requests.try_recv().unwrap();
+        if confirm {
+            assert_eq!(first["variables"]["mediaId"], 1);
+            assert!(first["query"].as_str().unwrap().contains("mediaListEntry"));
+        } else {
+            assert_eq!(first["variables"]["progress"], 11);
+        }
         assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
         assert_eq!(
             requests.try_recv().unwrap()["variables"],
@@ -982,15 +1306,15 @@ async fn a_corrected_statusless_clamp_reopens_only_the_matching_completion() {
             );
         } else {
             assert!(pending[0].conflict, "{change}");
-            assert!(
-                pending[0]
-                    .error
-                    .as_deref()
-                    .unwrap()
-                    .contains("AniList changed while"),
-                "{change}"
-            );
-            assert_eq!(edit(9, None).await.unwrap().progress, 9);
+            let error = pending[0].error.as_deref().unwrap();
+            if change == "id" {
+                assert_eq!(error, ENTRY_REPLACED);
+                assert_eq!(state.db.get_entry(1).unwrap().unwrap().id, Some(23));
+                assert_eq!(edit(9, None).await.unwrap_err(), ENTRY_REPLACED);
+            } else {
+                assert!(error.contains("AniList changed while"), "{change}");
+                assert_eq!(edit(9, None).await.unwrap().progress, 9);
+            }
         }
         sync_pending_changes(&state).await.unwrap();
         assert!(requests.try_recv().is_err(), "{change}");

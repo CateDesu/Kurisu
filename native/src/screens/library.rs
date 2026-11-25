@@ -11,7 +11,7 @@ use gpui::{
     prelude::*, px, rgb,
 };
 use kurisu_core::{
-    Platform,
+    LibraryBindingScope as BindScope, Platform, library_binding_folder,
     models::{LibraryBinding, LibraryFile, ListEntry, UnreadableFolder, WatchHistoryItem},
 };
 
@@ -33,6 +33,18 @@ struct Group {
     files: Vec<LibraryFile>,
     bound: bool,
 }
+
+impl Group {
+    fn next_file(&self) -> Option<&LibraryFile> {
+        let episode = self
+            .entry
+            .as_ref()
+            .map_or(0, |entry| entry.progress)
+            .checked_add(1)?;
+        self.files.iter().find(|file| file.episode == Some(episode))
+    }
+}
+
 enum LibraryRow {
     Group(Box<Group>),
     File(LibraryFile, i64, i64, String),
@@ -53,11 +65,6 @@ impl LibraryRow {
 enum BindMode {
     Link,
     Numbering,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BindScope {
-    File,
-    Folder,
 }
 struct BindDialog {
     id: u64,
@@ -96,36 +103,14 @@ struct BindingCandidates {
     rows: Vec<BindingCandidate>,
 }
 
-fn normalize_folder_key(path: &str) -> String {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    if trimmed.is_empty() {
-        path.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 impl BindDialog {
-    fn folder(&self) -> String {
-        Path::new(&self.path)
-            .parent()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
     fn folder_allowed(&self, roots: &[String]) -> bool {
-        let folder = self.folder();
-        if folder.is_empty() || Path::new(&folder).parent().is_none() {
-            return false;
-        }
-        let key = normalize_folder_key(&folder);
-        !roots.iter().any(|root| normalize_folder_key(root) == key)
+        library_binding_folder(&self.path, roots).is_some()
     }
     fn target(&self, roots: &[String], folders_loaded: bool) -> Option<String> {
         match self.scope {
             BindScope::File => Some(self.path.clone()),
-            BindScope::Folder if folders_loaded && self.folder_allowed(roots) => {
-                Some(self.folder())
-            }
+            BindScope::Folder if folders_loaded => library_binding_folder(&self.path, roots),
             BindScope::Folder => None,
         }
     }
@@ -154,6 +139,7 @@ pub(super) struct LibraryState {
     history_open: bool,
     history: Vec<WatchHistoryItem>,
     history_loading: bool,
+    history_refresh_pending: bool,
     history_error: String,
     history_more: bool,
     history_request: u64,
@@ -203,6 +189,7 @@ impl Default for LibraryState {
             history_open: false,
             history: Vec::new(),
             history_loading: false,
+            history_refresh_pending: false,
             history_error: String::new(),
             history_more: false,
             history_request: 0,
@@ -441,9 +428,7 @@ impl Workspace {
             self.load_library_binding(window, cx);
         }
         self.ensure_library_fresh(window, cx);
-        if self.library_screen.history_open && !self.library_screen.history_loading {
-            self.load_library_history(false, window, cx);
-        }
+        self.refresh_library_history(window, cx);
         self.refresh_library_covers();
     }
 
@@ -989,10 +974,7 @@ impl Workspace {
                 Ok(worker
                     .library_binding_for(target)
                     .await?
-                    .map(|media_id| LibraryBinding {
-                        media_id,
-                        episode_offset: 0,
-                    }))
+                    .map(LibraryBinding::from))
             } else {
                 worker.library_binding_details(target).await
             }
@@ -1153,6 +1135,7 @@ impl Workspace {
         bind.revision = bind.revision.wrapping_add(1);
         let bind_id = bind.id;
         let save_revision = bind.revision;
+        let scope = bind.scope;
         bind.busy = true;
         bind.error.clear();
         if let Some(input) = &self.library_screen.offset {
@@ -1166,7 +1149,7 @@ impl Workspace {
             let result = joined(
                 core.spawn(async move {
                     worker
-                        .bind_library_path(target, media_id, Some(offset))
+                        .bind_library_path(target, media_id, Some(offset), scope)
                         .await
                 })
                 .await,
@@ -1270,26 +1253,29 @@ impl Workspace {
     }
 
     pub(super) fn refresh_library_history(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.stopping {
-            return;
-        }
         if self.library_screen.history_open {
             self.load_library_history(false, window, cx);
         }
     }
+
     fn load_library_history(&mut self, more: bool, window: &Window, cx: &mut Context<Self>) {
+        const PAGE_SIZE: usize = 50;
+
         if self.stopping
             || self.writes_fenced()
             || self.profile.is_none()
-            || self.library_screen.history_loading
+            || self.core.generation() != self.generation
         {
             return;
         }
-        let before = if more {
-            self.library_screen.history.last().map(|item| item.id)
-        } else {
-            None
-        };
+        if self.library_screen.history_loading {
+            self.library_screen.history_refresh_pending |= !more;
+            return;
+        }
+        if more && !self.library_screen.history_more {
+            return;
+        }
+        let tail = self.library_screen.history.last().map(|item| item.id);
         self.library_screen.history_request += 1;
         let request = self.library_screen.history_request;
         let generation = self.generation;
@@ -1299,11 +1285,39 @@ impl Workspace {
         cx.notify();
         let core = self.core.clone();
         let worker = core.clone();
-        let job = core.spawn(async move { worker.get_watch_history(Some(50), before).await });
+        let job = core.spawn(async move {
+            let mut before = if more { tail } else { None };
+            let oldest = tail.filter(|_| !more);
+            let mut history = Vec::new();
+            loop {
+                if worker.generation() != generation {
+                    return Err("Account changed".into());
+                }
+                let mut page = worker
+                    .get_watch_history(Some(PAGE_SIZE as i64 + 1), before)
+                    .await?;
+                if !page.is_empty() && worker.saved_account_id().await != account {
+                    return Err("Account changed".into());
+                }
+                let has_more = page.len() > PAGE_SIZE;
+                page.truncate(PAGE_SIZE);
+                // Re-read through the oldest loaded row, keeping at least one page.
+                let keep = oldest
+                    .filter(|_| !history.is_empty())
+                    .map_or(page.len(), |id| page.partition_point(|item| item.id >= id));
+                let passed_oldest = keep < page.len();
+                page.truncate(keep);
+                history.extend(page);
+                before = history.last().map(|item| item.id);
+                if passed_oldest || !has_more || oldest.is_none_or(|id| before <= Some(id)) {
+                    return Ok((history, has_more || passed_oldest));
+                }
+            }
+        });
         self.replace_reads("library-history", vec![job.abort_handle()]);
         cx.spawn_in(window, async move |this, cx| {
             let result = joined(job.await);
-            let _ = this.update_in(cx, |this, _, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 if this.stopping
                     || this.generation != generation
                     || this.profile.as_ref().map(|user| user.id) != account
@@ -1312,37 +1326,52 @@ impl Workspace {
                     return;
                 }
                 this.library_screen.history_loading = false;
+                if this.core.generation() != generation {
+                    return;
+                }
+                let refresh_pending =
+                    std::mem::take(&mut this.library_screen.history_refresh_pending);
+                if refresh_pending && !more {
+                    this.load_library_history(false, window, cx);
+                    cx.notify();
+                    return;
+                }
                 match result {
-                    Ok(rows) => {
+                    Ok((rows, has_more)) => {
                         let old = this.library_screen.history_widget.logical_scroll_top();
-                        let anchor = this
-                            .library_screen
-                            .history
-                            .get(old.item_ix)
-                            .map(|item| item.id);
-                        this.library_screen.history_more = rows.len() == 50;
+                        let history = &mut this.library_screen.history;
+                        let at_end = !history.is_empty() && old.item_ix >= history.len();
+                        let anchor = history.get(old.item_ix).or_else(|| history.last());
+                        let anchor = anchor.map(|item| item.id);
+                        this.library_screen.history_more = has_more;
                         if more {
-                            this.library_screen.history.extend(rows);
+                            history.extend(rows);
                         } else {
-                            this.library_screen.history = rows;
+                            *history = rows;
                         }
-                        this.library_screen
-                            .history_widget
-                            .reset_with_uniform_height(this.library_screen.history.len(), px(56.));
-                        if let Some(id) = anchor
-                            && let Some(index) = this
-                                .library_screen
-                                .history
-                                .iter()
-                                .position(|item| item.id == id)
-                        {
-                            this.library_screen.history_widget.scroll_to(ListOffset {
-                                item_ix: index,
-                                offset_in_item: old.offset_in_item,
+                        let widget = &this.library_screen.history_widget;
+                        widget.reset_with_uniform_height(history.len(), px(56.));
+                        if at_end && !more {
+                            widget.scroll_to_end();
+                        } else if let Some(id) = anchor {
+                            let index = history.partition_point(|item| item.id > id);
+                            widget.scroll_to(ListOffset {
+                                item_ix: index.min(history.len().saturating_sub(1)),
+                                offset_in_item: if history
+                                    .get(index)
+                                    .is_some_and(|item| item.id == id)
+                                {
+                                    old.offset_in_item
+                                } else {
+                                    px(0.)
+                                },
                             });
                         }
                     }
                     Err(error) => this.library_screen.history_error = error,
+                }
+                if refresh_pending {
+                    this.load_library_history(false, window, cx);
                 }
                 cx.notify();
             });
@@ -1630,6 +1659,7 @@ impl Workspace {
                         },
                         false,
                     )
+                    .debug_selector(|| "library-history-toggle".into())
                     .bg(rgb(BASE))
                     .border_color(rgb(BASE))
                     .px(px(0.))
@@ -1642,11 +1672,7 @@ impl Workspace {
                             return;
                         }
                         this.library_screen.history_open = !this.library_screen.history_open;
-                        if this.library_screen.history_open
-                            && this.library_screen.history.is_empty()
-                        {
-                            this.load_library_history(false, window, cx);
-                        }
+                        this.refresh_library_history(window, cx);
                         cx.notify();
                     })),
                 ),
@@ -1726,7 +1752,7 @@ impl Workspace {
                                             .border_color(rgb(EDGE))
                                             .child(
                                                 button(
-                                                    format!("history-{index}"),
+                                                    format!("history-{generation}-{}", item.id),
                                                     format!(
                                                         "{} · Episode {}",
                                                         item.title, item.episode
@@ -1736,6 +1762,9 @@ impl Workspace {
                                                 .on_click(move |_, window, app| {
                                                     let _ = weak.update(app, |this, cx| {
                                                         if scope_matches(this, generation, account)
+                                                            && this.core.generation() == generation
+                                                            && this.route == Route::Library
+                                                            && this.library_screen.history_open
                                                         {
                                                             this.navigate(
                                                                 Route::Anime(id),
@@ -2326,6 +2355,7 @@ fn open_file(
     cx: &mut Context<Workspace>,
 ) {
     if !scope_matches(this, generation, account)
+        || this.core.generation() != generation
         || this.library_controls_disabled(None)
         || this.library_screen.opening_file
     {
@@ -2352,7 +2382,9 @@ fn open_file(
                 return;
             }
             this.library_screen.opening_file = false;
-            if let Err(error) = result {
+            if this.core.generation() == generation
+                && let Err(error) = result
+            {
                 this.library_screen.action_error = error;
             }
             cx.notify();
@@ -2388,10 +2420,6 @@ fn render_library_row(
                 .as_ref()
                 .and_then(|entry| entry.media.as_ref())
                 .and_then(|media| media.episodes);
-            let next = group
-                .files
-                .iter()
-                .find(|file| file.episode == Some(progress.unwrap_or(0) + 1));
             let weak_toggle = weak.clone();
             let weak_detail = weak.clone();
             let weak_unlink = weak.clone();
@@ -2479,7 +2507,7 @@ fn render_library_row(
                     }),
                 );
             }
-            if let Some(file) = next {
+            if let Some(file) = group.next_file() {
                 let path = file.path.clone();
                 let episode = file.episode.unwrap_or(0);
                 let movie = group
@@ -2491,7 +2519,7 @@ fn render_library_row(
                 let weak_play = weak.clone();
                 line = line.child(
                     button(
-                        format!("library-next-{id}"),
+                        format!("library-next-{generation}-{id}-{episode}-{path}"),
                         if movie {
                             "▶ Play movie".into()
                         } else {
@@ -2499,9 +2527,20 @@ fn render_library_row(
                         },
                         file_actions_disabled,
                     )
+                    .debug_selector(move || format!("library-next-{id}"))
                     .on_click(move |_, _, app| {
                         let _ = weak_play.update(app, |this, cx| {
-                            open_file(this, &path, false, generation, account, cx)
+                            let next = this.library_screen.rows.iter().find_map(|row| match row {
+                                LibraryRow::Group(group) if group.media_id == id => {
+                                    group.next_file()
+                                }
+                                _ => None,
+                            });
+                            if next.is_some_and(|file| {
+                                file.path == path && file.episode == Some(episode)
+                            }) {
+                                open_file(this, &path, false, generation, account, cx);
+                            }
                         });
                     }),
                 );
@@ -2678,6 +2717,347 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn history_accessibility_target_survives_insertion(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = super::super::workspace_tests::fixture();
+        let session = core.clone();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let record = |id, media_id, title: &str| WatchHistoryItem {
+            id,
+            media_id,
+            title: title.into(),
+            path: format!("/fixture/{id}.mkv"),
+            episode: 1,
+            watched_at: 0,
+        };
+        cx.simulate_resize(gpui::size(px(1100.), px(1000.)));
+        cx.simulate_accessibility_activation();
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Library;
+            let library = &mut w.library_screen;
+            library.history_open = true;
+            library.history = vec![record(1, 90, "Original")];
+            library.history_widget.reset_with_uniform_height(1, px(56.));
+            cx.notify();
+        });
+        cx.update(|window, app| window.draw(app).clear(app));
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (original, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Original · Episode 1"))
+            .unwrap();
+        workspace.update_in(cx, |w, _, cx| {
+            let library = &mut w.library_screen;
+            library.history.insert(0, record(2, 91, "New playback"));
+            library.history_widget.reset_with_uniform_height(2, px(56.));
+            cx.notify();
+        });
+        cx.update(|window, app| window.draw(app).clear(app));
+        let click = gpui::accesskit::ActionRequest {
+            action: gpui::AccessibleAction::Click,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: *original,
+            data: None,
+        };
+        cx.simulate_accessibility_action(click.clone());
+        workspace.read_with(cx, |w, _| assert_eq!(w.route, Route::Anime(90)));
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.route = Route::Library;
+            cx.notify();
+        });
+        cx.update(|window, app| window.draw(app).clear(app));
+        session.begin_login_intent();
+        cx.simulate_accessibility_action(click);
+        workspace.read_with(cx, |w, _| assert_eq!(w.route, Route::Library));
+    }
+
+    #[gpui::test]
+    fn library_next_file_handles_max_progress(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = super::super::workspace_tests::fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(1000.)));
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Library;
+            w.library_screen.folders = vec!["/fixture".into()];
+            w.library_screen.scan_loaded = true;
+            w.library_screen.files = [i64::MIN, i64::MAX]
+                .into_iter()
+                .map(|episode| LibraryFile {
+                    path: format!("/fixture/episode-{episode}.mkv"),
+                    media_id: Some(9),
+                    episode: Some(episode),
+                    ..Default::default()
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        for (progress, expected) in [(i64::MAX, false), (i64::MAX - 1, true)] {
+            workspace.update_in(cx, |w, _, cx| {
+                w.library_screen.entries = vec![ListEntry {
+                    media_id: 9,
+                    progress,
+                    ..Default::default()
+                }];
+                w.rebuild_library_rows();
+                cx.notify();
+            });
+            cx.update(|window, app| window.draw(app).clear(app));
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            let label = format!("▶ Ep {}", i64::MAX);
+            assert_eq!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(&label)),
+                expected
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn library_next_file_stays_bound_to_the_pressed_path(cx: &mut gpui::TestAppContext) {
+        let (core, _runtime, _dir) = super::super::workspace_tests::fixture();
+        let session = core.clone();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let file = |path: &str| LibraryFile {
+            media_id: Some(9),
+            episode: Some(2),
+            path: path.into(),
+            ..Default::default()
+        };
+        cx.simulate_resize(gpui::size(px(1100.), px(1000.)));
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Library;
+            w.library_screen.folders = vec!["/fixture".into()];
+            w.library_screen.scan_loaded = true;
+            w.library_screen.entries = vec![ListEntry {
+                media_id: 9,
+                progress: 1,
+                ..Default::default()
+            }];
+            w.library_screen.files = vec![file("/fixture/old.mkv")];
+            w.rebuild_library_rows();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let play = cx.debug_bounds("library-next-9").unwrap().center();
+        cx.simulate_mouse_down(play, gpui::MouseButton::Left, gpui::Modifiers::default());
+        workspace.update_in(cx, |w, _, cx| {
+            w.library_screen.files = vec![file("/fixture/new.mkv")];
+            w.rebuild_library_rows();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_up(play, gpui::MouseButton::Left, gpui::Modifiers::default());
+        workspace.read_with(cx, |w, _| assert!(!w.library_screen.opening_file));
+
+        session.begin_login_intent();
+        cx.simulate_click(play, gpui::Modifiers::default());
+        workspace.read_with(cx, |w, _| assert!(!w.library_screen.opening_file));
+    }
+
+    #[gpui::test]
+    fn history_refresh_reconciles_loaded_pages_after_pagination(cx: &mut gpui::TestAppContext) {
+        use super::super::workspace_tests::{TestPlatform, fixture};
+        use std::time::{Duration, Instant};
+
+        let (initial, runtime, dir) = fixture();
+        drop(initial);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let profile = kurisu_core::User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        };
+        db.replace_account("synthetic-token", &profile).unwrap();
+        for episode in 1..=125 {
+            db.record_watch(7, "/fixture/show.mkv", 9, episode).unwrap();
+        }
+        let core = kurisu_core::Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let finish = |cx: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while view.read_with(cx, |w, _| w.library_screen.history_loading) {
+                assert!(Instant::now() < deadline, "history read did not finish");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                cx.run_until_parked();
+            }
+        };
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(profile);
+            w.route = Route::Library;
+            w.library_screen.history_open = true;
+            w.refresh_library_history(window, cx);
+        });
+        finish(cx);
+        view.update_in(cx, |w, window, cx| {
+            assert_eq!(w.library_screen.history.len(), 50);
+            w.load_library_history(true, window, cx);
+            db.record_watch(7, "/fixture/show.mkv", 9, 126).unwrap();
+            w.refresh_library_history(window, cx);
+        });
+        finish(cx);
+        view.update_in(cx, |w, window, cx| {
+            let state = &w.library_screen;
+            assert_eq!(state.history.len(), 101);
+            assert_eq!(state.history[0].episode, 126);
+            assert_eq!(state.history.last().unwrap().episode, 26);
+            assert!(state.history_more);
+            state.history_widget.scroll_to(ListOffset {
+                item_ix: 70,
+                offset_in_item: px(7.),
+            });
+            assert_eq!(state.history[70].episode, 56);
+            db.record_watch(7, "/fixture/show.mkv", 9, 127).unwrap();
+            db.0.lock()
+                .execute("DELETE FROM watch_history WHERE episode = 57", [])
+                .unwrap();
+            db.upsert_media(&kurisu_core::models::Media {
+                id: 9,
+                title_english: Some("Updated title".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            w.refresh_library_history(window, cx);
+            w.refresh_library_history(window, cx);
+        });
+        finish(cx);
+        view.update_in(cx, |w, window, cx| {
+            let state = &w.library_screen;
+            assert_eq!(state.history.len(), 101);
+            assert_eq!(state.history[0].episode, 127);
+            assert!(
+                state
+                    .history
+                    .iter()
+                    .all(|item| item.episode != 57 && item.title == "Updated title")
+            );
+            assert_eq!(state.history.last().unwrap().episode, 26);
+            assert_eq!(
+                state.history_widget.logical_scroll_top(),
+                ListOffset {
+                    item_ix: 70,
+                    offset_in_item: px(7.)
+                }
+            );
+            w.load_library_history(true, window, cx);
+        });
+        finish(cx);
+        view.read_with(cx, |w, _| {
+            let state = &w.library_screen;
+            assert_eq!(state.history.len(), 126);
+            assert_eq!(state.history.last().unwrap().episode, 1);
+            assert!(!state.history_more);
+        });
+
+        cx.run_until_parked();
+        let toggle = cx.debug_bounds("library-history-toggle").unwrap().center();
+        cx.simulate_click(toggle, gpui::Modifiers::default());
+        db.record_watch(7, "/fixture/show.mkv", 9, 128).unwrap();
+        view.update_in(cx, |w, window, cx| {
+            assert!(!w.library_screen.history_open);
+            w.handle_event(
+                kurisu_core::Event {
+                    generation: w.generation,
+                    account_id: Some(7),
+                    prompt_id: None,
+                    kind: kurisu_core::EventKind::WatchHistoryUpdated(128),
+                },
+                window,
+                cx,
+            );
+        });
+        cx.simulate_click(toggle, gpui::Modifiers::default());
+        finish(cx);
+        view.read_with(cx, |w, _| {
+            assert!(w.library_screen.history_open);
+            assert_eq!(w.library_screen.history[0].episode, 128);
+            assert_eq!(w.library_screen.history.len(), 127);
+        });
+    }
+
+    #[gpui::test]
+    fn history_rejects_core_account_change_before_workspace_updates(cx: &mut gpui::TestAppContext) {
+        use super::super::workspace_tests::{TestPlatform, fixture};
+
+        let (initial, runtime, dir) = fixture();
+        drop(initial);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let profile = kurisu_core::User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        };
+        db.replace_account("synthetic-token", &profile).unwrap();
+        let core = kurisu_core::Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        let job = view.update_in(cx, |w, window, cx| {
+            w.profile = Some(profile.clone());
+            w.route = Route::Library;
+            w.library_screen.history_open = true;
+            w.refresh_library_history(window, cx);
+            w.read_aborts["library-history"][0].clone()
+        });
+        core.begin_login_intent();
+        db.replace_account("replacement-token", &kurisu_core::User { id: 8, ..profile })
+            .unwrap();
+        db.record_watch(8, "/fixture/replacement.mkv", 9, 1)
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |w, _| {
+            assert_eq!(w.profile.as_ref().unwrap().id, 7);
+            assert!(w.library_screen.history.is_empty());
+        });
+    }
+
+    #[gpui::test]
     fn accesskit_clicks_only_reach_the_active_dialog(cx: &mut gpui::TestAppContext) {
         use super::super::workspace_tests::{fixture, settle, tracking_fixture, update_fixture};
         use gpui::accesskit::{Action, ActionRequest, NodeId, TreeId, TreeUpdate};
@@ -2689,6 +3069,12 @@ mod tests {
         };
         let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
         db.replace_account("synthetic-token", &profile).unwrap();
+        db.upsert_media(&kurisu_core::models::Media {
+            id: 9,
+            title_english: Some("Show".into()),
+            ..Default::default()
+        })
+        .unwrap();
         db.upsert_entry(&ListEntry {
             media_id: 9,
             status: "CURRENT".into(),
@@ -2877,6 +3263,12 @@ mod tests {
         };
         let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
         db.replace_account("synthetic-token", &profile).unwrap();
+        db.upsert_media(&kurisu_core::models::Media {
+            id: 9,
+            title_english: Some("Show".into()),
+            ..Default::default()
+        })
+        .unwrap();
         db.upsert_entry(&ListEntry {
             media_id: 9,
             status: "CURRENT".into(),
@@ -3565,10 +3957,7 @@ mod tests {
                 mode: BindMode::Link,
                 scope: BindScope::File,
                 request: 1,
-                current: Some(LibraryBinding {
-                    media_id: 1,
-                    episode_offset: 0,
-                }),
+                current: Some(1.into()),
                 current_title: None,
                 checked: true,
                 loading: false,
@@ -3760,10 +4149,7 @@ mod tests {
                 mode: BindMode::Numbering,
                 scope: BindScope::File,
                 request: 1,
-                current: Some(LibraryBinding {
-                    media_id: 1,
-                    episode_offset: 0,
-                }),
+                current: Some(1.into()),
                 current_title: None,
                 checked: true,
                 loading: false,
@@ -3845,10 +4231,7 @@ mod tests {
                 mode: BindMode::Link,
                 scope: BindScope::File,
                 request: 1,
-                current: Some(LibraryBinding {
-                    media_id: 1,
-                    episode_offset: 0,
-                }),
+                current: Some(1.into()),
                 current_title: None,
                 checked: true,
                 loading: false,
@@ -4149,7 +4532,7 @@ mod tests {
 
     #[test]
     fn bind_dialog_rejects_filesystem_root() {
-        let dialog = BindDialog {
+        let mut dialog = BindDialog {
             id: 0,
             revision: 0,
             path: "/Show - 01.mkv".into(),
@@ -4169,6 +4552,18 @@ mod tests {
             offset_edited: false,
         };
         assert!(!dialog.folder_allowed(&[]));
+        let (_core, _runtime, dir) = super::super::workspace_tests::fixture();
+        let root = dir.0.join("library root");
+        let show = root.join("show");
+        std::fs::create_dir_all(&show).unwrap();
+        let roots = [reqwest::Url::from_directory_path(&root)
+            .unwrap()
+            .to_string()];
+        dialog.path = root.join("Episode 01.mkv").to_str().unwrap().into();
+        assert!(!dialog.folder_allowed(&roots));
+        assert_eq!(dialog.target(&roots, true), None);
+        dialog.path = show.join("Episode 01.mkv").to_str().unwrap().into();
+        assert_eq!(dialog.target(&roots, true).as_deref(), show.to_str());
     }
 }
 
@@ -4329,13 +4724,14 @@ mod modal_regressions {
             .block_on(core.add_library_folder(folder.to_string_lossy().into_owned()))
             .unwrap();
         runtime
-            .block_on(core.bind_library_path(path.clone(), 9, Some(5)))
+            .block_on(core.bind_library_path(path.clone(), 9, Some(5), BindScope::File))
             .unwrap();
         runtime
             .block_on(core.bind_library_path(
                 show_folder.to_string_lossy().into_owned(),
                 9,
                 Some(7),
+                BindScope::Folder,
             ))
             .unwrap();
         let (view, cx) =

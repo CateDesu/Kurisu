@@ -1233,6 +1233,7 @@ mod tests {
             let binding = LibraryBinding {
                 media_id: entry.media_id,
                 episode_offset: 0,
+                scope: None,
             };
             let bound = cache.scan(
                 std::slice::from_ref(&root),

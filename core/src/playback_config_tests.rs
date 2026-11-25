@@ -90,7 +90,7 @@ impl Fixture {
         let sample = fixture.sample();
         assert!(state.anilist.lock().has_token());
         let matched =
-            crate::recognize::match_title(&state.matchers.lock(), &sample.title, &sample.trackid)
+            crate::recognize::match_title(&state.matchers.lock(), &sample.title, &sample.location)
                 .expect("fixture playback title must match")
                 .media_id;
         assert_eq!(Some(matched), sample.media_id);
@@ -100,8 +100,14 @@ impl Fixture {
     fn sample(&self) -> TickInfo {
         TickInfo {
             playing: true,
+            eof_reached: false,
             player: "controlled".into(),
-            trackid: self
+            player_id: None,
+            player_track_id: None,
+            mpv_endpoint: None,
+            process_id: None,
+            mpv_entry_id: None,
+            location: self
                 .profile
                 .0
                 .join("episode02.mkv")
@@ -158,8 +164,17 @@ impl Fixture {
         work: &PlaybackWork,
         active: &mut Option<ActiveTrack>,
     ) -> anyhow::Result<()> {
+        self.tick_sample(work, active, Some(self.sample())).await
+    }
+
+    async fn tick_sample(
+        &self,
+        work: &PlaybackWork,
+        active: &mut Option<ActiveTrack>,
+        sample: Option<TickInfo>,
+    ) -> anyhow::Result<()> {
         let mut cache = RecognitionCache {
-            probe_result: Some(self.sample()),
+            probe_result: Some(sample),
             ..Default::default()
         };
         tokio::time::timeout(
@@ -234,7 +249,7 @@ async fn tracking_read_errors_preserve_opt_outs_and_recover() {
     );
     assert_eq!(error.to_string(), expected);
     let track = active.as_ref().unwrap();
-    assert!(!track.asked && !track.prompted && track.push.is_none());
+    assert!(!track.asked && track.prompt_watch.is_none() && track.push.is_none());
     assert!(track.accumulated >= Duration::from_secs(20));
 
     f.repair_read();
@@ -247,7 +262,7 @@ async fn tracking_read_errors_preserve_opt_outs_and_recover() {
         f.tick(&work, &mut active).await.unwrap_err().to_string(),
         expected
     );
-    assert!(!active.as_ref().unwrap().prompted);
+    assert!(active.as_ref().unwrap().prompt_watch.is_none());
     assert!(tracking_events(&mut events).is_empty());
     f.repair_read();
     f.tick(&work, &mut active).await.unwrap();
@@ -329,6 +344,7 @@ async fn tracking_load_defaults_and_legacy_contract_are_unchanged() {
 #[tokio::test]
 async fn failed_tracking_read_defers_new_writes_but_preserves_accepted_write() {
     let f = Fixture::new();
+    std::fs::write(f.sample().location, []).unwrap();
     let state = f.core.state();
     let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
     let (mut api, mut requests) = crate::anilist::mock_api(vec![
@@ -381,7 +397,504 @@ async fn failed_tracking_read_defers_new_writes_but_preserves_accepted_write() {
     f.repair_read();
     f.tick(&work, &mut active).await.unwrap();
     let track = active.as_ref().unwrap();
-    assert!(track.incremented && track.history_recorded && track.push.is_none());
+    assert!(
+        track.incremented && track.history_recorded.load(Ordering::Relaxed) && track.push.is_none()
+    );
     assert!(requests.try_recv().is_err());
     assert!(state.db.pending(7).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn playback_switch_and_stop_retire_an_offer_before_its_preflight_finishes() {
+    for switch_endpoint in [false, true] {
+        let f = Fixture::new();
+        let state = f.core.state();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (mut api, mut requests) = crate::anilist::mock_api_gated(
+            vec![(
+                200,
+                json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":{
+                    "id":22,"mediaId":1,"status":"CURRENT","progress":1,"repeat":0,"score":0
+                }}}}),
+            )],
+            Some(gate.clone()),
+        )
+        .await;
+        api.record_viewer(7);
+        *state.anilist.lock() = api;
+        TrackingConfig {
+            prompt_seconds: 1,
+            ..original("prompt")
+        }
+        .save(&state.db)
+        .unwrap();
+        let work = PlaybackWork::default();
+        let mut active = None;
+        let mut sample = f.sample();
+        sample.mpv_endpoint = Some("first".into());
+        f.tick_sample(&work, &mut active, Some(sample.clone()))
+            .await
+            .unwrap();
+        active.as_mut().unwrap().accumulated = Duration::from_secs(2);
+        f.tick_sample(&work, &mut active, Some(sample.clone()))
+            .await
+            .unwrap();
+        let offer = state.retained_tracking_prompt().unwrap();
+        sample.playing = false;
+        f.tick_sample(&work, &mut active, Some(sample.clone()))
+            .await
+            .unwrap();
+        assert!(state.event_is_current(&offer));
+
+        let core = f.core.clone();
+        let confirm = tokio::spawn(async move { core.confirm_tracking_prompt(offer, 2).await });
+        let lookup = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lookup["variables"]["mediaId"], 1);
+        sample.playing = true;
+        sample.mpv_endpoint = Some("second".into());
+        f.tick_sample(&work, &mut active, switch_endpoint.then_some(sample))
+            .await
+            .unwrap();
+        assert_eq!(active.is_some(), switch_endpoint);
+        if let Some(track) = active {
+            assert_eq!(track.accumulated, Duration::ZERO);
+        }
+        assert!(state.retained_tracking_prompt().is_none());
+        gate.add_permits(1);
+        assert!(tokio::time::timeout(Duration::from_secs(5), confirm)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(requests.try_recv().is_err());
+        assert!(state.db.pending(7).unwrap().is_empty());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 1);
+        assert!(state.db.watch_history(7, 10, None).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_independent_player_cannot_finish_watch_history_for_mpv() {
+    for ipc_first in [true, false] {
+        let f = Fixture::new();
+        let state = f.core.state();
+        original("auto").save(&state.db).unwrap();
+        let mut mpv = f.sample();
+        std::fs::write(&mpv.location, []).unwrap();
+        mpv.episode = Some(1);
+        mpv.process_id = Some(8);
+        mpv.mpv_endpoint = Some("fixture-socket".into());
+        let mut vlc = f.sample();
+        vlc.episode = Some(1);
+        vlc.player = "VLC".into();
+        vlc.player_id = Some("org.mpris.MediaPlayer2.vlc :1.9".into());
+        vlc.location = reqwest::Url::from_file_path(&mpv.location).unwrap().into();
+        let (first, second) = if ipc_first { (mpv, vlc) } else { (vlc, mpv) };
+        let work = PlaybackWork::default();
+        let mut active = None;
+        f.tick_sample(&work, &mut active, Some(first))
+            .await
+            .unwrap();
+        active.as_mut().unwrap().accumulated = Duration::from_secs(25);
+        f.tick_sample(&work, &mut active, Some(second.clone()))
+            .await
+            .unwrap();
+        assert_eq!(active.as_ref().unwrap().accumulated, Duration::ZERO);
+        assert!(state.db.watch_history(7, 10, None).unwrap().is_empty());
+
+        active.as_mut().unwrap().accumulated = Duration::from_secs(25);
+        f.tick_sample(&work, &mut active, Some(second))
+            .await
+            .unwrap();
+        assert_eq!(state.db.watch_history(7, 10, None).unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn mpv_eof_can_finish_at_100_percent_without_adding_watch_time() {
+    for (earned, same_player, expected_progress) in [(24, true, 1), (25, false, 1), (25, true, 2)] {
+        let f = Fixture::new();
+        std::fs::write(f.sample().location, []).unwrap();
+        let state = f.core.state();
+        let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
+        let (mut api, mut requests) = crate::anilist::mock_api(vec![
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"mediaListEntry":remote(1)}}}),
+            ),
+            (200, json!({"data":{"SaveMediaListEntry":remote(2)}})),
+        ])
+        .await;
+        api.record_viewer(7);
+        *state.anilist.lock() = api;
+        TrackingConfig {
+            auto_percent: 100,
+            ..original("auto")
+        }
+        .save(&state.db)
+        .unwrap();
+
+        let work = PlaybackWork::default();
+        let mut active = None;
+        let mut sample = f.sample();
+        let endpoint = "fixture-socket".to_string();
+        sample.mpv_endpoint = Some(if same_player {
+            endpoint.clone()
+        } else {
+            "independent-socket".into()
+        });
+        sample.position_us = 79_000_000;
+        f.tick_sample(&work, &mut active, Some(sample.clone()))
+            .await
+            .unwrap();
+        let track = active.as_mut().unwrap();
+        track.accumulated = Duration::from_secs(earned);
+        track.last_tick -= TICK;
+        sample.playing = false;
+        sample.eof_reached = true;
+        sample.mpv_endpoint = Some(endpoint);
+        sample.position_us = 99_000_000;
+        f.tick_sample(&work, &mut active, Some(sample))
+            .await
+            .unwrap();
+        assert_eq!(
+            active.as_ref().unwrap().accumulated,
+            Duration::from_secs(if same_player { earned } else { 0 })
+        );
+        drop(active);
+        tokio::time::timeout(Duration::from_secs(5), work.join_retired(false))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.db.get_entry(1).unwrap().unwrap().progress,
+            expected_progress
+        );
+        let advanced = expected_progress == 2;
+        assert_eq!(
+            state.db.watch_history(7, 10, None).unwrap().len(),
+            usize::from(advanced)
+        );
+        assert_eq!(
+            std::iter::from_fn(|| requests.try_recv().ok()).count(),
+            if advanced { 2 } else { 0 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_mpv_eof_retry_keeps_earned_watch_time_without_opening_a_prompt() {
+    let f = Fixture::new();
+    std::fs::write(f.sample().location, []).unwrap();
+    let state = f.core.state();
+    TrackingConfig {
+        auto_percent: 80,
+        auto_ask: true,
+        ..original("auto")
+    }
+    .save(&state.db)
+    .unwrap();
+    let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
+    let (mut api, mut requests) = crate::anilist::mock_api(vec![
+        (
+            200,
+            json!({"data":{"Media":{"id":1,"mediaListEntry":remote(1)}}}),
+        ),
+        (200, json!({"data":{"SaveMediaListEntry":remote(2)}})),
+    ])
+    .await;
+    api.record_viewer(7);
+    *state.anilist.lock() = api;
+    let work = PlaybackWork::default();
+    let mut active = None;
+    let mut sample = f.sample();
+    sample.mpv_endpoint = Some("fixture-socket".into());
+    sample.position_us = 79_000_000;
+    f.tick_sample(&work, &mut active, Some(sample.clone()))
+        .await
+        .unwrap();
+    let track = active.as_mut().unwrap();
+    track.accumulated = Duration::from_secs(25);
+    track.fail_count = 1;
+    track.retry_at = Some(Instant::now() + TICK);
+    sample.playing = false;
+    sample.eof_reached = true;
+    sample.position_us = 99_000_000;
+    f.tick_sample(&work, &mut active, Some(sample.clone()))
+        .await
+        .unwrap();
+    let track = active.as_mut().unwrap();
+    assert!(track.push.is_none());
+    track.retry_at = Some(Instant::now());
+    track.last_tick -= TICK;
+    f.tick_sample(&work, &mut active, Some(sample))
+        .await
+        .unwrap();
+    let track = active.as_ref().unwrap();
+    assert_eq!(track.accumulated, Duration::from_secs(25));
+    assert!(state.retained_tracking_prompt().is_none());
+    assert!(track.push.is_some());
+    tokio::time::timeout(Duration::from_secs(5), work.wait_idle())
+        .await
+        .unwrap();
+    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 2);
+    assert_eq!(state.db.watch_history(7, 10, None).unwrap().len(), 1);
+    assert_eq!(std::iter::from_fn(|| requests.try_recv().ok()).count(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn history_preserves_a_playable_alias_for_utf8_and_non_utf8_targets() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+    for target in [b"recording.mkv".as_slice(), b"recording-\xff.mkv"] {
+        let f = Fixture::new();
+        let mut sample = f.sample();
+        let target = f.profile.0.join(std::ffi::OsStr::from_bytes(target));
+        std::fs::write(&target, []).unwrap();
+        symlink(target, &sample.location).unwrap();
+        sample.episode = Some(1);
+        original("auto").save(&f.core.state().db).unwrap();
+
+        let work = PlaybackWork::default();
+        let mut active = None;
+        f.tick_sample(&work, &mut active, Some(sample.clone()))
+            .await
+            .unwrap();
+        active.as_mut().unwrap().accumulated = Duration::from_secs(25);
+        let expected_path = sample.location.clone();
+        f.tick_sample(&work, &mut active, Some(sample))
+            .await
+            .unwrap();
+
+        let rows = f.core.get_watch_history(None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, expected_path);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pending_prompt_uses_a_utf8_alias_reported_after_it_qualified() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+    let f = Fixture::new();
+    let state = f.core.state();
+    let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
+    let (mut api, _) = crate::anilist::mock_api(vec![
+        (
+            200,
+            json!({"data":{"Media":{"id":1,"mediaListEntry":remote(1)}}}),
+        ),
+        (200, json!({"data":{"SaveMediaListEntry":remote(2)}})),
+    ])
+    .await;
+    api.record_viewer(7);
+    *state.anilist.lock() = api;
+    TrackingConfig {
+        prompt_seconds: 1,
+        ..original("prompt")
+    }
+    .save(&state.db)
+    .unwrap();
+
+    let mut sample = f.sample();
+    let alias = PathBuf::from(&sample.location);
+    let target = f
+        .profile
+        .0
+        .join(std::ffi::OsStr::from_bytes(b"video-\xff.mkv"));
+    std::fs::write(&target, []).unwrap();
+    symlink(&target, &alias).unwrap();
+    sample.location = reqwest::Url::from_file_path(target).unwrap().into();
+    let work = PlaybackWork::default();
+    let mut active = None;
+    f.tick_sample(&work, &mut active, Some(sample.clone()))
+        .await
+        .unwrap();
+    active.as_mut().unwrap().accumulated = Duration::from_secs(25);
+    f.tick_sample(&work, &mut active, Some(sample))
+        .await
+        .unwrap();
+    let offer = state.retained_tracking_prompt().unwrap();
+    f.tick(&work, &mut active).await.unwrap();
+    f.core.confirm_tracking_prompt(offer, 2).await.unwrap();
+
+    let rows = f.core.get_watch_history(None, None).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(Path::new(&rows[0].path), alias);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delayed_automatic_history_keeps_the_sampled_file_after_stop_and_retargeting() {
+    assert_delayed_history(false, WatchQualification::BeforeRequest).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delayed_prompt_history_keeps_the_sampled_file_after_stop_and_retargeting() {
+    for qualification in [
+        WatchQualification::BeforeRequest,
+        WatchQualification::DuringPreflight,
+        WatchQualification::DuringMutation,
+        WatchQualification::AfterSwitch,
+        WatchQualification::Never,
+    ] {
+        assert_delayed_history(true, qualification).await;
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum WatchQualification {
+    BeforeRequest,
+    DuringPreflight,
+    DuringMutation,
+    AfterSwitch,
+    Never,
+}
+
+#[cfg(unix)]
+async fn assert_delayed_history(confirm_prompt: bool, qualification: WatchQualification) {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let state = f.core.state();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let remote = |progress| json!({"id":22,"mediaId":1,"status":"CURRENT","progress":progress,"repeat":0,"score":0});
+    let (mut api, mut requests) = crate::anilist::mock_api_gated(
+        vec![
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"mediaListEntry":remote(1)}}}),
+            ),
+            (200, json!({"data":{"SaveMediaListEntry":remote(2)}})),
+        ],
+        Some(gate.clone()),
+    )
+    .await;
+    api.record_viewer(7);
+    *state.anilist.lock() = api;
+    TrackingConfig {
+        prompt_seconds: 1,
+        ..original(if confirm_prompt { "prompt" } else { "auto" })
+    }
+    .save(&state.db)
+    .unwrap();
+    let alias = PathBuf::from(f.sample().location);
+    let watched = f.profile.0.join("watched.mkv");
+    let replacement = f.profile.0.join("replacement.mkv");
+    std::fs::write(&watched, []).unwrap();
+    std::fs::write(&replacement, []).unwrap();
+    symlink(&watched, &alias).unwrap();
+    let work = PlaybackWork::default();
+    let mut active = None;
+    f.tick(&work, &mut active).await.unwrap();
+    active.as_mut().unwrap().accumulated =
+        Duration::from_secs(if qualification == WatchQualification::BeforeRequest {
+            60
+        } else {
+            2
+        });
+    f.tick(&work, &mut active).await.unwrap();
+    let confirm = confirm_prompt.then(|| {
+        let offer = state.retained_tracking_prompt().unwrap();
+        let core = f.core.clone();
+        tokio::spawn(async move { core.confirm_tracking_prompt(offer, 2).await })
+    });
+    let first = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first["variables"]["mediaId"], 1);
+    if qualification == WatchQualification::DuringPreflight {
+        active.as_mut().unwrap().accumulated = Duration::from_secs(60);
+        f.tick(&work, &mut active).await.unwrap();
+    }
+    gate.add_permits(1);
+    let second = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second["variables"]["progress"], 2);
+    if qualification == WatchQualification::DuringMutation {
+        active.as_mut().unwrap().accumulated = Duration::from_secs(60);
+        f.tick(&work, &mut active).await.unwrap();
+    }
+    if qualification == WatchQualification::AfterSwitch {
+        let mut other = f.sample();
+        other.location = replacement.to_str().unwrap().into();
+        f.tick_sample(&work, &mut active, Some(other.clone()))
+            .await
+            .unwrap();
+        active.as_mut().unwrap().accumulated = Duration::from_secs(60);
+        f.tick_sample(&work, &mut active, Some(other))
+            .await
+            .unwrap();
+        assert!(state.retained_tracking_prompt().is_some());
+    }
+
+    std::fs::remove_file(&alias).unwrap();
+    symlink(&replacement, &alias).unwrap();
+    f.tick_sample(&work, &mut active, None).await.unwrap();
+    assert!(active.is_none());
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), work.join_retired(false))
+        .await
+        .unwrap();
+    if let Some(confirm) = confirm {
+        tokio::time::timeout(Duration::from_secs(5), confirm)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 2);
+    let history = state.db.watch_history(7, 10, None).unwrap();
+    assert_eq!(
+        history.len(),
+        usize::from(matches!(
+            qualification,
+            WatchQualification::BeforeRequest
+                | WatchQualification::DuringPreflight
+                | WatchQualification::DuringMutation
+        )),
+        "{qualification:?}"
+    );
+    if let Some(entry) = history.first() {
+        assert_eq!(Path::new(&entry.path), watched.canonicalize().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn manual_progress_records_history_only_after_qualifying_playback() {
+    let f = Fixture::new();
+    std::fs::write(f.sample().location, []).unwrap();
+    let state = f.core.state();
+    let (mut api, mut requests) = crate::anilist::mock_api(vec![(
+        200,
+        json!({"data":{"SaveMediaListEntry":{
+            "id":22,"mediaId":1,"status":"CURRENT","progress":2,"repeat":0,"score":0
+        }}}),
+    )])
+    .await;
+    api.record_viewer(7);
+    *state.anilist.lock() = api;
+    original("prompt").save(&state.db).unwrap();
+    let work = PlaybackWork::default();
+    let mut active = None;
+    f.tick(&work, &mut active).await.unwrap();
+    commands::set_progress(1, 2, Some(1), state).await.unwrap();
+    assert_eq!(requests.try_recv().unwrap()["variables"]["progress"], 2);
+    assert!(state.db.watch_history(7, 10, None).unwrap().is_empty());
+    active.as_mut().unwrap().accumulated = Duration::from_secs(95);
+    let mut events = f.core.subscribe();
+    f.tick(&work, &mut active).await.unwrap();
+    assert_eq!(state.db.watch_history(7, 10, None).unwrap().len(), 1);
+    assert!(tracking_events(&mut events).is_empty());
+    assert!(requests.try_recv().is_err());
 }

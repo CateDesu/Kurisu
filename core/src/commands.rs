@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -5,7 +6,7 @@ use parking_lot::Mutex;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::anilist::{self, AniList};
-use crate::db::{CatalogRead, Db, ListPreferences};
+use crate::db::{CatalogRead, CatalogUpdate, Db, ListPreferences, TOKEN_KEY, TOKEN_REJECTED_KEY};
 use crate::library;
 use crate::models::{
     AiringItem, EntryDetails, FuzzyDate, LibraryScan, ListEntry, ListStatus, Media, MediaDetail,
@@ -14,7 +15,6 @@ use crate::models::{
 use crate::recognize;
 use crate::rss;
 
-const TOKEN_KEY: &str = "anilist_token";
 const CLIENT_ID_KEY: &str = "anilist_client_id";
 const REDIRECT_URI_KEY: &str = "anilist_redirect_uri";
 const USERNAME_KEY: &str = "anilist_username";
@@ -41,7 +41,13 @@ pub struct AppState {
     pub events: tokio::sync::broadcast::Sender<crate::Event>,
     pub last_auth_expired: Mutex<Option<crate::Event>>,
     pub last_now_playing: Mutex<Option<crate::Event>>,
-    pub last_tracking_prompt: Mutex<Option<crate::Event>>,
+    pub(crate) last_tracking_prompt: Mutex<Option<RetainedTrackingPrompt>>,
+}
+
+pub(crate) struct RetainedTrackingPrompt {
+    event: crate::Event,
+    entry_identity: Option<crate::EntryIdentity>,
+    watched: Option<crate::playback::PromptWatch>,
 }
 
 fn same_tracking_prompt(a: &crate::Event, b: &crate::Event) -> bool {
@@ -79,7 +85,12 @@ impl AppState {
         self.origin() == origin
     }
 
-    fn send_event(&self, origin: crate::EventOrigin, kind: crate::EventKind) {
+    fn send_event(
+        &self,
+        origin: crate::EventOrigin,
+        kind: crate::EventKind,
+        watched: Option<crate::playback::PromptWatch>,
+    ) {
         let prompt_id = matches!(
             &kind,
             crate::EventKind::TrackingPrompt(_) | crate::EventKind::TrackingAsk(_)
@@ -105,12 +116,19 @@ impl AppState {
                 }
                 *self.last_now_playing.lock() = Some(event.clone());
             }
-            crate::EventKind::TrackingPrompt(_) | crate::EventKind::TrackingAsk(_) => {
+            crate::EventKind::TrackingPrompt(prompt) | crate::EventKind::TrackingAsk(prompt) => {
+                let Ok(entry) = self.db.get_entry(prompt.media_id) else {
+                    return;
+                };
                 let mut retained = self.last_tracking_prompt.lock();
                 if !self.origin_is_current(origin) {
                     return;
                 }
-                *retained = Some(event.clone());
+                *retained = Some(RetainedTrackingPrompt {
+                    event: event.clone(),
+                    entry_identity: entry.as_ref().map(ListEntry::identity),
+                    watched,
+                });
             }
             _ => {}
         }
@@ -119,7 +137,18 @@ impl AppState {
 
     pub(crate) fn emit_from(&self, origin: crate::EventOrigin, kind: crate::EventKind) {
         if kind.is_global() || self.origin_is_current(origin) {
-            self.send_event(origin, kind);
+            self.send_event(origin, kind, None);
+        }
+    }
+
+    pub(crate) fn emit_tracking_offer(
+        &self,
+        origin: crate::EventOrigin,
+        kind: crate::EventKind,
+        watched: crate::playback::PromptWatch,
+    ) {
+        if self.origin_is_current(origin) {
+            self.send_event(origin, kind, Some(watched));
         }
     }
 
@@ -149,7 +178,8 @@ impl AppState {
 
     pub(crate) fn clear_tracking_prompt_from(&self, origin: crate::EventOrigin) {
         let mut retained = self.last_tracking_prompt.lock();
-        if retained.as_ref().is_some_and(|event| {
+        if retained.as_ref().is_some_and(|retained| {
+            let event = &retained.event;
             event.generation == origin.generation && event.account_id == origin.account_id
         }) {
             retained.take();
@@ -158,14 +188,18 @@ impl AppState {
 
     fn clear_tracking_prompt_if_advanced(&self, origin: crate::EventOrigin, entry: &ListEntry) {
         let mut retained = self.last_tracking_prompt.lock();
-        if retained.as_ref().is_some_and(|event| match &event.kind {
-            crate::EventKind::TrackingPrompt(prompt) | crate::EventKind::TrackingAsk(prompt) => {
-                event.generation == origin.generation
-                    && event.account_id == origin.account_id
-                    && prompt.media_id == entry.media_id
-                    && entry.progress >= prompt.episode
+        if retained.as_ref().is_some_and(|retained| {
+            let event = &retained.event;
+            match &event.kind {
+                crate::EventKind::TrackingPrompt(prompt)
+                | crate::EventKind::TrackingAsk(prompt) => {
+                    event.generation == origin.generation
+                        && event.account_id == origin.account_id
+                        && prompt.media_id == entry.media_id
+                        && entry.progress >= prompt.episode
+                }
+                _ => false,
             }
-            _ => false,
         }) {
             retained.take();
         }
@@ -177,20 +211,24 @@ impl AppState {
         media_id: i64,
     ) {
         let mut retained = self.last_tracking_prompt.lock();
-        if retained.as_ref().is_some_and(|event| match &event.kind {
-            crate::EventKind::TrackingPrompt(prompt) | crate::EventKind::TrackingAsk(prompt) => {
-                event.generation == origin.generation
-                    && event.account_id == origin.account_id
-                    && prompt.media_id == media_id
+        if retained.as_ref().is_some_and(|retained| {
+            let event = &retained.event;
+            match &event.kind {
+                crate::EventKind::TrackingPrompt(prompt)
+                | crate::EventKind::TrackingAsk(prompt) => {
+                    event.generation == origin.generation
+                        && event.account_id == origin.account_id
+                        && prompt.media_id == media_id
+                }
+                _ => false,
             }
-            _ => false,
         }) {
             retained.take();
         }
     }
 
     pub(crate) fn retained_tracking_prompt(&self) -> Option<crate::Event> {
-        let retained = self.last_tracking_prompt.lock().clone()?;
+        let retained = self.last_tracking_prompt.lock().as_ref()?.event.clone();
         let origin = self.origin();
         let prompt = match &retained.kind {
             crate::EventKind::TrackingPrompt(prompt) | crate::EventKind::TrackingAsk(prompt) => {
@@ -210,7 +248,7 @@ impl AppState {
             let mut current = self.last_tracking_prompt.lock();
             if current
                 .as_ref()
-                .is_some_and(|event| same_tracking_prompt(event, &retained))
+                .is_some_and(|current| same_tracking_prompt(&current.event, &retained))
             {
                 current.take();
             }
@@ -236,7 +274,7 @@ impl AppState {
         let mut retained = self.last_tracking_prompt.lock();
         if retained
             .as_ref()
-            .is_some_and(|current| same_tracking_prompt(current, event))
+            .is_some_and(|current| same_tracking_prompt(&current.event, event))
         {
             retained.take();
             true
@@ -282,9 +320,13 @@ impl AppState {
     fn cache_media_batch(&self, read: &CatalogRead, media: &mut Vec<Media>) {
         let removed = read.removed_media();
         media.retain(|item| !removed.contains(&item.id));
-        read.preserve_totals(&self.db, media.iter_mut());
+        read.preserve_newer(&self.db, media.iter_mut());
         if self.db.upsert_media_batch(media).is_ok() {
-            read.record_totals(&self.db, media.iter().map(|item| item.id));
+            read.record_write(
+                &self.db,
+                CatalogUpdate::Metadata,
+                media.iter().map(|item| item.id),
+            );
         }
         self.refresh_media_matchers(&media.iter().map(|item| item.id).collect::<Vec<_>>());
     }
@@ -417,24 +459,15 @@ fn signed_out_origin_guard(
 #[cfg(test)]
 fn clear_rejected_session(state: &AppState) {
     let token = state.anilist.lock().token();
-    clear_rejected_session_from(state, state.origin(), &token);
+    reject_write_session(state, state.origin(), &token);
 }
 
-/// Caller holds remote_lock and entry_lock.
-fn clear_rejected_session_from(
-    state: &AppState,
-    origin: crate::EventOrigin,
-    token: &Option<String>,
-) -> bool {
-    clear_rejected_session_after(state, origin, token, || {}).is_some()
-}
-
-pub(crate) fn clear_rejected_session_after<T>(
+fn clear_rejected_session_after<T>(
     state: &AppState,
     origin: crate::EventOrigin,
     token: &Option<String>,
     settle: impl FnOnce() -> T,
-) -> Option<T> {
+) -> Option<(T, WriteAuthFailure)> {
     let intent = state.auth_intent.borrow();
     if *intent != origin.generation
         || crate::sync_queue::account_id(&state.db) != origin.account_id
@@ -442,8 +475,33 @@ pub(crate) fn clear_rejected_session_after<T>(
     {
         return None;
     }
-    let settled = settle();
+    let failure = match remove_saved_token(&state.db) {
+        Ok(warning) => {
+            if let Some(warning) = warning {
+                log::warn!("failed to scrub rejected token: {warning}");
+            }
+            WriteAuthFailure::Expired
+        }
+        Err(error) => {
+            log::warn!("failed to remove rejected token: {error}");
+            match state.db.durable_write(|tx| {
+                let written = tx.execute(
+                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,'1')",
+                    [TOKEN_REJECTED_KEY],
+                )?;
+                anyhow::ensure!(written == 1, "token rejection marker was not written");
+                Ok(())
+            }) {
+                Ok(()) => WriteAuthFailure::Expired,
+                Err(error) => {
+                    log::error!("failed to record rejected token: {error}");
+                    WriteAuthFailure::PersistenceFailed
+                }
+            }
+        }
+    };
     state.clear_session();
+    let settled = settle();
     if let Err(e) = state.db.preserve_list_owner() {
         log::warn!("failed to preserve list owner of the rejected session: {e}");
         for key in crate::db::SCOPED_LIST_PREFERENCE_KEYS {
@@ -451,9 +509,6 @@ pub(crate) fn clear_rejected_session_after<T>(
                 log::warn!("failed to clear unowned list preference {key}: {del_err}");
             }
         }
-    }
-    if let Err(e) = state.db.delete_setting(TOKEN_KEY) {
-        log::warn!("failed to drop rejected token from db: {e}");
     }
     if let Err(e) = state.db.delete_setting(USERNAME_KEY) {
         log::warn!("failed to drop rejected username from db: {e}");
@@ -467,38 +522,40 @@ pub(crate) fn clear_rejected_session_after<T>(
     if let Err(e) = state.db.clear_entries() {
         log::warn!("failed to clear the cached list of the rejected session: {e}");
     }
-    state.send_event(origin, crate::EventKind::AuthExpired);
+    state.send_event(origin, crate::EventKind::AuthExpired, None);
     drop(intent);
     state.clear_tracking_prompt_from(origin);
-    Some(settled)
+    Some((settled, failure))
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum WriteAuthFailure {
+enum WriteAuthFailure {
     Expired,
+    PersistenceFailed,
     Replaced,
 }
 
 impl WriteAuthFailure {
-    pub(crate) fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
             Self::Expired => SESSION_EXPIRED,
+            Self::PersistenceFailed => concat!(
+                "Your AniList session expired. Kurisu could not disable the saved token. ",
+                "It may be loaded again after a restart. Please sign in again."
+            ),
             Self::Replaced => AUTH_REPLACED,
         }
     }
 }
 
 /// Caller holds remote_lock and entry_lock when handling an auth rejection.
-pub(crate) fn reject_write_session(
+fn reject_write_session(
     state: &AppState,
     origin: crate::EventOrigin,
     token: &Option<String>,
 ) -> WriteAuthFailure {
-    if clear_rejected_session_from(state, origin, token) {
-        WriteAuthFailure::Expired
-    } else {
-        WriteAuthFailure::Replaced
-    }
+    clear_rejected_session_after(state, origin, token, || {})
+        .map_or(WriteAuthFailure::Replaced, |(_, failure)| failure)
 }
 
 pub(crate) fn write_err(
@@ -523,10 +580,10 @@ pub(crate) fn settle_write_error<T>(
     settle: impl FnOnce(&str) -> Result<T, String>,
 ) -> Result<(T, String), String> {
     if anilist::is_auth_rejection(error) {
-        let settled =
+        let (settled, failure) =
             clear_rejected_session_after(state, origin, token, || settle(SESSION_EXPIRED))
-                .ok_or(AUTH_REPLACED)??;
-        return Ok((settled, SESSION_EXPIRED.into()));
+                .ok_or(AUTH_REPLACED)?;
+        return Ok((settled?, failure.message().into()));
     }
     let _intent = write_origin_guard(state, origin, token)?;
     let message = error.to_string();
@@ -881,28 +938,43 @@ async fn logout_inner(state: &Arc<AppState>, intent: u64) -> Result<(), String> 
     .await
 }
 
+fn remove_saved_token(db: &Db) -> Result<Option<String>, String> {
+    let Err(e) = db.scrub_setting(TOKEN_KEY) else {
+        return Ok(None);
+    };
+    if db
+        .get_setting(TOKEN_KEY)
+        .is_ok_and(|saved| saved.is_none_or(|token| token.is_empty()))
+    {
+        return Ok(Some(format!(
+            "signed out, but the token could not be scrubbed from the local database: {e}"
+        )));
+    }
+    db.durable_write(|tx| {
+        let written = tx.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?, '')",
+            [TOKEN_KEY],
+        )?;
+        anyhow::ensure!(written == 1, "the saved token was not blanked");
+        Ok(())
+    })
+    .map_err(|_| e.to_string())?;
+    Ok(Some(e.to_string()))
+}
+
 fn finish_logout(
     state: &AppState,
     previous_token: Option<String>,
     previous_user: Option<User>,
 ) -> Result<(), String> {
-    let scrub_failure = state.db.scrub_setting(TOKEN_KEY).err();
-    let mut token_delete_failure = None;
-    if scrub_failure.is_some() {
-        if let Err(delete_err) = state.db.delete_setting(TOKEN_KEY) {
-            if state.db.set_setting(TOKEN_KEY, "").is_err() {
-                let token_remains = state
-                    .db
-                    .get_setting(TOKEN_KEY)
-                    .map_or(true, |saved| saved.is_some_and(|token| !token.is_empty()));
-                if previous_token.is_some() && token_remains {
-                    state.restore_session(previous_token, previous_user);
-                    return Err(delete_err.to_string());
-                }
-            }
-            token_delete_failure = Some(delete_err.to_string());
+    let token_warning = match remove_saved_token(&state.db) {
+        Ok(warning) => warning,
+        Err(e) if previous_token.is_some() => {
+            state.restore_session(previous_token, previous_user);
+            return Err(e);
         }
-    }
+        Err(e) => Some(e),
+    };
     let mut cleanup_error = None;
     let mut record = |result: anyhow::Result<()>| {
         if let Err(e) = result {
@@ -921,16 +993,8 @@ fn finish_logout(
     record(state.db.delete_setting(USERNAME_KEY));
     record(state.db.delete_setting(USER_ID_KEY));
     record(state.db.delete_setting(PROFILE_KEY));
-    if let Some(error) = token_delete_failure {
+    if let Some(error) = token_warning.or(cleanup_error) {
         return Err(error);
-    }
-    if let Some(error) = cleanup_error {
-        return Err(error);
-    }
-    if let Some(e) = scrub_failure {
-        return Err(format!(
-            "signed out, but the token could not be scrubbed from the local database: {e}"
-        ));
     }
     Ok(())
 }
@@ -1019,10 +1083,9 @@ pub(crate) async fn current_user_mode(
         Err(e) => {
             if anilist::is_auth_rejection(&e) {
                 drop(current_intent);
-                return if clear_rejected_session_from(state, origin, &token_used) {
-                    Ok(None)
-                } else {
-                    Err(AUTH_REPLACED.into())
+                return match reject_write_session(state, origin, &token_used) {
+                    WriteAuthFailure::Expired => Ok(None),
+                    failure => Err(failure.message().into()),
                 };
             }
             if refresh {
@@ -1102,23 +1165,35 @@ pub async fn get_recommendations(media_id: i64, state: &AppState) -> Result<Vec<
 }
 
 pub async fn get_media(id: i64, state: &AppState) -> Result<Media, String> {
+    let read = state.db.catalog_read();
     if let Some(m) = state.db.get_media(id).map_err(|e| e.to_string())? {
         return Ok(m);
     }
     let al = state.anilist.lock().clone();
-    let read = state.db.catalog_read();
-    let mut v = match al.media_by_id(id).await {
-        Ok(v) => v,
-        Err(e) if anilist::media_not_found(&e) => return Err(MEDIA_GONE.to_string()),
-        Err(e) => return Err(e.to_string()),
-    };
+    let result = al.media_by_id(id).await;
     let _write = state.entry_lock.lock().await;
     if read.removed_media().contains(&id) {
         return Err(MEDIA_GONE.into());
     }
-    read.preserve_totals(&state.db, [&mut v]);
+    let mut v = match result {
+        Ok(v) => v,
+        Err(e) if anilist::media_not_found(&e) => {
+            if read.has_newer_media(id) {
+                if let Some(media) = state
+                    .db
+                    .cached_catalog_media(id)
+                    .map_err(|e| e.to_string())?
+                {
+                    return Ok(media);
+                }
+            }
+            return Err(MEDIA_GONE.into());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    read.preserve_newer(&state.db, [&mut v]);
     state.db.upsert_media(&v).map_err(|e| e.to_string())?;
-    read.record_totals(&state.db, std::iter::once(v.id));
+    read.record_write(&state.db, CatalogUpdate::Metadata, std::iter::once(v.id));
     state.refresh_media_matchers(&[v.id]);
     Ok(v)
 }
@@ -1128,12 +1203,20 @@ pub async fn get_media_detail(id: i64, state: &AppState) -> Result<MediaDetail, 
 }
 
 async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail, String> {
+    const SECTIONS: [&str; 3] = ["relations", "characters", "staff"];
     let origin = state.origin();
     let al = state
         .anilist
         .lock()
         .for_intent(&state.auth_intent, origin.generation);
     let expected_token = al.token();
+    let check_origin = || {
+        if expected_token.is_some() {
+            write_origin_guard(state, origin, &expected_token)
+        } else {
+            signed_out_origin_guard(state, origin)
+        }
+    };
     let key = format!("media_detail:{id}");
     let cached = || {
         state
@@ -1142,18 +1225,49 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
             .ok()
             .flatten()
             .and_then(|v| serde_json::from_str::<MediaDetail>(&v).ok())
-            .filter(|detail| detail.media.has_metadata())
+            .filter(|detail| {
+                detail.media.id == id && (detail.cached_at.is_some() || detail.media.has_metadata())
+            })
     };
     let read = state.db.catalog_read();
+    let fallback = |error: anyhow::Error, removed: &std::collections::HashSet<i64>| {
+        if removed.contains(&id) {
+            return Err(MEDIA_GONE.into());
+        }
+        if let Some(mut detail) = cached() {
+            detail.relations.retain(|r| !removed.contains(&r.media.id));
+            state.db.restore_cached_metadata(&mut detail.media);
+            state.db.restore_cached_relations(&mut detail.relations);
+            detail.warning = Some(error.to_string());
+            return Ok(detail);
+        }
+        match state
+            .db
+            .cached_catalog_media(id)
+            .map_err(|e| e.to_string())?
+        {
+            Some(media) => Ok(MediaDetail {
+                media,
+                relations: vec![],
+                characters: vec![],
+                staff: vec![],
+                cached_at: None,
+                warning: Some(error.to_string()),
+                unavailable_sections: SECTIONS.map(str::to_owned).into(),
+            }),
+            None => Err(error.to_string()),
+        }
+    };
     match al.media_detail(id).await {
         Ok(mut detail) => {
             let _write = state.entry_lock.lock().await;
+            let _intent = check_origin()?;
             let removed = read.removed_media();
             if removed.contains(&id) {
                 return Err(MEDIA_GONE.into());
             }
             detail.relations.retain(|r| !removed.contains(&r.media.id));
-            read.preserve_totals(
+            read.preserve_newer(
                 &state.db,
                 std::iter::once(&mut detail.media).chain(
                     detail
@@ -1163,7 +1277,7 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
                 ),
             );
             if state.db.upsert_media_detail(&detail.media).is_ok() {
-                read.record_totals(&state.db, std::iter::once(detail.media.id));
+                read.record_write(&state.db, CatalogUpdate::Detail, std::iter::once(id));
             }
             if state
                 .db
@@ -1176,32 +1290,56 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
                 )
                 .is_ok()
             {
-                read.record_totals(&state.db, detail.relations.iter().map(|r| r.media.id));
+                read.record_write(
+                    &state.db,
+                    CatalogUpdate::Metadata,
+                    detail.relations.iter().map(|relation| relation.media.id),
+                );
             }
             let ids = std::iter::once(detail.media.id)
                 .chain(detail.relations.iter().map(|relation| relation.media.id))
                 .collect::<Vec<_>>();
             state.refresh_media_matchers(&ids);
-            if let Some(old) = (!detail.unavailable_sections.is_empty())
+            let unavailable = detail.unavailable_sections.clone();
+            let newer = SECTIONS.map(|section| read.has_newer_section(id, section));
+            if let Some(mut old) = (newer.contains(&true) || !unavailable.is_empty())
                 .then(cached)
                 .flatten()
             {
-                for section in &detail.unavailable_sections {
-                    match section.as_str() {
+                for (section, newer) in SECTIONS.into_iter().zip(newer) {
+                    let incoming_unavailable = unavailable.iter().any(|name| name == section);
+                    if !incoming_unavailable && !newer {
+                        continue;
+                    }
+                    match section {
                         "relations" => {
-                            detail.relations = old.relations.clone();
+                            detail.relations = std::mem::take(&mut old.relations);
                             detail.relations.retain(|r| !removed.contains(&r.media.id));
                             state.db.restore_cached_relations(&mut detail.relations);
                         }
-                        "characters" => detail.characters = old.characters.clone(),
-                        "staff" => detail.staff = old.staff.clone(),
+                        "characters" => detail.characters = std::mem::take(&mut old.characters),
+                        "staff" => detail.staff = std::mem::take(&mut old.staff),
                         _ => {}
+                    }
+                    if newer {
+                        detail.unavailable_sections.retain(|name| name != section);
+                        if old.unavailable_sections.iter().any(|name| name == section) {
+                            detail.unavailable_sections.push(section.into());
+                        }
                     }
                 }
             }
             detail.cached_at = Some(chrono::Utc::now().timestamp());
-            if let Ok(value) = serde_json::to_string(&detail) {
-                let _ = state.db.set_setting(&key, &value);
+            if state.db.cache_media_detail_sections(&key, &detail).is_ok() {
+                for section in SECTIONS {
+                    if !unavailable.iter().any(|name| name == section) {
+                        read.record_write(
+                            &state.db,
+                            CatalogUpdate::Section(section),
+                            std::iter::once(id),
+                        );
+                    }
+                }
             }
             Ok(detail)
         }
@@ -1215,6 +1353,10 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
         Err(e) if anilist::media_not_found(&e) => {
             let _remote = state.remote_lock.lock().await;
             let _guard = state.entry_lock.lock().await;
+            if read.has_newer_media(id) {
+                let _intent = check_origin()?;
+                return fallback(e, &read.removed_media());
+            }
             if expected_token.is_some() {
                 let intent = write_origin_guard(state, origin, &expected_token)?;
                 crate::sync_queue::mark_media_missing_from(state, origin, intent, id, true)
@@ -1230,33 +1372,8 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
         }
         Err(e) => {
             let _write = state.entry_lock.lock().await;
-            let removed = read.removed_media();
-            if removed.contains(&id) {
-                return Err(MEDIA_GONE.into());
-            }
-            if let Some(mut detail) = cached() {
-                detail.relations.retain(|r| !removed.contains(&r.media.id));
-                state.db.restore_cached_totals([&mut detail.media]);
-                state.db.restore_cached_relations(&mut detail.relations);
-                detail.warning = Some(e.to_string());
-                return Ok(detail);
-            }
-            match state.db.get_media(id).map_err(|e| e.to_string())? {
-                Some(media) => Ok(MediaDetail {
-                    media,
-                    relations: vec![],
-                    characters: vec![],
-                    staff: vec![],
-                    cached_at: None,
-                    warning: Some(e.to_string()),
-                    unavailable_sections: vec![
-                        "relations".into(),
-                        "characters".into(),
-                        "staff".into(),
-                    ],
-                }),
-                None => Err(e.to_string()),
-            }
+            let _intent = check_origin()?;
+            fallback(e, &read.removed_media())
         }
     }
 }
@@ -1266,19 +1383,29 @@ pub async fn get_airing_schedule(
     end: i64,
     state: &AppState,
 ) -> Result<Vec<AiringItem>, String> {
-    if end <= start || end - start > 15 * 86_400 {
+    if !end
+        .checked_sub(start)
+        .is_some_and(|span| (1..=15 * 86_400).contains(&span))
+    {
         return Err("invalid schedule range".to_string());
     }
-    let al = state.anilist.lock().clone();
+    let origin = state.origin();
+    let al = state
+        .anilist
+        .lock()
+        .for_intent(&state.auth_intent, origin.generation);
+    let token = al.token();
     let read = state.db.catalog_read();
-    let mut items = al
-        .airing_schedule(start, end)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut items = match al.airing_schedule(start, end).await {
+        Ok(items) => items,
+        Err(e) if e.is::<anilist::UnsentRequest>() => return Err(AUTH_REPLACED.into()),
+        Err(e) => return Err(e.to_string()),
+    };
     let _write = state.entry_lock.lock().await;
+    let _intent = write_origin_guard(state, origin, &token)?;
     let removed = read.removed_media();
     items.retain(|item| !removed.contains(&item.media.id));
-    read.preserve_totals(&state.db, items.iter_mut().map(|item| &mut item.media));
+    read.preserve_newer(&state.db, items.iter_mut().map(|item| &mut item.media));
     let on_list: std::collections::HashSet<i64> = state
         .db
         .entry_media_ids()
@@ -1287,7 +1414,11 @@ pub async fn get_airing_schedule(
         .collect();
     for item in &items {
         if on_list.contains(&item.media.id) && state.db.upsert_media(&item.media).is_ok() {
-            read.record_totals(&state.db, std::iter::once(item.media.id));
+            read.record_write(
+                &state.db,
+                CatalogUpdate::Metadata,
+                std::iter::once(item.media.id),
+            );
         }
     }
     state.refresh_media_matchers(
@@ -1367,7 +1498,13 @@ async fn sync_my_list_inner(
         account_id: Some(account),
     };
     drop(_write);
-    crate::sync_queue::flush_from(state, origin).await?;
+    match crate::sync_queue::flush_from(state, origin).await {
+        Ok(()) => {}
+        Err(crate::sync_queue::EntryFlushError::Entry(error)) => {
+            log::debug!("pending sync: {error}")
+        }
+        Err(crate::sync_queue::EntryFlushError::Batch(error)) => return Err(error),
+    }
     let _write = state.entry_lock.lock().await;
     check_read_account(state, account, &token, intent)?;
     let mut score_format = state
@@ -1410,7 +1547,9 @@ async fn sync_my_list_inner(
     let state = state.clone();
     persist(entry, Some(remote), move || {
         let intent = state.auth_intent_guard(intent)?;
-        read.preserve_totals(
+        let removed = read.removed_media();
+        entries.retain(|entry| !removed.contains(&entry.media_id));
+        read.preserve_newer(
             &state.db,
             entries.iter_mut().filter_map(|entry| entry.media.as_mut()),
         );
@@ -1419,8 +1558,9 @@ async fn sync_my_list_inner(
                 "sync incomplete: the remote list could not be cached, remote deletions were not reconciled: {e}"
             )
         })?;
-        read.record_totals(
+        read.record_write(
             &state.db,
+            CatalogUpdate::Metadata,
             entries
                 .iter()
                 .filter_map(|entry| entry.media.as_ref().map(|media| media.id)),
@@ -1491,9 +1631,14 @@ fn local_entry_updates_locked(
                 .db
                 .pending_change(account_id, media_id)
                 .map_err(|e| e.to_string())?;
-            let Some(pending) = pending else {
+            let Some(pending) = pending.filter(|pending| !pending.needs_cleanup_only()) else {
                 return Ok(stored);
             };
+            if !crate::sync_queue::overlay_allowed(state, account_id, &pending, stored.as_ref())
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(stored);
+            }
             if pending.deleting {
                 if let Some(entry) = stored.as_mut().filter(|entry| entry.media.is_none()) {
                     let total = state
@@ -1518,6 +1663,7 @@ fn local_entry_updates_locked(
                     || stored.progress != entry.progress
                     || stored.score != entry.score
                     || stored.repeat != entry.repeat
+                    || stored.queued_creation != entry.queued_creation
             }) {
                 state.db.upsert_entry(&entry).map_err(|e| e.to_string())?;
                 matchers_changed |= stored
@@ -1550,6 +1696,20 @@ pub async fn get_entry(media_id: i64, state: &AppState) -> Result<Option<ListEnt
 }
 
 const MEDIA_GONE: &str = "AniList no longer has this anime. It was likely merged into another entry. Search for it to re-add the correct one.";
+const EDITOR_ENTRY_CHANGED: &str =
+    "Your AniList entry changed or was removed. Refresh your list and reopen the editor.";
+const EDITOR_ENTRY_UNVERIFIED: &str =
+    "This entry has no verified AniList ID. Refresh your list and reopen the editor.";
+
+fn check_editor_account(
+    target: Option<&crate::EntryEditTarget>,
+    account: i64,
+) -> Result<(), String> {
+    if target.is_some_and(|target| target.account_id != Some(account)) {
+        return Err("Your AniList account changed. Reopen the editor.".into());
+    }
+    Ok(())
+}
 
 /// Reaching the total completes unless another status is chosen.
 /// Completed fills progress to the known total.
@@ -1596,10 +1756,72 @@ impl crate::Core {
             repeat,
             expected_progress,
             Some(displayed_format),
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_editor_entry(
+        &self,
+        media_id: i64,
+        target: crate::EntryEditTarget,
+        status: Option<String>,
+        progress: Option<i64>,
+        score: Option<f64>,
+        repeat: Option<i64>,
+        expected_progress: i64,
+        displayed_format: Option<String>,
+    ) -> Result<ListEntry, String> {
+        save_entry_inner_checked_impl(
+            &self.state,
+            media_id,
+            status,
+            progress,
+            score,
+            repeat,
+            Some(expected_progress),
+            Some(displayed_format),
+            Some(EntryWriteTarget::Editor(target)),
+        )
+        .await
+    }
+
+    pub async fn update_discovery_status(
+        &self,
+        media_id: i64,
+        account_id: Option<i64>,
+        identity: Option<crate::EntryIdentity>,
+        status: String,
+    ) -> Result<ListEntry, String> {
+        save_entry_inner_checked_impl(
+            &self.state,
+            media_id,
+            Some(status),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(EntryWriteTarget::Discovery {
+                account_id,
+                identity,
+            }),
         )
         .await
     }
 }
+
+enum EntryWriteTarget {
+    Editor(crate::EntryEditTarget),
+    Discovery {
+        account_id: Option<i64>,
+        identity: Option<crate::EntryIdentity>,
+    },
+}
+
+const DISCOVERY_ENTRY_CHANGED: &str =
+    "Your AniList entry changed. Review its status before trying again.";
 
 pub async fn save_entry_inner_checked(
     state: &AppState,
@@ -1619,6 +1841,7 @@ pub async fn save_entry_inner_checked(
         repeat,
         expected_progress,
         None,
+        None,
     )
     .await
 }
@@ -1633,6 +1856,7 @@ async fn save_entry_inner_checked_impl(
     repeat: Option<i64>,
     expected_progress: Option<i64>,
     displayed_format: Option<Option<String>>,
+    target: Option<EntryWriteTarget>,
 ) -> Result<ListEntry, String> {
     let origin = state.origin();
     let expected_token = state.anilist.lock().token();
@@ -1653,6 +1877,45 @@ async fn save_entry_inner_checked_impl(
     }
     let account = entry_account(state, origin)?;
     let before = crate::sync_queue::current_entry(state, media_id).map_err(|e| e.to_string())?;
+    let expects_absent = matches!(
+        &target,
+        Some(EntryWriteTarget::Discovery { identity: None, .. })
+    );
+    if let Some(EntryWriteTarget::Discovery {
+        account_id,
+        identity,
+    }) = &target
+    {
+        let matches = match (identity.as_ref(), before.as_ref()) {
+            (Some(identity), Some(entry)) => identity.matches(entry),
+            (None, None) => true,
+            _ => false,
+        };
+        if *account_id != origin.account_id || !matches {
+            return Err(DISCOVERY_ENTRY_CHANGED.into());
+        }
+    }
+    if let Some(EntryWriteTarget::Editor(target)) = target {
+        check_editor_account(Some(&target), account)?;
+        if target.identity == crate::EntryIdentity::Unverified {
+            return Err(EDITOR_ENTRY_UNVERIFIED.into());
+        }
+        if before
+            .as_ref()
+            .is_none_or(|entry| !target.identity.matches(entry))
+        {
+            return Err(EDITOR_ENTRY_CHANGED.into());
+        }
+        if before.as_ref().is_some_and(|entry| entry.id.is_none())
+            && state
+                .db
+                .pending_change(account, media_id)
+                .map_err(|e| e.to_string())?
+                .is_none_or(|pending| pending.base.is_some())
+        {
+            return Err(EDITOR_ENTRY_UNVERIFIED.into());
+        }
+    }
     if let Some(expected) = expected_progress {
         match before.as_ref() {
             None => return Err("the entry is no longer on your list".into()),
@@ -1708,13 +1971,17 @@ async fn save_entry_inner_checked_impl(
             crate::sync_queue::validate_progress_edit(state, media_id, progress, total)
                 .map_err(|e| e.to_string())?;
         }
+        let requested_repeat = repeat;
         let (status, progress, repeat) = edit(total, before);
         validate_entry_values(progress, score, repeat)?;
+        let automatic_completion = (st.is_none() && status.as_deref() == Some("COMPLETED"))
+            .then(|| crate::sync_queue::AutomaticCompletion::new(requested_repeat));
         Ok::<_, String>(crate::sync_queue::Patch {
             status,
             progress,
             score,
             repeat,
+            automatic_completion,
             ..Default::default()
         })
     };
@@ -1730,7 +1997,11 @@ async fn save_entry_inner_checked_impl(
             .map(|account| state.db.pending_change(account, media_id))
             .transpose()
             .map_err(|e| e.to_string())?
-            .flatten();
+            .flatten()
+            .filter(|pending| !pending.needs_cleanup_only());
+        if expects_absent && existing.is_some() {
+            return Err(DISCOVERY_ENTRY_CHANGED.into());
+        }
         if let Some(existing) = &existing {
             if existing.deleting {
                 return Err(
@@ -1773,16 +2044,49 @@ async fn save_entry_inner_checked_impl(
                     episodes,
                 )?;
                 let entry = remote.map(|remote| crate::sync_queue::remote_entry(media_id, remote));
+                if let Some(entry) = entry.as_ref().filter(|_| expects_absent) {
+                    let intent = write_origin_guard(state, origin, &expected_token)?;
+                    state.db.upsert_entry(entry).map_err(|e| e.to_string())?;
+                    drop(intent);
+                    state.refresh_matchers();
+                    crate::sync_queue::publish_from(state, origin, entry);
+                    return Err(DISCOVERY_ENTRY_CHANGED.into());
+                }
                 if let Some(existing) = &existing {
+                    let queue_account = origin.account_id.ok_or(AUTH_REPLACED)?;
+                    let replaced = crate::sync_queue::cache_entry_replacement(
+                        state,
+                        origin,
+                        &expected_token,
+                        queue_account,
+                        existing,
+                        entry.as_ref(),
+                    )?;
+                    if replaced
+                        || !crate::sync_queue::overlay_allowed(
+                            state,
+                            queue_account,
+                            existing,
+                            entry.as_ref(),
+                        )
+                        .map_err(|e| e.to_string())?
+                    {
+                        return Err(EDITOR_ENTRY_CHANGED.into());
+                    }
                     let projected =
                         crate::sync_queue::projected_entry(state, existing, entry.clone())
                             .map_err(|e| e.to_string())?;
                     let patch = to_patch(episodes.unwrap_or(total), Some(&projected))?;
                     let intent = write_origin_guard(state, origin, &expected_token)?;
-                    let (account, pending, _) =
-                        crate::sync_queue::prepare_entry(state, media_id, patch, None)
-                            .map_err(|e| e.to_string())?
-                            .ok_or(AUTH_REPLACED)?;
+                    let (account, pending, _) = crate::sync_queue::prepare_entry(
+                        state,
+                        media_id,
+                        patch,
+                        None,
+                        entry.as_ref(),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .ok_or(AUTH_REPLACED)?;
                     let saved = crate::sync_queue::commit_pending_projection(
                         state, origin, intent, account, &pending, entry,
                     )?;
@@ -1821,7 +2125,7 @@ async fn save_entry_inner_checked_impl(
                 };
                 let intent = write_origin_guard(state, origin, &expected_token)?;
                 if let Some((account, mut pending, _)) =
-                    crate::sync_queue::prepare_entry(state, media_id, patch, None)
+                    crate::sync_queue::prepare_entry(state, media_id, patch, None, None)
                         .map_err(|e| e.to_string())?
                 {
                     if !pending.conflict {
@@ -1917,11 +2221,12 @@ async fn save_entry_unlocked(
     source: EntrySave<'_>,
     mut write_guard: tokio::sync::MutexGuard<'_, ()>,
 ) -> Result<ListEntry, String> {
-    let check_remote = matches!(source, EntrySave::AutomaticPlayback(_));
     let playback_episode = match source {
         EntrySave::AutomaticPlayback(episode) | EntrySave::Prompt { episode, .. } => Some(episode),
         EntrySave::Manual => None,
     };
+    let allow_adjusted_completion =
+        playback_episode.is_none() && patch.automatic_completion.is_none();
     let progress = patch.progress;
     let score = patch.score;
     let mut repeat = patch.repeat;
@@ -1935,18 +2240,54 @@ async fn save_entry_unlocked(
     check_write_origin(state, origin, &token)?;
     let account = entry_account(state, origin)?;
     let before = crate::sync_queue::current_entry(state, media_id).map_err(|e| e.to_string())?;
-    let mut staged = crate::sync_queue::prepare_entry(state, media_id, patch, playback_episode)
-        .map_err(|e| e.to_string())?;
+    let check_prompt = || -> Result<(), String> {
+        if let EntrySave::Prompt { event, total, .. } = source {
+            if !state.event_is_current(event)
+                || state
+                    .db
+                    .episode_total(media_id)
+                    .map_err(|e| e.to_string())?
+                    != total
+                || crate::sync_queue::current_entry(state, media_id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|entry| {
+                        Some(entry.identity()) != before.as_ref().map(ListEntry::identity)
+                            || progress.is_some_and(|target| entry.progress >= target)
+                    })
+            {
+                return Err(PROMPT_CHANGED.into());
+            }
+        }
+        Ok(())
+    };
+    let prompt_guard = || {
+        let EntrySave::Prompt { event, .. } = source else {
+            return Ok(None);
+        };
+        let retained = state.last_tracking_prompt.lock();
+        if retained
+            .as_ref()
+            .is_some_and(|current| same_tracking_prompt(&current.event, event))
+        {
+            Ok(Some(retained))
+        } else {
+            Err(PROMPT_CHANGED.to_string())
+        }
+    };
+    let mut staged =
+        crate::sync_queue::prepare_entry(state, media_id, patch, playback_episode, before.as_ref())
+            .map_err(|e| e.to_string())?;
     if let Some((account, pending, _)) = staged
         .as_ref()
         .filter(|(_, pending, already_pending)| *already_pending || pending.conflict)
     {
+        let _prompt = prompt_guard()?;
         let intent = write_origin_guard(state, origin, &token)?;
         return crate::sync_queue::commit_pending_projection(
             state, origin, intent, *account, pending, before,
         );
     }
-    if check_remote && staged.is_none() {
+    if playback_episode.is_some() && staged.is_none() {
         return Err("Reconnect to AniList before tracking progress for this account.".into());
     }
     let entry_id = before.as_ref().and_then(|entry| entry.id);
@@ -1980,41 +2321,38 @@ async fn save_entry_unlocked(
         let result = crate::sync_queue::verify_write_account(state, origin, &al, account).await;
         write_guard = state.entry_lock.lock().await;
         check_write_origin(state, origin, &token)?;
-        if let EntrySave::Prompt { event, total, .. } = source {
-            if result.is_ok() || result.as_ref().is_err_and(anilist::is_retryable) {
-                // Account verification released the entry lock before dispatch.
-                if !state.event_is_current(event)
-                    || state
-                        .db
-                        .episode_total(media_id)
-                        .map_err(|e| e.to_string())?
-                        != total
-                    || crate::sync_queue::current_entry(state, media_id)
-                        .map_err(|e| e.to_string())?
-                        .is_none_or(|entry| progress.is_some_and(|target| entry.progress >= target))
-                {
-                    return Err(PROMPT_CHANGED.into());
-                }
-            }
+        if result.is_ok() || result.as_ref().is_err_and(anilist::is_retryable) {
+            check_prompt()?;
         }
         result
     } else {
         Ok(())
     };
-    // Automatic playback must respect the same baseline as queued retries.
     let score_format = state.cached_score_format()?;
     let preflight = if let Err(error) = verified {
         Err(error)
-    } else if let Some((account, pending, _)) = staged.as_mut().filter(|_| check_remote) {
+    } else if let Some((account, pending, _)) =
+        staged.as_mut().filter(|_| playback_episode.is_some())
+    {
         drop(write_guard);
         let result = al
             .entry_by_media_id_with_episodes(media_id, score_format.as_deref())
             .await;
         write_guard = state.entry_lock.lock().await;
         check_write_origin(state, origin, &token)?;
+        if !result.as_ref().is_err_and(anilist::is_auth_rejection) {
+            check_prompt()?;
+        }
         match result {
             Ok((remote, total)) => {
                 crate::sync_queue::cache_reported_episodes(state, origin, &token, media_id, total)?;
+                if let (EntrySave::Prompt { episode, .. }, Some(fresh_total)) = (&source, total) {
+                    let target =
+                        progress_for_total(before.as_ref(), fresh_total, *episode).progress;
+                    if progress != Some(target) {
+                        return Err(PROMPT_CHANGED.into());
+                    }
+                }
                 if !pending.refresh_playback_total(state, total.flatten())? {
                     return Err(EPISODE_EXCEEDS_TOTAL.into());
                 }
@@ -2038,6 +2376,7 @@ async fn save_entry_unlocked(
                     snapshot.as_ref(),
                     score_format.as_deref(),
                 ) {
+                    let _prompt = prompt_guard()?;
                     let intent = write_origin_guard(state, origin, &token)?;
                     let mut pending = pending.clone();
                     pending.conflict = true;
@@ -2067,8 +2406,9 @@ async fn save_entry_unlocked(
     } else {
         Ok(None)
     };
-    let intent = write_origin_guard(state, origin, &token)?;
     let dispatched = matches!(preflight, Ok(None));
+    let prompt = if dispatched { prompt_guard()? } else { None };
+    let intent = write_origin_guard(state, origin, &token)?;
     if let Some((account, pending, _)) = staged.as_ref().filter(|_| dispatched) {
         state
             .db
@@ -2076,6 +2416,7 @@ async fn save_entry_unlocked(
             .map_err(|e| e.to_string())?;
     }
     drop(intent);
+    drop(prompt);
     drop(write_guard);
     let saved = match preflight {
         Err(error) => Err(error),
@@ -2089,6 +2430,7 @@ async fn save_entry_unlocked(
                 score,
                 repeat,
                 score_format.as_deref(),
+                allow_adjusted_completion,
             )
             .await
         }
@@ -2186,7 +2528,7 @@ async fn save_entry_unlocked(
         if anilist::is_auth_rejection(e) {
             let unconfirmed = e.is::<anilist::UnconfirmedEntryWrite>();
             let mut staged_write = staged_write;
-            if let Some(settlement) = clear_rejected_session_after(state, origin, &token, || {
+            let rejection = clear_rejected_session_after(state, origin, &token, || {
                 let Some((account, pending, _)) = staged_write.as_deref_mut() else {
                     return Ok(());
                 };
@@ -2199,9 +2541,10 @@ async fn save_entry_unlocked(
                 } else {
                     remove_rejected_pending(state, *account, pending, SESSION_EXPIRED)
                 }
-            }) {
+            });
+            if let Some((settlement, failure)) = rejection {
                 settlement?;
-                return Err(SESSION_EXPIRED.into());
+                return Err(failure.message().into());
             }
             if let Some((account, pending, _)) = staged_write.filter(|_| !unconfirmed) {
                 restore_rejected_entry(state, *account, pending, &e.to_string(), origin)
@@ -2352,6 +2695,12 @@ async fn save_entry_unlocked(
             }
             if let Some((account, mut pending, _)) = staged {
                 if anilist::is_retryable(&e) {
+                    let _prompt = if dispatched {
+                        None
+                    } else {
+                        check_prompt()?;
+                        prompt_guard()?
+                    };
                     let intent = write_origin_guard(state, origin, &token)?;
                     pending.error = Some(e.to_string());
                     return crate::sync_queue::commit_pending_projection(
@@ -2362,29 +2711,7 @@ async fn save_entry_unlocked(
             return Err(e.to_string());
         }
     };
-    let origin_result = write_origin_guard(state, origin, &token);
-    if let Err(origin_error) = &origin_result {
-        if !dispatched {
-            return Err(origin_error.clone());
-        }
-        // Settle a confirmed write before a waiting auth change takes remote_lock.
-        if !write_session_account_matches(state, origin, &token) {
-            if let Some((account, _, _)) = staged {
-                state
-                    .db
-                    .remove_pending(account, media_id)
-                    .map_err(|e| e.to_string())?;
-            }
-            return Err(origin_error.clone());
-        }
-    }
-    if let Some(total) = confirmed_total {
-        state
-            .db
-            .cache_episode_total(media_id, Some(total))
-            .map_err(|e| e.to_string())?;
-    }
-    let entry = ListEntry {
+    let mut entry = ListEntry {
         id: Some(saved.id),
         media_id,
         status: saved.status,
@@ -2396,11 +2723,45 @@ async fn save_entry_unlocked(
                 .updated_at
                 .unwrap_or_else(|| chrono::Utc::now().timestamp()),
         ),
-        media: state.db.get_media(media_id).map_err(|e| e.to_string())?,
+        media: None,
+        queued_creation: if dispatched && entry_id.is_none() {
+            staged
+                .as_ref()
+                .and_then(|(_, pending, _)| pending.patch.creation_key.clone())
+        } else {
+            None
+        },
     };
+    // Settle a confirmed write before a waiting auth change takes remote_lock.
+    let origin_result = write_origin_guard(state, origin, &token);
+    if let Err(origin_error) = &origin_result {
+        if !dispatched {
+            return Err(origin_error.clone());
+        }
+        if !write_session_account_matches(state, origin, &token) {
+            if let Some((account, _, _)) = staged {
+                if let Err(error) = state.db.remove_pending(account, media_id) {
+                    state
+                        .db
+                        .mark_acknowledged_pending(account, &entry)
+                        .map_err(|e| e.to_string())?;
+                    return Err(error.to_string());
+                }
+            }
+            return Err(origin_error.clone());
+        }
+    }
     // A cached read can apply the staged status during the request.
     let replaced = state.db.get_entry(media_id).ok().flatten();
-    state.db.upsert_entry(&entry).map_err(|e| e.to_string())?;
+    state
+        .db
+        .cache_acknowledged_entry(
+            staged.as_ref().map(|(account, _, _)| *account),
+            &mut entry,
+            confirmed_total,
+        )
+        .map_err(|e| e.to_string())?;
+    entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
     let acknowledgement = staged.map_or(Ok(()), |(account, _, _)| {
         state.db.remove_pending(account, media_id)
     });
@@ -2518,10 +2879,36 @@ pub async fn set_progress(
     expected: Option<i64>,
     state: &AppState,
 ) -> Result<ListEntry, String> {
-    let (entry, origin) =
-        set_progress_inner_with_origin(state, media_id, progress, expected).await?;
+    let (outcome, origin) =
+        set_progress_inner_with_origin(state, media_id, progress, expected, None).await?;
+    let (ControlFlow::Continue(entry) | ControlFlow::Break(entry)) = outcome;
     crate::sync_queue::publish_from(state, origin, &entry);
     Ok(entry)
+}
+
+impl crate::Core {
+    /// A baseline conflict breaks with the current entry and skips the write.
+    pub async fn set_list_progress(
+        &self,
+        media_id: i64,
+        progress: i64,
+        expected: i64,
+        account_id: Option<i64>,
+        identity: crate::EntryIdentity,
+    ) -> Result<ControlFlow<ListEntry, ListEntry>, String> {
+        let (outcome, origin) = set_progress_inner_with_origin(
+            &self.state,
+            media_id,
+            progress,
+            Some(expected),
+            Some((account_id, identity)),
+        )
+        .await?;
+        if let ControlFlow::Continue(entry) = &outcome {
+            crate::sync_queue::publish_from(&self.state, origin, entry);
+        }
+        Ok(outcome)
+    }
 }
 
 #[cfg(test)]
@@ -2531,9 +2918,9 @@ pub async fn set_progress_inner(
     progress: i64,
     expected: Option<i64>,
 ) -> Result<ListEntry, String> {
-    set_progress_inner_with_origin(state, media_id, progress, expected)
+    set_progress_inner_with_origin(state, media_id, progress, expected, None)
         .await
-        .map(|(entry, _)| entry)
+        .map(|(ControlFlow::Continue(entry) | ControlFlow::Break(entry), _)| entry)
 }
 
 async fn set_progress_inner_with_origin(
@@ -2541,43 +2928,131 @@ async fn set_progress_inner_with_origin(
     media_id: i64,
     progress: i64,
     expected: Option<i64>,
-) -> Result<(ListEntry, crate::EventOrigin), String> {
+    target: Option<(Option<i64>, crate::EntryIdentity)>,
+) -> Result<(ControlFlow<ListEntry, ListEntry>, crate::EventOrigin), String> {
     let origin = state.origin();
     let expected_token = state.anilist.lock().token();
     let _remote = state.remote_lock.lock().await;
-    let _write = state.entry_lock.lock().await;
+    let mut write = state.entry_lock.lock().await;
     check_write_origin(state, origin, &expected_token)?;
     let cur = crate::sync_queue::current_entry(state, media_id).map_err(|e| e.to_string())?;
     // A missing row was deleted. Never recreate it from a buffered edit.
     let Some(entry) = cur else {
         return Err("the entry is no longer on your list".to_string());
     };
+    if let Some((account_id, identity)) = &target {
+        if *account_id != origin.account_id || !identity.matches(&entry) {
+            return Err("Your AniList entry changed. Review before saving.".into());
+        }
+    }
     if let Some(exp) = expected {
         if entry.progress != exp {
             let mut entry = entry;
             entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
-            return Ok((entry, origin));
+            return Ok((ControlFlow::Break(entry), origin));
         }
     }
+    // Existing queued edits check their baseline on replay.
+    let lookup_error = match target.as_ref().zip(origin.account_id) {
+        Some(((_, identity), account))
+            if state
+                .db
+                .pending_change(account, media_id)
+                .map_err(|e| e.to_string())?
+                .is_none_or(|pending| pending.needs_cleanup_only()) =>
+        {
+            let al = state
+                .anilist
+                .lock()
+                .for_intent(&state.auth_intent, origin.generation);
+            let format = state.cached_score_format()?;
+            drop(write);
+            let result =
+                match crate::sync_queue::verify_write_account(state, origin, &al, account).await {
+                    Ok(()) => {
+                        al.entry_by_media_id_with_episodes(media_id, format.as_deref())
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+            write = state.entry_lock.lock().await;
+            check_write_origin(state, origin, &expected_token)?;
+            match result {
+                Ok((remote, total)) => {
+                    let remote = remote.map(|saved| {
+                        let mut remote = crate::sync_queue::remote_entry(media_id, saved);
+                        if remote.id == entry.id {
+                            remote.queued_creation.clone_from(&entry.queued_creation);
+                        }
+                        remote
+                    });
+                    let intent = write_origin_guard(state, origin, &expected_token)?;
+                    state
+                        .db
+                        .durable_write_with_episode_total(media_id, total, |tx| match &remote {
+                            Some(entry) => Db::write_entry(tx, entry),
+                            None => Db::delete_entry_from(tx, media_id),
+                        })
+                        .map_err(|e| e.to_string())?;
+                    drop(intent);
+                    state.refresh_matchers();
+                    let Some(mut remote) = remote else {
+                        state.clear_tracking_prompt_for_media(origin, media_id);
+                        return Err("the entry is no longer on your list".into());
+                    };
+                    if !identity.matches(&remote) || expected != Some(remote.progress) {
+                        remote.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
+                        state.clear_tracking_prompt_if_advanced(origin, &remote);
+                        return Ok((ControlFlow::Break(remote), origin));
+                    }
+                    None
+                }
+                Err(error) if anilist::media_not_found(&error) => {
+                    let intent = write_origin_guard(state, origin, &expected_token)?;
+                    crate::sync_queue::mark_media_missing_from(
+                        state, origin, intent, media_id, true,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Err(MEDIA_GONE.into());
+                }
+                Err(error) if anilist::is_retryable(&error) => Some(error.to_string()),
+                Err(error) => return Err(write_err(state, origin, &expected_token, &error)),
+            }
+        }
+        _ => None,
+    };
     let w = compute_set_progress(state, media_id, progress)?;
     crate::sync_queue::validate_progress_edit(state, media_id, Some(progress), Some(w.progress))
         .map_err(|e| e.to_string())?;
-    let entry = save_entry_unlocked(
-        state,
-        origin,
-        media_id,
-        crate::sync_queue::Patch {
-            status: w.send_status.then_some(w.status),
-            progress: Some(w.progress),
-            repeat: w.send_repeat.then_some(w.repeat),
-            ..Default::default()
-        },
-        EntrySave::Manual,
-        _write,
-    )
-    .await?;
+    let automatic_completion = (w.send_status && w.status == "COMPLETED")
+        .then(|| crate::sync_queue::AutomaticCompletion::new(None));
+    let patch = crate::sync_queue::Patch {
+        status: w.send_status.then_some(w.status),
+        progress: Some(w.progress),
+        repeat: w.send_repeat.then_some(w.repeat),
+        automatic_completion,
+        ..Default::default()
+    };
+    let entry = if let Some(error) = lookup_error {
+        let intent = write_origin_guard(state, origin, &expected_token)?;
+        let (account, mut pending, _) =
+            crate::sync_queue::prepare_entry(state, media_id, patch, None, Some(&entry))
+                .map_err(|e| e.to_string())?
+                .ok_or(AUTH_REPLACED)?;
+        pending.error = Some(error);
+        crate::sync_queue::commit_pending_projection(
+            state,
+            origin,
+            intent,
+            account,
+            &pending,
+            Some(entry),
+        )?
+    } else {
+        save_entry_unlocked(state, origin, media_id, patch, EntrySave::Manual, write).await?
+    };
     state.clear_tracking_prompt_if_advanced(origin, &entry);
-    Ok((entry, origin))
+    Ok((ControlFlow::Continue(entry), origin))
 }
 
 pub(crate) async fn confirm_tracking_prompt(
@@ -2605,6 +3080,16 @@ pub(crate) async fn confirm_tracking_prompt(
     if !state.event_is_current(&event) {
         return Err("Playback prompt is no longer current.".into());
     }
+    let (offered_identity, watched) = {
+        let retained = state.last_tracking_prompt.lock();
+        let Some(retained) = retained
+            .as_ref()
+            .filter(|retained| same_tracking_prompt(&retained.event, &event))
+        else {
+            return Err("Playback prompt is no longer current.".into());
+        };
+        (retained.entry_identity.clone(), retained.watched.clone())
+    };
     let entry = crate::sync_queue::current_entry(state, prompt.media_id)
         .map_err(|e| e.to_string())?
         .filter(|entry| entry.progress < prompt.episode && prompt.progress < prompt.episode);
@@ -2612,6 +3097,10 @@ pub(crate) async fn confirm_tracking_prompt(
         state.take_tracking_prompt(&event);
         return Ok(());
     };
+    if offered_identity != Some(entry.identity()) {
+        state.take_tracking_prompt(&event);
+        return Err(PROMPT_CHANGED.into());
+    }
     let total = state
         .db
         .episode_total(prompt.media_id)
@@ -2649,6 +3138,12 @@ pub(crate) async fn confirm_tracking_prompt(
         _write,
     )
     .await?;
+    if let Some(watched) = watched.filter(|_| saved.progress >= prompt.episode) {
+        let _write = state.entry_lock.lock().await;
+        if let Some(watched) = watched.lock().as_ref() {
+            watched.record(state, origin);
+        }
+    }
     state.take_tracking_prompt(&event);
     crate::sync_queue::publish_from(state, origin, &saved);
     Ok(())
@@ -2804,7 +3299,25 @@ pub async fn delete_entry_cmd(media_id: i64, state: &AppState) -> Result<(), Str
     delete_entry_inner(media_id, state).await
 }
 
+impl crate::Core {
+    pub async fn delete_editor_entry(
+        &self,
+        media_id: i64,
+        target: crate::EntryEditTarget,
+    ) -> Result<(), String> {
+        delete_entry_target(media_id, Some(target), &self.state).await
+    }
+}
+
 async fn delete_entry_inner(media_id: i64, state: &AppState) -> Result<(), String> {
+    delete_entry_target(media_id, None, state).await
+}
+
+async fn delete_entry_target(
+    media_id: i64,
+    target: Option<crate::EntryEditTarget>,
+    state: &AppState,
+) -> Result<(), String> {
     let origin = state.origin();
     let expected_token = state.anilist.lock().token();
     let _remote = state.remote_lock.lock().await;
@@ -2814,7 +3327,9 @@ async fn delete_entry_inner(media_id: i64, state: &AppState) -> Result<(), Strin
         return Err("Account changed".into());
     }
     drop(_write);
-    delete_entry_unlocked(media_id, true, state, origin).await
+    delete_entry_with_target(media_id, true, state, origin, target)
+        .await
+        .map_err(String::from)
 }
 
 /// Caller holds remote_lock through deletion and durable acknowledgement.
@@ -2823,15 +3338,28 @@ pub(crate) async fn delete_entry_unlocked(
     explicit: bool,
     state: &AppState,
     origin: crate::EventOrigin,
-) -> Result<(), String> {
+) -> Result<(), crate::sync_queue::EntryFlushError> {
+    delete_entry_with_target(media_id, explicit, state, origin, None).await
+}
+
+async fn delete_entry_with_target(
+    media_id: i64,
+    explicit: bool,
+    state: &AppState,
+    origin: crate::EventOrigin,
+    target: Option<crate::EntryEditTarget>,
+) -> Result<(), crate::sync_queue::EntryFlushError> {
+    use crate::sync_queue::EntryFlushError;
+
     let mut write_guard = state.entry_lock.lock().await;
     if !state.origin_is_current(origin) {
-        return Err("Account changed".into());
+        return Err(EntryFlushError::Batch("Account changed".into()));
     }
     if !state.anilist.lock().has_token() {
-        return Err("not authenticated".into());
+        return Err(EntryFlushError::Batch("not authenticated".into()));
     }
     let owner = entry_account(state, origin)?;
+    check_editor_account(target.as_ref(), owner)?;
     let entry = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
     let account = origin.account_id;
     let queued = account
@@ -2839,6 +3367,44 @@ pub(crate) async fn delete_entry_unlocked(
         .transpose()
         .map_err(|e| e.to_string())?
         .flatten();
+    let editor_id = match target.as_ref().map(|target| &target.identity) {
+        Some(crate::EntryIdentity::Unverified) => {
+            return Err(EDITOR_ENTRY_UNVERIFIED.to_string().into())
+        }
+        Some(identity @ crate::EntryIdentity::Remote(id))
+            if entry.as_ref().is_none_or(|entry| identity.matches(entry)) =>
+        {
+            Some(*id)
+        }
+        Some(identity @ crate::EntryIdentity::Queued(key)) => match entry.as_ref() {
+            Some(entry) if identity.matches(entry) && entry.id.is_some() => entry.id,
+            Some(entry)
+                if identity.matches(entry)
+                    && queued.as_ref().is_some_and(|pending| {
+                        pending.base.is_none()
+                            && pending.deletion_id.is_none()
+                            && pending.patch.creation_key.as_ref() == Some(key)
+                    }) =>
+            {
+                None
+            }
+            _ => return Err(EDITOR_ENTRY_CHANGED.to_string().into()),
+        },
+        Some(_) => return Err(EDITOR_ENTRY_CHANGED.to_string().into()),
+        None => None,
+    };
+    if let (Some(account), Some(queued)) = (account, &queued) {
+        if (!explicit || target.is_some())
+            && !crate::sync_queue::overlay_allowed(state, account, queued, entry.as_ref())
+                .map_err(|e| e.to_string())?
+        {
+            return if explicit {
+                Err(EDITOR_ENTRY_CHANGED.to_string().into())
+            } else {
+                Ok(())
+            };
+        }
+    }
     let mut deletion = queued.clone().unwrap_or(crate::sync_queue::Pending {
         media_id,
         deleting: false,
@@ -2859,7 +3425,9 @@ pub(crate) async fn delete_entry_unlocked(
     deletion.conflict = false;
     deletion.error = None;
     deletion.retry_error = None;
-    if explicit {
+    if target.is_some() {
+        deletion.deletion_id = editor_id;
+    } else if explicit {
         deletion.deletion_id = entry
             .as_ref()
             .and_then(|entry| entry.id)
@@ -2898,7 +3466,8 @@ pub(crate) async fn delete_entry_unlocked(
     let result = async {
         let mut write = write_guard;
         let original_target = deletion.deletion_id;
-        let lookup = if let Some(id) = deletion.deletion_id {
+        let verify_absent_cache = target.is_some() && entry.is_none();
+        let lookup = if let Some(id) = deletion.deletion_id.filter(|_| !verify_absent_cache) {
             Ok(Some(id))
         } else if explicit || entry.is_some() || queued.is_some() {
             drop(write);
@@ -2906,6 +3475,9 @@ pub(crate) async fn delete_entry_unlocked(
             write = state.entry_lock.lock().await;
             check_write_origin(state, origin, &token).map_err(anyhow::Error::msg)?;
             match result {
+                Ok(Some(remote)) if target.is_some() && editor_id != Some(remote.id) => {
+                    anyhow::bail!(EDITOR_ENTRY_CHANGED);
+                }
                 Ok(Some(remote)) if explicit => {
                     deletion.deletion_id = Some(remote.id);
                     Ok(Some(remote.id))
@@ -2922,6 +3494,15 @@ pub(crate) async fn delete_entry_unlocked(
             retain_failure = true;
         })?;
         let Some(id) = id else {
+            if let Some(account) = account.filter(|_| {
+                queued.as_ref().is_some_and(|pending| {
+                    !pending.deleting && !pending.needs_cleanup_only()
+                })
+            }) {
+                let _intent =
+                    write_origin_guard(state, origin, &token).map_err(anyhow::Error::msg)?;
+                state.db.put_pending(account, &deletion)?;
+            }
             return Ok(());
         };
         let intent = write_origin_guard(state, origin, &token).map_err(anyhow::Error::msg)?;
@@ -2950,7 +3531,7 @@ pub(crate) async fn delete_entry_unlocked(
                     let _write = state.entry_lock.lock().await;
                     let intent =
                         write_origin_guard(state, origin, &token).map_err(anyhow::Error::msg)?;
-                    if !explicit && deletion.deletion_id != Some(live.id) {
+                    if (!explicit || target.is_some()) && deletion.deletion_id != Some(live.id) {
                         anyhow::bail!("AniList entry identity changed during removal. Choose which version to keep.");
                     }
                     let previous_target = deletion.deletion_id.replace(live.id);
@@ -2997,19 +3578,27 @@ pub(crate) async fn delete_entry_unlocked(
                 deletion.error = Some(format!(
                     "Removal is pending. Send saved change retries removal. Keep AniList version cancels it. {error}"
                 ));
-                state.db.put_pending(account, &deletion)?;
+                state.db.put_pending_with_retry_position(
+                    account,
+                    &deletion,
+                    !explicit && !replaced && anilist::is_entry_retry_error(&error),
+                )?;
             }
             Ok(true)
         };
-        let (settlement, error) = if anilist::is_auth_rejection(&error) {
+        let (settlement, failure) = if anilist::is_auth_rejection(&error) {
             match clear_rejected_session_after(state, origin, &token, || settle(false)) {
-                Some(result) => (result, SESSION_EXPIRED.into()),
-                None => (settle(true), AUTH_REPLACED.into()),
+                Some((result, failure)) => (result, failure.message().to_string().into()),
+                None => (settle(true), EntryFlushError::Batch(AUTH_REPLACED.into())),
             }
         } else {
             let intent = write_origin_guard(state, origin, &token);
             let result = settle(intent.is_err());
-            (result, intent.err().unwrap_or_else(|| error.to_string()))
+            let failure = match intent {
+                Ok(_) => EntryFlushError::from_remote(&error, error.to_string()),
+                Err(error) => error.into(),
+            };
+            (result, failure)
         };
         if settlement.map_err(|e: anyhow::Error| e.to_string())? {
             state.emit_from(
@@ -3017,12 +3606,12 @@ pub(crate) async fn delete_entry_unlocked(
                 crate::EventKind::PendingChanged(Some(vec![media_id])),
             );
         }
-        return Err(error);
+        return Err(failure);
     }
     let origin_result = write_origin_guard(state, origin, &token);
     if let Err(origin_error) = &origin_result {
         if !confirmed_removed {
-            return Err(origin_error.clone());
+            return Err(origin_error.clone().into());
         }
         // Settle a confirmed removal before a waiting auth change takes remote_lock.
         if !write_session_account_matches(state, origin, &token) {
@@ -3032,18 +3621,15 @@ pub(crate) async fn delete_entry_unlocked(
                     .remove_pending(account, media_id)
                     .map_err(|e| e.to_string())?;
             }
-            return Err(origin_error.clone());
+            return Err(origin_error.clone().into());
         }
     }
     state
         .db
         .durable_write(|tx| {
-            tx.execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
+            Db::delete_entry_from(tx, media_id)?;
             if let Some(account) = account {
-                tx.execute(
-                    "DELETE FROM pending_change WHERE account_id = ? AND media_id = ?",
-                    [account, media_id],
-                )?;
+                Db::delete_pending_from(tx, account, media_id)?;
             }
             Ok(())
         })
@@ -3061,7 +3647,7 @@ pub(crate) async fn delete_entry_unlocked(
         }
         Err(origin_error) => {
             state.refresh_matchers();
-            Err(origin_error)
+            Err(origin_error.into())
         }
     }
 }
@@ -3082,17 +3668,17 @@ async fn library_db_work<T: Send + 'static>(
 
 async fn library_write<T: Send + 'static>(
     state: &AppState,
-    work: impl FnOnce(&Db, bool) -> anyhow::Result<T> + Send + 'static,
+    work: impl FnOnce(&Db, Option<Arc<Vec<recognize::Matcher>>>) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, String> {
     let intent = *state.auth_intent.borrow();
     let expected_token = state.anilist.lock().token();
     let entry = state.entry_lock.clone().lock_owned().await;
     state.check_auth_intent(intent)?;
     check_write_session(state, &expected_token)?;
-    let signed_in = expected_token.is_some();
+    let matchers = expected_token.map(|_| state.matchers.lock().clone());
     let db = state.db.clone();
     persist(entry, None, move || {
-        work(&db, signed_in).map_err(|e| e.to_string())
+        work(&db, matchers).map_err(|e| e.to_string())
     })
     .await
 }
@@ -3121,35 +3707,58 @@ async fn remove_library_folder_inner(
 }
 
 pub async fn scan_library(state: &AppState) -> Result<LibraryScan, String> {
-    let folders = library::get_folders(&state.db).map_err(|e| e.to_string())?;
-    let bindings = library::get_bindings(&state.db).map_err(|e| e.to_string())?;
-    let matchers = state.matchers.lock().clone();
+    let intent = *state.auth_intent.borrow();
+    let expected_token = state.anilist.lock().token();
+    let (folders, bindings, account, matchers) = {
+        let _entry = state.entry_lock.lock().await;
+        state.check_auth_intent(intent)?;
+        check_write_session(state, &expected_token)?;
+        let (folders, bindings, account) = library_db_work(state.db.clone(), |db| {
+            Ok((
+                library::get_folders(db)?,
+                library::get_bindings(db)?,
+                crate::sync_queue::account_id(db),
+            ))
+        })
+        .await?;
+        (folders, bindings, account, state.matchers.lock().clone())
+    };
     let cache = state.library_cache.clone();
-    tokio::task::spawn_blocking(move || cache.lock().scan(&folders, &matchers, &bindings))
-        .await
-        .map_err(|e| e.to_string())
+    let db = state.db.clone();
+    let (scan, current_account) = tokio::task::spawn_blocking(move || {
+        let scan = cache.lock().scan(&folders, &matchers, &bindings);
+        (scan, crate::sync_queue::account_id(&db))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    state.check_auth_intent(intent)?;
+    check_write_session(state, &expected_token)?;
+    if current_account != account {
+        return Err("Your AniList account changed. Try again.".into());
+    }
+    Ok(scan)
 }
 
 pub async fn bind_library_path(
     path: String,
     media_id: i64,
     episode_offset: Option<i64>,
+    scope: library::LibraryBindingScope,
     state: &AppState,
 ) -> Result<(), String> {
-    bind_library_path_inner(path, media_id, episode_offset, state).await
-}
-
-async fn bind_library_path_inner(
-    path: String,
-    media_id: i64,
-    episode_offset: Option<i64>,
-    state: &AppState,
-) -> Result<(), String> {
-    library_write(state, move |db, signed_in| {
-        if !signed_in || db.get_entry(media_id)?.is_none() {
+    library_write(state, move |db, matchers| {
+        let Some(matchers) = matchers else {
+            return Err(anyhow::anyhow!("only shows on your list can be linked"));
+        };
+        if db.get_entry(media_id)?.is_none() {
             return Err(anyhow::anyhow!("only shows on your list can be linked"));
         }
-        library::bind_path(db, &path, media_id, episode_offset.unwrap_or(0))
+        if !matchers.iter().any(|matcher| matcher.media_id == media_id) {
+            return Err(anyhow::anyhow!(
+                "Show details are unavailable. Refresh your list and try again."
+            ));
+        }
+        library::bind_scoped_path(db, &path, scope, media_id, episode_offset.unwrap_or(0))
     })
     .await
 }
@@ -3182,8 +3791,9 @@ async fn library_binding_details_inner(
     if expected_token.is_none() {
         return Ok(None);
     }
+    let matchers = state.matchers.lock().clone();
     library_db_work(state.db.clone(), move |db| {
-        library::effective_binding(db, &path)
+        library::effective_binding(db, &path, &matchers)
     })
     .await
 }
@@ -3241,14 +3851,15 @@ pub fn remove_rss_feed(url: String, state: &AppState) -> Result<Vec<String>, Str
 }
 
 pub async fn fetch_torrents(state: &AppState) -> Result<TorrentFetch, String> {
-    let feeds = rss::get_feeds(&state.db).map_err(|e| e.to_string())?;
-    if feeds.is_empty() {
+    let read = rss::read_feeds(&state.db).map_err(|e| e.to_string())?;
+    if read.feeds.is_empty() {
         return Ok(TorrentFetch::default());
     }
-    let fetched = rss::fetch_all(&feeds).await.map_err(|e| e.to_string())?;
+    let fetched = rss::fetch_all(&read.feeds)
+        .await
+        .map_err(|e| e.to_string())?;
     let failures = fetched.failures;
     let raw = fetched.items;
-    let mut carried: Vec<String> = raw.iter().map(crate::show_torrents::stable_guid).collect();
     let seen = state.db.rss_seen_set().map_err(|e| e.to_string())?;
     let matchers = state.matchers.lock().clone();
     let (progress_by_id, total_by_id): (
@@ -3296,10 +3907,167 @@ pub async fn fetch_torrents(state: &AppState) -> Result<TorrentFetch, String> {
         })
         .collect();
     items.sort_by_key(|i| std::cmp::Reverse(i.published.unwrap_or(0)));
-    // Retain seen marks for current feed items to avoid flagging old releases.
-    carried.extend(items.iter().map(|i| i.guid.clone()));
-    let _ = state.db.prune_rss_seen_keeping(60, &carried);
+    // A partial feed snapshot cannot establish that an old release is gone.
+    if failures.is_empty() {
+        let carried: Vec<_> = items
+            .iter()
+            .flat_map(|item| std::iter::once(item.guid.clone()).chain(item.seen_guid.clone()))
+            .collect();
+        let _ = read.prune_seen(&carried);
+    }
     Ok(TorrentFetch { items, failures })
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn partial_rss_refresh_preserves_seen_marks_until_feeds_recover() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let state = tests::test_state();
+    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let good_feed = format!("http://{address}/good");
+    let recovering_feed = format!("http://{address}/recovering");
+    state
+        .db
+        .set_setting(
+            "rss_feeds",
+            &serde_json::json!([good_feed, recovering_feed]).to_string(),
+        )
+        .unwrap();
+    let carried = format!("{recovering_feed}\u{1}episode");
+    state
+        .db
+        .0
+        .lock()
+        .execute(
+            "INSERT INTO rss_seen VALUES (?,0), ('expired-absent',0)",
+            [&carried],
+        )
+        .unwrap();
+    let responses = tokio::spawn(async move {
+        let mut recovered = false;
+        for _ in 0..4 {
+            let (stream, _) = server.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let recovering = line.starts_with("GET /recovering ");
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let (status, body) = if !recovering {
+                ("200 OK", "<rss><channel></channel></rss>")
+            } else if recovered {
+                (
+                    "200 OK",
+                    "<rss><channel><item><title>Show - 01</title>\
+                     <link>https://example.invalid/episode</link>\
+                     <guid>episode</guid></item></channel></rss>",
+                )
+            } else {
+                recovered = true;
+                ("503 Service Unavailable", "")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+
+    let partial = fetch_torrents(&state).await.unwrap();
+    assert_eq!(partial.failures.len(), 1);
+    assert_eq!(partial.failures[0].url, recovering_feed);
+    assert!(state.db.rss_seen_set().unwrap().contains(&carried));
+    let complete = fetch_torrents(&state).await.unwrap();
+    assert!(complete.failures.is_empty());
+    assert_eq!(complete.items.len(), 1);
+    assert!(complete.items[0].seen);
+    let seen = state.db.rss_seen_set().unwrap();
+    assert!(seen.contains(&carried));
+    assert!(!seen.contains("expired-absent"));
+    responses.await.unwrap();
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn rss_refresh_does_not_prune_seen_marks_after_a_feed_is_added() {
+    assert_rss_refresh_keeps_seen_marks_after_feed_edits(false).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn rss_refresh_does_not_prune_seen_marks_after_feed_configuration_is_restored() {
+    assert_rss_refresh_keeps_seen_marks_after_feed_edits(true).await;
+}
+
+#[cfg(test)]
+async fn assert_rss_refresh_keeps_seen_marks_after_feed_edits(restore: bool) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let state = Arc::new(tests::test_state());
+    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let original_feed = format!("http://{address}/original");
+    let added_feed = format!("http://{address}/added");
+    state
+        .db
+        .set_setting("rss_feeds", &serde_json::json!([original_feed]).to_string())
+        .unwrap();
+    let seen_feed = if restore { &original_feed } else { &added_feed };
+    let seen_guid = format!("{seen_feed}\u{1}episode");
+    state
+        .db
+        .0
+        .lock()
+        .execute("INSERT INTO rss_seen VALUES (?,0)", [&seen_guid])
+        .unwrap();
+
+    let worker = state.clone();
+    let refresh = tokio::spawn(async move { fetch_torrents(&worker).await.unwrap() });
+    let (socket, _) = server.accept().await.unwrap();
+    let mut socket = BufReader::new(socket);
+    let mut line = String::new();
+    while socket.read_line(&mut line).await.unwrap() > 0 && line != "\r\n" {
+        line.clear();
+    }
+    if restore {
+        assert!(remove_rss_feed(original_feed.clone(), &state)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            add_rss_feed(original_feed.clone(), &state).unwrap(),
+            vec![original_feed]
+        );
+    } else {
+        assert_eq!(
+            add_rss_feed(added_feed.clone(), &state).unwrap(),
+            vec![original_feed, added_feed]
+        );
+    }
+    let body = "<rss><channel/></rss>";
+    socket
+        .get_mut()
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(refresh.await.unwrap().failures.is_empty());
+    assert!(state.db.rss_seen_set().unwrap().contains(&seen_guid));
 }
 
 pub fn mark_torrents_seen(guids: Vec<String>, state: &AppState) -> Result<(), String> {
@@ -3514,13 +4282,136 @@ pub async fn get_entry_details(media_id: i64, state: &AppState) -> Result<EntryD
     get_entry_details_inner(media_id, state).await
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedEntryDetails {
+    entry_id: i64,
+    #[serde(flatten)]
+    details: EntryDetails,
+}
+
+const ENTRY_DETAILS_MISSING: &str = "This show has no saved AniList entry yet";
+
+fn read_cached_entry_details(db: &Db, key: &str) -> Option<CachedEntryDetails> {
+    serde_json::from_str(&db.get_setting(key).ok().flatten()?).ok()
+}
+
+fn write_entry_details_cache(db: &Db, key: &str, value: &str) -> anyhow::Result<()> {
+    db.durable_write(|tx| {
+        let written = tx.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+            [key, value],
+        )?;
+        anyhow::ensure!(written == 1, "entry details cache was not written");
+        Ok(())
+    })
+}
+
+fn invalidate_entry_details(db: &Db, key: &str) -> Result<(), String> {
+    db.durable_write(|tx| Db::delete_setting_from(tx, key))
+        .or_else(|_| write_entry_details_cache(db, key, "null"))
+        .map_err(|e| format!("Could not invalidate saved entry details: {e}"))
+}
+
+fn cache_entry_details(
+    db: &Db,
+    account: i64,
+    media_id: i64,
+    entry_id: i64,
+    details: &EntryDetails,
+) {
+    if let Ok(value) = serde_json::to_string(&CachedEntryDetails {
+        entry_id,
+        details: details.clone(),
+    }) {
+        let key = format!("entry_details:{account}:{media_id}");
+        if let Err(error) = write_entry_details_cache(db, &key, &value) {
+            log::warn!("Could not cache entry details: {error}");
+            if read_cached_entry_details(db, &key).is_some_and(|cached| cached.entry_id != entry_id)
+            {
+                if let Err(error) = invalidate_entry_details(db, &key) {
+                    log::warn!("{error}");
+                }
+            }
+        }
+    }
+}
+
 async fn get_entry_details_inner(media_id: i64, state: &AppState) -> Result<EntryDetails, String> {
+    get_entry_details_target(media_id, None, state).await
+}
+
+impl crate::Core {
+    pub async fn get_editor_entry_details(
+        &self,
+        media_id: i64,
+        target: crate::EntryEditTarget,
+    ) -> Result<EntryDetails, String> {
+        get_entry_details_target(media_id, Some(target), &self.state).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_editor_entry_details(
+        &self,
+        media_id: i64,
+        target: crate::EntryEditTarget,
+        notes: Option<String>,
+        started_at: Option<FuzzyDate>,
+        completed_at: Option<FuzzyDate>,
+        custom_lists: Option<Vec<String>>,
+    ) -> Result<EntryDetails, String> {
+        update_entry_details_target(
+            media_id,
+            notes,
+            started_at,
+            completed_at,
+            custom_lists,
+            Some(target),
+            &self.state,
+        )
+        .await
+    }
+}
+
+fn check_editor_details_target(
+    state: &AppState,
+    media_id: i64,
+    account: i64,
+    target: Option<&crate::EntryEditTarget>,
+) -> Result<Option<i64>, String> {
+    check_editor_account(target, account)?;
+    if let Some(target) = target {
+        let entry = state.db.get_entry(media_id).map_err(|e| e.to_string())?;
+        match (&target.identity, entry.as_ref()) {
+            (crate::EntryIdentity::Remote(id), entry)
+                if entry.is_none_or(|entry| target.identity.matches(entry)) =>
+            {
+                return Ok(Some(*id))
+            }
+            (crate::EntryIdentity::Queued(_), Some(entry)) if target.identity.matches(entry) => {
+                return entry
+                    .id
+                    .map(Some)
+                    .ok_or_else(|| EDITOR_ENTRY_UNVERIFIED.into());
+            }
+            (crate::EntryIdentity::Unverified, _) => return Err(EDITOR_ENTRY_UNVERIFIED.into()),
+            _ => return Err(EDITOR_ENTRY_CHANGED.into()),
+        }
+    }
+    Ok(None)
+}
+
+async fn get_entry_details_target(
+    media_id: i64,
+    target: Option<crate::EntryEditTarget>,
+    state: &AppState,
+) -> Result<EntryDetails, String> {
     let origin = state.origin();
     let expected_token = state.anilist.lock().token();
     let _remote = state.remote_lock.lock().await;
     let _guard = state.entry_lock.lock().await;
     check_write_origin(state, origin, &expected_token)?;
     let user = cached_feature_user(state)?;
+    let editor_id = check_editor_details_target(state, media_id, user.id, target.as_ref())?;
     let key = format!("entry_details:{}:{media_id}", user.id);
     let al = state
         .anilist
@@ -3528,32 +4419,54 @@ async fn get_entry_details_inner(media_id: i64, state: &AppState) -> Result<Entr
         .for_intent(&state.auth_intent, origin.generation);
     drop(_guard);
     let result = match crate::sync_queue::verify_write_account(state, origin, &al, user.id).await {
-        Ok(()) => al.entry_details(media_id).await,
+        Ok(()) => al.entry_details_with_id(media_id).await,
         Err(e) if anilist::is_retryable(&e) || anilist::is_auth_rejection(&e) => Err(e),
         Err(e) => return Err(e.to_string()),
     };
     let _guard = state.entry_lock.lock().await;
     check_write_origin(state, origin, &expected_token)?;
     match result {
-        Ok(mut details) => {
+        Ok(Some((entry_id, mut details))) => {
+            let _intent = write_origin_guard(state, origin, &expected_token)?;
             details.cached_at = Some(chrono::Utc::now().timestamp());
-            if let Ok(value) = serde_json::to_string(&details) {
-                let _ = state.db.set_setting(&key, &value);
+            cache_entry_details(&state.db, user.id, media_id, entry_id, &details);
+            if editor_id.is_some_and(|id| id != entry_id) {
+                return Err(EDITOR_ENTRY_CHANGED.into());
             }
             Ok(details)
+        }
+        Ok(None) => {
+            let _intent = write_origin_guard(state, origin, &expected_token)?;
+            invalidate_entry_details(&state.db, &key)?;
+            Err(ENTRY_DETAILS_MISSING.into())
+        }
+        Err(e) if anilist::media_not_found(&e) => {
+            let _intent = write_origin_guard(state, origin, &expected_token)?;
+            invalidate_entry_details(&state.db, &key)?;
+            Err(e.to_string())
         }
         Err(e) if anilist::is_auth_rejection(&e) => {
             Err(write_err(state, origin, &expected_token, &e))
         }
         Err(e) => {
-            let cached = state
+            let _intent = write_origin_guard(state, origin, &expected_token)?;
+            if origin.account_id != Some(user.id) {
+                return Err(e.to_string());
+            }
+            let entry_id = state
                 .db
-                .get_setting(&key)
+                .get_entry(media_id)
                 .ok()
                 .flatten()
-                .and_then(|v| serde_json::from_str::<EntryDetails>(&v).ok());
+                .and_then(|entry| entry.id)
+                .ok_or_else(|| e.to_string())?;
+            if editor_id.is_some_and(|id| id != entry_id) {
+                return Err(EDITOR_ENTRY_CHANGED.into());
+            }
+            let cached = read_cached_entry_details(&state.db, &key)
+                .filter(|cached| cached.entry_id == entry_id);
             match cached {
-                Some(mut details) => {
+                Some(CachedEntryDetails { mut details, .. }) => {
                     details.warning = Some(e.to_string());
                     Ok(details)
                 }
@@ -3612,6 +4525,27 @@ async fn update_entry_details_inner(
     custom_lists: Option<Vec<String>>,
     state: &AppState,
 ) -> Result<EntryDetails, String> {
+    update_entry_details_target(
+        media_id,
+        notes,
+        started_at,
+        completed_at,
+        custom_lists,
+        None,
+        state,
+    )
+    .await
+}
+
+async fn update_entry_details_target(
+    media_id: i64,
+    notes: Option<String>,
+    started_at: Option<FuzzyDate>,
+    completed_at: Option<FuzzyDate>,
+    custom_lists: Option<Vec<String>>,
+    target: Option<crate::EntryEditTarget>,
+    state: &AppState,
+) -> Result<EntryDetails, String> {
     if notes.as_ref().is_some_and(|v| v.chars().count() > 6000) {
         return Err("Notes must be 6000 characters or fewer".into());
     }
@@ -3623,6 +4557,7 @@ async fn update_entry_details_inner(
     let _guard = state.entry_lock.lock().await;
     check_write_origin(state, origin, &expected_token)?;
     let user = cached_feature_user(state)?;
+    let editor_id = check_editor_details_target(state, media_id, user.id, target.as_ref())?;
     let al = state
         .anilist
         .lock()
@@ -3632,7 +4567,26 @@ async fn update_entry_details_inner(
     let result = al.entry_details_with_id(media_id).await;
     let _guard = state.entry_lock.lock().await;
     check_write_origin(state, origin, &expected_token)?;
-    let (entry_id, current) = result.map_err(|e| write_err(state, origin, &expected_token, &e))?;
+    let key = format!("entry_details:{}:{media_id}", user.id);
+    let (entry_id, current) = match result {
+        Ok(Some(details)) => details,
+        Ok(None) => {
+            let _intent = write_origin_guard(state, origin, &expected_token)?;
+            invalidate_entry_details(&state.db, &key)?;
+            return Err(ENTRY_DETAILS_MISSING.into());
+        }
+        Err(e) if anilist::media_not_found(&e) => {
+            let _intent = write_origin_guard(state, origin, &expected_token)?;
+            invalidate_entry_details(&state.db, &key)?;
+            return Err(e.to_string());
+        }
+        Err(e) => return Err(write_err(state, origin, &expected_token, &e)),
+    };
+    if editor_id.is_some_and(|id| id != entry_id) {
+        let _intent = write_origin_guard(state, origin, &expected_token)?;
+        invalidate_entry_details(&state.db, &key)?;
+        return Err(EDITOR_ENTRY_CHANGED.into());
+    }
     if custom_lists.as_ref().is_some_and(|lists| {
         lists
             .iter()
@@ -3656,6 +4610,25 @@ async fn update_entry_details_inner(
     let mut details = match result {
         Ok(details) => details,
         Err(e) => {
+            if e.is::<anilist::UnconfirmedEntryDetailsWrite>() {
+                let _intent = origin_result?;
+                if state.db.get_setting(&key).is_ok_and(|value| {
+                    value.is_none_or(|value| {
+                        serde_json::from_str::<CachedEntryDetails>(&value)
+                            .is_ok_and(|cached| cached.entry_id != entry_id)
+                    })
+                }) {
+                    let mut current = current;
+                    current.cached_at = Some(chrono::Utc::now().timestamp());
+                    cache_entry_details(&state.db, user.id, media_id, entry_id, &current);
+                }
+                return Err(e.to_string());
+            }
+            if anilist::media_not_found(&e) {
+                let _intent = origin_result?;
+                invalidate_entry_details(&state.db, &key)?;
+                return Err(e.to_string());
+            }
             drop(origin_result?);
             return Err(write_err(state, origin, &expected_token, &e));
         }
@@ -3663,11 +4636,7 @@ async fn update_entry_details_inner(
     details.available_custom_lists = current.available_custom_lists;
     details.cached_at = Some(chrono::Utc::now().timestamp());
     // Persist confirmed details for this account before a waiting auth change takes remote_lock.
-    if let Ok(value) = serde_json::to_string(&details) {
-        let _ = state
-            .db
-            .set_setting(&format!("entry_details:{}:{media_id}", user.id), &value);
-    }
+    cache_entry_details(&state.db, user.id, media_id, entry_id, &details);
     origin_result?;
     Ok(details)
 }
@@ -4385,8 +5354,138 @@ mod tests {
                 repeat,
                 updated_at: None,
                 media: None,
+                queued_creation: None,
             })
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn my_list_progress_reads_remote_baseline_before_saving() {
+        use serde_json::json;
+
+        for (id, progress) in [(10, 6), (10, 7), (11, 5), (10, 5)] {
+            let mut replies = vec![(
+                200,
+                json!({"data":{"Media":{
+                    "id":1,"episodes":12,"mediaListEntry":{
+                        "id":id,"mediaId":1,"status":"PAUSED","progress":progress,"repeat":1,"score":0
+                    }
+                }}}),
+            )];
+            let can_save = (id, progress) == (10, 5);
+            if can_save {
+                replies.push((
+                    200,
+                    json!({"data":{"SaveMediaListEntry":{
+                        "id":id,"mediaId":1,"status":"PAUSED","progress":7,"repeat":1,"score":0
+                    }}}),
+                ));
+            }
+            let (mut api, mut requests) = anilist::mock_api(replies).await;
+            api.record_viewer(7);
+            let state = test_state();
+            *state.anilist.lock() = api;
+            state
+                .db
+                .replace_account(
+                    "test-session",
+                    &User {
+                        id: 7,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            seed(&state, Some(12), "CURRENT", 5, 0);
+
+            let (result, _) = set_progress_inner_with_origin(
+                &state,
+                1,
+                7,
+                Some(5),
+                Some((Some(7), crate::EntryIdentity::Remote(10))),
+            )
+            .await
+            .unwrap();
+            let lookup = requests.try_recv().unwrap();
+            assert!(lookup["query"].as_str().unwrap().contains("mediaListEntry"));
+            let saved = if can_save {
+                let ControlFlow::Continue(saved) = result else {
+                    panic!("save was skipped");
+                };
+                let write = requests.try_recv().unwrap();
+                assert_eq!(write["variables"]["id"], 10);
+                assert_eq!(write["variables"]["progress"], 7);
+                assert!(write["variables"]["status"].is_null());
+                saved
+            } else {
+                let ControlFlow::Break(saved) = result else {
+                    panic!("expected a conflict, got {result:?}");
+                };
+                assert_eq!(saved.progress, progress);
+                saved
+            };
+            assert_eq!(saved.id, Some(id));
+            assert_eq!(saved.status, "PAUSED");
+            assert_eq!(saved.repeat, 1);
+            assert_eq!(
+                state.db.get_entry(1).unwrap().unwrap().progress,
+                saved.progress
+            );
+            assert!(state.db.pending(7).unwrap().is_empty());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn my_list_progress_queues_when_lookup_is_unavailable_but_skips_removed_entries() {
+        use serde_json::json;
+
+        for (status, body) in [
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":null}}}),
+            ),
+        ] {
+            let (mut api, mut requests) = anilist::mock_api(vec![(status, body)]).await;
+            api.record_viewer(7);
+            let state = test_state();
+            *state.anilist.lock() = api;
+            state
+                .db
+                .replace_account(
+                    "test-session",
+                    &User {
+                        id: 7,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            seed(&state, Some(12), "CURRENT", 5, 0);
+            let result = set_progress_inner_with_origin(
+                &state,
+                1,
+                7,
+                Some(5),
+                Some((Some(7), crate::EntryIdentity::Remote(10))),
+            )
+            .await;
+            if status == 503 {
+                assert!(
+                    matches!(result, Ok((ControlFlow::Continue(entry), _)) if entry.progress == 7)
+                );
+                let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+                assert_eq!(pending.base.unwrap().progress, 5);
+                assert_eq!(pending.patch.progress, Some(7));
+            } else {
+                assert_eq!(result.unwrap_err(), "the entry is no longer on your list");
+                assert!(state.db.get_entry(1).unwrap().is_none());
+                assert!(state.db.pending(7).unwrap().is_empty());
+            }
+            let lookup = requests.try_recv().unwrap();
+            assert!(lookup["query"].as_str().unwrap().contains("mediaListEntry"));
+            assert!(requests.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -5790,8 +6889,6 @@ mod regression_tests {
                 (404, json!({"errors":[{"message":"Not Found."}]})),
                 (200, json!({"data":{"Media":{"id":1,"mediaListEntry":{"id":22,"mediaId":1,"status":"CURRENT","progress":4,"repeat":0,"score":0}}}})),
                 (200, json!({"data":{"DeleteMediaListEntry":{"deleted":true}}})),
-                (404, json!({"errors":[{"message":"Not Found."}]})),
-                (200, live.clone()),
                 (200, live),
             ]).await;
             let mut state = state_with_api(api);
@@ -5865,12 +6962,7 @@ mod regression_tests {
                     .await
                     .map(|_| ())
             };
-            assert!(result.unwrap_err().contains("identity changed"));
-            assert_eq!(requests.recv().await.unwrap()["variables"]["id"], 22);
-            assert!(requests.recv().await.unwrap()["query"]
-                .as_str()
-                .unwrap()
-                .contains("mediaListEntry"));
+            result.unwrap();
             assert!(requests.try_recv().is_err());
             let pending = state.db.pending_change(7, 1).unwrap().unwrap();
             assert!(pending.conflict && pending.deleting);
@@ -6021,6 +7113,130 @@ mod regression_tests {
                 assert!(state.db.get_entry(1).unwrap().is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn removal_detects_a_silent_list_cache_delete_failure() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (
+                200,
+                json!({"data":{"DeleteMediaListEntry":{"deleted":true}}}),
+            ),
+            (404, json!({"errors":[{"message":"Not Found"}]})),
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+            ),
+        ])
+        .await;
+        let state = state_with_api(api);
+        state
+            .db
+            .replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(22),
+                media_id: 1,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER ignore_list_removal BEFORE DELETE ON list_entry
+             BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+
+        let error = delete_entry_inner(1, &state).await.unwrap_err();
+        assert!(error.contains("the list entry was not removed"), "{error}");
+        assert!(state.db.get_entry(1).unwrap().is_some());
+        assert!(state.db.pending_change(7, 1).unwrap().unwrap().deleting);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 22);
+
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch("DROP TRIGGER ignore_list_removal")
+            .unwrap();
+        crate::sync_queue::flush_background(&state).await.unwrap();
+        assert!(state.db.pending(7).unwrap().is_empty());
+        assert!(state.db.get_entry(1).unwrap().is_none());
+        assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 22);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn removing_an_absent_queued_add_does_not_replay_it_after_local_cleanup_fails() {
+        let absent = (
+            200,
+            json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+        );
+        let (api, mut requests) = anilist::mock_api(vec![absent.clone(), absent]).await;
+        let state = state_with_api(api);
+        state
+            .db
+            .replace_account(
+                "test-session",
+                &User {
+                    id: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (_, pending, _) = crate::sync_queue::stage(
+            &state,
+            1,
+            crate::sync_queue::Patch {
+                progress: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        crate::sync_queue::local_entry(&state, &pending).unwrap();
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_absent_removal BEFORE DELETE ON pending_change
+             BEGIN SELECT RAISE(FAIL, 'fixture absence cleanup failure'); END;",
+            )
+            .unwrap();
+
+        let error = delete_entry_inner(1, &state).await.unwrap_err();
+        assert!(error.contains("fixture absence cleanup failure"), "{error}");
+        let retained = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(retained.deleting);
+        assert!(retained.deletion_id.is_none());
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch("DROP TRIGGER fail_absent_removal")
+            .unwrap();
+        crate::sync_queue::flush_background(&state).await.unwrap();
+        assert!(state.db.pending(7).unwrap().is_empty());
+        assert!(state.db.get_entry(1).unwrap().is_none());
+        for _ in 0..2 {
+            let request = requests.try_recv().unwrap();
+            assert!(request["query"].as_str().unwrap().starts_with("query"));
+        }
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -7150,6 +8366,276 @@ mod feature_cache_tests {
     }
 
     #[tokio::test]
+    async fn delayed_detail_enriches_newer_search_metadata_and_keeps_it_offline() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut media = anilist::mock_media(1);
+        media["title"]["english"] = json!("Old title");
+        media["seasonYear"] = json!(2025);
+        media["bannerImage"] = json!("banner.jpg");
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![(200, json!({"data":{"Media":media}}))],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = Arc::new(state(api));
+        let worker = state.clone();
+        let read = tokio::spawn(async move { get_media_detail(1, &worker).await });
+        requests.recv().await.unwrap();
+
+        let search = |year| {
+            let (status, mut body) = total_search(None);
+            body["data"]["Page"]["media"][0]["seasonYear"] = json!(year);
+            (status, body)
+        };
+        let (api, _) = anilist::mock_api(vec![
+            search(Some(2026)),
+            search(None),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        *state.anilist.lock() = api;
+        search_anime_page("test".into(), 1, &state).await.unwrap();
+        gate.add_permits(1);
+        let detail = read.await.unwrap().unwrap();
+        assert_eq!(detail.media.display_title(), "Search title");
+        assert_eq!(detail.media.season_year, Some(2026));
+        assert_eq!(detail.media.banner_image.as_deref(), Some("banner.jpg"));
+        assert_eq!(get_media(1, &state).await.unwrap(), detail.media);
+
+        search_anime_page("test".into(), 1, &state).await.unwrap();
+        let cached = get_media_detail(1, &state).await.unwrap();
+        assert!(cached.warning.is_some());
+        assert_eq!(cached.media.season_year, None);
+        assert_eq!(cached.media.banner_image.as_deref(), Some("banner.jpg"));
+        assert_eq!(get_media(1, &state).await.unwrap(), cached.media);
+    }
+
+    #[tokio::test]
+    async fn delayed_detail_ignores_a_search_cache_write_that_was_skipped() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut media = anilist::mock_media(1);
+        media["title"]["english"] = json!("Detail title");
+        media["bannerImage"] = json!("banner.jpg");
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![(200, json!({"data":{"Media":media}}))],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = Arc::new(state(api));
+        cache_media_details(&state);
+        let worker = state.clone();
+        let read = tokio::spawn(async move { get_media_detail(1, &worker).await });
+        requests.recv().await.unwrap();
+
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER skip_search BEFORE INSERT ON media
+             WHEN NEW.title_english = 'Search title' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        let (api, _) = anilist::mock_api(vec![total_search(Some(24))]).await;
+        *state.anilist.lock() = api;
+        assert_eq!(
+            search_anime_page("test".into(), 1, &state)
+                .await
+                .unwrap()
+                .items[0]
+                .display_title(),
+            "Search title"
+        );
+        assert_eq!(
+            state.db.get_media(1).unwrap().unwrap().display_title(),
+            "Saved show"
+        );
+        gate.add_permits(1);
+        let detail = read.await.unwrap().unwrap();
+        assert_eq!(detail.media.display_title(), "Detail title");
+        assert_eq!(detail.media.banner_image.as_deref(), Some("banner.jpg"));
+        assert_eq!(get_media(1, &state).await.unwrap(), detail.media);
+    }
+
+    #[tokio::test]
+    async fn offline_detail_keeps_newer_explicitly_empty_metadata() {
+        let mut media = anilist::mock_media(1);
+        media["title"]["english"] = json!("Saved show");
+        media["staff"]["edges"] = json!([{
+            "role":"Director","node":{"name":{"full":"Staff"},"image":null}
+        }]);
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":media}})),
+            (200, json!({"data":{"Page":{"media":[anilist::mock_media(1)],"pageInfo":{"hasNextPage":false}}}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        let state = state(api);
+        let first = get_media_detail(1, &state).await.unwrap();
+        assert_eq!(first.media.display_title(), "Saved show");
+        let newer = search_anime_page("test".into(), 1, &state).await.unwrap();
+        assert_eq!(newer.items[0].display_title(), "#1");
+        let cached = get_media_detail(1, &state).await.unwrap();
+        assert!(cached.warning.is_some());
+        assert_eq!(cached.media, newer.items[0]);
+        assert_eq!(cached.staff[0].name, "Staff");
+    }
+
+    #[tokio::test]
+    async fn delayed_detail_not_found_keeps_newer_search_metadata() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let missing = (404, json!({"errors":[{"message":"Not Found"}]}));
+        let (api, mut requests) =
+            anilist::mock_api_gated(vec![missing.clone()], Some(gate.clone())).await;
+        let state = Arc::new(state(api));
+        let worker = state.clone();
+        let read = tokio::spawn(async move { get_media_detail(1, &worker).await });
+        requests.recv().await.unwrap();
+        let (mut api, _) = anilist::mock_api(vec![total_search(Some(12)), missing]).await;
+        api.record_viewer(7);
+        *state.anilist.lock() = api;
+        let search = search_anime_page("test".into(), 1, &state).await.unwrap();
+        gate.add_permits(1);
+
+        let delayed = read.await.unwrap().unwrap();
+        assert!(delayed.warning.is_some());
+        assert_eq!(delayed.media, search.items[0]);
+        assert_eq!(get_media(1, &state).await.unwrap(), delayed.media);
+        assert_eq!(get_media_detail(1, &state).await.unwrap_err(), MEDIA_GONE);
+        assert!(state.db.get_media(1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delayed_lookup_not_found_keeps_a_newer_catalog_stub() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![(404, json!({"errors":[{"message":"Not Found"}]}))],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = Arc::new(state(api));
+        let worker = state.clone();
+        let read = tokio::spawn(async move { get_media(1, &worker).await });
+        requests.recv().await.unwrap();
+
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Page":{"media":[anilist::mock_media(1)],"pageInfo":{"hasNextPage":false}}}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        *state.anilist.lock() = api;
+        let search = search_anime_page("test".into(), 1, &state).await.unwrap();
+        gate.add_permits(1);
+        assert_eq!(read.await.unwrap().unwrap(), search.items[0]);
+        let detail = get_media_detail(1, &state).await.unwrap();
+        assert_eq!(detail.media, search.items[0]);
+        assert!(detail.warning.is_some());
+    }
+
+    #[tokio::test]
+    async fn delayed_detail_keeps_newer_sections_and_fills_unavailable_ones() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut older = anilist::mock_media(1);
+        older["bannerImage"] = json!("stale.jpg");
+        older["characters"]["edges"] = json!([{
+            "role":"MAIN","node":{"name":{"full":"Character"},"image":null},"voiceActors":[]
+        }]);
+        older["staff"]["edges"] = json!([{
+            "role":"Director","node":{"name":{"full":"Staff"},"image":null}
+        }]);
+        let mut newer = anilist::mock_media(1);
+        newer["staff"] = json!(null);
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![(200, json!({"data":{"Media":older}}))],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = Arc::new(state(api));
+        let worker = state.clone();
+        let read = tokio::spawn(async move { get_media_detail(1, &worker).await });
+        requests.recv().await.unwrap();
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":newer}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        *state.anilist.lock() = api;
+        let fresh = get_media_detail(1, &state).await.unwrap();
+        assert_eq!(fresh.unavailable_sections, ["staff"]);
+
+        gate.add_permits(1);
+        let delayed = read.await.unwrap().unwrap();
+        let offline = get_media_detail(1, &state).await.unwrap();
+        for detail in [delayed, offline] {
+            assert_eq!(detail.media.banner_image, None);
+            assert!(detail.characters.is_empty());
+            assert!(detail.unavailable_sections.is_empty());
+            assert_eq!(detail.staff[0].name, "Staff");
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_detail_enriches_when_newer_sections_were_not_cached() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut older = anilist::mock_media(1);
+        older["staff"]["edges"] = json!([{
+            "role":"Director","node":{"name":{"full":"Staff"},"image":null}
+        }]);
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![(200, json!({"data":{"Media":older}}))],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = Arc::new(state(api));
+        cache_media_details(&state);
+        let worker = state.clone();
+        let read = tokio::spawn(async move { get_media_detail(1, &worker).await });
+        requests.recv().await.unwrap();
+
+        let mut newer = anilist::mock_media(1);
+        newer["title"]["english"] = json!("New title");
+        newer["bannerImage"] = json!("new-banner.jpg");
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":newer}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        *state.anilist.lock() = api;
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER skip_sections BEFORE INSERT ON settings
+             WHEN NEW.key = 'media_detail:1' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        let fresh = get_media_detail(1, &state).await.unwrap();
+        assert!(fresh.staff.is_empty());
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch("DROP TRIGGER skip_sections")
+            .unwrap();
+        let offline = get_media_detail(1, &state).await.unwrap();
+        assert!(offline.warning.is_some());
+        assert_eq!(
+            offline.media.banner_image.as_deref(),
+            Some("new-banner.jpg")
+        );
+
+        gate.add_permits(1);
+        let delayed = read.await.unwrap().unwrap();
+        let cached = get_media_detail(1, &state).await.unwrap();
+        for detail in [delayed, cached] {
+            assert_eq!(detail.media.display_title(), "New title");
+            assert_eq!(detail.staff[0].name, "Staff");
+        }
+    }
+
+    #[tokio::test]
     async fn delayed_search_preserves_a_lookup_total_and_fresh_search_can_replace_it() {
         for confirmed in [Some(13), Some(12), None] {
             let page = |total, title| {
@@ -7266,6 +8752,14 @@ mod feature_cache_tests {
             assert_eq!(entries[0].progress, 5);
             let expected = (!commit).then_some(12);
             assert_eq!(entries[0].media.as_ref().unwrap().episodes, expected);
+            assert_eq!(
+                entries[0].media.as_ref().unwrap().display_title(),
+                if commit {
+                    "Search title"
+                } else {
+                    "Snapshot title"
+                }
+            );
             assert_eq!(state.db.cached_episode_total(1).unwrap(), Some(expected));
         }
     }
@@ -7312,6 +8806,14 @@ mod feature_cache_tests {
             gate.add_permits(1);
             let search = read.await.unwrap().unwrap();
             assert_eq!(search.items[0].episodes, expected);
+            assert_eq!(
+                search.items[0].display_title(),
+                if commit {
+                    "Snapshot title"
+                } else {
+                    "Search title"
+                }
+            );
             assert_eq!(state.db.episode_total(1).unwrap(), expected);
         }
     }
@@ -7364,6 +8866,211 @@ mod feature_cache_tests {
         let fresh = get_media_detail_inner(1, &state).await.unwrap();
         assert_eq!(fresh.relations[0].media.episodes, Some(24));
         assert_eq!(state.db.episode_total(2).unwrap(), Some(24));
+    }
+
+    #[tokio::test]
+    async fn omitted_detail_fields_preserve_only_the_affected_cached_sections() {
+        let mut saved = anilist::mock_media(1);
+        saved["title"]["english"] = json!("Saved show");
+        saved["characters"]["edges"] = json!([{
+            "role":"MAIN",
+            "node":{"name":{"full":"Character"},"image":null},
+            "voiceActors":[{"name":{"full":"Actor"},"image":{"medium":"actor.jpg"}}]
+        }]);
+        saved["staff"]["edges"] = json!([{
+            "role":"Director","node":{"name":{"full":"Staff"},"image":null}
+        }]);
+        let mut partial = saved.clone();
+        partial["title"]["english"] = json!("Fresh show");
+        partial["characters"]["edges"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("voiceActors");
+        partial["staff"]["edges"][0]["role"] = json!("Producer");
+        let mut recovered = partial.clone();
+        recovered["characters"]["edges"][0]["voiceActors"] = json!(null);
+        recovered["staff"]["edges"] = json!([]);
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":saved}})),
+            (200, json!({"data":{"Media":partial}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+            (200, json!({"data":{"Media":recovered}})),
+        ])
+        .await;
+        let state = state(api);
+        get_media_detail(1, &state).await.unwrap();
+        for warning in [false, true] {
+            let detail = get_media_detail(1, &state).await.unwrap();
+            assert_eq!(detail.warning.is_some(), warning);
+            assert_eq!(detail.media.display_title(), "Fresh show");
+            assert_eq!(detail.unavailable_sections, ["characters"]);
+            assert_eq!(detail.characters[0].va_name.as_deref(), Some("Actor"));
+            assert_eq!(detail.staff[0].role.as_deref(), Some("Producer"));
+        }
+        let recovered = get_media_detail(1, &state).await.unwrap();
+        assert!(recovered.unavailable_sections.is_empty());
+        assert_eq!(recovered.characters[0].va_name, None);
+        assert!(recovered.staff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detail_cache_keeps_credits_when_base_metadata_is_null() {
+        let mut saved = anilist::mock_media(1);
+        saved["staff"]["edges"] = json!([{
+            "role":null,"node":{"name":{"full":"Staff"},"image":{"medium":null}}
+        }]);
+        let mut partial = saved.clone();
+        partial["staff"] = json!(null);
+        let (api, _) = anilist::mock_api(vec![
+            (200, json!({"data":{"Media":saved}})),
+            (200, json!({"data":{"Media":partial}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        let state = state(api);
+        for _ in 0..3 {
+            let detail = get_media_detail(1, &state).await.unwrap();
+            assert_eq!(detail.staff.len(), 1);
+            assert_eq!(detail.staff[0].name, "Staff");
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_settlement_does_not_outlive_its_session() {
+        use std::time::Duration;
+
+        let mut media = anilist::mock_media(1);
+        media["title"]["english"] = json!("Late show");
+        for response in [
+            (200, json!({"data":{"Media":media}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (api, mut requests) =
+                anilist::mock_api_gated(vec![response], Some(gate.clone())).await;
+            let state = Arc::new(state(api));
+            cache_media_details(&state);
+            let stored = state.db.get_setting("media_detail:1").unwrap();
+            let lock = state.entry_lock.lock().await;
+            let baseline = state.auth_intent.receiver_count();
+            let worker = state.clone();
+            let task = tokio::spawn(async move { get_media_detail(1, &worker).await });
+            tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(state.auth_intent.receiver_count() > baseline + 1);
+            gate.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.auth_intent.receiver_count() > baseline + 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            state.begin_auth_intent();
+            drop(lock);
+            assert_eq!(task.await.unwrap().unwrap_err(), AUTH_REPLACED);
+            assert_eq!(state.db.get_setting("media_detail:1").unwrap(), stored);
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_read_cancels_when_its_session_is_replaced() {
+        use std::time::Duration;
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![(
+                200,
+                json!({"data":{"Page":{
+                    "pageInfo":{"hasNextPage":false},"airingSchedules":[]
+                }}}),
+            )],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = Arc::new(state(api));
+        let worker = state.clone();
+        let mut task = tokio::spawn(async move { get_airing_schedule(100, 200, &worker).await });
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        state.begin_auth_intent();
+        let result = tokio::time::timeout(Duration::from_millis(750), &mut task).await;
+        gate.add_permits(1);
+        assert_eq!(
+            result
+                .expect("Calendar read waited for the old session")
+                .unwrap()
+                .unwrap_err(),
+            AUTH_REPLACED
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_calendar_page_keeps_cached_media_until_a_complete_retry() {
+        for invalid in ["outside", "episode", "media", "adult"] {
+            let mut media = anilist::mock_media(1);
+            media["isAdult"] = json!(null);
+            media["episodes"] = json!(99);
+            let first = json!({"airingAt":100,"episode":1,"media":media});
+            let mut second = json!({"airingAt":199,"episode":2,"media":media});
+            let mut invalid_row = second.clone();
+            match invalid {
+                "outside" => invalid_row["airingAt"] = json!(200),
+                "episode" => invalid_row["episode"] = json!(-1),
+                "media" => invalid_row["media"]["id"] = json!(0),
+                "adult" => {
+                    invalid_row["media"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("isAdult");
+                }
+                _ => unreachable!(),
+            }
+            second["media"]["episodes"] = json!(13);
+            second["episode"] = json!(0);
+            let page = |number, more, rows| {
+                (
+                    200,
+                    json!({"data":{"Page":{
+                        "pageInfo":{"currentPage":number,"hasNextPage":more},
+                        "airingSchedules":rows
+                    }}}),
+                )
+            };
+            let (api, _) = anilist::mock_api(vec![
+                page(1, true, vec![first]),
+                page(2, false, vec![invalid_row]),
+                page(1, false, vec![second]),
+            ])
+            .await;
+            let state = state(api);
+            cache_media_details(&state);
+            pending_progress(&state);
+
+            assert!(
+                get_airing_schedule(100, 200, &state).await.is_err(),
+                "{invalid}"
+            );
+            assert_eq!(state.db.episode_total(1).unwrap(), Some(12), "{invalid}");
+            let items = get_airing_schedule(100, 200, &state).await.unwrap();
+            assert_eq!(items[0].episode, 0);
+            assert_eq!(state.db.episode_total(1).unwrap(), Some(13));
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_rejects_ranges_that_overflow() {
+        let state = super::tests::test_state();
+        assert_eq!(
+            get_airing_schedule(i64::MIN, i64::MAX, &state)
+                .await
+                .unwrap_err(),
+            "invalid schedule range"
+        );
     }
 
     #[tokio::test]
@@ -7830,7 +9537,11 @@ mod feature_cache_tests {
                     cached_at: Some(100),
                     ..Default::default()
                 };
-                let saved = serde_json::to_string(&cached).unwrap();
+                let saved = serde_json::to_string(&CachedEntryDetails {
+                    entry_id: 22,
+                    details: cached.clone(),
+                })
+                .unwrap();
                 state.db.set_setting("entry_details:7:1", &saved).unwrap();
                 if operation == "read" {
                     let recovered = get_entry_details_inner(1, &state).await.unwrap();
@@ -7878,6 +9589,49 @@ mod feature_cache_tests {
                 assert_eq!(state.db.pending(7).unwrap()[0].patch.progress, Some(4));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_metadata_save_drops_cache_for_a_replaced_entry() {
+        let replacement = json!({"id":33,"mediaId":1,"notes":"Replacement note",
+            "startedAt":null,"completedAt":null,"customLists":{}});
+        let (api, mut requests) = anilist::mock_api(vec![
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"mediaListEntry":replacement}}}),
+            ),
+            (200, json!({"data":{"SaveMediaListEntry":replacement}})),
+            (503, json!({"errors":[{"message":"Unavailable"}]})),
+        ])
+        .await;
+        let state = state(api);
+        pending_progress(&state);
+        cache_entry_details(
+            &state.db,
+            7,
+            1,
+            22,
+            &EntryDetails {
+                notes: "Removed entry note".into(),
+                ..Default::default()
+            },
+        );
+
+        let error =
+            update_entry_details_inner(1, Some("Requested note".into()), None, None, None, &state)
+                .await
+                .unwrap_err();
+        assert!(error.contains("did not confirm"), "{error}");
+        let cached = read_cached_entry_details(&state.db, "entry_details:7:1").unwrap();
+        assert_eq!(
+            (cached.entry_id, cached.details.notes.as_str()),
+            (33, "Replacement note")
+        );
+        assert!(get_entry_details_inner(1, &state).await.is_err());
+        requests.try_recv().unwrap();
+        assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 33);
+        requests.try_recv().unwrap();
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -7938,7 +9692,8 @@ mod feature_cache_tests {
                 assert_eq!(result.unwrap().notes, "New note");
             } else {
                 assert!(result.is_err(), "{outcome}");
-                assert_eq!(state.db.get_setting("entry_details:7:1").unwrap(), cached);
+                let expected = if outcome == "removed" { None } else { cached };
+                assert_eq!(state.db.get_setting("entry_details:7:1").unwrap(), expected);
             }
         }
     }
@@ -8027,9 +9782,12 @@ mod feature_cache_tests {
             ]).await;
             let state = state(api);
             pending_progress(&state);
-            let cached = serde_json::to_string(&EntryDetails {
-                notes: "Cached note".into(),
-                ..Default::default()
+            let cached = serde_json::to_string(&CachedEntryDetails {
+                entry_id: 22,
+                details: EntryDetails {
+                    notes: "Cached note".into(),
+                    ..Default::default()
+                },
             })
             .unwrap();
             state.db.set_setting("entry_details:7:1", &cached).unwrap();
@@ -8077,12 +9835,12 @@ mod feature_cache_tests {
     }
 
     #[tokio::test]
-    async fn offline_profile_can_recover_saved_statistics_and_entry_details() {
+    async fn offline_profile_recovers_statistics_and_entry_details_with_a_known_entry_id() {
         let (api, _) = anilist::mock_api(vec![
             (200, json!({"data":{"User":{"id":7,"statistics":null}}})),
             (
-                200,
-                json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+                503,
+                json!({"errors":[{"message":"Temporarily unavailable"}]}),
             ),
         ])
         .await;
@@ -8101,13 +9859,8 @@ mod feature_cache_tests {
             cached_at: Some(100),
             ..Default::default()
         };
-        state
-            .db
-            .set_setting(
-                "entry_details:7:1",
-                &serde_json::to_string(&details).unwrap(),
-            )
-            .unwrap();
+        pending_progress(&state);
+        cache_entry_details(&state.db, 7, 1, 22, &details);
         let recovered = get_user_stats_inner(&state).await.unwrap();
         assert_eq!(recovered.count, 12);
         assert!(recovered.warning.is_some());
@@ -8179,6 +9932,191 @@ mod persistence_tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn offline_entry_details_require_the_same_remote_entry_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "kurisu-entry-details-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let offline = (
+            503,
+            json!({"errors":[{"message":"Temporarily unavailable"}]}),
+        );
+        let details = json!({"data":{"Media":{"mediaListEntry":{
+            "id":22,"mediaId":1,"notes":"Old entry notes",
+            "startedAt":null,"completedAt":null,"customLists":null
+        }}}});
+        let mut snapshot = score_snapshot(70.0, false, 1);
+        snapshot["data"]["MediaListCollection"]["lists"][0]["entries"][0]["id"] = json!(99);
+        let (api, _) = anilist::mock_api(vec![offline.clone(), (200, details)]).await;
+        let mut first = state(api);
+        let db = Db::open(&path).unwrap();
+        db.replace_account("test-session", &first.user.lock().clone().unwrap())
+            .unwrap();
+        db.upsert_entry(&first.db.get_entry(1).unwrap().unwrap())
+            .unwrap();
+        db.set_setting("entry_details:7:1", r#"{"notes":"Legacy notes"}"#)
+            .unwrap();
+        Arc::get_mut(&mut first).unwrap().db = Arc::new(db);
+        assert!(get_entry_details(1, &first).await.is_err());
+        assert_eq!(
+            get_entry_details(1, &first).await.unwrap().notes,
+            "Old entry notes"
+        );
+        drop(first);
+
+        let (api, _) = anilist::mock_api(vec![
+            offline.clone(),
+            (200, snapshot),
+            (200, score_profile("POINT_100")),
+        ])
+        .await;
+        let mut restarted = state(api);
+        Arc::get_mut(&mut restarted).unwrap().db = Arc::new(Db::open(&path).unwrap());
+        restarted
+            .anilist
+            .lock()
+            .set_token(Some("test-session".into()));
+        *restarted.user.lock() = None;
+        let cached = get_entry_details(1, &restarted).await.unwrap();
+        assert_eq!(cached.notes, "Old entry notes");
+        assert!(cached.warning.is_some());
+        assert_eq!(sync_my_list(&restarted).await.unwrap()[0].id, Some(99));
+        drop(restarted);
+
+        let (api, _) = anilist::mock_api(vec![offline]).await;
+        let mut replaced = state(api);
+        Arc::get_mut(&mut replaced).unwrap().db = Arc::new(Db::open(&path).unwrap());
+        assert_eq!(replaced.db.get_entry(1).unwrap().unwrap().id, Some(99));
+        assert!(get_entry_details(1, &replaced)
+            .await
+            .unwrap_err()
+            .contains("503"));
+        drop(replaced);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_offline_read_cannot_recover_details_after_confirmed_entry_removal() {
+        for (removed, block_delete) in [
+            (
+                (
+                    200,
+                    json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+                ),
+                false,
+            ),
+            (
+                (
+                    404,
+                    json!({"errors":[{"message":"Not Found","status":404}]}),
+                ),
+                true,
+            ),
+        ] {
+            let (api, _) = anilist::mock_api(vec![
+                removed,
+                (
+                    503,
+                    json!({"errors":[{"message":"Temporarily unavailable"}]}),
+                ),
+            ])
+            .await;
+            let state = state(api);
+            cache_entry_details(
+                &state.db,
+                7,
+                1,
+                22,
+                &EntryDetails {
+                    notes: "Old entry notes".into(),
+                    ..Default::default()
+                },
+            );
+            cache_entry_details(
+                &state.db,
+                8,
+                1,
+                23,
+                &EntryDetails {
+                    notes: "Other account notes".into(),
+                    ..Default::default()
+                },
+            );
+            if block_delete {
+                state
+                    .db
+                    .0
+                    .lock()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_cache_delete BEFORE DELETE ON settings
+                     WHEN OLD.key = 'entry_details:7:1' BEGIN SELECT RAISE(IGNORE); END;",
+                    )
+                    .unwrap();
+            }
+            assert!(get_entry_details(1, &state).await.is_err());
+            assert!(get_entry_details(1, &state)
+                .await
+                .unwrap_err()
+                .contains("503"));
+            assert_eq!(
+                read_cached_entry_details(&state.db, "entry_details:8:1")
+                    .unwrap()
+                    .details
+                    .notes,
+                "Other account notes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_cache_write_cannot_restore_notes_for_a_replaced_remote_entry() {
+        let (api, _) = anilist::mock_api(vec![
+            (
+                200,
+                json!({"data":{"Media":{"mediaListEntry":{
+                    "id":99,"mediaId":1,"notes":"New entry notes",
+                    "startedAt":null,"completedAt":null,"customLists":null
+                }}}}),
+            ),
+            (
+                503,
+                json!({"errors":[{"message":"Temporarily unavailable"}]}),
+            ),
+        ])
+        .await;
+        let state = state(api);
+        cache_entry_details(
+            &state.db,
+            7,
+            1,
+            22,
+            &EntryDetails {
+                notes: "Old entry notes".into(),
+                ..Default::default()
+            },
+        );
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER refuse_cache_write BEFORE INSERT ON settings
+             WHEN NEW.key = 'entry_details:7:1' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert_eq!(
+            get_entry_details(1, &state).await.unwrap().notes,
+            "New entry notes"
+        );
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().id, Some(22));
+        assert!(get_entry_details(1, &state)
+            .await
+            .unwrap_err()
+            .contains("503"));
+    }
 
     fn state(mut api: AniList) -> Arc<AppState> {
         api.record_viewer(7);
@@ -8968,6 +10906,174 @@ mod persistence_tests {
     }
 
     #[tokio::test]
+    async fn prompt_checks_remote_progress_before_sending() {
+        let mut advanced = remote();
+        advanced["progress"] = json!(8);
+        advanced["status"] = json!("CURRENT");
+        let (api, mut requests) = anilist::mock_api(vec![(
+            200,
+            json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":advanced}}}),
+        )])
+        .await;
+        let state = state(api);
+        let mut base = state.db.get_entry(1).unwrap().unwrap();
+        base.progress = 2;
+        base.status = "CURRENT".into();
+        state.db.upsert_entry(&base).unwrap();
+        state.emit(crate::EventKind::TrackingPrompt(crate::TrackingPrompt {
+            media_id: 1,
+            episode: 3,
+            progress: 2,
+            title: "Fixture".into(),
+            raw_title: "Fixture 3".into(),
+        }));
+
+        let result =
+            confirm_tracking_prompt(state.retained_tracking_prompt().unwrap(), 3, &state).await;
+        let request = requests.try_recv().unwrap();
+        assert!(
+            request["query"]
+                .as_str()
+                .unwrap()
+                .contains("mediaListEntry"),
+            "{request}"
+        );
+        assert!(requests.try_recv().is_err());
+        result.unwrap();
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.conflict);
+        assert_eq!(pending.base.unwrap().progress, 2);
+        assert!(state.retained_tracking_prompt().is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_preflight_rejects_a_changed_displayed_target() {
+        let mut before = remote();
+        before["progress"] = json!(11);
+        let (api, mut requests) = anilist::mock_api(vec![(
+            200,
+            json!({"data":{"Media":{"id":1,"episodes":13,"mediaListEntry":before}}}),
+        )])
+        .await;
+        let state = state(api);
+        let mut base = state.db.get_entry(1).unwrap().unwrap();
+        base.progress = 11;
+        state.db.upsert_entry(&base).unwrap();
+        state.emit(crate::EventKind::TrackingPrompt(crate::TrackingPrompt {
+            media_id: 1,
+            episode: 13,
+            progress: 11,
+            title: "Fixture".into(),
+            raw_title: "Fixture 13".into(),
+        }));
+        let event = state.retained_tracking_prompt().unwrap();
+
+        assert_eq!(
+            confirm_tracking_prompt(event.clone(), 12, &state)
+                .await
+                .unwrap_err(),
+            PROMPT_CHANGED
+        );
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert!(requests.try_recv().is_err());
+        assert!(state.event_is_current(&event));
+        assert_eq!(state.db.episode_total(1).unwrap(), Some(13));
+        assert!(state.db.pending(7).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_preflight_rejects_a_replaced_local_entry() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut before = remote();
+        before["status"] = json!("CURRENT");
+        before["progress"] = json!(2);
+        let mut saved = before.clone();
+        saved["progress"] = json!(3);
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![
+                (
+                    200,
+                    json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":before}}}),
+                ),
+                (200, json!({"data":{"SaveMediaListEntry":saved}})),
+            ],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = state(api);
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.progress = 2;
+        entry.status = "CURRENT".into();
+        state.db.upsert_entry(&entry).unwrap();
+        state.emit(crate::EventKind::TrackingAsk(crate::TrackingPrompt {
+            media_id: 1,
+            episode: 3,
+            progress: 2,
+            title: "Fixture".into(),
+            raw_title: "Fixture 3".into(),
+        }));
+        let event = state.retained_tracking_prompt().unwrap();
+        let task = {
+            let state = state.clone();
+            let event = event.clone();
+            tokio::spawn(async move { confirm_tracking_prompt(event, 3, &state).await })
+        };
+        assert_eq!(requests.recv().await.unwrap()["variables"]["mediaId"], 1);
+        {
+            let _write = state.entry_lock.lock().await;
+            entry.id = Some(23);
+            state.db.upsert_entry(&entry).unwrap();
+        }
+        gate.add_permits(2);
+        assert_eq!(task.await.unwrap().unwrap_err(), PROMPT_CHANGED);
+        assert!(requests.try_recv().is_err());
+        assert!(state.event_is_current(&event));
+        assert!(state.db.pending(7).unwrap().is_empty());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().id, Some(23));
+    }
+
+    #[tokio::test]
+    async fn a_retained_prompt_cannot_update_a_replacement_entry() {
+        let mut before = remote();
+        before["id"] = json!(23);
+        before["status"] = json!("CURRENT");
+        before["progress"] = json!(2);
+        let mut saved = before.clone();
+        saved["progress"] = json!(3);
+        let (api, mut requests) = anilist::mock_api(vec![
+            (
+                200,
+                json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":before}}}),
+            ),
+            (200, json!({"data":{"SaveMediaListEntry":saved}})),
+        ])
+        .await;
+        let state = state(api);
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.status = "CURRENT".into();
+        entry.progress = 2;
+        state.db.upsert_entry(&entry).unwrap();
+        state.emit(crate::EventKind::TrackingPrompt(crate::TrackingPrompt {
+            media_id: 1,
+            episode: 3,
+            progress: 2,
+            title: "Fixture".into(),
+            raw_title: "Fixture 3".into(),
+        }));
+        let event = state.retained_tracking_prompt().unwrap();
+
+        entry.id = Some(23);
+        state.db.upsert_entry(&entry).unwrap();
+        assert!(confirm_tracking_prompt(event.clone(), 3, &state)
+            .await
+            .is_err());
+        assert!(!state.event_is_current(&event));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 2);
+        assert!(state.db.pending(7).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn prompt_rechecks_the_displayed_target_after_waiting() {
         for verify_owner in [false, true] {
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -9023,10 +11129,18 @@ mod persistence_tests {
 
     #[tokio::test]
     async fn clamped_confirmation_retires_only_the_confirmed_prompt() {
-        for replaced in [false, true] {
+        for replacement in [None, Some("preflight"), Some("mutation")] {
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut before = remote();
+            before["progress"] = json!(11);
             let (api, mut requests) = anilist::mock_api_gated(
-                vec![(200, json!({"data":{"SaveMediaListEntry":remote()}}))],
+                vec![
+                    (
+                        200,
+                        json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":before}}}),
+                    ),
+                    (200, json!({"data":{"SaveMediaListEntry":remote()}})),
+                ],
                 Some(gate.clone()),
             )
             .await;
@@ -9049,9 +11163,22 @@ mod persistence_tests {
                 tokio::spawn(
                     async move { confirm_tracking_prompt(requested, 12, &confirms).await },
                 );
+            let lookup = identity_request_while_running(&mut requests, &mut confirm).await;
+            assert_eq!(lookup["variables"]["mediaId"], 1);
+            if replacement == Some("preflight") {
+                state.emit(crate::EventKind::TrackingPrompt(prompt));
+                let newer = state.retained_tracking_prompt().unwrap();
+                gate.add_permits(1);
+                assert_eq!(confirm.await.unwrap().unwrap_err(), PROMPT_CHANGED);
+                assert!(state.event_is_current(&newer));
+                assert!(state.db.pending(7).unwrap().is_empty());
+                assert!(requests.try_recv().is_err());
+                continue;
+            }
+            gate.add_permits(1);
             let mutation = identity_request_while_running(&mut requests, &mut confirm).await;
             assert_eq!(mutation["variables"]["progress"], 12);
-            let newer = if replaced {
+            let newer = if replacement == Some("mutation") {
                 state.emit(crate::EventKind::TrackingPrompt(prompt));
                 state.retained_tracking_prompt()
             } else {
@@ -9857,6 +11984,73 @@ mod persistence_tests {
     }
 
     #[tokio::test]
+    async fn repeated_final_list_chunk_preserves_cached_entries() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (200, score_snapshot(90.0, true, 1)),
+            (200, score_snapshot(90.0, false, 1)),
+            (200, score_profile("POINT_100")),
+        ])
+        .await;
+        let state = state(api);
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(23),
+                media_id: 2,
+                progress: 5,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let result = sync_my_list(&state).await;
+        assert_eq!(requests.try_recv().unwrap()["variables"]["chunk"], 1);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["chunk"], 2);
+        assert!(state.db.get_entry(2).unwrap().is_some(), "{result:?}");
+        assert!(result.is_err());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_entry_server_error_does_not_block_a_complete_list_refresh() {
+        let (api, mut requests) = anilist::mock_api(vec![
+            (
+                500,
+                json!({"errors":[{"message":"Entry temporarily unavailable","status":500}]}),
+            ),
+            (200, score_snapshot(90.0, false, 2)),
+            (200, score_profile("POINT_100")),
+        ])
+        .await;
+        let state = state(api);
+        crate::sync_queue::stage(
+            &state,
+            1,
+            crate::sync_queue::Patch {
+                repeat: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let entries = sync_my_list(&state).await.unwrap();
+        assert!(entries.iter().any(|entry| entry.media_id == 2));
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending
+            .error
+            .unwrap()
+            .contains("Entry temporarily unavailable"));
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().repeat, 3);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["chunk"], 1);
+        assert!(requests.try_recv().unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .contains("Viewer"));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn incomplete_queue_lookups_and_acknowledgements_keep_saved_changes() {
         for lookup in [true, false] {
             let mut partial = remote();
@@ -10035,6 +12229,7 @@ mod persistence_tests {
             None,
             None,
             Some(Some("POINT_5".into())),
+            None,
         )
         .await;
         assert!(result.unwrap_err().contains("Score format changed"));
@@ -10059,6 +12254,7 @@ mod persistence_tests {
             None,
             None,
             Some(Some("POINT_100".into())),
+            None,
         )
         .await
         .unwrap();
@@ -10076,6 +12272,338 @@ mod persistence_tests {
             .contains("Viewer"));
         assert!(requests.try_recv().is_err());
     }
+
+    #[tokio::test]
+    async fn editor_durable_idless_entry_only_edits_a_queued_add() {
+        let unavailable = (503, json!({"errors":[{"message":"Unavailable"}]}));
+        let (api, mut requests) = anilist::mock_api(vec![unavailable]).await;
+        let state = state(api);
+        let target = crate::EntryEditTarget {
+            account_id: Some(7),
+            identity: crate::EntryIdentity::Unverified,
+        };
+        let mut legacy = state.db.get_entry(1).unwrap().unwrap();
+        legacy.id = None;
+        state.db.upsert_entry(&legacy).unwrap();
+        let save = |media_id, expected_progress, target| {
+            save_entry_inner_checked_impl(
+                &state,
+                media_id,
+                None,
+                None,
+                None,
+                Some(5),
+                Some(expected_progress),
+                Some(Some("POINT_100".into())),
+                Some(EntryWriteTarget::Editor(target)),
+            )
+        };
+        assert_eq!(
+            save(1, 12, target).await.unwrap_err(),
+            EDITOR_ENTRY_UNVERIFIED
+        );
+        assert!(requests.try_recv().is_err());
+        let new = save_entry_inner(&state, 2, Some("PLANNING".into()), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(new.id, None);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 2);
+        let target = crate::EntryEditTarget {
+            account_id: Some(7),
+            identity: new.identity(),
+        };
+        let other_account = crate::EntryEditTarget {
+            account_id: Some(8),
+            ..target.clone()
+        };
+        assert!(save(2, 0, other_account)
+            .await
+            .unwrap_err()
+            .contains("account changed"));
+        assert_eq!(save(2, 0, target.clone()).await.unwrap().repeat, 5);
+        let pending = state.db.pending_change(7, 2).unwrap().unwrap();
+        assert!(pending.base.is_none());
+        assert_eq!(pending.patch.repeat, Some(5));
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(44),
+                repeat: 1,
+                ..new
+            })
+            .unwrap();
+        assert_eq!(save(2, 0, target).await.unwrap_err(), EDITOR_ENTRY_CHANGED);
+        assert_eq!(state.db.get_entry(2).unwrap().unwrap().repeat, 1);
+        assert!(state.db.pending_change(7, 2).unwrap().unwrap().conflict);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn guarded_progress_and_discovery_do_not_write_a_replacement() {
+        let mut replacement = remote();
+        replacement["id"] = json!(33);
+        let (api, mut requests) = anilist::mock_api(vec![(
+            200,
+            json!({"data":{"Media":{"id":1,"mediaListEntry":replacement}}}),
+        )])
+        .await;
+        let state = state(api);
+        let original = state.db.get_entry(1).unwrap().unwrap();
+        state
+            .db
+            .upsert_entry(&ListEntry {
+                id: Some(33),
+                ..original.clone()
+            })
+            .unwrap();
+
+        assert!(set_progress_inner_with_origin(
+            &state,
+            1,
+            11,
+            Some(12),
+            Some((Some(7), original.identity())),
+        )
+        .await
+        .is_err());
+        let change_status = |identity| {
+            save_entry_inner_checked_impl(
+                &state,
+                1,
+                Some("PLANNING".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(EntryWriteTarget::Discovery {
+                    account_id: Some(7),
+                    identity,
+                }),
+            )
+        };
+        assert_eq!(
+            change_status(Some(original.identity())).await.unwrap_err(),
+            DISCOVERY_ENTRY_CHANGED
+        );
+        assert_eq!(
+            change_status(None).await.unwrap_err(),
+            DISCOVERY_ENTRY_CHANGED
+        );
+        assert!(requests.try_recv().is_err());
+
+        state.db.delete_entry(1).unwrap();
+        assert_eq!(
+            change_status(None).await.unwrap_err(),
+            DISCOVERY_ENTRY_CHANGED
+        );
+        let lookup = requests.try_recv().unwrap();
+        assert!(lookup["query"].as_str().unwrap().starts_with("query"));
+        assert!(requests.try_recv().is_err());
+        let cached = state.db.get_entry(1).unwrap().unwrap();
+        assert_eq!(
+            (cached.id, cached.status, cached.progress),
+            (Some(33), original.status, 12)
+        );
+        assert!(state.db.pending(7).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_editor_cannot_cancel_a_recreated_queued_add() {
+        let absent = (
+            200,
+            json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+        );
+        let unavailable = (503, json!({"errors":[{"message":"Unavailable"}]}));
+        let (api, mut requests) = anilist::mock_api(vec![
+            unavailable.clone(),
+            absent.clone(),
+            unavailable,
+            absent,
+        ])
+        .await;
+        let state = state(api);
+        state.db.delete_entry(1).unwrap();
+        let add = || save_entry_inner(&state, 1, Some("PLANNING".into()), None, None, None);
+        let first = add().await.unwrap();
+        let target = crate::EntryEditTarget {
+            account_id: Some(7),
+            identity: first.identity(),
+        };
+        crate::sync_queue::resolve_pending_change(1, false, &state)
+            .await
+            .unwrap();
+        assert!(state.db.get_entry(1).unwrap().is_none());
+        let second = add().await.unwrap();
+        assert_ne!(first.identity(), second.identity());
+        for _ in 0..3 {
+            assert_eq!(requests.recv().await.unwrap()["variables"]["mediaId"], 1);
+        }
+        let stale = delete_entry_target(1, Some(target), &state).await;
+        assert_eq!(stale.unwrap_err(), EDITOR_ENTRY_CHANGED);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            state.db.get_entry(1).unwrap().unwrap().identity(),
+            second.identity()
+        );
+        assert!(state.db.pending_change(7, 1).unwrap().is_some());
+        let target = crate::EntryEditTarget {
+            account_id: Some(7),
+            identity: second.identity(),
+        };
+        let other_account = crate::EntryEditTarget {
+            account_id: Some(8),
+            ..target.clone()
+        };
+        assert!(delete_entry_target(1, Some(other_account), &state)
+            .await
+            .unwrap_err()
+            .contains("account changed"));
+        assert!(requests.try_recv().is_err());
+        delete_entry_target(1, Some(target), &state).await.unwrap();
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert!(state.db.get_entry(1).unwrap().is_none());
+        assert!(state.db.pending_change(7, 1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_creation_acknowledges_its_projected_identity() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (api, mut requests) = anilist::mock_api_gated(
+            vec![
+                (
+                    200,
+                    json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+                ),
+                (200, json!({"data":{"SaveMediaListEntry":remote()}})),
+            ],
+            Some(gate.clone()),
+        )
+        .await;
+        let state = state(api);
+        state.db.delete_entry(1).unwrap();
+        let writer = state.clone();
+        let save = tokio::spawn(async move {
+            save_entry_inner(&writer, 1, Some("COMPLETED".into()), None, None, None).await
+        });
+        assert_eq!(requests.recv().await.unwrap()["variables"]["mediaId"], 1);
+        gate.add_permits(1);
+        let mutation = requests.recv().await.unwrap();
+        assert!(mutation["query"]
+            .as_str()
+            .unwrap()
+            .contains("SaveMediaListEntry"));
+        let projected = get_entry(1, &state).await.unwrap().unwrap();
+        let identity = projected.identity();
+        assert!(matches!(identity, crate::EntryIdentity::Queued(_)));
+        gate.add_permits(1);
+        let confirmed = save.await.unwrap().unwrap();
+        assert_eq!(confirmed.id, Some(22));
+        assert!(identity.matches(&confirmed));
+        assert!(identity.matches(&state.db.get_entry(1).unwrap().unwrap()));
+        assert!(state.db.pending(7).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guarded_progress_follows_only_its_acknowledged_creation() {
+        for (remote_id, remote_progress) in [(22, 7), (22, 6), (33, 7)] {
+            let mut current = remote();
+            current["id"] = json!(remote_id);
+            current["status"] = json!("CURRENT");
+            current["progress"] = json!(remote_progress);
+            let mut saved = current.clone();
+            saved["progress"] = json!(8);
+            let (api, mut requests) = anilist::mock_api(vec![
+                (
+                    200,
+                    json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":current}}}),
+                ),
+                (200, json!({"data":{"SaveMediaListEntry":saved}})),
+            ])
+            .await;
+            let state = state(api);
+            let mut entry = state.db.get_entry(1).unwrap().unwrap();
+            entry.status = "CURRENT".into();
+            entry.progress = 7;
+            let identity = crate::EntryIdentity::Queued("displayed-creation".into());
+            entry.queued_creation = Some("displayed-creation".into());
+            state
+                .db
+                .cache_acknowledged_entry(None, &mut entry, None)
+                .unwrap();
+            assert!(identity.matches(&entry));
+
+            let (outcome, _) = set_progress_inner_with_origin(
+                &state,
+                1,
+                8,
+                Some(7),
+                Some((Some(7), identity.clone())),
+            )
+            .await
+            .unwrap();
+            assert!(requests.try_recv().unwrap()["query"]
+                .as_str()
+                .unwrap()
+                .contains("mediaListEntry"));
+            if (remote_id, remote_progress) == (22, 7) {
+                let ControlFlow::Continue(saved) = outcome else {
+                    panic!("the acknowledged creation should still be editable");
+                };
+                assert_eq!(saved.progress, 8);
+                assert!(identity.matches(&saved));
+                assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 22);
+            } else {
+                let ControlFlow::Break(current) = outcome else {
+                    panic!("the conflicting entry must remain untouched");
+                };
+                assert_eq!(
+                    (current.id, current.progress),
+                    (Some(remote_id), remote_progress)
+                );
+                assert_eq!(identity.matches(&current), remote_id == 22);
+                let cached = state.db.get_entry(1).unwrap().unwrap();
+                assert_eq!(cached.progress, remote_progress);
+                assert_eq!(identity.matches(&cached), remote_id == 22);
+            }
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_removal_cannot_retry_against_a_replacement_id() {
+        let replacement = json!({"data":{"Media":{"id":1,"mediaListEntry":{
+            "id":33,"mediaId":1,"status":"COMPLETED","progress":12,"score":70,"repeat":1
+        }}}});
+        let (api, mut requests) = anilist::mock_api(vec![
+            (404, json!({"errors":[{"message":"Not Found."}]})),
+            (200, replacement.clone()),
+            (200, replacement),
+        ])
+        .await;
+        let state = state(api);
+        let target = crate::EntryEditTarget {
+            account_id: Some(7),
+            identity: crate::EntryIdentity::Remote(22),
+        };
+        assert!(delete_entry_target(1, Some(target), &state)
+            .await
+            .unwrap_err()
+            .contains("identity changed"));
+        assert_eq!(requests.try_recv().unwrap()["variables"]["id"], 22);
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert!(requests.try_recv().is_err());
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.conflict && pending.deleting);
+        assert_eq!(pending.deletion_id, Some(22));
+        crate::sync_queue::resolve_pending_change(1, false, &state)
+            .await
+            .unwrap();
+        assert_eq!(requests.try_recv().unwrap()["variables"]["mediaId"], 1);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(state.db.get_entry(1).unwrap().unwrap().id, Some(33));
+    }
+
     #[tokio::test]
     async fn foreground_score_preflight_expiration_is_not_a_successful_save() {
         let (api, _) = anilist::mock_api(vec![(
@@ -11269,6 +13797,7 @@ mod persistence_tests {
 
     fn score_snapshot(score: f64, more: bool, media_id: i64) -> serde_json::Value {
         let mut entry = remote();
+        entry["id"] = json!(21 + media_id);
         entry["mediaId"] = json!(media_id);
         entry["score"] = json!(score);
         json!({"data":{"MediaListCollection":{"user":{"id":7},"hasNextChunk":more,"lists":[{"entries":[entry]}]}}})

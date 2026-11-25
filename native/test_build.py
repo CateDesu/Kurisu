@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import select
@@ -73,6 +75,250 @@ class BuildVersionTests(unittest.TestCase):
 
 
 class PackagingTests(unittest.TestCase):
+    def test_cleanup_failure_preserves_promotion_result(self):
+        for promote in (False, True):
+            with self.subTest(promote=promote), tempfile.TemporaryDirectory() as directory:
+                bundle = Path(directory) / "bundle.tar.gz"
+                bundle.write_bytes(b"previous archive")
+                checksum = BUILD.write_sidecar(bundle)
+                original = checksum.read_text()
+                stderr = io.StringIO()
+
+                with patch.object(BUILD.shutil, "rmtree", side_effect=OSError("fixture cleanup failure")), \
+                        patch.object(BUILD.sys, "stderr", stderr):
+                    if promote:
+                        with BUILD.stage_artifact(bundle) as staged:
+                            staged.write_bytes(b"new archive")
+                    else:
+                        with self.assertRaisesRegex(OSError, "fixture write failure"):
+                            with BUILD.stage_artifact(bundle) as staged:
+                                staged.write_bytes(b"partial archive")
+                                raise OSError("fixture write failure")
+
+                self.assertIn("fixture cleanup failure", stderr.getvalue())
+                if promote:
+                    self.assertEqual(bundle.read_bytes(), b"new archive")
+                    digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+                    self.assertEqual(checksum.read_text(), f"{digest}  {bundle.name}\n")
+                else:
+                    self.assertEqual(bundle.read_bytes(), b"previous archive")
+                    self.assertEqual(checksum.read_text(), original)
+
+    def test_linux_packaging_failure_preserves_existing_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "kurisu-native"
+            binary.write_bytes(b"new executable")
+            archive = root / "target/release/bundle/Kurisu_1.2.3_linux-x64.tar.gz"
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b"previous archive")
+            BUILD.write_sidecar(archive)
+            original = {path.name: path.read_bytes() for path in archive.parent.iterdir()}
+
+            with patch.object(BUILD, "ROOT", root), self.assertRaises(FileNotFoundError):
+                BUILD.package_linux("1.2.3", binary)
+
+            self.assertEqual({path.name: path.read_bytes() for path in archive.parent.iterdir()}, original)
+
+    def test_windows_packaging_failure_preserves_existing_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "kurisu-native.exe"
+            binary.write_bytes(b"new executable")
+            installer = root / "target/release/bundle/Kurisu-Native_1.2.3_x64-install.exe"
+            installer.parent.mkdir(parents=True)
+            installer.write_bytes(b"previous installer")
+            BUILD.write_sidecar(installer)
+            original = {path.name: path.read_bytes() for path in installer.parent.iterdir()}
+
+            def fail_compiler(command, **_):
+                output = next(value.removeprefix("/DOUTPUT=") for value in command if value.startswith("/DOUTPUT="))
+                Path(output).write_bytes(b"partial installer")
+                raise BUILD.subprocess.CalledProcessError(1, command)
+
+            with patch.object(BUILD, "ROOT", root), patch.object(BUILD.shutil, "which", return_value="makensis"), \
+                    patch.object(BUILD.subprocess, "run", side_effect=fail_compiler), \
+                    self.assertRaises(BUILD.subprocess.CalledProcessError):
+                BUILD.package_windows("1.2.3", binary)
+
+            self.assertEqual({path.name: path.read_bytes() for path in installer.parent.iterdir()}, original)
+
+    def test_checksum_write_failure_preserves_existing_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "bundle.tar.gz"
+            archive.write_bytes(b"previous archive")
+            checksum = BUILD.write_sidecar(archive)
+            old_checksum = checksum.read_bytes()
+
+            def fail_checksum(staged):
+                staged.with_name(checksum.name).write_bytes(b"partial checksum")
+                raise OSError("fixture write failure")
+
+            with patch.object(BUILD, "write_sidecar", side_effect=fail_checksum), self.assertRaises(OSError):
+                with BUILD.stage_artifact(archive) as staged:
+                    staged.write_bytes(b"new archive")
+
+            self.assertEqual(archive.read_bytes(), b"previous archive")
+            self.assertEqual(checksum.read_bytes(), old_checksum)
+            self.assertEqual(set(archive.parent.iterdir()), {archive, checksum})
+
+    def test_checksum_promotion_failure_restores_previous_bundle(self):
+        for previous in (False, True):
+            with self.subTest(previous=previous), tempfile.TemporaryDirectory() as directory:
+                bundle = Path(directory) / "bundle.tar.gz"
+                checksum = bundle.with_name(bundle.name + ".sha256")
+                if previous:
+                    bundle.write_bytes(b"previous archive")
+                    BUILD.write_sidecar(bundle)
+                original = {path.name: path.read_bytes() for path in bundle.parent.iterdir()}
+                replace = Path.replace
+
+                def fail_checksum(source, destination):
+                    if destination == checksum:
+                        raise PermissionError("fixture checksum promotion failure")
+                    return replace(source, destination)
+
+                with patch.object(Path, "replace", fail_checksum), self.assertRaises(PermissionError):
+                    with BUILD.stage_artifact(bundle) as staged:
+                        staged.write_bytes(b"new archive")
+
+                self.assertEqual({path.name: path.read_bytes() for path in bundle.parent.iterdir()}, original)
+                with BUILD.stage_artifact(bundle) as staged:
+                    staged.write_bytes(b"new archive")
+                digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+                self.assertEqual(checksum.read_text(), f"{digest}  {bundle.name}\n")
+
+    def test_failed_bundle_restore_retains_recovery_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "bundle.tar.gz"
+            bundle.write_bytes(b"previous archive")
+            checksum = BUILD.write_sidecar(bundle)
+            previous_checksum = checksum.read_bytes()
+            replace = Path.replace
+
+            def fail_restore_and_checksum(source, destination):
+                if source.name != bundle.name:
+                    raise PermissionError("fixture destination locked")
+                return replace(source, destination)
+
+            with patch.object(Path, "replace", fail_restore_and_checksum), \
+                    self.assertRaisesRegex(OSError, "Recovery files are in"):
+                with BUILD.stage_artifact(bundle) as staged:
+                    staged.write_bytes(b"new archive")
+
+            self.assertEqual((staged.parent / "previous").read_bytes(), b"previous archive")
+            self.assertEqual(checksum.read_bytes(), previous_checksum)
+
+    def test_linux_packaging_rejects_an_empty_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "kurisu-native"
+            (root / "packaging").mkdir()
+            for path in (root / "LICENSE", root / "THIRD_PARTY_NOTICES.txt", root / "PROFILE_TRANSFER.md",
+                         root / "packaging/kurisu.png", root / "packaging/kurisu.desktop"):
+                path.write_text("fixture", encoding="utf-8")
+            binary.touch()
+            with patch.object(BUILD, "ROOT", root), self.assertRaisesRegex(ValueError, "kurisu-native"):
+                BUILD.package_linux("1.2.3", binary)
+            self.assertEqual(list((root / "target/release/bundle").iterdir()), [])
+
+    def test_windows_packaging_rejects_an_empty_installer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "kurisu-native.exe"
+            binary.write_bytes(b"fixture executable")
+
+            def empty_installer(command, **_):
+                output = next(value.removeprefix("/DOUTPUT=") for value in command if value.startswith("/DOUTPUT="))
+                Path(output).touch()
+
+            with patch.object(BUILD, "ROOT", root), patch.object(BUILD.shutil, "which", return_value="makensis"), \
+                    patch.object(BUILD.subprocess, "run", side_effect=empty_installer), \
+                    self.assertRaisesRegex(ValueError, "install.exe"):
+                BUILD.package_windows("1.2.3", binary)
+            self.assertEqual(list((root / "target/release/bundle").iterdir()), [])
+
+    def test_linux_archive_reproduces_bytes_after_input_mtime_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "kurisu-native"
+            (root / "packaging").mkdir()
+            files = [binary, root / "LICENSE", root / "THIRD_PARTY_NOTICES.txt", root / "PROFILE_TRANSFER.md",
+                     root / "packaging/kurisu.png", root / "packaging/kurisu.desktop"]
+            for path in files:
+                path.write_text(path.name, encoding="utf-8")
+                os.utime(path, (100, 100))
+            with patch.object(BUILD, "ROOT", root):
+                archive = BUILD.package_linux("1.2.3", binary)
+                checksum = archive.with_name(archive.name + ".sha256")
+                original = (archive.read_bytes(), checksum.read_bytes())
+                for path in files:
+                    os.utime(path, (200, 200))
+                BUILD.package_linux("1.2.3", binary)
+            self.assertEqual((archive.read_bytes(), checksum.read_bytes()), original)
+            self.assertEqual(original[0][4:8], bytes(4))
+            with tarfile.open(archive) as bundle:
+                self.assertTrue(all(entry.mtime == entry.uid == entry.gid == 0 for entry in bundle))
+                self.assertEqual(bundle.getmember("Kurisu/kurisu").mode, 0o755)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux Cargo fixture")
+    def test_forced_cargo_version_preserves_existing_release_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / ".cargo").mkdir()
+            (root / "Cargo.toml").write_text('[package]\nname="kurisu-native"\nversion="1.2.3"\nedition="2024"\n')
+            (root / ".cargo/config.toml").write_text(
+                '[env]\nKURISU_BUILD_VERSION = { value = "9.9.9", force = true }\n')
+            (root / "src/main.rs").write_text('fn main() { println!("kurisu-native {}", env!("KURISU_BUILD_VERSION")); }')
+            (root / "packaging").mkdir()
+            for name in ("kurisu.png", "kurisu.desktop"):
+                (root / "packaging" / name).write_text("fixture")
+            (root / "PROFILE_TRANSFER.md").write_text("Fixture transfer guide")
+            BUILD.subprocess.run(["cargo", "generate-lockfile", "--offline"], check=True, cwd=root)
+            binary = root / "target/release/kurisu-native"
+            binary.parent.mkdir(parents=True)
+            archive = binary.parent / "bundle/Kurisu_1.2.3_linux-x64.tar.gz"
+            archive.parent.mkdir()
+            good = b'#!/bin/sh\nprintf "kurisu-native 1.2.3\\n"\n'
+            binary.write_bytes(good)
+            binary.chmod(0o755)
+            archive.write_bytes(b"earlier bundle")
+            for artifact in (binary, archive):
+                BUILD.write_sidecar(artifact)
+            for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt", "PROFILE_TRANSFER.md"):
+                (binary.parent / name).write_text("earlier companion")
+            existing = {path: path.read_bytes() for path in binary.parent.rglob("*") if path.is_file()}
+            run = BUILD.subprocess.run
+
+            def run_from_fixture(command, **options):
+                return run(command, cwd=root, **options)
+
+            def notices(destination, offline, target=None):
+                for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
+                    (destination / name).write_text("current companion")
+
+            with patch.object(BUILD, "ROOT", root), patch.object(BUILD, "write_notices", side_effect=notices), \
+                    patch.object(BUILD.subprocess, "run", side_effect=run_from_fixture):
+                args = ["--offline", "--build-version", "1.2.3"]
+                self.assertEqual(BUILD.main(args), 1)
+                compiled = root / "target" / BUILD.build_target() / "release/kurisu-native"
+                self.assertEqual(run([compiled, "--version"], check=True, capture_output=True).stdout,
+                                 b"kurisu-native 9.9.9\n")
+                self.assertEqual({path: path.read_bytes() for path in existing}, existing)
+                self.assertFalse(list(binary.parent.glob(".packaging-*")))
+                (root / ".cargo/config.toml").unlink()
+                self.assertEqual(BUILD.main(args), 0)
+            self.assertEqual(run([binary, "--version"], check=True, capture_output=True).stdout,
+                             b"kurisu-native 1.2.3\n")
+            with tarfile.open(archive) as bundle:
+                self.assertEqual(bundle.extractfile("Kurisu/kurisu").read(), binary.read_bytes())
+            for artifact in (binary, archive):
+                digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                self.assertEqual(artifact.with_name(artifact.name + ".sha256").read_text(),
+                                 f"{digest}  {artifact.name}\n")
+            self.assertFalse(list(binary.parent.glob(f".{binary.name}-*")))
+
     def test_windows_release_embeds_runtime_and_stages_the_target_binary(self):
         for flags in ({"RUSTFLAGS": "-C opt-level=2"},
                       {"CARGO_ENCODED_RUSTFLAGS": "-C\x1fopt-level=2"},

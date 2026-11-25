@@ -195,15 +195,32 @@ impl ListState {
         self.revision += 1;
     }
 
-    pub fn clear_scores(&mut self) {
-        for entry in self.entries.values_mut() {
-            entry.score = None;
-        }
+    pub fn clear_scores(&mut self, now: i64) -> ListChange {
+        let changed_ids = self
+            .entries
+            .values_mut()
+            .filter_map(|entry| entry.score.take().map(|_| entry.media_id))
+            .collect();
+        let order_changed = if self.sort == SortKey::Score {
+            let previous = self.visible.clone();
+            self.rebuild(now);
+            previous != self.visible
+        } else {
+            false
+        };
         self.revision += 1;
+        ListChange {
+            order_changed,
+            changed_ids,
+            ..ListChange::default()
+        }
     }
 
     pub fn entry(&self, id: i64) -> Option<&ListEntry> {
         self.entries.get(&id)
+    }
+    pub fn ordered_entries(&self) -> impl Iterator<Item = &ListEntry> {
+        self.order.iter().filter_map(|id| self.entries.get(id))
     }
     pub fn visible(&self) -> &[i64] {
         &self.visible
@@ -214,8 +231,8 @@ impl ListState {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn tracked_episodes(&self) -> i64 {
-        self.entries.values().map(|e| e.progress).sum()
+    pub fn tracked_episodes(&self) -> i128 {
+        self.entries.values().map(|e| i128::from(e.progress)).sum()
     }
     pub fn count(&self, status: &str) -> usize {
         self.entries.values().filter(|e| e.status == status).count()
@@ -370,7 +387,7 @@ impl ListState {
             let titles: HashMap<_, _> = self
                 .visible
                 .iter()
-                .map(|id| (*id, title_key(&entries[id])))
+                .map(|id| (*id, list_title(&entries[id])))
                 .collect();
             self.visible.sort_by(|a, b| {
                 let order = compare_titles(&titles[a], &titles[b]);
@@ -388,19 +405,24 @@ fn matches_query(entry: &ListEntry, needle: &str) -> bool {
         return true;
     }
     let Some(media) = entry.media.as_ref() else {
-        return false;
+        return list_title(entry).contains(needle);
     };
-    [
+    let mut titles = [
         &media.title_english,
         &media.title_romaji,
         &media.title_native,
     ]
     .into_iter()
     .flatten()
-    .any(|title| title.to_lowercase().contains(needle))
+    .filter(|title| !title.trim().is_empty())
+    .peekable();
+    if titles.peek().is_none() {
+        return list_title(entry).contains(needle);
+    }
+    titles.any(|title| title.to_lowercase().contains(needle))
 }
 
-fn title_key(entry: &ListEntry) -> String {
+pub(super) fn list_title(entry: &ListEntry) -> String {
     entry
         .media
         .as_ref()
@@ -409,7 +431,7 @@ fn title_key(entry: &ListEntry) -> String {
 }
 
 fn title_cmp(a: &ListEntry, b: &ListEntry) -> Ordering {
-    compare_titles(&title_key(a), &title_key(b))
+    compare_titles(&list_title(a), &list_title(b))
 }
 
 pub(super) fn compare_titles(a: &str, b: &str) -> Ordering {
@@ -475,10 +497,22 @@ pub struct ProgressEdit {
     pub in_flight: bool,
     pub error: Option<String>,
     pub deleting: bool,
+    pub identity: kurisu_core::EntryIdentity,
+    pub remote_identity: Option<kurisu_core::EntryIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgressReview {
+    pub generation: u64,
+    pub id: i64,
+    pub progress: Option<i64>,
+    pub identity: Option<kurisu_core::EntryIdentity>,
 }
 
 impl ProgressEdit {
+    const CHANGED_PROGRESS: &str = "Progress changed on your list. Review before saving.";
     const MISSING_ENTRY: &str = "This entry is no longer on your list. Review the saved progress.";
+    const REPLACED_ENTRY: &str = "AniList replaced this entry. Review before saving.";
 
     fn can_retry(&self) -> bool {
         !self.busy() && !self.requires_review && self.dirty() && self.error.is_some()
@@ -495,6 +529,8 @@ impl ProgressEdit {
             in_flight: false,
             error: None,
             deleting: false,
+            identity: kurisu_core::EntryIdentity::Unverified,
+            remote_identity: None,
         }
     }
 
@@ -518,10 +554,11 @@ impl ProgressEdit {
         if self.in_flight || self.deleting || self.requires_review {
             return false;
         }
-        let next = self
-            .pending
-            .saturating_add(delta)
-            .clamp(0, self.total.unwrap_or(9999).max(0));
+        let limit = self.total.unwrap_or(9999).max(0);
+        if delta > 0 && self.pending >= limit {
+            return false;
+        }
+        let next = self.pending.saturating_add(delta).clamp(0, limit);
         if next == self.pending {
             return false;
         }
@@ -547,7 +584,7 @@ impl ProgressEdit {
                 self.error = Some("This entry is back on your list. Review before saving.".into());
                 self.due = None;
             } else if progress != self.saved && self.remote_progress != Some(progress) {
-                self.error = Some("Progress changed on your list. Review before saving.".into());
+                self.error = Some(Self::CHANGED_PROGRESS.into());
                 self.due = None;
             }
             self.remote_progress = Some(progress);
@@ -557,7 +594,7 @@ impl ProgressEdit {
             if progress != self.saved {
                 self.remote_progress = Some(progress);
                 self.requires_review = true;
-                self.error = Some("Progress changed on your list. Review before saving.".into());
+                self.error = Some(Self::CHANGED_PROGRESS.into());
                 self.due = None;
             }
             return;
@@ -576,9 +613,33 @@ impl ProgressEdit {
         } else if progress != self.saved {
             self.remote_progress = Some(progress);
             self.requires_review = true;
-            self.error = Some("Progress changed on your list. Review before saving.".into());
+            self.error = Some(Self::CHANGED_PROGRESS.into());
             self.due = None;
         }
+    }
+
+    fn absorb_entry(&mut self, entry: &ListEntry) {
+        let total = entry.media.as_ref().and_then(|media| media.episodes);
+        let identity = entry.identity();
+        if self.busy() {
+            self.total = total;
+            return;
+        }
+        if identity != self.identity
+            && !self.identity.matches(entry)
+            && (self.dirty() || self.error.is_some() || self.requires_review)
+        {
+            self.total = total;
+            self.remote_progress = Some(entry.progress);
+            self.remote_identity = Some(identity);
+            self.requires_review = true;
+            self.error = Some(Self::REPLACED_ENTRY.into());
+            self.due = None;
+            return;
+        }
+        self.identity = identity.clone();
+        self.absorb(entry.progress, total);
+        self.remote_identity = self.requires_review.then_some(identity);
     }
 
     pub fn begin_save(&mut self) -> Option<(i64, i64)> {
@@ -611,13 +672,20 @@ impl ProgressEdit {
         }
     }
 
+    pub fn finish_conflicted_save(&mut self, entry: &ListEntry) {
+        self.in_flight = false;
+        self.due = None;
+        self.requires_review = true;
+        self.error = Some(Self::CHANGED_PROGRESS.into());
+        self.absorb_entry(entry);
+    }
+
     pub fn finish_superseded_save(&mut self, submitted: i64, progress: i64) {
         self.in_flight = false;
         self.due = None;
         if self.pending == submitted {
             self.pending = progress;
         } else if progress != submitted {
-            // Core returns the current value when the expected baseline no longer matches.
             self.absorb(progress, self.total);
             return;
         }
@@ -657,6 +725,7 @@ impl ProgressRegistry {
                 saved.due = None;
                 saved.requires_review = true;
                 saved.remote_progress = None;
+                saved.remote_identity = None;
                 drafts.insert(*id, saved);
             }
             false
@@ -672,9 +741,17 @@ impl ProgressRegistry {
     }
 
     pub fn reconcile_entries(&mut self, generation: u64, list: &ListState) {
+        self.reconcile_list(generation, list, None);
+    }
+
+    pub fn reconcile_scoped_entries(&mut self, generation: u64, list: &ListState, ids: &[i64]) {
+        self.reconcile_list(generation, list, Some(ids));
+    }
+
+    fn reconcile_list(&mut self, generation: u64, list: &ListState, ids: Option<&[i64]>) {
         let mut settled_missing = Vec::new();
         for (&(owner, id), edit) in &mut self.edits {
-            if owner != generation {
+            if owner != generation || ids.is_some_and(|ids| !ids.contains(&id)) {
                 continue;
             }
             let Some(entry) = list.entry(id) else {
@@ -685,16 +762,14 @@ impl ProgressRegistry {
                     edit.error = Some(ProgressEdit::MISSING_ENTRY.into());
                     edit.requires_review = true;
                     edit.remote_progress = None;
+                    edit.remote_identity = None;
                     edit.due = None;
                 } else {
                     settled_missing.push((owner, id));
                 }
                 continue;
             };
-            edit.absorb(
-                entry.progress,
-                entry.media.as_ref().and_then(|media| media.episodes),
-            );
+            edit.absorb_entry(entry);
         }
         for key in settled_missing {
             self.edits.remove(&key);
@@ -703,20 +778,30 @@ impl ProgressRegistry {
 
     pub fn reconcile_entry(&mut self, generation: u64, entry: &ListEntry) {
         if let Some(edit) = self.edits.get_mut(&(generation, entry.media_id)) {
-            edit.absorb(
-                entry.progress,
-                entry.media.as_ref().and_then(|media| media.episodes),
-            );
+            edit.absorb_entry(entry);
         }
     }
 
-    pub fn first_review(&self, generation: u64) -> Option<(i64, Option<i64>)> {
+    pub fn review(&self, generation: u64, id: i64) -> Option<ProgressReview> {
+        let edit = self
+            .edit(generation, id)
+            .filter(|edit| edit.requires_review)?;
+        Some(ProgressReview {
+            generation,
+            id,
+            progress: edit.remote_progress,
+            identity: edit.remote_identity.clone(),
+        })
+    }
+
+    pub fn first_review(&self, generation: u64) -> Option<ProgressReview> {
         self.edits
             .iter()
             .filter_map(|(&(owner, id), edit)| {
-                (owner == generation && edit.requires_review).then_some((id, edit.remote_progress))
+                (owner == generation && edit.requires_review).then_some(id)
             })
-            .min_by_key(|(id, _)| *id)
+            .min()
+            .and_then(|id| self.review(generation, id))
     }
 
     pub fn resolve_review(
@@ -739,6 +824,9 @@ impl ProgressRegistry {
         }
         if let Some(progress) = observed {
             edit.saved = progress;
+            if let Some(identity) = edit.remote_identity.take() {
+                edit.identity = identity;
+            }
             if !keep_local {
                 edit.pending = progress;
             }
@@ -774,15 +862,14 @@ impl ProgressRegistry {
             .edits
             .entry((generation, entry.media_id))
             .or_insert_with(|| {
-                ProgressEdit::new(
+                let mut edit = ProgressEdit::new(
                     entry.progress,
                     entry.media.as_ref().and_then(|m| m.episodes),
-                )
+                );
+                edit.identity = entry.identity();
+                edit
             });
-        edit.absorb(
-            entry.progress,
-            entry.media.as_ref().and_then(|m| m.episodes),
-        );
+        edit.absorb_entry(entry);
         edit
     }
 
@@ -982,31 +1069,51 @@ impl EditorState {
         self.media.as_ref().and_then(|m| m.episodes)
     }
 
-    pub fn refresh_episode_total(&mut self, entry: &ListEntry, progress_input_current: bool) {
-        let Some(media) = entry.media.as_ref() else {
-            return;
-        };
-        let Some(total) = media.episodes else { return };
-        if self.total() == Some(total) {
-            return;
+    pub fn refresh_entry_progress(
+        &mut self,
+        entry: &ListEntry,
+        progress_input_current: bool,
+    ) -> bool {
+        self.adopt_queued_entry(entry);
+        if !self.matches_entry(entry) {
+            return false;
         }
-        self.media.get_or_insert_with(|| media.clone()).episodes = Some(total);
-        if !progress_input_current {
-            return;
-        }
-        if self.status_chosen && self.status == "COMPLETED" {
+        let changed_total = entry.media.as_ref().and_then(|media| {
+            let total = media
+                .episodes
+                .filter(|total| Some(*total) != self.total())?;
+            self.media.get_or_insert_with(|| media.clone()).episodes = Some(total);
+            Some(total)
+        });
+        if let Some(total) = changed_total
+            && self.status_chosen
+            && self.status == "COMPLETED"
+        {
             self.progress = total;
             self.completion_pending = true;
-        } else if self.progress_edited || self.status_before_completion.is_some() {
-            self.update_progress_status();
-        } else if !self.status_chosen && self.progress == self.snapshot.progress {
+            return true;
+        }
+        if !progress_input_current {
+            return false;
+        }
+        let previous = self.progress;
+        if self.progress_edited || self.status_before_completion.is_some() {
+            if changed_total.is_some() {
+                self.update_progress_status();
+            }
+        } else if !self.status_chosen
+            && !self.completion_pending
+            && !self.busy
+            && self.review_progress.is_none()
+            && self.progress == self.snapshot.progress
+            && self.status == self.snapshot.status
+        {
             self.progress = entry.progress;
             self.snapshot.progress = entry.progress;
-            if self.status == self.snapshot.status {
-                self.status = entry.status.clone();
-                self.snapshot.status = entry.status.clone();
-            }
+            self.status.clone_from(&entry.status);
+            self.snapshot.status.clone_from(&entry.status);
         }
+        self.progress != previous
     }
 
     pub fn choose_status(&mut self, status: &str) {
@@ -1139,6 +1246,14 @@ impl EditorState {
         }
     }
 
+    fn score_patch(&self, score_available: bool) -> Option<f64> {
+        if self.score_cleared {
+            return Some(0.0);
+        }
+        let score = self.score.or(self.snapshot.score.map(|_| 0.0))?;
+        (score_available && self.snapshot.score != Some(score)).then_some(score)
+    }
+
     pub fn basic_patch(&self, score_available: bool) -> EntryPatch {
         let progress_touched = self.progress != self.snapshot.progress
             || self.status_before_completion.is_some()
@@ -1149,8 +1264,7 @@ impl EditorState {
                 .then(|| self.status.clone()),
             // Core distinguishes exact completion from overshoot before clamping.
             progress: progress_touched.then_some(self.progress),
-            score: (score_available && (self.score_cleared || self.score != self.snapshot.score))
-                .then_some(self.score.unwrap_or(0.0)),
+            score: self.score_patch(score_available),
             repeat: (self.repeat != self.snapshot.repeat).then_some(self.repeat.max(0)),
         }
     }
@@ -1165,6 +1279,25 @@ impl EditorState {
 
     pub fn saved_progress(&self) -> i64 {
         self.snapshot.progress
+    }
+
+    pub fn saved_identity(&self) -> kurisu_core::EntryIdentity {
+        self.snapshot.identity()
+    }
+
+    pub fn adopt_queued_entry(&mut self, entry: &ListEntry) {
+        if self.media_id == entry.media_id
+            && self.snapshot.id.is_none()
+            && entry.id.is_some()
+            && self.snapshot.queued_creation.is_some()
+            && self.snapshot.queued_creation == entry.queued_creation
+        {
+            self.snapshot.id = entry.id;
+        }
+    }
+
+    pub fn matches_entry(&self, entry: &ListEntry) -> bool {
+        self.media_id == entry.media_id && self.snapshot.identity() == entry.identity()
     }
 
     pub fn accept_progress(&mut self, entry: &ListEntry) {
@@ -1191,16 +1324,26 @@ impl EditorState {
         }
     }
 
-    pub fn refresh_score_format(&mut self, format: Option<String>) -> bool {
+    pub fn refresh_score_format(&mut self, format: Option<String>, input: Option<&str>) -> bool {
         if self.displayed_format == format {
             return false;
+        }
+        if self.score_available() {
+            self.score_cleared = match input.map(str::trim) {
+                Some("") => {
+                    self.score_cleared || self.snapshot.score.is_some_and(|score| score > 0.0)
+                }
+                Some(input) => input.parse::<f64>() == Ok(0.0) && self.snapshot.score != Some(0.0),
+                None => self.score_patch(true) == Some(0.0),
+            };
         }
         self.displayed_format = format;
         self.score_format_revision = self.score_format_revision.wrapping_add(1);
         self.score = None;
         self.snapshot.score = None;
-        self.score_cleared = false;
-        self.error = "Score format changed. Re-enter the score before saving.".into();
+        if !self.score_cleared {
+            self.error = "Score format changed. Re-enter the score before saving.".into();
+        }
         true
     }
 
@@ -1210,6 +1353,12 @@ impl EditorState {
     }
 
     pub fn accept_basic(&mut self, submitted: &Self, mut entry: ListEntry) {
+        if entry.id.is_none()
+            && entry.queued_creation.is_some()
+            && entry.queued_creation == self.snapshot.queued_creation
+        {
+            entry.id = self.snapshot.id;
+        }
         if self.status == submitted.status
             && self.status_chosen == submitted.status_chosen
             && self.status_before_completion == submitted.status_before_completion
@@ -1228,6 +1377,12 @@ impl EditorState {
         }
         if !self.score_format_matches(submitted) {
             // A format refresh invalidates both the draft score and its baseline.
+            if self.score_cleared
+                && entry.score == Some(0.0)
+                && submitted.score_patch(true) == Some(0.0)
+            {
+                self.score_cleared = false;
+            }
             entry.score = self.snapshot.score;
         } else if self.score == submitted.score && self.score_cleared == submitted.score_cleared {
             self.score = entry.score;
@@ -1262,14 +1417,14 @@ pub fn clamp_score(score: f64, format: Option<&str>) -> f64 {
     if !score.is_finite() {
         return 0.0;
     }
-    let (max, step) = match format {
-        Some("POINT_3") => (3.0, 1.0),
-        Some("POINT_5") => (5.0, 1.0),
-        Some("POINT_10") => (10.0, 1.0),
-        Some("POINT_10_DECIMAL") => (10.0, 0.1),
-        _ => (100.0, 1.0),
+    let max = match format {
+        Some("POINT_3") => 3.0,
+        Some("POINT_5") => 5.0,
+        Some("POINT_10") => 10.0,
+        Some("POINT_10_DECIMAL") => return (score.clamp(0.0, 10.0) * 10.0).round() / 10.0,
+        _ => 100.0,
     };
-    ((score.clamp(0.0, max) / step).round() * step * 10.0).round() / 10.0
+    score.clamp(0.0, max).round()
 }
 
 #[derive(Default)]
@@ -1489,15 +1644,37 @@ mod tests {
         translated.media.as_mut().unwrap().title_romaji = Some("Zebra".into());
         let restored: ListEntry =
             serde_json::from_str(&serde_json::to_string(&translated).unwrap()).unwrap();
-        assert_eq!(title_key(&restored), "Zebra");
+        assert_eq!(list_title(&restored), "Zebra");
         let mut list = ListState::new();
         list.replace(vec![restored, entry(2, "Alpha", "CURRENT", 0, None)], 0);
         assert_eq!(list.visible(), &[2, 1]);
         translated.media.as_mut().unwrap().title_romaji = Some("\n".into());
         translated.media.as_mut().unwrap().title_native = Some("原題".into());
-        assert_eq!(title_key(&translated), "原題");
+        assert_eq!(list_title(&translated), "原題");
         translated.media.as_mut().unwrap().title_native = None;
-        assert_eq!(title_key(&translated), "#1");
+        assert_eq!(list_title(&translated), "#1");
+    }
+
+    #[test]
+    fn list_search_matches_displayed_media_id_fallback() {
+        let mut titled = entry(43, "English", "CURRENT", 0, None);
+        titled.media.as_mut().unwrap().title_romaji = Some("Romaji".into());
+        let mut missing = entry(44, "", "CURRENT", 0, None);
+        missing.media = None;
+        let mut list = ListState::new();
+        list.replace(
+            vec![entry(42, " \t", "CURRENT", 0, None), titled, missing],
+            0,
+        );
+        for (query, expected) in [
+            ("#42", &[42][..]),
+            ("#44", &[44]),
+            ("#43", &[]),
+            ("romaji", &[43]),
+        ] {
+            list.set_query(query.into(), 0);
+            assert_eq!(list.visible(), expected);
+        }
     }
 
     #[test]
@@ -1679,13 +1856,101 @@ mod tests {
     }
 
     #[test]
+    fn clearing_scores_preserves_filters_and_restores_title_order() {
+        let scored = |id, title, status, score| ListEntry {
+            score: Some(score),
+            ..entry(id, title, status, 0, None)
+        };
+        for desc in [false, true] {
+            let mut list = ListState::new();
+            list.set_filter("PAUSED", 0);
+            list.set_query("show".into(), 0);
+            list.set_sort(SortKey::Score, 0);
+            list.set_desc(desc, 0);
+            list.replace(
+                vec![
+                    scored(1, "Alpha Show", "PAUSED", if desc { 3.0 } else { 7.0 }),
+                    scored(2, "Beta Show", "PAUSED", 5.0),
+                    scored(3, "Other", "PAUSED", 6.0),
+                    scored(4, "Other Show", "CURRENT", 9.0),
+                ],
+                0,
+            );
+            assert_eq!(list.visible(), &[2, 1]);
+            let revision = list.revision();
+            let change = list.clear_scores(0);
+            assert!(change.order_changed);
+            assert_eq!(change.changed_ids.len(), 4);
+            assert_eq!(list.visible(), &[1, 2]);
+            assert!(list.ordered_entries().all(|entry| entry.score.is_none()));
+            assert_eq!(list.revision(), revision + 1);
+        }
+    }
+
+    #[test]
+    fn entry_refresh_absorbs_only_unedited_progress_and_status() {
+        let before = ListEntry {
+            id: Some(1),
+            ..entry(9, "Show", "CURRENT", 11, Some(12))
+        };
+        let after = ListEntry {
+            status: "COMPLETED".into(),
+            progress: 12,
+            repeat: 4,
+            score: Some(80.0),
+            ..before.clone()
+        };
+        let mut editor = EditorState::new(before.clone());
+        editor.set_score(Some(80.0), Some("POINT_100"));
+        editor.apply_details(EntryDetails::default());
+        editor.notes = "Draft note".into();
+        editor.refresh_entry_progress(&after, true);
+        assert_eq!((editor.status.as_str(), editor.progress), ("COMPLETED", 12));
+        assert_eq!(editor.saved_progress(), 12);
+        let patch = editor.basic_patch(true);
+        assert_eq!(patch.status, None);
+        assert_eq!(patch.progress, None);
+        assert_eq!(patch.repeat, None);
+        assert_eq!(editor.repeat, before.repeat);
+        assert_eq!(patch.score, Some(80.0));
+        assert_eq!(editor.details_patch().notes.as_deref(), Some("Draft note"));
+
+        for case in [
+            "input",
+            "progress",
+            "status",
+            "busy",
+            "review",
+            "replacement",
+        ] {
+            let mut editor = EditorState::new(before.clone());
+            let mut after = after.clone();
+            match case {
+                "progress" => editor.edit_progress(11),
+                "status" => editor.choose_status("CURRENT"),
+                "busy" => editor.busy = true,
+                "review" => editor.review_progress = Some(10),
+                "replacement" => after.id = Some(2),
+                _ => {}
+            }
+            editor.refresh_entry_progress(&after, case != "input");
+            assert_eq!(
+                (editor.status.as_str(), editor.progress),
+                ("CURRENT", 11),
+                "{case}"
+            );
+            assert_eq!(editor.saved_progress(), 11, "{case}");
+        }
+    }
+
+    #[test]
     fn new_episode_total_preserves_explicit_progress_and_reconsiders_inferred_completion() {
         let before = entry(9, "Show", "CURRENT", 3, Some(12));
         let after = entry(9, "Show", "CURRENT", 3, Some(13));
         for progress in [8, 12, 13] {
             let mut editor = EditorState::new(before.clone());
             editor.edit_progress(progress);
-            editor.refresh_episode_total(&after, true);
+            editor.refresh_entry_progress(&after, true);
             assert_eq!(editor.progress, progress);
             assert_eq!(
                 editor.status,
@@ -1700,7 +1965,7 @@ mod tests {
         let mut editor = EditorState::new(entry(9, "Show", "COMPLETED", 12, Some(12)));
         editor.edit_progress(11);
         editor.edit_progress(12);
-        editor.refresh_episode_total(&after, true);
+        editor.refresh_entry_progress(&after, true);
         assert_eq!((editor.status.as_str(), editor.progress), ("CURRENT", 12));
     }
 
@@ -1811,11 +2076,31 @@ mod tests {
 
     #[test]
     fn score_formats_clamp_to_production_steps() {
-        assert_eq!(clamp_score(3.6, Some("POINT_3")), 3.0);
-        assert_eq!(clamp_score(6.0, Some("POINT_5")), 5.0);
-        assert_eq!(clamp_score(7.7, Some("POINT_10")), 8.0);
-        assert_eq!(clamp_score(7.76, Some("POINT_10_DECIMAL")), 7.8);
-        assert_eq!(clamp_score(101.0, Some("POINT_100")), 100.0);
+        for (format, max) in [
+            ("POINT_3", 3),
+            ("POINT_5", 5),
+            ("POINT_10", 10),
+            ("POINT_100", 100),
+        ] {
+            let format = Some(format);
+            assert_eq!(clamp_score(-1.0, format), 0.0);
+            assert_eq!(clamp_score(f64::from(max + 1), format), f64::from(max));
+            for whole in 0..max {
+                assert_eq!(
+                    clamp_score(f64::from(whole) + 0.5, format),
+                    f64::from(whole + 1)
+                );
+            }
+        }
+        let format = Some("POINT_10_DECIMAL");
+        assert_eq!(clamp_score(-1.0, format), 0.0);
+        assert_eq!(clamp_score(11.0, format), 10.0);
+        assert_eq!(clamp_score(4.349, format), 4.3);
+        assert_eq!(clamp_score(4.351, format), 4.4);
+        for tenth in 0..100 {
+            let score = format!("{}.{}5", tenth / 10, tenth % 10).parse().unwrap();
+            assert_eq!(clamp_score(score, format), f64::from(tenth + 1) / 10.0);
+        }
     }
 
     #[test]
@@ -1830,7 +2115,12 @@ mod tests {
         registry.entry(9, &entry(4, "A", "CURRENT", 5, Some(12)));
         assert_eq!(registry.edit(9, 4).unwrap().saved, 2);
         assert_eq!(registry.edit(9, 4).unwrap().pending, 3);
-        assert_eq!(registry.first_review(9), Some((4, Some(5))));
+        assert_eq!(
+            registry
+                .first_review(9)
+                .map(|review| (review.id, review.progress)),
+            Some((4, Some(5)))
+        );
         assert_eq!(registry.edit_mut(9, 4).unwrap().begin_save(), None);
         assert!(registry.begin_delete(9, 4));
         registry.finish_delete(9, 4, false);
@@ -2069,7 +2359,12 @@ mod tests {
             registry.entry(9, current.entry(4).unwrap()).begin_save(),
             None
         );
-        assert_eq!(registry.first_review(9), Some((4, Some(5))));
+        assert_eq!(
+            registry
+                .first_review(9)
+                .map(|review| (review.id, review.progress)),
+            Some((4, Some(5)))
+        );
         assert!(registry.resolve_review(9, 4, Some(5), false));
         assert!(registry.dirty_ids(9).is_empty());
     }
@@ -2126,33 +2421,24 @@ mod tests {
     }
 
     #[test]
-    fn superseded_compare_miss_cannot_retry_the_submitted_intent() {
-        for submitted in [3, 8] {
-            let mut edit = ProgressEdit::new(2, Some(12));
-            assert!(edit.step(submitted - 2, Instant::now()));
-            assert_eq!(edit.begin_save(), Some((submitted, 2)));
-            edit.finish_superseded_save(submitted, 5);
-            edit.absorb(5, Some(12));
-            assert_eq!((edit.saved, edit.pending), (5, 5));
-            assert!(!edit.in_flight && !edit.requires_review);
-            assert_eq!(edit.begin_save(), None);
-        }
-    }
-
-    #[test]
-    fn superseded_compare_miss_preserves_a_distinct_draft_for_review() {
-        let mut edit = ProgressEdit::new(2, Some(12));
-        assert!(edit.step(1, Instant::now()));
-        assert_eq!(edit.begin_save(), Some((3, 2)));
-        edit.pending = 8;
-        edit.finish_superseded_save(3, 5);
-        edit.absorb(5, Some(12));
+    fn progress_conflict_requires_review_even_if_current_progress_matches_intent() {
+        let before = entry(4, "A", "CURRENT", 5, Some(12));
+        let mut observed = before.clone();
+        observed.progress = 7;
+        let mut registry = ProgressRegistry::default();
+        let edit = registry.entry(9, &before);
+        assert!(edit.step(2, Instant::now()));
+        assert_eq!(edit.begin_save(), Some((7, 5)));
+        edit.finish_conflicted_save(&observed);
+        assert!(!edit.in_flight && edit.requires_review);
         assert_eq!(
             (edit.saved, edit.pending, edit.remote_progress),
-            (2, 8, Some(5))
+            (5, 7, Some(7))
         );
-        assert!(edit.requires_review);
         assert_eq!(edit.begin_save(), None);
+        assert!(!registry.retry_error(9, 4));
+        assert!(registry.resolve_review(9, 4, Some(7), true));
+        assert!(registry.dirty_ids(9).is_empty());
     }
 
     #[test]
@@ -2223,9 +2509,9 @@ mod tests {
                 editor.displayed_format = Some("POINT_100".into());
                 editor.score = score;
                 let submitted = editor.clone();
-                editor.refresh_score_format(Some("POINT_5".into()));
+                editor.refresh_score_format(Some("POINT_5".into()), None);
                 if round_trip {
-                    editor.refresh_score_format(Some("POINT_100".into()));
+                    editor.refresh_score_format(Some("POINT_100".into()), None);
                 }
                 editor.repeat = 7;
                 let accepted = ListEntry {
@@ -2252,7 +2538,7 @@ mod tests {
         editor.displayed_format = Some("POINT_100".into());
         editor.score = Some(80.0);
         let old = editor.clone();
-        editor.refresh_score_format(Some("POINT_5".into()));
+        editor.refresh_score_format(Some("POINT_5".into()), None);
         editor.score = Some(4.0);
         let new = editor.clone();
         editor.accept_basic(
@@ -2281,12 +2567,34 @@ mod tests {
         });
         editor.displayed_format = Some("POINT_100".into());
         editor.progress = 5;
-        assert!(editor.refresh_score_format(Some("POINT_5".into())));
+        assert!(editor.refresh_score_format(Some("POINT_5".into()), None));
         assert_eq!(editor.score, None);
         assert_eq!(editor.basic_patch(true).score, None);
         editor.score_cleared = true;
         assert_eq!(editor.basic_patch(true).score, Some(0.0));
         assert_eq!(editor.basic_patch(true).progress, Some(5));
+    }
+
+    #[test]
+    fn score_clear_acknowledgement_survives_a_format_switch() {
+        let mut editor = EditorState::new(ListEntry {
+            score: Some(8.4),
+            ..Default::default()
+        });
+        editor.displayed_format = Some("POINT_10_DECIMAL".into());
+        editor.set_score(None, Some("POINT_10_DECIMAL"));
+        let submitted = editor.clone();
+        editor.refresh_score_format(None, Some(""));
+        assert_eq!(editor.basic_patch(false).score, Some(0.0));
+        editor.accept_basic(
+            &submitted,
+            ListEntry {
+                score: Some(0.0),
+                ..submitted.snapshot.clone()
+            },
+        );
+        assert_eq!(editor.basic_patch(false).score, None);
+        assert_eq!(editor.basic_patch(true).score, None);
     }
 
     #[test]

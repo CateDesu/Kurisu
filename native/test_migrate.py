@@ -1,5 +1,6 @@
 import hashlib
 from contextlib import closing
+import errno
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -54,6 +56,8 @@ def schema(connection, version=7):
         connection.execute("CREATE INDEX watch_history_duplicate ON watch_history (account_id,path,media_id,episode,watched_at)")
     if version >= 7:
         connection.execute("CREATE INDEX watch_history_account_id ON watch_history (account_id,id)")
+    if version >= 8:
+        connection.execute("ALTER TABLE list_entry ADD COLUMN queued_creation TEXT")
     connection.execute(f"PRAGMA user_version = {version}")
     connection.commit()
 
@@ -130,12 +134,14 @@ mode = sys.argv[2]
 db.execute('PRAGMA journal_mode=WAL')
 db.execute('PRAGMA wal_autocheckpoint=0')
 db.execute('UPDATE list_entry SET progress=4 WHERE media_id=3')
-if mode == 'reset':
+if mode in ('padded', 'reset', 'reset-uncommitted'):
     db.executemany('INSERT INTO settings VALUES (?,?)',
                    [(f'large-{n}', 'x' * 4000) for n in range(100)])
 db.commit()
+if mode in ('reset', 'reset-uncommitted'):
+    busy, frames, checkpointed = db.execute('PRAGMA wal_checkpoint(RESTART)').fetchone()
+    assert busy == 0 and frames == checkpointed
 if mode == 'reset':
-    db.execute('PRAGMA wal_checkpoint(RESTART)')
     db.execute('UPDATE list_entry SET progress=5 WHERE media_id=3')
     db.commit()
 elif mode == 'uncommitted':
@@ -143,6 +149,11 @@ elif mode == 'uncommitted':
     db.execute('UPDATE list_entry SET progress=9 WHERE media_id=3')
     db.executemany('INSERT INTO settings VALUES (?,?)',
                    [(f'uncommitted-{n}', 'x' * 4000) for n in range(100)])
+elif mode == 'reset-uncommitted':
+    db.execute('PRAGMA cache_size=1')
+    db.execute('UPDATE list_entry SET progress=9 WHERE media_id=3')
+    db.execute("UPDATE settings SET value=replace(value,'x','y') "
+               "WHERE key LIKE 'large-%' AND CAST(substr(key,7) AS INTEGER)<50")
 os._exit(0)
 """
         subprocess.run([sys.executable, "-c", child, str(self.source), mode], check=True)
@@ -225,6 +236,92 @@ os._exit(0)
         for database in (self.backup, self.native / "kurisu.db"):
             with closing(sqlite3.connect(database)) as connection:
                 self.assertEqual(connection.execute("SELECT progress FROM list_entry").fetchone(), (5,))
+        self.assertEqual(before, {str(path): digest(path) for path in MIGRATE._source_files(self.source)})
+
+    def test_recycled_wal_accepts_an_older_checksum_byte_order(self):
+        wal = self.make_wal("padded")
+        content = bytearray(wal.read_bytes())
+        native_magic = content[3]
+        content[3] ^= 1
+        order = ">" if content[3] == 0x83 else "<"
+        frame_size = 24 + int.from_bytes(content[8:12], "big")
+        checksum = MIGRATE._wal_checksum(content[:24], order, (0, 0))
+        struct.pack_into(">2I", content, 24, *checksum)
+        for offset in range(32, len(content), frame_size):
+            checksum = MIGRATE._wal_checksum(content[offset:offset + 8], order, checksum)
+            checksum = MIGRATE._wal_checksum(content[offset + 24:offset + frame_size], order, checksum)
+            struct.pack_into(">2I", content, offset + 16, *checksum)
+        wal.write_bytes(content)
+        Path(f"{self.source}-shm").unlink()
+
+        child = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+busy, frames, checkpointed = db.execute('PRAGMA wal_checkpoint(RESTART)').fetchone()
+assert busy == 0 and frames == checkpointed and frames > 2
+db.execute('UPDATE list_entry SET progress=5 WHERE media_id=3')
+db.commit()
+os._exit(0)
+"""
+        subprocess.run([sys.executable, "-c", child, str(self.source)], check=True)
+        recycled = wal.read_bytes()
+        self.assertEqual(recycled[3], native_magic)
+        self.assertEqual(recycled[32 + 2 * frame_size:], content[32 + 2 * frame_size:])
+
+        def check_rows(database):
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(connection.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+                self.assertEqual(connection.execute("SELECT progress FROM list_entry").fetchone(), (5,))
+                self.assertEqual(connection.execute(
+                    "SELECT count(*) FROM settings WHERE key LIKE 'large-%'"
+                ).fetchone(), (100,))
+
+        control = self.root / "opposite-order-control.db"
+        shutil.copyfile(self.source, control)
+        shutil.copyfile(wal, Path(f"{control}-wal"))
+        check_rows(control)
+        before = {str(path): digest(path) for path in MIGRATE._source_files(self.source)}
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for database in (self.backup, self.native / "kurisu.db"):
+            check_rows(database)
+        self.assertEqual(before, {str(path): digest(path) for path in MIGRATE._source_files(self.source)})
+
+    def test_recycled_wal_without_a_new_commit_keeps_checkpointed_rows(self):
+        wal = self.make_wal("reset-uncommitted")
+        content = wal.read_bytes()
+        frame_size = 24 + int.from_bytes(content[8:12], "big")
+        frames = [content[offset:offset + frame_size] for offset in range(32, len(content), frame_size)]
+        current = [frame for frame in frames if frame[8:16] == content[16:24]]
+        self.assertGreater(len(current), 1)
+        self.assertLess(len(current), len(frames))
+        self.assertTrue(all(frame[4:8] == bytes(4) for frame in current))
+
+        def check_rows(database):
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(connection.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+                self.assertEqual(connection.execute("SELECT progress FROM list_entry").fetchone(), (4,))
+                self.assertEqual(connection.execute(
+                    "SELECT count(*),min(value),max(value) FROM settings WHERE key LIKE 'large-%'"
+                ).fetchone(), (100, "x" * 4000, "x" * 4000))
+
+        control = self.root / "sqlite-control.db"
+        shutil.copyfile(self.source, control)
+        shutil.copyfile(wal, Path(f"{control}-wal"))
+        check_rows(control)
+
+        second = 32 + frame_size
+        stale = 32 + len(current) * frame_size
+        wal.write_bytes(content[:second + 8] + content[stale + 8:stale + 16]
+                        + content[second + 16:second + frame_size])
+        self.assert_wal_refused()
+        wal.write_bytes(content)
+
+        before = {str(path): digest(path) for path in MIGRATE._source_files(self.source)}
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for database in (self.backup, self.native / "kurisu.db"):
+            check_rows(database)
         self.assertEqual(before, {str(path): digest(path) for path in MIGRATE._source_files(self.source)})
 
     def test_documented_cli_carries_wal_rows_preferences_and_rollback(self):
@@ -317,7 +414,7 @@ os._exit(0)
             self.assertEqual(connection.execute("SELECT progress FROM list_entry WHERE media_id=3").fetchone(), (2,))
 
     def test_every_supported_source_schema_version_is_preserved(self):
-        for version in range(1, 8):
+        for version in range(1, 9):
             with self.subTest(version=version):
                 directory = self.root / f"schema-v{version}"
                 directory.mkdir()
@@ -327,10 +424,23 @@ os._exit(0)
                 self.backup = directory / "backup.db"
                 self.native = directory / "native-profile"
                 self.make_source(version=version)
+                if version == 8:
+                    with closing(sqlite3.connect(self.source)) as connection:
+                        connection.execute("UPDATE list_entry SET entry_id=NULL, queued_creation='fixture-creation'")
+                        connection.execute("UPDATE pending_change SET payload=?", (json.dumps({
+                            "media_id": 3, "base": None, "patch": {"creation_key": "fixture-creation"},
+                            "conflict": False,
+                        }),))
+                        connection.commit()
                 MIGRATE.transfer(self.source, self.export, self.backup, self.native)
                 with closing(sqlite3.connect(self.native / "kurisu.db")) as connection:
                     self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (version,))
                     self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+                if version == 8:
+                    for database in (self.backup, self.native / "kurisu.db"):
+                        with closing(sqlite3.connect(database)) as connection:
+                            self.assertEqual(connection.execute("SELECT queued_creation FROM list_entry").fetchone(), ("fixture-creation",))
+                            self.assertEqual(connection.execute("SELECT json_extract(payload, '$.patch.creation_key') FROM pending_change").fetchone(), ("fixture-creation",))
 
     def test_existing_destination_and_backup_are_never_replaced(self):
         self.make_source()
@@ -369,7 +479,14 @@ os._exit(0)
     def test_publication_failure_keeps_a_complete_backup_and_no_profile(self):
         self.make_source()
         original = digest(self.source)
-        with patch.object(MIGRATE, "_publish_dir_no_replace", side_effect=MIGRATE.TransferError("synthetic publication failure")):
+        rename = MIGRATE._rename_no_replace
+
+        def fail_profile_publication(stage, destination):
+            if destination == self.native:
+                raise MIGRATE.TransferError("synthetic publication failure")
+            rename(stage, destination)
+
+        with patch.object(MIGRATE, "_rename_no_replace", side_effect=fail_profile_publication):
             with self.assertRaisesRegex(MIGRATE.TransferError, "publication failure"):
                 MIGRATE.transfer(self.source, self.export, self.backup, self.native)
         self.assertFalse(self.native.exists())
@@ -378,18 +495,138 @@ os._exit(0)
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             self.assertEqual(connection.execute("SELECT progress FROM list_entry WHERE media_id=3").fetchone(), (2,))
         self.assertEqual(list(self.root.glob(".kurisu-native-transfer-*")), [])
+        backup_before = digest(self.backup)
+        unavailable = self.root / "unavailable"
+        self.legacy.rename(unavailable)
+        try:
+            with self.assertRaisesRegex(MIGRATE.TransferError, "File does not exist"):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+            self.assertFalse(self.native.exists())
+            self.assertEqual(digest(self.backup), backup_before)
+        finally:
+            unavailable.rename(self.legacy)
+        MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertEqual(digest(self.backup), backup_before)
+        self.assertTrue((self.native / MIGRATE.RECEIPT).is_file())
 
-    def test_source_change_during_native_population_refuses_publication(self):
+    def test_backup_publication_does_not_require_hard_links(self):
         self.make_source()
-        populate = MIGRATE._populate_native
+        with patch.object(MIGRATE.os, "link", side_effect=PermissionError("hard links unavailable")):
+            MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        for database in (self.backup, self.native / "kurisu.db"):
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+                self.assertEqual(connection.execute("SELECT progress FROM list_entry").fetchone(), (2,))
 
-        def changed_source(backup, stage, values):
-            populate(backup, stage, values)
-            with closing(sqlite3.connect(self.source)) as connection:
-                connection.execute("UPDATE list_entry SET progress=8 WHERE media_id=3")
-                connection.commit()
+    def test_backup_publication_refuses_a_late_collision(self):
+        self.make_source()
+        rename = MIGRATE._rename_no_replace
 
-        with patch.object(MIGRATE, "_populate_native", side_effect=changed_source):
+        def add_collision(stage, destination):
+            if destination == self.backup:
+                destination.write_bytes(b"preserve late collision")
+            rename(stage, destination)
+
+        with patch.object(MIGRATE, "_rename_no_replace", side_effect=add_collision):
+            with self.assertRaisesRegex(MIGRATE.TransferError, "Backup destination appeared"):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertEqual(self.backup.read_bytes(), b"preserve late collision")
+        self.assertFalse(self.native.exists())
+
+    def test_profile_publication_refuses_a_late_empty_directory(self):
+        self.make_source()
+        rename = MIGRATE._rename_no_replace
+        identity = None
+
+        def add_collision(stage, destination):
+            nonlocal identity
+            if destination == self.native:
+                destination.mkdir()
+                identity = destination.stat()
+            rename(stage, destination)
+
+        with patch.object(MIGRATE, "_rename_no_replace", side_effect=add_collision):
+            with self.assertRaises(OSError):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertIsNotNone(identity)
+        self.assertTrue(os.path.samestat(self.native.stat(), identity))
+        self.assertEqual(list(self.native.iterdir()), [])
+        self.assertTrue(self.backup.is_file())
+
+    def test_backup_sidecar_created_during_publication_blocks_profile(self):
+        self.make_source()
+        rename = MIGRATE._rename_no_replace
+        sidecar = Path(f"{self.backup}-wal")
+
+        def add_sidecar(stage, destination):
+            if destination == self.backup:
+                sidecar.write_bytes(b"preserve late sidecar")
+            rename(stage, destination)
+
+        with patch.object(MIGRATE, "_rename_no_replace", side_effect=add_sidecar):
+            with self.assertRaisesRegex(MIGRATE.TransferError, "Backup path has SQLite sidecars"):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertTrue(self.backup.is_file())
+        self.assertEqual(sidecar.read_bytes(), b"preserve late sidecar")
+        self.assertFalse(self.native.exists())
+
+    def test_directory_sync_failure_reports_which_complete_copy_was_published(self):
+        self.make_source()
+        original = digest(self.source)
+        sync = MIGRATE._sync_directory
+        for phase in ("standalone backup", "native profile"):
+            with self.subTest(phase=phase):
+                backup_parent = self.root / f"{phase} backup parent"
+                profile_parent = self.root / f"{phase} profile parent"
+                backup_parent.mkdir()
+                profile_parent.mkdir()
+                backup = backup_parent / "backup.db"
+                profile = profile_parent / "native"
+                failed_parent = backup_parent if phase == "standalone backup" else profile_parent
+
+                def fail_sync(path):
+                    if path == failed_parent:
+                        raise OSError(errno.ENOSPC, "synthetic directory sync failure")
+                    sync(path)
+
+                with patch.object(MIGRATE, "_sync_directory", side_effect=fail_sync):
+                    for _ in range(2):
+                        with self.assertRaisesRegex(MIGRATE.TransferError, f"published {phase}.*Errno 28"):
+                            MIGRATE.transfer(self.source, self.export, backup, profile)
+                self.assertEqual(profile.is_dir(), phase == "native profile")
+                published = [backup, profile / "kurisu.db"] if profile.is_dir() else [backup]
+                for database in published:
+                    with closing(sqlite3.connect(database)) as connection:
+                        self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+                        self.assertEqual(connection.execute("SELECT progress FROM list_entry").fetchone(), (2,))
+                self.assertEqual(digest(self.source), original)
+                before = {database: digest(database) for database in published}
+                source = self.source.parent
+                hidden = self.root / "unavailable"
+                if profile.is_dir():
+                    source.rename(hidden)
+                try:
+                    MIGRATE.transfer(self.source, self.export, backup, profile)
+                finally:
+                    if hidden.exists():
+                        hidden.rename(source)
+                self.assertEqual({database: digest(database) for database in published}, before)
+                self.assertTrue((profile / MIGRATE.RECEIPT).is_file())
+                with self.assertRaisesRegex(MIGRATE.TransferError, "belongs to another profile"):
+                    MIGRATE.transfer(self.source, self.export, self.root / "other.db", profile)
+
+    def test_source_change_at_stage_sync_refuses_publication(self):
+        self.make_source()
+        sync = MIGRATE._sync_directory
+
+        def changed_source(path):
+            sync(path)
+            if path.name.startswith(".kurisu-native-transfer-"):
+                with closing(sqlite3.connect(self.source)) as connection:
+                    connection.execute("UPDATE list_entry SET progress=8 WHERE media_id=3")
+                    connection.commit()
+
+        with patch.object(MIGRATE, "_sync_directory", side_effect=changed_source):
             with self.assertRaisesRegex(MIGRATE.TransferError, "Source changed"):
                 MIGRATE.transfer(self.source, self.export, self.backup, self.native)
         self.assertFalse(self.native.exists())
@@ -397,6 +634,162 @@ os._exit(0)
             self.assertEqual(connection.execute("SELECT progress FROM list_entry WHERE media_id=3").fetchone(), (2,))
         with closing(sqlite3.connect(self.source)) as connection:
             self.assertEqual(connection.execute("SELECT progress FROM list_entry WHERE media_id=3").fetchone(), (8,))
+
+    def test_snapshot_rejects_a_transient_source_change_that_was_copied(self):
+        self.make_source()
+        original = self.source.read_bytes()
+        copy = MIGRATE._copy_private
+
+        def copy_changed_source(source, destination):
+            if source != self.source:
+                copy(source, destination)
+                return
+            with closing(sqlite3.connect(source)) as connection:
+                connection.execute("UPDATE list_entry SET progress=8 WHERE media_id=3")
+                connection.commit()
+            try:
+                copy(source, destination)
+            finally:
+                source.write_bytes(original)
+
+        with patch.object(MIGRATE, "_copy_private", side_effect=copy_changed_source):
+            with self.assertRaisesRegex(MIGRATE.TransferError, "Source changed during transfer"):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.native.exists())
+        self.assertEqual(self.run_cli().returncode, 0)
+
+    def test_native_copy_rejects_a_transient_backup_change(self):
+        self.make_source()
+        copy = MIGRATE._copy_private
+
+        def copy_changed_backup(source, destination):
+            if source != self.backup:
+                copy(source, destination)
+                return
+            original = source.read_bytes()
+            with closing(sqlite3.connect(source)) as connection:
+                connection.execute("UPDATE list_entry SET progress=8 WHERE media_id=3")
+                connection.commit()
+            try:
+                copy(source, destination)
+            finally:
+                source.write_bytes(original)
+
+        with patch.object(MIGRATE, "_copy_private", side_effect=copy_changed_backup):
+            with self.assertRaisesRegex(MIGRATE.TransferError, "Backup changed during transfer"):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertFalse(self.native.exists())
+        with closing(sqlite3.connect(self.backup)) as connection:
+            self.assertEqual(connection.execute("SELECT progress FROM list_entry WHERE media_id=3").fetchone(), (2,))
+        self.assertEqual(self.run_cli().returncode, 0)
+
+    def test_retry_reports_that_the_rollback_backup_was_not_checked(self):
+        self.make_source()
+        first = self.run_cli()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(f"Standalone rollback backup: {self.backup}", first.stdout)
+        self.backup.unlink()
+        retry = self.run_cli()
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIn("Native profile ready", retry.stdout)
+        self.assertNotIn("Standalone rollback backup", retry.stdout)
+        self.assertIn(f"Rollback backup was not checked on this retry: {self.backup}", retry.stderr)
+        self.assertFalse(self.backup.exists())
+
+    def test_retry_refuses_truncated_database_with_matching_receipt(self):
+        self.make_source()
+        self.assertEqual(self.run_cli().returncode, 0)
+        database = self.native / "kurisu.db"
+        database.write_bytes(database.read_bytes()[:101])
+        before = {path.name: digest(path) for path in self.native.iterdir()}
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("Native database could not be validated", result.stderr)
+        self.assertNotIn("Native profile ready", result.stdout)
+        self.assertEqual(before, {path.name: digest(path) for path in self.native.iterdir()})
+
+    def test_retry_validates_committed_native_wal_without_touching_profile(self):
+        self.make_source()
+        self.assertEqual(self.run_cli().returncode, 0)
+        database = self.native / "kurisu.db"
+        child = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute('PRAGMA journal_mode=WAL')
+db.execute('UPDATE list_entry SET progress=5 WHERE media_id=3')
+db.commit()
+os._exit(0)
+"""
+        subprocess.run([sys.executable, "-c", child, str(database)], check=True)
+        wal = database.with_name("kurisu.db-wal")
+        shm = database.with_name("kurisu.db-shm")
+        self.assertGreater(wal.stat().st_size, 32)
+        self.legacy.rename(self.root / "unavailable")
+        self.assertTrue(shm.is_file())
+        for with_shm in (True, False):
+            with self.subTest(with_shm=with_shm):
+                if not with_shm:
+                    shm.unlink()
+                before = {path.name: digest(path) for path in self.native.iterdir()}
+                result = self.run_cli()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Native profile ready", result.stdout)
+                self.assertEqual(before, {path.name: digest(path) for path in self.native.iterdir()})
+        damaged = wal.read_bytes()[:-1]
+        wal.write_bytes(damaged)
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("Native database could not be validated", result.stderr)
+        self.assertFalse(shm.exists())
+        self.assertEqual(wal.read_bytes(), damaged)
+
+    def test_retry_detects_a_concurrent_commit_to_the_native_wal(self):
+        self.make_source()
+        MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.legacy.rename(self.root / "unavailable")
+        validate = MIGRATE._validate_schema
+        with closing(sqlite3.connect(self.native / "kurisu.db")) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("UPDATE list_entry SET progress=5 WHERE media_id=3")
+            writer.commit()
+            updated = {}
+
+            def commit_during_validation(connection):
+                validate(connection)
+                writer.execute("UPDATE list_entry SET progress=6 WHERE media_id=3")
+                writer.commit()
+                updated.update({path.name: digest(path) for path in self.native.iterdir()})
+
+            with patch.object(MIGRATE, "_validate_schema", side_effect=commit_during_validation):
+                with self.assertRaisesRegex(MIGRATE.TransferError, "Native database changed during validation"):
+                    MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+            result = self.run_cli()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(updated, {path.name: digest(path) for path in self.native.iterdir()})
+            self.assertEqual(writer.execute("SELECT progress FROM list_entry").fetchone(), (6,))
+
+    def test_preferences_change_during_native_population_retries_with_same_backup(self):
+        self.make_source()
+        populate = MIGRATE._populate_native
+
+        def changed_preferences(backup, backup_digest, stage, values):
+            populate(backup, backup_digest, stage, values)
+            self.values["kurisu.list.q"] = "Updated query"
+            self.write_export()
+
+        with patch.object(MIGRATE, "_populate_native", side_effect=changed_preferences):
+            with self.assertRaisesRegex(MIGRATE.TransferError, "Preference export changed"):
+                MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertFalse(self.native.exists())
+        before = digest(self.backup)
+        MIGRATE.transfer(self.source, self.export, self.backup, self.native)
+        self.assertEqual(digest(self.backup), before)
+        with closing(sqlite3.connect(self.native / "kurisu.db")) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM settings WHERE key='native_preference:kurisu.list.q'"
+            ).fetchone(), ("Updated query",))
 
     def test_invalid_export_and_schema_fail_without_publication(self):
         self.make_source()
@@ -409,7 +802,7 @@ os._exit(0)
         del self.values["unexpected.secret"]
         self.write_export()
         with closing(sqlite3.connect(self.source)) as connection:
-            connection.execute("PRAGMA user_version=8")
+            connection.execute("PRAGMA user_version=9")
         with self.assertRaisesRegex(MIGRATE.TransferError, "Unsupported legacy schema"):
             MIGRATE.transfer(self.source, self.export, self.backup, self.native)
         self.assertFalse(self.backup.exists())

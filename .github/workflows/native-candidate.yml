@@ -15,6 +15,11 @@ on:
       build-version:
         type: string
         default: ''
+    outputs:
+      linux-artifact-id:
+        value: ${{ jobs.build.outputs.linux-artifact-id }}
+      windows-artifact-id:
+        value: ${{ jobs.build.outputs.windows-artifact-id }}
   pull_request:
     paths:
       - 'core/**'
@@ -33,10 +38,11 @@ env:
   KURISU_RELEASE_REPOSITORY: ${{ vars.KURISU_RELEASE_REPOSITORY || 'CateDesu/Kurisu' }}
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: native-candidate-${{ github.ref }}
+  group: native-candidate-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -66,6 +72,9 @@ jobs:
 
   build:
     needs: resolve-source
+    outputs:
+      linux-artifact-id: ${{ runner.os == 'Linux' && steps.upload.outputs.artifact-id || '' }}
+      windows-artifact-id: ${{ runner.os == 'Windows' && steps.upload.outputs.artifact-id || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -151,8 +160,9 @@ jobs:
         run: ldd native/target/release/kurisu-native
 
       - uses: actions/upload-artifact@v4
+        id: upload
         with:
-          name: kurisu-native-${{ runner.os }}
+          name: kurisu-native-${{ runner.os }}-attempt-${{ github.run_attempt }}
           if-no-files-found: error
           path: |
             native/target/release/kurisu-native
@@ -181,7 +191,9 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: kurisu-native-Windows
+          artifact-ids: ${{ needs.build.outputs.windows-artifact-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
           path: native/target/release
 
       - name: Verify Windows installer in disposable runner

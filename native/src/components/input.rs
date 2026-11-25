@@ -1041,12 +1041,15 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.input.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus_handle,
-            ElementInputHandler::new(bounds, self.input.clone()),
-            cx,
-        );
+        let input = self.input.read(cx);
+        let focused = !input.disabled && input.focus_handle.is_focused(window);
+        if focused {
+            window.handle_input(
+                &input.focus_handle,
+                ElementInputHandler::new(bounds, self.input.clone()),
+                cx,
+            );
+        }
         for selection in prepaint.selection.drain(..) {
             window.paint_quad(selection);
         }
@@ -1064,9 +1067,7 @@ impl Element for TextElement {
             .unwrap();
             top += line.size(line_height).height;
         }
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
+        if focused && let Some(cursor) = prepaint.cursor.take() {
             window.paint_quad(cursor);
         }
         self.input.update(cx, |input, _cx| {
@@ -1110,6 +1111,8 @@ impl Render for TextInput {
             })
             .when(!disabled, |field| {
                 field
+                    .tab_stop(true)
+                    .track_focus(&self.focus_handle(cx))
                     .on_a11y_action(
                         AccessibleAction::SetTextSelection,
                         move |data, window, cx| {
@@ -1131,9 +1134,7 @@ impl Render for TextInput {
                         }
                     })
             })
-            .tab_stop(!disabled)
             .key_context("TextInput")
-            .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))

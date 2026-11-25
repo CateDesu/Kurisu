@@ -1,7 +1,8 @@
-import { readFileSync, appendFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, appendFileSync, readdirSync, statSync, copyFileSync, constants, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const MAX_BUFFER = 64 * 1024 * 1024;
@@ -61,8 +62,8 @@ export function nativeAssets(names, tag) {
   return required;
 }
 
-function run(program, args) {
-  const result = spawnSync(program, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "pipe"] });
+function run(program, args, cwd) {
+  const result = spawnSync(program, args, { cwd, encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "pipe"] });
   if (result.error || result.status !== 0) throw new Error(result.error?.message || result.stderr || `${program} failed`);
   return result.stdout.trim();
 }
@@ -79,18 +80,46 @@ function parseJsonLines(text) {
   return text ? text.split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 }
 
-function refusePublished(tag) {
+function existingRelease(tag) {
   const releases = parseJsonLines(run("gh", [
-    "api", "--paginate", "--jq", ".[] | {tag_name, draft, prerelease}",
+    "api", "--paginate", "--jq", ".[] | {id, tag_name, draft, prerelease}",
     `repos/${repository()}/releases?per_page=100`,
   ]));
-  if (releases.some(release => release.tag_name === tag)) throw new Error("Release already exists; do not overwrite or reuse its assets");
+  const matches = releases.filter(release => release.tag_name === tag);
+  if (matches.length > 1 || matches.some(release => typeof release.draft !== "boolean" || release.prerelease !== false
+      || !Number.isSafeInteger(release.id) || release.id <= 0)) {
+    throw new Error("Release already exists without a unique stable release or draft");
+  }
   for (const release of releases.filter(release => !release.draft && !release.prerelease)) {
-    if (/^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(release.tag_name) && compare(release.tag_name, tag) >= 0) {
+    if (release.tag_name !== tag && /^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(release.tag_name) && compare(release.tag_name, tag) >= 0) {
       throw new Error("A stable release at this or a higher version is already published");
     }
   }
+  return matches[0];
 }
+
+function verifiedAssets(release, expected) {
+  const label = release.draft ? "Draft" : "Published release";
+  const uploaded = new Set();
+  const incomplete = new Map();
+  for (const asset of release.assets) {
+    const local = expected.get(asset.name);
+    if (!local || uploaded.has(asset.name) || incomplete.has(asset.name)) {
+      throw new Error(`Unexpected ${release.draft ? "draft" : "published"} asset: ${asset.name}`);
+    }
+    if (release.draft && asset.state === "starter" && asset.size === 0 && !asset.digest
+        && Number.isSafeInteger(asset.id) && asset.id > 0) {
+      incomplete.set(asset.name, asset.id);
+    } else if (asset.state === "uploaded" && asset.size === local.size && asset.digest === local.digest) {
+      uploaded.add(asset.name);
+    } else {
+      throw new Error(`${label} asset does not match the verified build: ${asset.name}. ${retryArtifacts}`);
+    }
+  }
+  return { uploaded, incomplete };
+}
+
+const retryArtifacts = "Use the original verified build artifacts. In GitHub Actions, re-run failed jobs from the original Native release run.";
 
 function verifyPinnedBridgeInstaller(directory, installerName) {
   if (!/^[0-9a-f]{64}$/.test(transition.bridgeInstallerSha256)) {
@@ -103,16 +132,46 @@ function verifyPinnedBridgeInstaller(directory, installerName) {
 }
 
 function verifySidecars(directory, names) {
+  const assets = new Map();
   for (const name of names.filter(name => !name.endsWith(".sha256"))) {
-    const sidecar = readFileSync(join(directory, `${name}.sha256`), "utf8").trim();
+    const path = join(directory, name);
+    const size = statSync(path).size;
+    if (size === 0) throw new Error(`Empty release asset: ${name}`);
+    const checksum = `${name}.sha256`;
+    const content = readFileSync(join(directory, checksum));
+    const sidecar = content.toString("utf8").trim();
     if (!new RegExp(`^[0-9a-f]{64}  ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`).test(sidecar)) {
       throw new Error(`Invalid existing checksum sidecar: ${name}`);
     }
-    run("sha256sum", ["--check", "--strict", join(directory, `${name}.sha256`)]);
+    run("sha256sum", ["--check", "--strict", checksum], directory);
+    assets.set(name, { size, digest: `sha256:${sidecar.slice(0, 64)}` });
+    assets.set(checksum, { size: content.length, digest: `sha256:${createHash("sha256").update(content).digest("hex")}` });
+  }
+  return assets;
+}
+
+function stageBridge(directory, names) {
+  const temporary = mkdtempSync(join(tmpdir(), "kurisu-release-bridge-"));
+  try {
+    gh(["release", "download", transition.bridgeTag, "--dir", temporary, ...names.flatMap(name => ["--pattern", name])]);
+    const verified = verifySidecars(temporary, names);
+    verifyPinnedBridgeInstaller(temporary, originalWindowsSelector(names));
+    for (const name of names) {
+      const path = join(directory, name);
+      if (!existsSync(path)) copyFileSync(join(temporary, name), path, constants.COPYFILE_EXCL);
+    }
+    const staged = verifySidecars(directory, names);
+    for (const [name, { digest }] of verified) {
+      if (staged.get(name).digest !== digest) throw new Error(`Staged asset differs from the pinned bridge: ${name}`);
+    }
+    return staged;
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
 }
 
 function verifyRemoteTagCommit(tag, expectedCommit) {
+  // GitHub ignores target_commitish for an existing release tag.
   const git = `repos/${repository()}/git`;
   let { object } = JSON.parse(run("gh", ["api", `${git}/ref/tags/${encodeURIComponent(tag)}`]));
   while (object.type === "tag") {
@@ -146,23 +205,91 @@ async function main() {
     return;
   }
   if (command !== "publish" || !directory) throw new Error("Use plan or publish with an artifact directory");
-  refusePublished(tag);
+  const endpoint = `repos/${repository()}/releases`;
+  const existing = existingRelease(tag);
+  let id = existing?.id;
+  const title = `Kurisu ${result.ver}`;
+  const notes = releaseNotes(tag);
   const absoluteDirectory = run("realpath", [directory]);
   const paths = readdirSync(absoluteDirectory).filter(name => statSync(join(absoluteDirectory, name)).isFile());
-  const names = nativeAssets(paths, tag);
-  const bridge = JSON.parse(run("gh", ["api", `repos/${repository()}/releases/tags/${transition.bridgeTag}`]));
+  const bridge = JSON.parse(run("gh", ["api", `${endpoint}/tags/${transition.bridgeTag}`]));
   const legacy = bridgeAssets(bridge);
-  gh(["release", "download", transition.bridgeTag, "--dir", absoluteDirectory, ...legacy.flatMap(name => ["--pattern", name])]);
-  names.push(...legacy);
-  if (originalWindowsSelector(names) !== originalWindowsSelector(legacy)) throw new Error("Native assets collide with the published updater");
-  process.chdir(absoluteDirectory);
-  verifySidecars(absoluteDirectory, names);
-  verifyPinnedBridgeInstaller(absoluteDirectory, originalWindowsSelector(legacy));
+  const names = nativeAssets(paths.filter(name => !legacy.includes(name)), tag);
+  const expected = new Map([...verifySidecars(absoluteDirectory, names), ...stageBridge(absoluteDirectory, legacy)]);
+  const manifest = Array.from(expected, ([name, { size, digest }]) => [name, size, digest]);
+  const fingerprint = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+  const marker = `${notes}\n\n<!-- Kurisu native release for ${commit} with assets `;
+  const body = `${marker}${fingerprint} -->`;
+  function readOwned(draft) {
+    const release = JSON.parse(run("gh", ["api", `${endpoint}/${id}`]));
+    const type = draft ? "native draft" : "published native release";
+    if (release?.id !== id || release.tag_name !== tag || release.draft !== draft || release.prerelease !== false
+        || release.name !== title || !Array.isArray(release.assets)) {
+      throw new Error(`Release already exists and is not the expected ${type}`);
+    }
+    if (release.body !== body) {
+      if (typeof release.body === "string" && release.body.startsWith(marker)
+          && /^[0-9a-f]{64} -->$/.test(release.body.slice(marker.length))) {
+        throw new Error(`Release artifacts differ from the original verified build. ${retryArtifacts}`);
+      }
+      throw new Error(`Release already exists and is not the expected ${type}`);
+    }
+    return release;
+  }
+  function matchesRelease(draft) {
+    const current = existingRelease(tag);
+    return current?.id === id && current?.draft === draft;
+  }
+  function verifyPublished() {
+    if (!matchesRelease(false)) throw new Error("Published release identity changed");
+    if (verifiedAssets(readOwned(false), expected).uploaded.size !== expected.size) {
+      throw new Error("Published release is missing verified assets");
+    }
+    verifyRemoteTagCommit(tag, commit);
+  }
+  if (!matchesRelease(existing?.draft)) throw new Error("Release changed during staging");
+  if (existing?.draft === false) {
+    verifyPublished();
+    console.log(`Verified previously published release ${tag}`);
+    return;
+  }
   verifyRemoteTagCommit(tag, commit);
-  gh(["release", "create", tag, "--verify-tag", "--target", commit, "--title", `Kurisu ${result.ver}`, "--notes", releaseNotes(tag), "--draft"]);
-  gh(["release", "upload", tag, ...names.map(name => join(absoluteDirectory, basename(name)))]);
+  if (id === undefined) {
+    const created = JSON.parse(run("gh", ["api", "--method", "POST", endpoint,
+      "-f", `tag_name=${tag}`, "-f", `target_commitish=${commit}`, "-f", `name=${title}`, "-f", `body=${body}`, "-F", "draft=true"]));
+    id = created?.id;
+    if (!Number.isSafeInteger(id) || id <= 0 || !matchesRelease(true)) {
+      throw new Error("Release changed after draft creation");
+    }
+  }
+  const draft = readOwned(true);
+  const uploadTemplate = draft.upload_url;
+  const uploadPath = `/${endpoint}/${id}/assets`;
+  const uploadHost = "https://uploads.github.com";
+  if (typeof uploadTemplate !== "string"
+      || uploadTemplate.toLowerCase() !== `${uploadHost}${uploadPath.toLowerCase()}{?name,label}`) {
+    throw new Error("Unexpected release asset upload URL");
+  }
+  const uploadUrl = uploadTemplate.slice(0, -"{?name,label}".length);
+  let assets = verifiedAssets(draft, expected);
   verifyRemoteTagCommit(tag, commit);
-  gh(["release", "edit", tag, "--tag", tag, "--verify-tag", "--target", commit, "--draft=false", "--latest"]);
+  for (const name of expected.keys()) {
+    if (assets.uploaded.has(name)) continue;
+    if (assets.incomplete.has(name)) {
+      run("gh", ["api", "--method", "DELETE", `${endpoint}/assets/${assets.incomplete.get(name)}`]);
+      assets = verifiedAssets(readOwned(true), expected);
+      if (assets.uploaded.has(name)) continue;
+    }
+    run("gh", ["api", "--method", "POST", `${uploadUrl}?name=${encodeURIComponent(name)}`,
+      "--header", "Content-Type: application/octet-stream", "--input", join(absoluteDirectory, name)]);
+    assets = verifiedAssets(readOwned(true), expected);
+  }
+  if (!matchesRelease(true)) throw new Error("Release changed during upload");
+  if (verifiedAssets(readOwned(true), expected).uploaded.size !== expected.size) throw new Error("Draft is missing verified assets");
+  verifyRemoteTagCommit(tag, commit);
+  run("gh", ["api", "--method", "PATCH", `${endpoint}/${id}`, "-F", "draft=false",
+    "-f", "make_latest=true", "-f", `target_commitish=${commit}`, "-f", `body=${body}`]);
+  verifyPublished();
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

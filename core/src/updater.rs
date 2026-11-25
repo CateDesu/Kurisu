@@ -47,12 +47,15 @@ fn sane_exe_path(exe: PathBuf) -> Result<PathBuf, String> {
     Ok(exe)
 }
 
-fn install_dir() -> Option<PathBuf> {
-    let exe = EXE_PATH
+fn install_exe() -> Option<PathBuf> {
+    EXE_PATH
         .get()
         .cloned()
-        .or_else(|| std::env::current_exe().ok())?;
-    exe.parent().map(Path::to_path_buf)
+        .or_else(|| sane_exe_path(std::env::current_exe().ok()?).ok())
+}
+
+fn install_dir() -> Option<PathBuf> {
+    install_exe()?.parent().map(Path::to_path_buf)
 }
 
 pub fn sweep_install_dir() -> bool {
@@ -629,7 +632,7 @@ pub fn verify_and_open(path: &Path, sidecar_text: &str) -> io::Result<Option<std
 
 #[cfg(target_os = "linux")]
 pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     if UPDATE_APPLIED.load(Ordering::SeqCst) {
         return Err("an update was already installed; restart Kurisu to finish it".to_string());
     }
@@ -651,7 +654,8 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     let (running, installed) = std::fs::metadata("/proc/self/exe")
         .and_then(|running| std::fs::metadata(&exe).map(|installed| (running, installed)))
         .map_err(|error| format!("could not identify the installed executable: {error}"))?;
-    if (running.dev(), running.ino()) != (installed.dev(), installed.ino()) {
+    if !same_linux_file(&running, &installed) {
+        UPDATE_APPLIED.store(true, Ordering::SeqCst);
         return Err("the installed executable has changed; restart Kurisu before updating".into());
     }
     let name = exe
@@ -665,33 +669,51 @@ pub fn apply_linux_update(new_bin: &mut std::fs::File) -> Result<(), String> {
     ));
     let backup = dir.join(format!("{name}.kurisu-old"));
     let mut created = false;
-    let result = (|| -> io::Result<()> {
-        let mut staged = std::fs::File::create_new(&staging)?;
+    let result = (|| {
+        let install_error = |error| format!("could not install the update: {error}");
+        let mut staged = std::fs::File::create_new(&staging).map_err(install_error)?;
         created = true;
-        io::copy(new_bin, &mut staged)?;
-        staged.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        io::copy(new_bin, &mut staged).map_err(install_error)?;
+        staged
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(install_error)?;
         // Flush before publishing so a crash cannot leave an empty executable.
-        staged.sync_all()?;
+        staged.sync_all().map_err(install_error)?;
         drop(staged);
-        preserve_executable(&exe, &backup)?;
-        std::fs::rename(&staging, &exe)?;
-        sync_dir(dir);
-        Ok(())
+        preserve_executable(&exe, &installed, &backup)
+            .map_err(|error| format!("could not secure the rollback executable: {error}"))?;
+        std::fs::rename(&staging, &exe).map_err(install_error)?;
+        created = false;
+        UPDATE_APPLIED.store(true, Ordering::SeqCst);
+        sync_dir(dir).map_err(|error| {
+            format!(
+                "the executable was replaced, but the installation could not be synced: {error}. The previous executable is saved at {}. Restart Kurisu before checking for updates again.",
+                backup.display()
+            )
+        })
     })();
     if created {
         let _ = std::fs::remove_file(&staging);
     }
-    if result.is_ok() {
-        UPDATE_APPLIED.store(true, Ordering::SeqCst);
-    }
-    result.map_err(|e| format!("could not install the update: {e}"))
+    result
 }
 
 #[cfg(target_os = "linux")]
-fn preserve_executable(exe: &Path, backup: &Path) -> io::Result<()> {
+fn preserve_executable(exe: &Path, installed: &std::fs::Metadata, backup: &Path) -> io::Result<()> {
     let dir = exe
         .parent()
         .ok_or_else(|| io::Error::other("no install directory"))?;
+    match std::fs::symlink_metadata(backup) {
+        Ok(saved) => {
+            // The current executable must be durable before replacing an older rollback copy.
+            sync_dir(dir)?;
+            if same_linux_file(installed, &saved) {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let temporary = dir.join(format!(
         ".kurisu-new-{}-{}",
         std::process::id(),
@@ -713,8 +735,8 @@ fn preserve_executable(exe: &Path, backup: &Path) -> io::Result<()> {
             created = true;
         }
         std::fs::rename(&temporary, backup)?;
-        sync_dir(dir);
-        Ok(())
+        created = false;
+        sync_dir(dir)
     })();
     if created {
         let _ = std::fs::remove_file(&temporary);
@@ -723,10 +745,8 @@ fn preserve_executable(exe: &Path, backup: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn sync_dir(dir: &Path) {
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(target_os = "linux")]
@@ -792,7 +812,6 @@ pub fn sweep_update_leftovers(dir: &Path) {
     }
 }
 
-/// Keep backups whose executable is missing. They may be the only working copy.
 pub fn sweep_install_leftovers(exe_dir: &Path) {
     #[cfg(target_os = "linux")]
     let Ok(_installation) = lock_install_dir(exe_dir) else {
@@ -804,13 +823,63 @@ pub fn sweep_install_leftovers(exe_dir: &Path) {
             let name = name.to_string_lossy();
             if name.starts_with(".kurisu-new-") {
                 let _ = std::fs::remove_file(entry.path());
-            } else if let Some(exe_name) = name.strip_suffix(".kurisu-old") {
-                if exe_dir.join(exe_name).exists() {
-                    let _ = std::fs::remove_file(entry.path());
-                }
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(exe) = install_exe().filter(|exe| exe.parent() == Some(exe_dir)) {
+        let _ = sweep_install_backup(&exe);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn same_linux_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (left.dev(), left.ino()) == (right.dev(), right.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn sweep_install_backup(exe: &Path) -> io::Result<()> {
+    use std::io::Read;
+
+    let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let backup = exe.with_file_name(format!("{name}.kurisu-old"));
+    let saved = std::fs::symlink_metadata(&backup)?;
+    let installed = std::fs::symlink_metadata(exe)?;
+    let running = std::fs::metadata("/proc/self/exe")?;
+    if !saved.is_file()
+        || !same_linux_file(&running, &installed)
+        || same_linux_file(&running, &saved)
+    {
+        return Ok(());
+    }
+    // A previous process may have published the replacement without syncing it.
+    let dir = backup
+        .parent()
+        .ok_or_else(|| io::Error::other("no install directory"))?;
+    sync_dir(dir)?;
+    if running.len() != saved.len() {
+        return std::fs::remove_file(backup);
+    }
+
+    // An interrupted install may have copied the running executable as its backup.
+    let mut old = std::fs::File::open(&backup)?;
+    let mut current = std::fs::File::open("/proc/self/exe")?;
+    let mut old_bytes = [0; 8192];
+    let mut current_bytes = [0; 8192];
+    let mut remaining = running.len();
+    while remaining > 0 {
+        let count = remaining.min(old_bytes.len() as u64) as usize;
+        old.read_exact(&mut old_bytes[..count])?;
+        current.read_exact(&mut current_bytes[..count])?;
+        if old_bytes[..count] != current_bytes[..count] {
+            return std::fs::remove_file(backup);
+        }
+        remaining -= count as u64;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1060,13 +1129,19 @@ mod tests {
             b"already installed by the other profile"
         );
         assert_eq!(std::fs::metadata(&backup).unwrap().ino(), original.ino());
-        assert!(!update_applied());
+        assert!(update_applied());
         std::fs::rename(&backup, &exe).unwrap();
+        UPDATE_APPLIED.store(false, Ordering::SeqCst);
 
+        std::fs::hard_link(&exe, &backup).unwrap();
         apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), replacement);
         assert_eq!(digest_file(&backup), original_digest);
         assert!(update_applied());
+        assert!(std::fs::read_dir(dir).unwrap().flatten().all(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kurisu-new-")));
         assert!(apply_linux_update(&mut std::fs::File::open(&payload).unwrap()).is_err());
     }
 

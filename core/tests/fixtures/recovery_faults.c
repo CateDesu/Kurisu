@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,15 +12,20 @@
 static int selected(const char *operation, const char *path) {
     const char *op = getenv("KURISU_RECOVERY_OP");
     const char *match = getenv("KURISU_RECOVERY_MATCH");
+    const char *exact = getenv("KURISU_RECOVERY_MATCH_EXACT");
     const char *arm = getenv("KURISU_RECOVERY_ARM");
     const char *after = getenv("KURISU_RECOVERY_AFTER");
     return (!after || access(after, F_OK) == 0) &&
         op && match && arm && access(arm, F_OK) == 0 &&
-        strcmp(op, operation) == 0 && strstr(path, match);
+        strcmp(op, operation) == 0 &&
+        (exact ? strcmp(path, match) == 0 : strstr(path, match) != NULL);
 }
 
 static int fault(const char *operation, const char *path) {
     if (!selected(operation, path)) return 0;
+    const char *skip = getenv("KURISU_RECOVERY_SKIP");
+    static atomic_uint matches;
+    if (skip && atomic_fetch_add(&matches, 1) < strtoul(skip, NULL, 10)) return 0;
     const char *gate = getenv("KURISU_RECOVERY_GATE");
     if (gate) {
         int fd = open(gate, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -97,6 +103,7 @@ int linkat(int source_dir, const char *source, int destination_dir,
 }
 
 int rename(const char *source, const char *destination) {
+    if (fault("rename", destination)) return -1;
     int (*real)(const char *, const char *) = dlsym(RTLD_NEXT, "rename");
     int result = real(source, destination);
     if (result == 0 && fault("renamed", destination)) return -1;
@@ -105,6 +112,7 @@ int rename(const char *source, const char *destination) {
 
 int renameat2(int source_dir, const char *source, int destination_dir,
               const char *destination, unsigned int flags) {
+    if (fault("rename", destination)) return -1;
     const char *collision = getenv("KURISU_RECOVERY_COLLISION");
     if (collision && strcmp(destination, collision) == 0) {
         int fd = open(destination, O_WRONLY | O_CREAT | O_EXCL, 0600);
