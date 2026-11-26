@@ -5,57 +5,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
-import { bridgeAssets, compare, nativeAssets, originalWindowsSelector, plan, transition } from "./release-transition.mjs";
+import { compare, nativeAssets, plan } from "./native-release.mjs";
 import { pruneNativeReleases } from "./prune-native-releases.mjs";
 
-const installer = "Kurisu_1.0.0_x64-setup.exe";
 const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
-const bridgeNames = ["kurisu", "kurisu.exe", installer].flatMap(name => [name, `${name}.sha256`]);
-const bridge = () => ({ tag_name: transition.bridgeTag, draft: false, prerelease: false,
-  assets: bridgeNames.map(name => ({ name })) });
 const nativeNames = tag => ["kurisu-native", "kurisu-native.exe",
   `Kurisu-Native_${tag.slice(1)}_x64-install.exe`, `Kurisu_${tag.slice(1)}_linux-x64.tar.gz`]
   .flatMap(name => [name, `${name}.sha256`]);
 
-// Exact shipped matching rule, including its original lack of a product prefix.
-function publishedWindowsSelector(names, arch = "x86_64") {
-  const marker = arch === "x86_64" ? "_x64-" : null;
-  if (!marker) return null;
-  const hits = names.filter(name => name.endsWith("-setup.exe") && name.includes(marker));
-  return hits.length === 1 ? hits[0] : null;
-}
-
-test("only native releases newer than the published bridge are allowed", () => {
-  assert.throws(() => plan("bridge", transition.bridgeTag), /Only native releases/);
-  assert.equal(plan("native", "v1.1.0").ver, "1.1.0");
-  for (const tag of ["v1.0.0.77", "v1.0.0.79"]) assert.throws(() => plan("bridge", tag));
-  for (const tag of ["v1.0.0.77", transition.bridgeTag, "v1.1.0-beta", "v1.1.65536", "v1.1.0\n"]) {
-    assert.throws(() => plan("native", tag));
+test("only valid stable numeric tags are planned", () => {
+  assert.equal(plan("v1.1.0").ver, "1.1.0");
+  assert.equal(plan("v1.1.0.2").ver, "1.1.0.2");
+  for (const tag of ["1.1.0", "v1.1.0-beta", "v1.1.65536", "v1.1.0\n"]) {
+    assert.throws(() => plan(tag));
   }
   assert.equal(compare("v1.1.0", "v1.1.0.0"), 0);
 });
 
-test("the frozen bridge requires both platforms, one installer and existing sidecars", () => {
-  assert.deepEqual(bridgeAssets(bridge()), bridgeNames);
-  for (const field of ["draft", "prerelease"]) assert.throws(() => bridgeAssets({ ...bridge(), [field]: true }));
-  assert.throws(() => bridgeAssets({ ...bridge(), tag_name: "v1.0.0.77" }));
-  for (const missing of bridgeNames) {
-    assert.throws(() => bridgeAssets({ ...bridge(), assets: bridge().assets.filter(asset => asset.name !== missing) }));
-  }
-  assert.throws(() => bridgeAssets({ ...bridge(), assets: [...bridge().assets, { name: "kurisu-native" }] }));
-  assert.throws(() => bridgeAssets({ ...bridge(), assets: [...bridge().assets, { name: "Other_x64-setup.exe" }] }));
-});
-
-test("users skipping the bridge still see exactly its old installer on every native release", () => {
+test("native releases require both platforms, Linux bundle and exact sidecars", () => {
   for (const tag of ["v1.1.0", "v1.2.3", "v2.0.0.5"]) {
-    const names = [...bridgeAssets(bridge()), ...nativeAssets(nativeNames(tag), tag)];
-    assert.equal(publishedWindowsSelector(names), installer);
-    assert.equal(originalWindowsSelector(names), publishedWindowsSelector(names));
-    assert.equal(publishedWindowsSelector(names, "aarch64"), null);
-    assert.equal(names.filter(name => name === "kurisu").length, 1);
+    const names = nativeAssets(nativeNames(tag), tag);
     assert.ok(names.includes("kurisu-native"));
+    assert.ok(names.includes(`Kurisu-Native_${tag.slice(1)}_x64-install.exe`));
   }
-  assert.equal(publishedWindowsSelector([...bridgeNames, "Kurisu-Native_1.1.0_x64-setup.exe"]), null);
   assert.throws(() => nativeAssets([...nativeNames("v1.1.0"), "Kurisu-Native_1.1.0_x64-setup.exe"], "v1.1.0"));
   assert.throws(() => nativeAssets(nativeNames("v1.1.0").slice(1), "v1.1.0"));
 });
@@ -64,7 +36,7 @@ function readWorkflow(name) {
   return readFileSync(new URL(`workflows/${name}.yml`, import.meta.url), "utf8").replaceAll("\r\n", "\n");
 }
 
-test("publishing is manual, default-off and never prunes the pinned bridge", () => {
+test("publishing is manual, default-off and uses native-release", () => {
   const workflow = readWorkflow("native-release");
   assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /^  (push|release):/m);
@@ -73,15 +45,10 @@ test("publishing is manual, default-off and never prunes the pinned bridge", () 
   assert.doesNotMatch(workflow, /release delete|cleanup-tag|prune-rolling|--clobber/);
 });
 
-test("the Windows installer proof checks the pinned bridge before launch", () => {
+test("the Windows installer proof runs the native installer directly", () => {
   const script = readFileSync(new URL("test-native-installer.ps1", import.meta.url), "utf8");
-  assert.match(script, /\$expectedBridgeHash = \[string\]\$transition\.bridgeInstallerSha256\b/);
-  assert.match(script, /\$actualBridgeHash -cne \$expectedBridgeHash -or \$actualBridgeHash -cne \$Matches\[1\]/);
-  const verifyIndex = script.indexOf("Bridge installer SHA-256 verification failed");
-  const launchIndex = script.indexOf("Start-Process -FilePath $BridgeInstaller");
-  assert.ok(verifyIndex >= 0, "expected SHA-256 verification error check in installer proof");
-  assert.ok(launchIndex > verifyIndex, "installer verification must precede launching the bridge installer");
-  assert.equal(transition.bridgeInstallerSha256, "9c16797d7b6dd24bf39465e04f2a266c97cb1f8b401d86897a7cd1d0dfd6112e");
+  assert.doesNotMatch(script, /BridgeInstaller|release-transition|PROFILE_TRANSFER|migrate\.py/);
+  assert.match(script, /Start-Process -FilePath \$installer\[0\]\.FullName/);
 });
 
 function workflowJob(workflow, name) {
@@ -95,18 +62,17 @@ test("release workflow builds and publishes the planned commit", () => {
   const [planJob, buildJob, publishJob] = ["plan", "build", "publish"].map(name => workflowJob(workflow, name));
   assert.match(planJob, /commit: \$\{\{ steps\.plan\.outputs\.commit \}\}/);
   assert.match(planJob, /ref: refs\/tags\/\$\{\{ inputs\.tag \}\}\s+fetch-depth: 0/);
-  assert.match(planJob, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}\s+run:\s*node \.github\/release-transition\.mjs plan native "\$RELEASE_TAG"/);
+  assert.match(planJob, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}\s+run:\s*node \.github\/native-release\.mjs plan "\$RELEASE_TAG"/);
   assert.doesNotMatch(planJob, /commit=.*GITHUB_OUTPUT/);
   assert.match(buildJob, /source-ref: \$\{\{ needs\.plan\.outputs\.commit \}\}/);
   assert.match(publishJob, /ref: \$\{\{ needs\.plan\.outputs\.commit \}\}\s+fetch-depth: 0/);
-  assert.match(publishJob, /RELEASE_COMMIT: \$\{\{ needs\.plan\.outputs\.commit \}\}\s+run: .* publish native /);
+  assert.match(publishJob, /RELEASE_COMMIT: \$\{\{ needs\.plan\.outputs\.commit \}\}\s+run: .*native-release\.mjs publish /);
   assert.match(publishJob, /artifact-ids: \$\{\{ needs\.build\.outputs\.linux-artifact-id \}\},\$\{\{ needs\.build\.outputs\.windows-artifact-id \}\}/);
 });
 
 test("candidate build and installer proof use the same resolved commit", () => {
   const workflow = readWorkflow("native-candidate");
   const resolve = workflowJob(workflow, "resolve-source");
-  assert.match(workflow, /KURISU_RELEASE_REPOSITORY: \$\{\{ vars\.KURISU_RELEASE_REPOSITORY \|\| 'CateDesu\/Kurisu' \}\}/);
   assert.match(resolve, /ref: \$\{\{ inputs\.source-ref \|\| github\.sha \}\}/);
   assert.match(resolve, /commit: \$\{\{ steps\.source\.outputs\.commit \}\}/);
   assert.match(resolve, /git rev-parse HEAD/);
@@ -118,8 +84,8 @@ test("candidate build and installer proof use the same resolved commit", () => {
   const dependencies = verify.match(/needs:\s*\[([^\]]+)\]/)[1].split(",").map(name => name.trim());
   assert.ok(dependencies.includes("build") && dependencies.includes("resolve-source"));
   assert.match(verify, /artifact-ids: \$\{\{ needs\.build\.outputs\.windows-artifact-id \}\}/);
-  assert.match(verify, /--repo \$env:KURISU_RELEASE_REPOSITORY.*--pattern '\*_x64-setup\.exe\.sha256'/);
-  assert.match(verify, /test-native-installer\.ps1 -BridgeInstaller/);
+  assert.match(verify, /run: \.github\/test-native-installer\.ps1$/m);
+  assert.doesNotMatch(workflow, /release-transition|test_migrate|PROFILE_TRANSFER/);
   assert.match(workflow, /name: kurisu-native-\$\{\{ runner\.os \}\}-attempt-\$\{\{ github\.run_attempt \}\}/);
   assert.doesNotMatch(workflow, /overwrite: true/);
 });
@@ -135,32 +101,23 @@ function publicationFixture(context, checkedOutCommit = sourceCommit) {
   const directory = mkdtempSync(join(tmpdir(), "kurisu-release-proof-"));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   const bin = join(directory, "bin");
-  const source = join(directory, "frozen-bridge");
   const artifact = join(directory, "build-artifact");
   const published = join(directory, "published-assets");
   const stage = join(directory, "stage");
-  for (const path of [bin, source, artifact, published]) mkdirSync(path);
-  for (const name of [...bridgeNames.filter(name => !name.endsWith(".sha256")),
-    ...nativeNames("v1.1.0").filter(name => !name.endsWith(".sha256"))]) {
-    const target = name.startsWith("kurisu-native") || name.endsWith("-install.exe") || name.endsWith(".tar.gz") ? artifact : source;
+  for (const path of [bin, artifact, published]) mkdirSync(path);
+  for (const name of nativeNames("v1.1.0").filter(name => !name.endsWith(".sha256"))) {
     const payload = Buffer.from(`immutable payload for ${name}`);
-    writeFileSync(join(target, name), payload);
-    writeFileSync(join(target, `${name}.sha256`), `${createHash("sha256").update(payload).digest("hex")}  ${name}\n`);
+    writeFileSync(join(artifact, name), payload);
+    writeFileSync(join(artifact, `${name}.sha256`), `${createHash("sha256").update(payload).digest("hex")}  ${name}\n`);
   }
   const restage = () => {
     rmSync(stage, { recursive: true, force: true });
     cpSync(artifact, stage, { recursive: true });
   };
   restage();
-  const pinnedDigest = createHash("sha256").update(readFileSync(join(source, installer))).digest("hex");
-  const scriptPath = join(directory, "release-transition.mjs");
-  writeFileSync(scriptPath, readFileSync(new URL("release-transition.mjs", import.meta.url)));
-  writeFileSync(join(directory, "release-transition.json"), JSON.stringify({
-    ...transition,
-    bridgeInstallerSha256: pinnedDigest,
-  }));
-  writeFileSync(join(directory, "bridge.json"), JSON.stringify(bridge()));
-  writeFileSync(join(directory, "releases.json"), JSON.stringify([[{ tag_name: "v1.0.0.78", draft: false, prerelease: false }], []]));
+  const scriptPath = join(directory, "native-release.mjs");
+  writeFileSync(scriptPath, readFileSync(new URL("native-release.mjs", import.meta.url)));
+  writeFileSync(join(directory, "releases.json"), JSON.stringify([[{ tag_name: "v1.0.0", draft: false, prerelease: false }], []]));
   writeFileSync(join(bin, "git"), `#!/bin/sh
 if [ -n "$KURISU_TEST_GIT_LOG" ]; then
   printf '%s\\n' "$*" >> "$KURISU_TEST_GIT_LOG"
@@ -275,13 +232,7 @@ if (args[0] === "api") {
   } else if (args[1]?.endsWith("/releases/" + state?.id)) {
     console.log(JSON.stringify(state));
   } else {
-    console.log(fs.readFileSync(process.env.KURISU_TEST_BRIDGE, "utf8"));
-  }
-} else if (args[1] === "download") {
-  const destination = args[args.indexOf("--dir") + 1];
-  for (let index = 0; index < args.length; index++) if (args[index] === "--pattern") {
-    const name = args[index + 1];
-    fs.copyFileSync(path.join(process.env.KURISU_TEST_SOURCE, name), path.join(destination, name), fs.constants.COPYFILE_EXCL);
+    throw new Error("Unexpected gh api call: " + args.join(" "));
   }
 } else {
   throw new Error("Unexpected gh invocation: " + args.join(" "));
@@ -290,17 +241,16 @@ if (args[0] === "api") {
   const log = join(directory, "commands.jsonl");
   const gitLog = join(directory, "git.log");
   const execute = (extraEnv = {}, command = "publish", tag = "v1.1.0") => spawnSync(process.execPath, [scriptPath,
-    command, "native", tag, stage], { cwd: directory, encoding: "utf8", env: {
+    command, tag, stage], { cwd: directory, encoding: "utf8", env: {
       ...process.env, PATH: `${bin}:${process.env.PATH}`, KURISU_TEST_LOG: log,
       GITHUB_REPOSITORY: "CateDesu/Kurisu", RELEASE_COMMIT: checkedOutCommit,
       KURISU_TEST_GIT_LOG: gitLog,
       KURISU_TEST_DRAFT: join(directory, "draft.json"),
       KURISU_TEST_PUBLISHED: published,
-      KURISU_TEST_SOURCE: source, KURISU_TEST_BRIDGE: join(directory, "bridge.json"),
       KURISU_TEST_RELEASES: join(directory, "releases.json"), ...extraEnv,
     } });
   const commands = () => readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
-  return { directory, source, stage, published, log, gitLog, execute, commands, restage };
+  return { directory, stage, published, log, gitLog, execute, commands, restage };
 }
 
 const releaseWrite = args => ["POST", "PATCH", "DELETE"].includes(args[2]);
@@ -315,7 +265,7 @@ test("publication waits for the release list after creating and publishing the d
   assert.equal(result.status, 0, result.stderr);
   const commands = fixture.commands();
   assert.equal(commands.filter(createDraft).length, 1);
-  assert.equal(commands.filter(uploadAsset).length, bridgeNames.length + nativeNames("v1.1.0").length);
+  assert.equal(commands.filter(uploadAsset).length, nativeNames("v1.1.0").length);
   assert.equal(commands.filter(args => args[2] === "PATCH").length, 1);
   for (const write of [commands.find(createDraft), commands.find(args => args[2] === "PATCH")]) {
     const index = commands.indexOf(write);
@@ -380,7 +330,7 @@ test("a failed upload can resume on the same tag without replacing its uploaded 
   assert.equal(after.draft, false);
   assert.doesNotMatch(after.body, /Kurisu native release draft for/);
   assert.ok(after.assets.some(asset => JSON.stringify(asset) === JSON.stringify(before.assets[0])));
-  assert.deepEqual(after.assets.map(asset => asset.name).sort(), [...bridgeNames, ...nativeNames("v1.1.0")].sort());
+  assert.deepEqual(after.assets.map(asset => asset.name).sort(), nativeNames("v1.1.0").sort());
   assert.equal(fixture.commands().filter(createDraft).length, 1);
 });
 
@@ -488,19 +438,18 @@ test("retry after retention fails reuses the original artifacts and prunes remai
   const first = fixture.execute();
   assert.equal(first.status, 0, first.stderr);
   const release = JSON.parse(readFileSync(join(fixture.directory, "draft.json")));
-  const older = ["v1.0.0.79", "v1.0.0.80"].map((tag_name, index) => ({
+  const older = ["v1.0.9", "v1.0.10"].map((tag_name, index) => ({
     id: index + 2, tag_name, draft: false, prerelease: false,
-    assets: [...bridgeNames, ...nativeNames(tag_name)].map(name => ({ name })),
+    assets: nativeNames(tag_name).map(name => ({ name })),
   }));
-  let releases = [release, { ...bridge(), id: 1 }, ...older];
+  let releases = [release, ...older];
   const deleted = [];
   const runRetention = () => pruneNativeReleases("v1.1.0", fixture.stage, args => {
     if (args.includes("--paginate")) return releases.map(item => JSON.stringify(item)).join("\n");
     if (args[1] === "download") {
-      const source = args[2] === transition.bridgeTag ? fixture.source : fixture.published;
       const destination = args[args.indexOf("--dir") + 1];
       for (let index = 0; index < args.length; index++) if (args[index] === "--pattern") {
-        copyFileSync(join(source, args[index + 1]), join(destination, args[index + 1]));
+        copyFileSync(join(fixture.published, args[index + 1]), join(destination, args[index + 1]));
       }
       return "";
     }
@@ -521,7 +470,7 @@ test("retry after retention fails reuses the original artifacts and prunes remai
   assert.ok(!fixture.commands().slice(offset).some(releaseWrite));
   assert.deepEqual(runRetention().removed, [older[1].tag_name]);
   assert.deepEqual(deleted, older.map(item => item.id));
-  assert.deepEqual(releases.map(item => item.tag_name), ["v1.1.0", transition.bridgeTag]);
+  assert.deepEqual(releases.map(item => item.tag_name), ["v1.1.0"]);
 });
 
 test("retry refuses changed draft metadata, assets, published state and moved tags before writing", {
@@ -567,7 +516,7 @@ test("plan exports the version and verified commit", { skip: process.platform ==
 test("plan rejects invalid tags before invoking git and requires HEAD to match the tag", {
   skip: process.platform === "win32",
 }, context => {
-  for (const badTag of ["v1.1.0-beta", transition.bridgeTag, "--verify"]) {
+  for (const badTag of ["v1.1.0-beta", "v1.1.65536", "--verify"]) {
     const fixture = publicationFixture(context);
     const result = fixture.execute({}, "plan", badTag);
     assert.equal(result.status, 1, `plan accepted invalid tag ${badTag}`);
@@ -596,28 +545,25 @@ test("publication rejects an invalid planned commit", { skip: process.platform =
   assert.match(result.stderr, /Invalid planned release commit/);
 });
 
-test("publication handles a large release history and copies verified bridge assets into the release", {
+test("publication handles a large release history and uploads verified native assets", {
   skip: process.platform === "win32",
 }, context => {
   const fixture = publicationFixture(context);
   const drafts = Array.from({ length: 100 }, (_, index) => ({
     tag_name: `v2.0.${index}`, draft: true, prerelease: false, body: "x".repeat(20_000),
   }));
-  writeFileSync(join(fixture.directory, "releases.json"), JSON.stringify([drafts, [bridge()]]));
+  writeFileSync(join(fixture.directory, "releases.json"), JSON.stringify([drafts, []]));
   const result = fixture.execute({ RELEASE_COMMIT: sourceCommit, KURISU_TEST_ANNOTATED_TAG: "1" });
   assert.equal(result.status, 0, result.stderr);
   const published = JSON.parse(readFileSync(join(fixture.directory, "draft.json")));
   assert.equal(published.target_commitish, "main");
   assert.equal(published.draft, false);
-  assert.equal(published.assets.length, nativeNames("v1.1.0").length + bridgeNames.length);
+  assert.equal(published.assets.length, nativeNames("v1.1.0").length);
   for (const { name, state, size, digest } of published.assets) {
     const local = readFileSync(join(fixture.stage, name));
     assert.equal(state, "uploaded");
     assert.equal(size, local.length);
     assert.equal(digest, `sha256:${createHash("sha256").update(local).digest("hex")}`);
-  }
-  for (const name of bridgeNames) {
-    assert.deepEqual(readFileSync(join(fixture.stage, name)), readFileSync(join(fixture.source, name)));
   }
   const commands = fixture.commands();
   assert.ok(commands.some(args => args.includes("--paginate") && args.includes("--jq")));
@@ -626,7 +572,6 @@ test("publication handles a large release history and copies verified bridge ass
   assert.equal(commands[commands.indexOf(draft) - 1][1], "repos/CateDesu/Kurisu/git/tags/" + "c".repeat(40));
   assert.ok(draft.includes(`target_commitish=${sourceCommit}`));
   const uploads = commands.filter(uploadAsset);
-  assert.ok(uploads.some(args => args.includes(join(fixture.stage, installer))));
   assert.ok(uploads.some(args => args.includes(join(fixture.stage, "Kurisu-Native_1.1.0_x64-install.exe"))));
   assert.ok(uploads.every(args => !args.includes("--clobber")));
   const publish = commands.filter(releaseWrite).at(-1);
@@ -634,53 +579,6 @@ test("publication handles a large release history and copies verified bridge ass
   assert.equal(publish[3], "repos/CateDesu/Kurisu/releases/123");
   assert.ok(publish.includes("draft=false"));
   assert.ok(publish.includes("make_latest=true"));
-});
-
-test("damaged frozen bridge refuses publication without creating or editing a release", {
-  skip: process.platform === "win32",
-}, context => {
-  const fixture = publicationFixture(context);
-  writeFileSync(join(fixture.source, "kurisu"), "damaged after original checksum was written");
-  const result = fixture.execute();
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /checksum did NOT match|FAILED/);
-  assert.ok(!fixture.commands().some(releaseWrite));
-});
-
-test("publication preserves mismatched staged bridge bytes and retries with matching bytes", {
-  skip: process.platform === "win32",
-}, context => {
-  const fixture = publicationFixture(context);
-  const asset = join(fixture.stage, "kurisu");
-  const checksum = asset + ".sha256";
-  const mismatched = Buffer.from("different staged bridge binary");
-  const sidecar = `${createHash("sha256").update(mismatched).digest("hex")}  kurisu\n`;
-  writeFileSync(asset, mismatched);
-  writeFileSync(checksum, sidecar);
-  const refused = fixture.execute();
-  assert.equal(refused.status, 1);
-  assert.match(refused.stderr, /Staged asset differs from the pinned bridge: kurisu/);
-  assert.deepEqual(readFileSync(asset), mismatched);
-  assert.equal(readFileSync(checksum, "utf8"), sidecar);
-  assert.ok(!fixture.commands().some(releaseWrite));
-
-  for (const name of ["kurisu", "kurisu.sha256"]) {
-    writeFileSync(join(fixture.stage, name), readFileSync(join(fixture.source, name)));
-  }
-  const retry = fixture.execute();
-  assert.equal(retry.status, 0, retry.stderr);
-  assert.equal(fixture.commands().filter(createDraft).length, 1);
-});
-
-test("a draft or missing bridge asset refuses native publication before any write", {
-  skip: process.platform === "win32",
-}, context => {
-  const fixture = publicationFixture(context);
-  writeFileSync(join(fixture.directory, "bridge.json"), JSON.stringify({ ...bridge(), draft: true }));
-  const result = fixture.execute();
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /published stable release/);
-  assert.ok(!fixture.commands().some(args => releaseWrite(args) || args[1] === "download"));
 });
 
 test("publication rejects newer stable releases and existing draft tags on later pages", {
@@ -721,19 +619,6 @@ test("publication rejects an empty native bundle with a matching checksum", {
   const result = fixture.execute();
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Empty release asset: Kurisu_1\.1\.0_linux-x64\.tar\.gz/);
-  assert.ok(!fixture.commands().some(releaseWrite));
-});
-
-test("publication verifies the pinned bridge installer digest even when its sidecar matches", {
-  skip: process.platform === "win32",
-}, context => {
-  const fixture = publicationFixture(context);
-  const replaced = Buffer.from("tampered legacy bridge installer with matching sidecar");
-  writeFileSync(join(fixture.source, installer), replaced);
-  writeFileSync(join(fixture.source, `${installer}.sha256`), `${createHash("sha256").update(replaced).digest("hex")}  ${installer}\n`);
-  const tampered = fixture.execute();
-  assert.notEqual(tampered.status, 0);
-  assert.match(tampered.stderr, /Bridge installer SHA-256/);
   assert.ok(!fixture.commands().some(releaseWrite));
 });
 

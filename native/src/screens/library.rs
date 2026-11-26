@@ -3054,7 +3054,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let (view, cx) = cx.add_window_view(|window, cx| {
@@ -3178,7 +3177,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let (view, cx) = cx.add_window_view(|window, cx| {
@@ -3241,7 +3239,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(super::super::workspace_tests::TestPlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let folder = dir.0.join("shows");
@@ -3435,7 +3432,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(super::super::workspace_tests::TestPlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let folder = dir.0.join("shows");
@@ -3975,7 +3971,6 @@ mod tests {
             directory.0.clone(),
             runtime.handle().clone(),
             Arc::new(NoExternal),
-            kurisu_core::UpdateChannel::Native,
         );
         let observer = core.clone();
         let (workspace, cx) = cx.add_window_view(|window, cx| {
@@ -4099,7 +4094,6 @@ mod tests {
             std::env::temp_dir(),
             runtime.handle().clone(),
             Arc::new(NoExternal),
-            kurisu_core::UpdateChannel::Native,
         );
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         workspace.update_in(cx, |this, window, cx| {
@@ -4204,7 +4198,6 @@ mod tests {
             std::env::temp_dir(),
             runtime.handle().clone(),
             Arc::new(NoExternal),
-            kurisu_core::UpdateChannel::Native,
         );
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         workspace.update_in(cx, |workspace, _, cx| {
@@ -4287,7 +4280,6 @@ mod tests {
             std::env::temp_dir(),
             runtime.handle().clone(),
             Arc::new(NoExternal),
-            kurisu_core::UpdateChannel::Native,
         );
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         workspace.update_in(cx, |this, window, cx| {
@@ -4370,7 +4362,6 @@ mod tests {
             std::env::temp_dir(),
             runtime.handle().clone(),
             Arc::new(NoExternalActions),
-            kurisu_core::UpdateChannel::Native,
         );
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         workspace.update_in(cx, |this, window, cx| {
@@ -4586,13 +4577,9 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let core = kurisu_core::Core::open(
-            root.clone(),
-            runtime.handle().clone(),
-            Arc::new(NoExternal),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(root.clone(), runtime.handle().clone(), Arc::new(NoExternal))
+                .unwrap();
         runtime
             .block_on(core.add_library_folder(anime_dir.to_string_lossy().into_owned()))
             .unwrap();
@@ -4733,7 +4720,7 @@ mod modal_regressions {
     use super::super::workspace_tests::{TestPlatform, fixture, settle};
     use super::*;
     use gpui::accesskit::{Action, ActionRequest, TreeId};
-    use kurisu_core::{Core, Db, UpdateChannel, User};
+    use kurisu_core::{Core, Db, User};
 
     #[gpui::test]
     fn library_cancel_button_and_escape_share_the_edit_fence(cx: &mut gpui::TestAppContext) {
@@ -4872,7 +4859,6 @@ mod modal_regressions {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         let folder = dir.0.join("shows");
@@ -5103,7 +5089,6 @@ mod modal_regressions {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         let folder = dir.0.join("shows");
@@ -5252,7 +5237,6 @@ mod modal_regressions {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         let folder = dir.0.join("shows");
@@ -5501,7 +5485,6 @@ mod modal_regressions {
                 dir.to_path_buf(),
                 runtime.handle().clone(),
                 Arc::new(TestPlatform),
-                UpdateChannel::Native,
             )
             .unwrap();
             runtime

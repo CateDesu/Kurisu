@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::anilist::{self, AniList};
-use crate::db::{CatalogRead, CatalogUpdate, Db, ListPreferences, TOKEN_KEY, TOKEN_REJECTED_KEY};
+use crate::db::{CatalogRead, CatalogUpdate, Db, TOKEN_KEY, TOKEN_REJECTED_KEY};
 use crate::library;
 use crate::models::{
     AiringItem, EntryDetails, FuzzyDate, LibraryScan, ListEntry, ListStatus, Media, MediaDetail,
@@ -762,17 +762,17 @@ pub fn set_app_setting(key: String, value: String, state: &AppState) -> Result<(
 pub async fn login_with_token(
     token: String,
     state: &AppState,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<User, String> {
     let intent = state.begin_auth_intent();
-    login_with_token_inner(token, state, intent, preferences).await
+    login_with_token_inner(token, state, intent, last_account).await
 }
 
 pub(crate) async fn login_with_token_inner(
     token: String,
     state: &AppState,
     intent: u64,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<User, String> {
     state.check_auth_intent(intent)?;
     // Keep the current token until the replacement passes verification.
@@ -799,7 +799,7 @@ pub(crate) async fn login_with_token_inner(
     let account_changed =
         match state
             .db
-            .replace_account_with_preferences(&token, &user, preferences)
+            .replace_account_with_last_account(&token, &user, last_account)
         {
             Ok(changed) => changed,
             Err(e) => {
@@ -823,7 +823,7 @@ pub async fn login_oauth(
     platform: &dyn crate::Platform,
     state: &AppState,
     intent: u64,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<User, String> {
     state.check_auth_intent(intent)?;
     let client_id = state
@@ -844,14 +844,14 @@ pub async fn login_oauth(
     let (oauth_state, _, rx) = start_oauth_callback(state, intent, anilist::OAUTH_PORT).await?;
     let url = anilist::authorize_url(&client_id, &redirect_uri, &oauth_state);
     platform.open_url(&url)?;
-    finish_oauth_login(state, intent, rx, preferences).await
+    finish_oauth_login(state, intent, rx, last_account).await
 }
 
 async fn finish_oauth_login(
     state: &AppState,
     intent: u64,
     receiver: anilist::OAuthReceiver,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<User, String> {
     let code = wait_for_oauth_code(state, intent, receiver).await?;
     let api = state.anilist.lock().clone();
@@ -859,7 +859,7 @@ async fn finish_oauth_login(
         result = api.exchange_code(&code) => result.map_err(|e| e.to_string())?,
         _ = state.auth_intent_changed(intent) => return Err(AUTH_REPLACED.into()),
     };
-    login_with_token_inner(token, state, intent, preferences).await
+    login_with_token_inner(token, state, intent, last_account).await
 }
 
 async fn start_oauth_callback(
@@ -1001,18 +1001,18 @@ fn finish_logout(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn refresh_current_user(state: &AppState) -> Result<Option<User>, String> {
-    current_user_mode(state, true, ListPreferences::Preserve).await
+    current_user_mode(state, true, None).await
 }
 
 #[cfg(test)]
 async fn current_user_inner(state: &AppState) -> Result<Option<User>, String> {
-    current_user_mode(state, false, ListPreferences::Preserve).await
+    current_user_mode(state, false, None).await
 }
 
 pub(crate) async fn current_user_mode(
     state: &AppState,
     refresh: bool,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<Option<User>, String> {
     let intent = *state.auth_intent.borrow();
     let (al, origin) = {
@@ -1059,10 +1059,10 @@ pub(crate) async fn current_user_mode(
             if switching {
                 *state.matchers.lock() = Arc::new(Vec::new());
             }
-            let changed = match state.db.replace_account_with_preferences(
+            let changed = match state.db.replace_account_with_last_account(
                 token_used.as_deref().unwrap(),
                 &u,
-                preferences,
+                last_account,
             ) {
                 Ok(changed) => changed,
                 Err(e) => {
@@ -1097,13 +1097,10 @@ pub(crate) async fn current_user_mode(
                 .map_err(|e| e.to_string())?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| e.to_string())?;
-            let id = match preferences {
-                ListPreferences::Native { .. } => origin
-                    .account_id
-                    .filter(|id| anilist::valid_account_id(*id))
-                    .unwrap_or_default(),
-                ListPreferences::Preserve => 0,
-            };
+            let id = origin
+                .account_id
+                .filter(|id| anilist::valid_account_id(*id))
+                .unwrap_or_default();
             let mut user = state
                 .db
                 .cached_user()
@@ -1503,14 +1500,14 @@ pub async fn get_airing_schedule(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn sync_my_list(state: &Arc<AppState>) -> Result<Vec<ListEntry>, String> {
-    sync_my_list_mode(state, ListPreferences::Preserve).await
+    sync_my_list_mode(state, None).await
 }
 
 pub(crate) async fn sync_my_list_mode(
     state: &Arc<AppState>,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<Vec<ListEntry>, String> {
-    sync_my_list_inner(state, preferences).await
+    sync_my_list_inner(state, last_account).await
 }
 
 fn saved_api_account_id(state: &AppState) -> Option<i64> {
@@ -1533,7 +1530,7 @@ fn check_read_account(
 
 async fn sync_my_list_inner(
     state: &Arc<AppState>,
-    preferences: ListPreferences,
+    last_account: Option<i64>,
 ) -> Result<Vec<ListEntry>, String> {
     let pre_intent = *state.auth_intent.borrow();
     let pre_token = state.anilist.lock().token();
@@ -1543,7 +1540,7 @@ async fn sync_my_list_inner(
     let pre_account = saved_api_account_id(state);
     if pre_account.is_none() {
         // Profile adoption acquires remote_lock itself.
-        current_user_mode(state, true, preferences).await?;
+        current_user_mode(state, true, last_account).await?;
     }
     let remote = state.remote_lock.clone().lock_owned().await;
     let _write = state.entry_lock.lock().await;
@@ -1623,7 +1620,7 @@ async fn sync_my_list_inner(
             &state.db,
             entries.iter_mut().filter_map(|entry| entry.media.as_mut()),
         );
-        state.db.replace_account_and_list(&token, &user, preferences, Some(&entries)).map_err(|e| {
+        state.db.replace_account_and_list(&token, &user, last_account, Some(&entries)).map_err(|e| {
             format!(
                 "sync incomplete: the remote list could not be cached, remote deletions were not reconciled: {e}"
             )
@@ -4871,50 +4868,25 @@ async fn update_entry_details_target(
 
 static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub async fn check_update(
-    channel: crate::UpdateChannel,
-) -> Result<crate::models::UpdateInfo, String> {
-    let rel = crate::updater::fetch_latest_release_channel(channel).await?;
-    Ok(crate::updater::update_info_channel(&rel, channel))
+pub async fn check_update() -> Result<crate::models::UpdateInfo, String> {
+    let rel = crate::updater::fetch_latest_release().await?;
+    Ok(crate::updater::update_info(&rel))
 }
 
-pub async fn check_bridge_update() -> Result<crate::models::UpdateInfo, String> {
-    let rel = crate::updater::fetch_bridge_release().await?;
-    Ok(crate::updater::bridge_update_info(&rel))
-}
-
-pub async fn install_bridge_update(data_dir: std::path::PathBuf) -> Result<String, String> {
-    install_update_with(data_dir, crate::UpdateChannel::Native, true).await
-}
-
-pub async fn install_update(
-    data_dir: std::path::PathBuf,
-    channel: crate::UpdateChannel,
-) -> Result<String, String> {
-    install_update_with(data_dir, channel, false).await
-}
-
-async fn install_update_with(
-    data_dir: std::path::PathBuf,
-    channel: crate::UpdateChannel,
-    bridge: bool,
-) -> Result<String, String> {
+pub async fn install_update(data_dir: std::path::PathBuf) -> Result<String, String> {
     // Serialize installs to prevent scratch file collisions.
     let _install = INSTALL_LOCK
         .try_lock()
         .map_err(|_| "an update is already in progress".to_string())?;
-    // Restart after replacing the running build, even for a same-version bridge handoff.
     if crate::updater::update_applied() {
         return Err("an update was already installed; restart Kurisu to finish".to_string());
     }
-    let rel = crate::updater::fetch_latest_release_channel(channel).await?;
+    let rel = crate::updater::fetch_latest_release().await?;
     let current = crate::updater::current_version();
-    if crate::updater::is_newer(current, &rel.version)
-        || (!bridge && !crate::updater::is_newer(&rel.version, current))
-    {
+    if !crate::updater::is_newer(&rel.version, current) {
         return Err("the latest release is not newer than this build".to_string());
     }
-    let asset = crate::updater::platform_asset_channel(&rel, channel)
+    let asset = crate::updater::platform_asset(&rel)
         .ok_or_else(|| "the latest release has no build for this platform".to_string())?
         .to_string();
     let url = rel
@@ -6024,16 +5996,9 @@ mod regression_tests {
             .await
             .unwrap();
         assert!(callback.status().is_success());
-        let user = finish_oauth_login(
-            &state,
-            intent,
-            receiver,
-            ListPreferences::Native {
-                last_account: Some(8),
-            },
-        )
-        .await
-        .unwrap();
+        let user = finish_oauth_login(&state, intent, receiver, Some(8))
+            .await
+            .unwrap();
         assert!(state
             .db
             .get_setting("native_preference:kurisu.list.q")
@@ -6066,7 +6031,7 @@ mod regression_tests {
         let intent = state.begin_auth_intent();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         sender.send(Ok("expired-code".into())).unwrap();
-        let error = finish_oauth_login(&state, intent, receiver, ListPreferences::Preserve)
+        let error = finish_oauth_login(&state, intent, receiver, None)
             .await
             .unwrap_err();
         assert!(error.contains("Start sign-in again"));
@@ -6090,7 +6055,7 @@ mod regression_tests {
         sender.send(Ok("old-code".into())).unwrap();
         state.begin_auth_intent();
         assert_eq!(
-            finish_oauth_login(&state, intent, receiver, ListPreferences::Preserve)
+            finish_oauth_login(&state, intent, receiver, None)
                 .await
                 .unwrap_err(),
             AUTH_REPLACED
@@ -6161,7 +6126,7 @@ mod regression_tests {
             .await
             .unwrap()
             .contains("Authorization received"));
-        let user = finish_oauth_login(&state, new_intent, next_receiver, ListPreferences::Preserve)
+        let user = finish_oauth_login(&state, new_intent, next_receiver, None)
             .await
             .unwrap();
         assert_eq!(user.id, 8);
@@ -6186,7 +6151,7 @@ mod regression_tests {
         sender.send(Ok("old-code".into())).unwrap();
         state.cancel_login();
         assert_eq!(
-            finish_oauth_login(&state, intent, receiver, ListPreferences::Preserve)
+            finish_oauth_login(&state, intent, receiver, None)
                 .await
                 .unwrap_err(),
             AUTH_REPLACED
@@ -6208,13 +6173,7 @@ mod regression_tests {
         let intent = state.begin_auth_intent();
         let waiting = state.clone();
         let job = tokio::spawn(async move {
-            login_with_token_inner(
-                "replacement-token".into(),
-                &waiting,
-                intent,
-                ListPreferences::Preserve,
-            )
-            .await
+            login_with_token_inner("replacement-token".into(), &waiting, intent, None).await
         });
         assert!(requests.recv().await.unwrap()["query"]
             .as_str()
@@ -6240,13 +6199,7 @@ mod regression_tests {
         let intent = state.begin_auth_intent();
         let waiting = state.clone();
         let job = tokio::spawn(async move {
-            login_with_token_inner(
-                "replacement-token".into(),
-                &waiting,
-                intent,
-                ListPreferences::Preserve,
-            )
-            .await
+            login_with_token_inner("replacement-token".into(), &waiting, intent, None).await
         });
         requests.recv().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -6277,25 +6230,13 @@ mod regression_tests {
         let first_intent = state.begin_auth_intent();
         let first_state = state.clone();
         let first = tokio::spawn(async move {
-            login_with_token_inner(
-                "earlier-token".into(),
-                &first_state,
-                first_intent,
-                ListPreferences::Preserve,
-            )
-            .await
+            login_with_token_inner("earlier-token".into(), &first_state, first_intent, None).await
         });
         requests.recv().await.unwrap();
         let latest_intent = state.begin_auth_intent();
         let latest_state = state.clone();
         let latest = tokio::spawn(async move {
-            login_with_token_inner(
-                "latest-token".into(),
-                &latest_state,
-                latest_intent,
-                ListPreferences::Preserve,
-            )
-            .await
+            login_with_token_inner("latest-token".into(), &latest_state, latest_intent, None).await
         });
         requests.recv().await.unwrap();
         drop(guard);
@@ -6317,13 +6258,7 @@ mod regression_tests {
         let first_intent = state.begin_auth_intent();
         let first_state = state.clone();
         let first = tokio::spawn(async move {
-            login_with_token_inner(
-                "earlier-token".into(),
-                &first_state,
-                first_intent,
-                ListPreferences::Preserve,
-            )
-            .await
+            login_with_token_inner("earlier-token".into(), &first_state, first_intent, None).await
         });
         requests.recv().await.unwrap();
         let logout_intent = state.begin_auth_intent();
@@ -6365,14 +6300,9 @@ mod regression_tests {
         let old_intent = state.begin_auth_intent();
         state.begin_auth_intent();
         assert_eq!(
-            login_with_token_inner(
-                "old-token".into(),
-                &state,
-                old_intent,
-                ListPreferences::Preserve
-            )
-            .await
-            .unwrap_err(),
+            login_with_token_inner("old-token".into(), &state, old_intent, None)
+                .await
+                .unwrap_err(),
             AUTH_REPLACED
         );
         assert!(requests.try_recv().is_err());
@@ -6413,9 +6343,7 @@ mod regression_tests {
                     let user = current_user_inner(&state).await.unwrap();
                     assert!(user.is_some_and(|user| user.offline && user.id == 7));
                 }
-                "sync" => assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                    .await
-                    .is_err()),
+                "sync" => assert!(sync_my_list_inner(&state, None).await.is_err()),
                 _ => {
                     let entry =
                         save_entry_inner(&state, 1, Some("PAUSED".into()), None, None, None)
@@ -6488,23 +6416,6 @@ mod regression_tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_offline_profile_is_marked_unavailable() {
-        let (api, _) = anilist::mock_api(vec![(
-            503,
-            json!({"errors": [{"message": "Service unavailable"}]}),
-        )])
-        .await;
-        let state = state_with_api(api);
-        state.db.set_setting(USERNAME_KEY, "Tester").unwrap();
-        state.db.set_setting(USER_ID_KEY, "71").unwrap();
-        let offline = current_user_inner(&state).await.unwrap().unwrap();
-        assert!(offline.offline);
-        assert!(offline.score_format.is_none());
-        assert_eq!(offline.name, "Tester");
-        assert_eq!(offline.id, 0);
-    }
-
-    #[tokio::test]
     async fn native_offline_profile_uses_saved_identity_without_cached_json() {
         for with_cached_profile in [false, true] {
             for (saved, expected) in [("71", 71), ("0", 0), ("-1", 0), ("2147483648", 0)] {
@@ -6534,14 +6445,10 @@ mod regression_tests {
                     with_cached_profile && expected != 0
                 );
 
-                let offline = current_user_mode(
-                    &state,
-                    false,
-                    ListPreferences::Native { last_account: None },
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                let offline = current_user_mode(&state, false, None)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert!(offline.offline);
                 assert_eq!(offline.id, expected);
                 assert_eq!(offline.name, "Tester");
@@ -6625,25 +6532,11 @@ mod regression_tests {
                 .unwrap();
             gate.add_permits(1);
             let failed = if via_refresh {
-                current_user_mode(
-                    &state,
-                    true,
-                    ListPreferences::Native {
-                        last_account: Some(7),
-                    },
-                )
-                .await
-                .unwrap_err()
+                current_user_mode(&state, true, Some(7)).await.unwrap_err()
             } else {
-                login_with_token(
-                    "token-b".into(),
-                    &state,
-                    ListPreferences::Native {
-                        last_account: Some(7),
-                    },
-                )
-                .await
-                .unwrap_err()
+                login_with_token("token-b".into(), &state, Some(7))
+                    .await
+                    .unwrap_err()
             };
             assert!(failed.contains("switch failed"), "{failed}");
             assert_eq!(state.matchers.lock()[0].media_id, 1);
@@ -6702,24 +6595,11 @@ mod regression_tests {
             let worker_state = state.clone();
             let job = tokio::spawn(async move {
                 if via_refresh {
-                    current_user_mode(
-                        &worker_state,
-                        true,
-                        ListPreferences::Native {
-                            last_account: Some(7),
-                        },
-                    )
-                    .await
-                    .map(|u| u.unwrap())
+                    current_user_mode(&worker_state, true, Some(7))
+                        .await
+                        .map(|u| u.unwrap())
                 } else {
-                    login_with_token(
-                        "token-b".into(),
-                        &worker_state,
-                        ListPreferences::Native {
-                            last_account: Some(7),
-                        },
-                    )
-                    .await
+                    login_with_token("token-b".into(), &worker_state, Some(7)).await
                 }
             });
             requests.recv().await.unwrap();
@@ -6910,14 +6790,10 @@ mod regression_tests {
             );
 
             assert_eq!(
-                login_with_token(
-                    "synthetic-other-token".into(),
-                    &state,
-                    ListPreferences::Preserve
-                )
-                .await
-                .unwrap()
-                .id,
+                login_with_token("synthetic-other-token".into(), &state, None)
+                    .await
+                    .unwrap()
+                    .id,
                 8
             );
             assert!(requests.try_recv().unwrap()["query"]
@@ -6939,14 +6815,10 @@ mod regression_tests {
             assert!(state.db.pending(8).unwrap().is_empty());
 
             assert_eq!(
-                login_with_token(
-                    "synthetic-original-token".into(),
-                    &state,
-                    ListPreferences::Preserve
-                )
-                .await
-                .unwrap()
-                .id,
+                login_with_token("synthetic-original-token".into(), &state, None)
+                    .await
+                    .unwrap()
+                    .id,
                 7
             );
             assert!(requests.try_recv().unwrap()["query"]
@@ -8036,9 +7908,7 @@ mod regression_tests {
                     ..Default::default()
                 })
                 .unwrap();
-            assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .is_err());
+            assert!(sync_my_list_inner(&state, None).await.is_err());
             assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 4);
         }
     }
@@ -12010,9 +11880,7 @@ mod persistence_tests {
                         .map(|_| ()),
                     "statistics" => get_user_stats_inner(&worker_state).await.map(|_| ()),
                     "details" => get_entry_details_inner(1, &worker_state).await.map(|_| ()),
-                    "sync" => sync_my_list_inner(&worker_state, ListPreferences::Preserve)
-                        .await
-                        .map(|_| ()),
+                    "sync" => sync_my_list_inner(&worker_state, None).await.map(|_| ()),
                     "queue" => {
                         let _remote = worker_state.remote_lock.lock().await;
                         crate::sync_queue::flush_unlocked(&worker_state).await
@@ -12206,9 +12074,7 @@ mod persistence_tests {
             )])
             .await;
             let state = state(api);
-            assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .is_err());
+            assert!(sync_my_list_inner(&state, None).await.is_err());
             assert_progress_preserved(&state);
             assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
         }
@@ -12378,10 +12244,7 @@ mod persistence_tests {
         .await;
         let state = state(api);
         let syncing = state.clone();
-        let sync =
-            tokio::spawn(
-                async move { sync_my_list_inner(&syncing, ListPreferences::Preserve).await },
-            );
+        let sync = tokio::spawn(async move { sync_my_list_inner(&syncing, None).await });
         requests.recv().await.unwrap();
         let editing = state.clone();
         let edit = tokio::spawn(async move {
@@ -12416,14 +12279,9 @@ mod persistence_tests {
         let intent = state.begin_auth_intent();
         assert_eq!(read.await.unwrap().unwrap_err(), AUTH_REPLACED);
         gate.add_permits(2);
-        login_with_token_inner(
-            "replacement".into(),
-            &state,
-            intent,
-            ListPreferences::Preserve,
-        )
-        .await
-        .unwrap();
+        login_with_token_inner("replacement".into(), &state, intent, None)
+            .await
+            .unwrap();
         assert_eq!(current_user_inner(&state).await.unwrap().unwrap().id, 8);
         assert_eq!(state.anilist.lock().token().as_deref(), Some("replacement"));
         assert!(matches!(
@@ -12881,7 +12739,7 @@ mod persistence_tests {
         assert_eq!(pending.patch.score, Some(80.0));
         assert!(!pending.conflict);
 
-        login_with_token("renewed-session".into(), &state, ListPreferences::Preserve)
+        login_with_token("renewed-session".into(), &state, None)
             .await
             .unwrap();
         assert!(crate::sync_queue::sync_pending_changes(&state)
@@ -14115,9 +13973,7 @@ mod persistence_tests {
             if old_name == "absent" {
                 state.db.delete_setting(USERNAME_KEY).unwrap();
             }
-            let entries = sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .unwrap();
+            let entries = sync_my_list_inner(&state, None).await.unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].media_id, 1);
             assert_eq!(state.db.cached_user().unwrap().unwrap().name, "Renamed");
@@ -14164,9 +14020,7 @@ mod persistence_tests {
                 let (api, _) = anilist::mock_api(replies).await;
                 let state = state(api);
                 let pending = conflicted_intent(&state);
-                assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                    .await
-                    .is_err());
+                assert!(sync_my_list_inner(&state, None).await.is_err());
                 assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
                 assert!(state.db.get_entry(2).unwrap().is_none());
                 assert!(state.anilist.lock().has_token());
@@ -14207,9 +14061,7 @@ mod persistence_tests {
             )
             .unwrap();
 
-        let error = sync_my_list_inner(&state, ListPreferences::Preserve)
-            .await
-            .unwrap_err();
+        let error = sync_my_list_inner(&state, None).await.unwrap_err();
         assert!(error.contains("synthetic overlay failure"));
         assert!(requests.try_recv().is_ok());
         assert!(requests.try_recv().is_ok());
@@ -14245,9 +14097,7 @@ mod persistence_tests {
             ]).await;
             let state = state(api);
             let intent = pending.then(|| conflicted_intent(&state));
-            let entries = sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .unwrap();
+            let entries = sync_my_list_inner(&state, None).await.unwrap();
             if let Some(intent) = intent {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].progress, 11);
@@ -14285,12 +14135,7 @@ mod persistence_tests {
             let (api, mut requests) = anilist::mock_api(replies).await;
             let state = state(api);
             let pending = conflicted_intent(&state);
-            assert!(
-                sync_my_list_inner(&state, ListPreferences::Preserve)
-                    .await
-                    .is_err(),
-                "{failure}"
-            );
+            assert!(sync_my_list_inner(&state, None).await.is_err(), "{failure}");
             assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
             assert!(state.db.get_entry(2).unwrap().is_none());
             assert!(state.anilist.lock().has_token());
@@ -14312,9 +14157,7 @@ mod persistence_tests {
         let state = state(api);
         let pending = conflicted_intent(&state);
         state.db.delete_setting(USER_ID_KEY).unwrap();
-        assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-            .await
-            .is_err());
+        assert!(sync_my_list_inner(&state, None).await.is_err());
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
         assert_eq!(
             serde_json::to_string(&state.db.pending(7).unwrap()[0]).unwrap(),
@@ -14338,9 +14181,7 @@ mod persistence_tests {
             let (api, mut requests) = anilist::mock_api(vec![(200, profile)]).await;
             let state = state(api);
             state.db.delete_setting(USER_ID_KEY).unwrap();
-            assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .is_err());
+            assert!(sync_my_list_inner(&state, None).await.is_err());
             assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
             assert!(state.db.get_setting(USER_ID_KEY).unwrap().is_none());
             assert!(state.anilist.lock().has_token());
@@ -14364,10 +14205,7 @@ mod persistence_tests {
                 state.db.set_setting(USER_ID_KEY, id).unwrap();
             }
             assert_eq!(
-                sync_my_list_inner(&state, ListPreferences::Preserve)
-                    .await
-                    .unwrap()[0]
-                    .score,
+                sync_my_list_inner(&state, None).await.unwrap()[0].score,
                 Some(90.0)
             );
             assert!(
@@ -14519,9 +14357,7 @@ mod persistence_tests {
                     let reading = state.clone();
                     let mut job = tokio::spawn(async move {
                         if list {
-                            sync_my_list_inner(&reading, ListPreferences::Preserve)
-                                .await
-                                .map(|_| ())
+                            sync_my_list_inner(&reading, None).await.map(|_| ())
                         } else {
                             get_user_stats_inner(&reading).await.map(|_| ())
                         }
@@ -14668,13 +14504,9 @@ mod persistence_tests {
             ])
             .await;
             *state.anilist.lock() = api;
-            login_with_token(
-                "replacement-session".into(),
-                &state,
-                ListPreferences::Preserve,
-            )
-            .await
-            .unwrap();
+            login_with_token("replacement-session".into(), &state, None)
+                .await
+                .unwrap();
             assert_eq!(get_user_stats(&state).await.unwrap().count, 6);
             let new_cache = state.db.get_setting("user_stats:9").unwrap().unwrap();
             gate.add_permits(1);
@@ -14847,12 +14679,7 @@ mod persistence_tests {
                 *state.anilist.lock() = api;
                 let signing_in = state.clone();
                 let mut login = tokio::spawn(async move {
-                    login_with_token(
-                        "replacement-session".into(),
-                        &signing_in,
-                        ListPreferences::Preserve,
-                    )
-                    .await
+                    login_with_token("replacement-session".into(), &signing_in, None).await
                 });
                 assert!(
                     identity_request_while_running(&mut new_requests, &mut login).await["query"]
@@ -14974,9 +14801,7 @@ mod persistence_tests {
         ])
         .await;
         let state = state(api);
-        let entries = sync_my_list_inner(&state, ListPreferences::Preserve)
-            .await
-            .unwrap();
+        let entries = sync_my_list_inner(&state, None).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].media_id, 1);
         assert!(state.db.get_entry(2).unwrap().is_none());
@@ -14996,9 +14821,7 @@ mod persistence_tests {
         ])
         .await;
         let state = state(api);
-        let entries = sync_my_list_inner(&state, ListPreferences::Preserve)
-            .await
-            .unwrap();
+        let entries = sync_my_list_inner(&state, None).await.unwrap();
         assert_eq!(entries[0].score, Some(4.0));
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(4.0));
         for source in [state.user.lock().clone(), state.db.cached_user().unwrap()] {
@@ -15037,9 +14860,7 @@ mod persistence_tests {
              BEGIN SELECT RAISE(ABORT, 'snapshot rejected'); END;",
             )
             .unwrap();
-        let error = sync_my_list_inner(&state, ListPreferences::Preserve)
-            .await
-            .unwrap_err();
+        let error = sync_my_list_inner(&state, None).await.unwrap_err();
         assert!(error.contains("snapshot rejected"), "{error}");
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
         for profile in [state.user.lock().clone(), state.db.cached_user().unwrap()] {
@@ -15059,10 +14880,7 @@ mod persistence_tests {
         let state = state(api);
         state.db.delete_setting(PROFILE_KEY).unwrap();
         assert_eq!(
-            sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .unwrap()[0]
-                .score,
+            sync_my_list_inner(&state, None).await.unwrap()[0].score,
             Some(80.0)
         );
         assert_eq!(
@@ -15098,9 +14916,7 @@ mod persistence_tests {
         ])
         .await;
         let state = state(api);
-        let entries = sync_my_list_inner(&state, ListPreferences::Preserve)
-            .await
-            .unwrap();
+        let entries = sync_my_list_inner(&state, None).await.unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(8.0));
         assert_eq!(state.db.get_entry(2).unwrap().unwrap().score, Some(9.0));
@@ -15149,9 +14965,7 @@ mod persistence_tests {
             let count = replies.len();
             let (api, mut requests) = anilist::mock_api(replies).await;
             let state = state(api);
-            assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .is_err());
+            assert!(sync_my_list_inner(&state, None).await.is_err());
             assert_eq!(state.db.get_entry(1).unwrap().unwrap().score, Some(70.0));
             assert!(state.db.get_entry(2).unwrap().is_none());
             let profile = state.db.cached_user().unwrap().unwrap();
@@ -15228,9 +15042,7 @@ mod persistence_tests {
             ])
             .await;
             let state = state(api);
-            assert!(sync_my_list_inner(&state, ListPreferences::Preserve)
-                .await
-                .is_err());
+            assert!(sync_my_list_inner(&state, None).await.is_err());
             if status == 401 {
                 assert!(state.db.entries_with_media().unwrap().is_empty());
                 assert!(state.user.lock().is_none());
@@ -16006,7 +15818,7 @@ mod persistence_tests {
                 let (result, ()) = tokio::join!(task, auth_expired);
                 assert_eq!(result.unwrap().unwrap_err(), SESSION_EXPIRED);
                 assert!(!state.anilist.lock().has_token());
-                login_with_token("renewed-session".into(), &state, ListPreferences::Preserve)
+                login_with_token("renewed-session".into(), &state, None)
                     .await
                     .unwrap();
             } else if mode == "viewer_503" {
@@ -17079,7 +16891,7 @@ mod persistence_tests {
                     assert!(pending.deleting, "{mode}");
                     assert!(!pending.conflict, "{mode}: 401 must not mark conflict");
                     assert_eq!(pending.error.as_deref(), Some(SESSION_EXPIRED), "{mode}");
-                    login_with_token("renewed-token".into(), &state, ListPreferences::Preserve)
+                    login_with_token("renewed-token".into(), &state, None)
                         .await
                         .unwrap();
                     crate::sync_queue::flush_background(&state).await.unwrap();

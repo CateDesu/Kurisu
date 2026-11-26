@@ -1,7 +1,7 @@
 use super::*;
 use crate::contracts::{CloseIntent, Route, WorkspaceEvent};
 use gpui::{TestAppContext, VisualTestContext};
-use kurisu_core::{Core, Db, UpdateChannel};
+use kurisu_core::{Core, Db};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -129,7 +129,6 @@ impl Fixture {
             profile.path.clone(),
             runtime.handle().clone(),
             Arc::new(LocalPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         let db = Arc::new(Db::open(&profile.path.join("kurisu.db")).unwrap());

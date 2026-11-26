@@ -79,8 +79,7 @@ pub(super) fn create(path: &Path) -> Result<(), String> {
     let stage = Stage::new(path)?;
     let database = stage.0.join(DATABASE);
     drop(kurisu_core::Db::open(&database).map_err(|error| error.to_string())?);
-    kurisu_core::profile_transfer::validate_database(&database)
-        .map_err(|error| error.to_string())?;
+    kurisu_core::db_validate::validate_database(&database).map_err(|error| error.to_string())?;
     File::options()
         .write(true)
         .open(database)
@@ -146,12 +145,7 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
             );
         }
     }
-    for name in [
-        "kurisu.db-wal",
-        "kurisu.db-shm",
-        "kurisu.db-journal",
-        kurisu_core::profile_transfer::RECEIPT,
-    ] {
+    for name in ["kurisu.db-wal", "kurisu.db-shm", "kurisu.db-journal"] {
         if !path_present(&path.join(MARKER))? && path_present(&path.join(name))? {
             return Err(CONFLICT.into());
         }
@@ -204,7 +198,7 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
         } else {
             database
         };
-        kurisu_core::profile_transfer::validate_database_with_scratch(&source, path)
+        kurisu_core::db_validate::validate_database_with_scratch(&source, path)
             .map_err(|error| error.to_string())?;
     }
     // Make the recovery name durable before publishing any files from it.

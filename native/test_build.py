@@ -231,7 +231,7 @@ class PackagingTests(unittest.TestCase):
             root = Path(directory)
             binary = root / "kurisu-native"
             (root / "packaging").mkdir()
-            for path in (root / "LICENSE", root / "THIRD_PARTY_NOTICES.txt", root / "PROFILE_TRANSFER.md",
+            for path in (root / "LICENSE", root / "THIRD_PARTY_NOTICES.txt",
                          root / "packaging/kurisu.png", root / "packaging/kurisu.desktop"):
                 path.write_text("fixture", encoding="utf-8")
             binary.touch()
@@ -260,7 +260,7 @@ class PackagingTests(unittest.TestCase):
             root = Path(directory)
             binary = root / "kurisu-native"
             (root / "packaging").mkdir()
-            files = [binary, root / "LICENSE", root / "THIRD_PARTY_NOTICES.txt", root / "PROFILE_TRANSFER.md",
+            files = [binary, root / "LICENSE", root / "THIRD_PARTY_NOTICES.txt",
                      root / "packaging/kurisu.png", root / "packaging/kurisu.desktop"]
             for path in files:
                 path.write_text(path.name, encoding="utf-8")
@@ -291,7 +291,6 @@ class PackagingTests(unittest.TestCase):
             (root / "packaging").mkdir()
             for name in ("kurisu.png", "kurisu.desktop"):
                 (root / "packaging" / name).write_text("fixture")
-            (root / "PROFILE_TRANSFER.md").write_text("Fixture transfer guide")
             BUILD.subprocess.run(["cargo", "generate-lockfile", "--offline"], check=True, cwd=root)
             binary = root / "target/release/kurisu-native"
             binary.parent.mkdir(parents=True)
@@ -303,7 +302,7 @@ class PackagingTests(unittest.TestCase):
             archive.write_bytes(b"earlier bundle")
             for artifact in (binary, archive):
                 BUILD.write_sidecar(artifact)
-            for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt", "PROFILE_TRANSFER.md"):
+            for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
                 (binary.parent / name).write_text("earlier companion")
             existing = {path: path.read_bytes() for path in binary.parent.rglob("*") if path.is_file()}
             run = BUILD.subprocess.run
@@ -342,7 +341,6 @@ class PackagingTests(unittest.TestCase):
                       {"CARGO_ENCODED_RUSTFLAGS": ""}):
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                (root / "PROFILE_TRANSFER.md").write_text("Transfer guide")
 
                 def build(command, **options):
                     if command[0] == "cargo":
@@ -380,7 +378,6 @@ class PackagingTests(unittest.TestCase):
             (root / "src").mkdir(parents=True)
             (root / "packaging").mkdir()
             (root / "Cargo.toml").write_text('[package]\nname="kurisu-native"\nversion="1.2.3"\nedition="2024"\n')
-            (root / "PROFILE_TRANSFER.md").write_text("Fixture transfer guide")
             for name in ("kurisu.png", "kurisu.desktop"):
                 (root / "packaging" / name).write_text("fixture")
             environment = os.environ.copy()
@@ -469,7 +466,6 @@ class PackagingTests(unittest.TestCase):
                 running.stdout.close()
             with tarfile.open(root / "target/release/bundle/Kurisu_1.2.3_linux-x64.tar.gz") as archive:
                 self.assertEqual(archive.extractfile("Kurisu/kurisu").read(), binary.read_bytes())
-            # Frozen bridge clients install only these executable bytes.
             installed = root / "bare-install"
             installed.mkdir()
             payload = installed / "kurisu"
@@ -580,7 +576,7 @@ class PackagingTests(unittest.TestCase):
                 BUILD.build_target()
             self.assertEqual(run.call_count, 1)
 
-    def test_windows_artifact_cannot_match_published_legacy_updater(self):
+    def test_windows_installer_uses_expected_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binary = root / "kurisu-native.exe"
@@ -594,7 +590,6 @@ class PackagingTests(unittest.TestCase):
             installer = root / "target/release/bundle/Kurisu-Native_1.1.0_x64-install.exe"
             self.assertTrue(installer.is_file())
             self.assertTrue(installer.with_name(installer.name + ".sha256").is_file())
-            self.assertFalse(installer.name.endswith("-setup.exe"))
             self.assertIn("/DWINDOWS_VERSION=1.1.0.0", run.call_args.args[0])
 
     def test_linux_fresh_bundle_has_normal_launcher_notices_icon_and_no_python(self):
@@ -602,7 +597,7 @@ class PackagingTests(unittest.TestCase):
             root = Path(directory)
             (root / "packaging").mkdir()
             binary = root / "kurisu-native"
-            for name in ("kurisu-native", "LICENSE", "THIRD_PARTY_NOTICES.txt", "PROFILE_TRANSFER.md"):
+            for name in ("kurisu-native", "LICENSE", "THIRD_PARTY_NOTICES.txt"):
                 (root / name).write_text(name)
             binary.chmod(0o755)
             for name in ("kurisu.png", "kurisu.desktop"):
@@ -612,7 +607,7 @@ class PackagingTests(unittest.TestCase):
             with tarfile.open(path) as archive:
                 self.assertEqual(set(archive.getnames()), {
                     "Kurisu/kurisu", "Kurisu/LICENSE", "Kurisu/THIRD_PARTY_NOTICES.txt",
-                    "Kurisu/PROFILE_TRANSFER.md", "Kurisu/kurisu.png", "Kurisu/kurisu.desktop",
+                    "Kurisu/kurisu.png", "Kurisu/kurisu.desktop",
                 })
                 self.assertEqual(archive.extractfile("Kurisu/kurisu").read(), b"kurisu-native")
                 self.assertTrue(archive.getmember("Kurisu/kurisu").mode & 0o111)
@@ -632,7 +627,6 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn('RMDir /r', script)
         self.assertNotIn('TerminateProcess', script)
         self.assertNotIn('taskkill', script)
-        self.assertNotIn('File "..\\migrate.py"', script)
         self.assertNotIn('Delete "$LOCALAPPDATA', script)
         self.assertNotIn('Delete "$APPDATA', script)
         self.assertIn('$CandidateDir == "$LOCALAPPDATA\\Programs\\Kurisu Native"', script)

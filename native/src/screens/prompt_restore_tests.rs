@@ -54,7 +54,6 @@ fn restored_prompt(cx: &mut TestAppContext, mode: &str) {
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|win, cx| Workspace::new(core.clone(), win, cx));
@@ -326,7 +325,6 @@ fn reconnect_account_recovers_dropped_tracking_ask_and_rejects_dismissed_replay(
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     core.emit(EventKind::TrackingAsk(tracking_fixture(4)));
@@ -401,7 +399,6 @@ fn quit_pending_auth(cx: &mut TestAppContext, mode: &str) {
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let login = mode == "quit-login";
@@ -494,7 +491,6 @@ pub(in crate::screens) fn signed_in_fixture(
         std::env::temp_dir(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     );
     (core, runtime, user)
 }
@@ -526,7 +522,6 @@ fn pending_editor_fixture() -> (
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     (core, runtime, dir, db, user, entry)

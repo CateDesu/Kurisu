@@ -1704,7 +1704,7 @@ mod tests {
         already_pending: bool,
         local_history: bool,
     ) {
-        use crate::{anilist, Db, ListEntry, UpdateChannel, User};
+        use crate::{anilist, Db, ListEntry, User};
         use serde_json::json;
         use std::path::Path;
 
@@ -1742,7 +1742,6 @@ mod tests {
             std::env::temp_dir().join("kurisu-playback-origin-fixture"),
             tokio::runtime::Handle::current(),
             Arc::new(NoPlatform),
-            UpdateChannel::Native,
         );
         let state = core.state();
         *state.anilist.lock() = api;
@@ -3783,7 +3782,7 @@ mod tests {
 
     #[tokio::test]
     async fn switching_title_only_players_restarts_watch_time_before_auto_progress() {
-        use crate::{anilist, Db, ListEntry, UpdateChannel, User};
+        use crate::{anilist, Db, ListEntry, User};
 
         let (mut api, _requests) = anilist::mock_api(vec![]).await;
         api.record_viewer(7);
@@ -3810,7 +3809,6 @@ mod tests {
             std::env::temp_dir().join("kurisu-playback-source-fixture"),
             tokio::runtime::Handle::current(),
             Arc::new(NoPlatform),
-            UpdateChannel::Native,
         );
         *core.state().anilist.lock() = api;
         let mut info = source("VLC", true, Some(1), Some(4));
@@ -4243,21 +4241,5 @@ mod tests {
             mpv_snapshot_info(&PlaybackMatches::new(&db, &matchers, &mut cache), &video);
         assert_eq!(unrecognized.media_id, None);
         assert_eq!(unrecognized.episode, None);
-    }
-
-    #[test]
-    fn event_payload_field_names_exist_in_types_ts() {
-        crate::models::assert_ts_declares("NowPlaying", &serde_json::to_value(idle()).unwrap());
-        crate::models::assert_ts_declares(
-            "TrackingPrompt",
-            &serde_json::to_value(TrackingPrompt {
-                media_id: 0,
-                episode: 0,
-                title: String::new(),
-                raw_title: String::new(),
-                progress: 0,
-            })
-            .unwrap(),
-        );
     }
 }

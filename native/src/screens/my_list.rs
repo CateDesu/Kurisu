@@ -1340,7 +1340,7 @@ mod tests {
         VisualTestContext,
     };
     use kurisu_core::models::{Media, User};
-    use kurisu_core::{Core, Platform, UpdateChannel};
+    use kurisu_core::{Core, Platform};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1402,7 +1402,6 @@ mod tests {
             path.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         (core, runtime, FixtureDir(path))

@@ -1,8 +1,8 @@
 use super::covers::CoverOwner;
 use super::*;
 use gpui::{Entity, TestAppContext, VisualTestContext, WindowVisibility, px, size};
+use kurisu_core::Platform;
 use kurisu_core::models::ListEntry;
-use kurisu_core::{Platform, UpdateChannel};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,7 +45,6 @@ fn fixture() -> (Core, tokio::runtime::Runtime, FixtureDir) {
         path.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     (core, runtime, FixtureDir(path))

@@ -9195,41 +9195,6 @@ mod tests {
     }
 
     #[test]
-    fn frontend_contracts_include_sync_and_history_fields() {
-        crate::models::assert_ts_declares(
-            "PendingChange",
-            &serde_json::to_value(PendingChange {
-                media_id: 1,
-                title: "Test".into(),
-                progress: Some(1),
-                status: None,
-                score: None,
-                repeat: None,
-                error: None,
-                conflict: false,
-                missing_media: false,
-            })
-            .unwrap(),
-        );
-        crate::models::assert_ts_declares(
-            "WatchHistoryItem",
-            &serde_json::to_value(WatchHistoryItem {
-                id: 1,
-                path: "episode.mkv".into(),
-                media_id: 1,
-                episode: 1,
-                watched_at: 1,
-                title: "Test".into(),
-            })
-            .unwrap(),
-        );
-        crate::models::assert_ts_declares(
-            "LibraryBinding",
-            &serde_json::to_value(crate::library::LibraryBinding::default()).unwrap(),
-        );
-    }
-
-    #[test]
     fn rewatch_and_remote_deletion_require_resolution() {
         let base = ListEntry {
             id: Some(22),

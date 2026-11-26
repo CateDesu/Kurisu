@@ -10,13 +10,11 @@ Browse seasonal anime and airing schedules, search torrent feeds, view watch sta
 
 ## Getting started
 
-1. Download the native Windows installer or Linux archive from [Releases](https://github.com/CateDesu/Kurisu/releases). On Windows, install and open **Kurisu**. On Linux, extract the archive, enter `Kurisu`, and launch `./kurisu` (run `chmod +x kurisu` if needed). Keep its license files beside the executable.
+1. Download the Windows installer or Linux archive from [Releases](https://github.com/CateDesu/Kurisu/releases). On Windows, install and open **Kurisu**. On Linux, extract the archive, enter `Kurisu`, and launch `./kurisu` (run `chmod +x kurisu` if needed). Keep its license files beside the executable.
 2. Choose **Connect via AniList** and authorize Kurisu in your browser to sync your list.
 3. Optionally add media folders in **Library**. Configure **Settings → Playback tracking** and click **Save tracking**. Automatic progress updates are off by default.
 
 Add shows to your list before watching them so playback can be matched. Your cached list is available offline. Progress, status, score, and rewatch changes are saved on this device during connection failures and retried for the same AniList account. Conflicting remote edits appear in the pending sync bar for you to resolve. Deleting entries and editing notes, dates, or custom lists require a connection. Interrupted removals retain their saved changes and can be retried from pending sync. For a failed removal, choose Send saved change to retry removal or keep the AniList version to cancel it.
-
-For older installations, see [Profile transfer and rollback](native/PROFILE_TRANSFER.md) for upgrade and recovery instructions.
 
 ## Player setup
 
@@ -55,9 +53,8 @@ The build helper stamps the newest published stable version to prevent repeated 
 Run the checks from the program root. Core playback tests need MPV on `PATH`; Linux MPRIS tests need `dbus-daemon`. Tests use controlled profiles and playback sessions.
 
 ```sh
-node --test .github/release-transition.test.mjs .github/prune-native-releases.test.mjs
+node --test .github/native-release.test.mjs .github/prune-native-releases.test.mjs
 python3 .github/test_discord_notify.py
-python3 -m unittest discover -s native -p test_migrate.py
 cargo fmt --manifest-path core/Cargo.toml -- --check
 cargo fmt --manifest-path native/Cargo.toml -- --check
 cargo test --locked --manifest-path core/Cargo.toml

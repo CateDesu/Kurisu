@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{AppContext, EntityInputHandler, Focusable, TestAppContext, WindowVisibility};
 use kurisu_core::models::{EntryDetails, ListEntry, Media, User};
-use kurisu_core::{Core, Event, EventKind, Platform, UpdateChannel};
+use kurisu_core::{Core, Event, EventKind, Platform};
 
 use super::covers::CoverOwner;
 use super::my_list::MyListSlot;
@@ -335,13 +335,7 @@ fn fixture_with_platform(
         .enable_all()
         .build()
         .unwrap();
-    let core = Core::open(
-        path.clone(),
-        runtime.handle().clone(),
-        platform,
-        UpdateChannel::Native,
-    )
-    .unwrap();
+    let core = Core::open(path.clone(), runtime.handle().clone(), platform).unwrap();
     (core, runtime, FixtureDir(path))
 }
 
@@ -439,7 +433,6 @@ fn query_reset_and_new_edit_settle_after_an_older_write(cx: &mut TestAppContext)
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| {
@@ -778,7 +771,6 @@ fn nonquery_reset_deletion_settles_after_older_value(cx: &mut TestAppContext) {
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| {
@@ -864,7 +856,6 @@ fn nonquery_selection_after_reset_supersedes_pending_delete(cx: &mut TestAppCont
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| {
@@ -1720,7 +1711,6 @@ fn successful_prompt_confirm_acknowledges_the_retained_event(cx: &mut TestAppCon
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     );
     core.emit(EventKind::TrackingPrompt(tracking_fixture(4)));
     let event = retained_prompt(&core);
@@ -2258,7 +2248,6 @@ fn my_list_progress_conflict_keeps_the_two_buffered_steps(cx: &mut TestAppContex
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx
@@ -2335,7 +2324,6 @@ fn episode_event_reconciles_open_views_from_the_current_account_cache(cx: &mut T
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx
@@ -2426,7 +2414,6 @@ fn scoped_episode_total_clear_updates_discovery_and_unblocks_detail_progress(
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let media = Media {
@@ -3740,7 +3727,6 @@ fn set_profile_and_reconnect_recover_dropped_tracking_ask_without_resurrecting_d
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|win, cx| {
@@ -3829,7 +3815,6 @@ fn dismissed_tracking_ask_lag_replay_does_not_navigate_or_resurrect_while_ack_is
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|win, cx| {
@@ -3939,7 +3924,6 @@ fn library_add_folder_and_watching_update_button_respect_busy_and_close_fences(
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let folder = dir.0.join("anime");
@@ -4055,7 +4039,6 @@ fn recovery_prompts_defer_during_close_ready_and_replay_on_resume(cx: &mut TestA
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     core.emit(EventKind::TrackingAsk(tracking_fixture(4)));
@@ -4141,7 +4124,6 @@ fn post_quit_events_do_not_spawn_reads_on_watching_route(cx: &mut TestAppContext
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|win, cx| {
@@ -4414,7 +4396,6 @@ fn hidden_resume_after_close_skips_cover_prefetch_and_list_sync_on_replayed_list
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) =
@@ -4480,7 +4461,6 @@ fn bucket_b_stale_recovery_keeps_new_live_prompt(cx: &mut TestAppContext) {
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|win, cx| {

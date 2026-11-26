@@ -257,7 +257,6 @@ def package_linux(version, binary):
             (binary, "kurisu"),
             (binary.parent / "LICENSE", "LICENSE"),
             (binary.parent / "THIRD_PARTY_NOTICES.txt", "THIRD_PARTY_NOTICES.txt"),
-            (binary.parent / "PROFILE_TRANSFER.md", "PROFILE_TRANSFER.md"),
             (ROOT / "packaging/kurisu.png", "kurisu.png"),
             (ROOT / "packaging/kurisu.desktop", "kurisu.desktop"),
         ]:
@@ -319,7 +318,6 @@ def main(argv=None):
                 raise ValueError("The built executable does not report the requested version")
         for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
             shutil.copyfile(notice_dir / name, binary.parent / name)
-        shutil.copyfile(ROOT / "PROFILE_TRANSFER.md", binary.parent / "PROFILE_TRANSFER.md")
         print(binary)
         if args.installer:
             package_windows(version, binary)

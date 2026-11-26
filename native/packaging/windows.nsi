@@ -40,8 +40,6 @@ Var BackedUpLicense
 Var PlacedLicense
 Var BackedUpNotices
 Var PlacedNotices
-Var BackedUpTransfer
-Var PlacedTransfer
 Var BackedUpIcon
 Var PlacedIcon
 
@@ -216,7 +214,6 @@ Function ${Prefix}RecoverInterruptedSwap
   !endif
   !insertmacro RecoverBackup "LICENSE"
   !insertmacro RecoverBackup "THIRD_PARTY_NOTICES.txt"
-  !insertmacro RecoverBackup "PROFILE_TRANSFER.md"
   !insertmacro RecoverBackup "kurisu.ico"
   ${If} $RestoreFailed == 0
     Call ${Prefix}RestoreRegistration
@@ -240,13 +237,11 @@ FunctionEnd
     Delete "$INSTDIR\.kurisu-install.tmp\uninstall.exe"
     Delete "$INSTDIR\.kurisu-install.tmp\LICENSE"
     Delete "$INSTDIR\.kurisu-install.tmp\THIRD_PARTY_NOTICES.txt"
-    Delete "$INSTDIR\.kurisu-install.tmp\PROFILE_TRANSFER.md"
     Delete "$INSTDIR\.kurisu-install.tmp\kurisu.ico"
     Delete "$INSTDIR\.kurisu-install.tmp\kurisu.exe.bak"
     Delete "$INSTDIR\.kurisu-install.tmp\uninstall.exe.bak"
     Delete "$INSTDIR\.kurisu-install.tmp\LICENSE.bak"
     Delete "$INSTDIR\.kurisu-install.tmp\THIRD_PARTY_NOTICES.txt.bak"
-    Delete "$INSTDIR\.kurisu-install.tmp\PROFILE_TRANSFER.md.bak"
     Delete "$INSTDIR\.kurisu-install.tmp\kurisu.ico.bak"
     Delete "$INSTDIR\.kurisu-install.tmp\.registration"
     Delete "$INSTDIR\.kurisu-install.tmp\.registering"
@@ -284,7 +279,6 @@ FunctionEnd
 
 Function RollbackStagedSwap
   !insertmacro RollbackSingleFile "kurisu.ico" $BackedUpIcon $PlacedIcon
-  !insertmacro RollbackSingleFile "PROFILE_TRANSFER.md" $BackedUpTransfer $PlacedTransfer
   !insertmacro RollbackSingleFile "THIRD_PARTY_NOTICES.txt" $BackedUpNotices $PlacedNotices
   !insertmacro RollbackSingleFile "LICENSE" $BackedUpLicense $PlacedLicense
   ${If} $PlacedUninstaller == 1
@@ -363,7 +357,6 @@ Section "Kurisu"
   !insertmacro CheckWritableTarget "$INSTDIR\kurisu.exe" "Kurisu could not install a required program file. Close programs using the installation folder and check its permissions, then run the installer again. The program and its registration have not been replaced."
   !insertmacro CheckWritableTarget "$INSTDIR\LICENSE" "Kurisu could not install a required program file. Close programs using the installation folder and check its permissions, then run the installer again. The program and its registration have not been replaced."
   !insertmacro CheckWritableTarget "$INSTDIR\THIRD_PARTY_NOTICES.txt" "Kurisu could not install a required program file. Close programs using the installation folder and check its permissions, then run the installer again. The program and its registration have not been replaced."
-  !insertmacro CheckWritableTarget "$INSTDIR\PROFILE_TRANSFER.md" "Kurisu could not install a required program file. Close programs using the installation folder and check its permissions, then run the installer again. The program and its registration have not been replaced."
   !insertmacro CheckWritableTarget "$INSTDIR\kurisu.ico" "Kurisu could not install a required program file. Close programs using the installation folder and check its permissions, then run the installer again. The program and its registration have not been replaced."
   !insertmacro CleanStagingDir ""
   ${If} ${FileExists} "$INSTDIR\.kurisu-install.tmp"
@@ -382,9 +375,6 @@ Section "Kurisu"
   !insertmacro CheckStagedFile
   ClearErrors
   File /oname=THIRD_PARTY_NOTICES.txt "${NOTICES}"
-  !insertmacro CheckStagedFile
-  ClearErrors
-  File /oname=PROFILE_TRANSFER.md "..\PROFILE_TRANSFER.md"
   !insertmacro CheckStagedFile
   ClearErrors
   File /oname=kurisu.ico "kurisu.ico"
@@ -412,8 +402,6 @@ Section "Kurisu"
   StrCpy $PlacedLicense 0
   StrCpy $BackedUpNotices 0
   StrCpy $PlacedNotices 0
-  StrCpy $BackedUpTransfer 0
-  StrCpy $PlacedTransfer 0
   StrCpy $BackedUpIcon 0
   StrCpy $PlacedIcon 0
   ; Finish the backup before the swap marker makes it eligible for recovery.
@@ -439,7 +427,6 @@ Section "Kurisu"
   !insertmacro PlaceStagedFile "uninstall.exe" $PlacedUninstaller
   !insertmacro SwapStagedFile "LICENSE" $BackedUpLicense $PlacedLicense
   !insertmacro SwapStagedFile "THIRD_PARTY_NOTICES.txt" $BackedUpNotices $PlacedNotices
-  !insertmacro SwapStagedFile "PROFILE_TRANSFER.md" $BackedUpTransfer $PlacedTransfer
   !insertmacro SwapStagedFile "kurisu.ico" $BackedUpIcon $PlacedIcon
   StrCpy $SwapFailure "register the installation"
   Call RegisterInstallation
@@ -454,8 +441,6 @@ Section "Kurisu"
     Delete "$CandidateDir\kurisu-native.exe"
     Delete "$CandidateDir\LICENSE"
     Delete "$CandidateDir\THIRD_PARTY_NOTICES.txt"
-    Delete "$CandidateDir\migrate.py"
-    Delete "$CandidateDir\PROFILE_TRANSFER.md"
     Delete "$CandidateDir\uninstall.exe"
     RMDir "$CandidateDir"
     Delete "$SMPROGRAMS\Kurisu Native.lnk"
@@ -603,7 +588,6 @@ Section "Uninstall"
   !insertmacro CheckRemovableFile "kurisu.ico"
   !insertmacro CheckRemovableFile "LICENSE"
   !insertmacro CheckRemovableFile "THIRD_PARTY_NOTICES.txt"
-  !insertmacro CheckRemovableFile "PROFILE_TRANSFER.md"
   !insertmacro CheckRemovableFile "uninstall.exe"
   ClearErrors
   Delete "$INSTDIR\kurisu.exe"
@@ -613,7 +597,6 @@ Section "Uninstall"
   Delete "$INSTDIR\kurisu.ico"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\THIRD_PARTY_NOTICES.txt"
-  Delete "$INSTDIR\PROFILE_TRANSFER.md"
   ${If} ${Errors}
     !insertmacro FailWithMessage "un." "Kurisu could not remove all program files. Close programs using the installation folder and retry uninstalling."
   ${EndIf}

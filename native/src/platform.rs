@@ -260,12 +260,6 @@ pub fn data_dir(argument: Option<PathBuf>) -> Result<PathBuf, String> {
     if !has_native_profile_unlocked(&path)? {
         sync_parent(&path)?;
         profile_init::create(&path)?;
-    } else {
-        #[cfg(unix)]
-        if path_present(&path.join(kurisu_core::profile_transfer::RECEIPT))? {
-            // Sync the selected directory entry without following paths in the receipt.
-            sync_parent(&path)?;
-        }
     }
     Ok(path)
 }
@@ -370,10 +364,9 @@ fn has_native_profile_unlocked(path: &Path) -> Result<bool, String> {
         "kurisu.db-wal",
         "kurisu.db-shm",
         "kurisu.db-journal",
-        kurisu_core::profile_transfer::RECEIPT,
     ] {
         if path_present(&path.join(name))? {
-            return Err("Existing profile data lacks the native profile marker. Keep it in place and use the Kurisu transition release.".into());
+            return Err("Existing profile data lacks the native profile marker. Keep it in place for recovery.".into());
         }
     }
     Ok(false)
@@ -559,7 +552,7 @@ impl InstanceGuard {
                     .min(Duration::from_millis(25)),
             );
         }
-        // Tighten legacy lock permissions only after owning the lock and before publishing the secret.
+        // Tighten existing lock permissions only after owning the lock and before publishing the secret.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -947,8 +940,14 @@ mod tests {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         path.hash(&mut hash);
         let profile_id = format!("{:016x}", hash.finish());
-        let occupied = TcpListener::bind(instance_address(&profile_id, 0)).unwrap();
+        // Skip OS-excluded ports such as Windows Hyper-V reserved ranges.
+        let occupied = (0..15)
+            .find_map(|attempt| TcpListener::bind(instance_address(&profile_id, attempt)).ok())
+            .expect("at least one activation candidate port should be bindable");
+        let occupied_port = occupied.local_addr().unwrap().port();
         let first = active_instance(path);
+        let (bound_port, _) = read_activation_endpoint(path).expect("endpoint written");
+        assert_ne!(bound_port, occupied_port);
         drop(occupied);
         assert_duplicate_activates(&first, path);
         drop(first);

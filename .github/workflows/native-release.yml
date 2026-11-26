@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Immutable native source tag, newer than the bridge
+        description: Immutable native source tag
         required: true
         default: v1.1.0
       publish:
-        description: Publish native assets and frozen bridge aliases
+        description: Publish native release assets
         type: boolean
         default: false
 
@@ -40,7 +40,7 @@ jobs:
       - id: plan
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: node .github/release-transition.mjs plan native "$RELEASE_TAG"
+        run: node .github/native-release.mjs plan "$RELEASE_TAG"
 
   build:
     needs: plan
@@ -74,13 +74,13 @@ jobs:
         run: |
           mkdir release-assets
           find downloaded-assets -type f \( -name 'kurisu-native*' -o -name 'Kurisu-Native_*' -o -name 'Kurisu_*_linux-x64.tar.gz*' \) -exec cp -t release-assets/ {} +
-      - name: Publish native release with unchanged bridge assets
+      - name: Publish native release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
-        run: node .github/release-transition.mjs publish native "$RELEASE_TAG" release-assets
-      - name: Keep the latest native release and all legacy releases
+        run: node .github/native-release.mjs publish "$RELEASE_TAG" release-assets
+      - name: Keep the latest native release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}

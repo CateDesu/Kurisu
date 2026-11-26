@@ -2861,7 +2861,7 @@ impl Workspace {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use kurisu_core::{Core, Db, UpdateChannel, models::Media};
+    use kurisu_core::{Core, Db, models::Media};
     use std::path::Path;
 
     #[gpui::test]
@@ -2965,7 +2965,6 @@ mod tests {
             std::env::temp_dir(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         );
         (core, runtime)
     }
@@ -3792,7 +3791,6 @@ mod tests {
             root.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| {

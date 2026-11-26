@@ -1,6 +1,6 @@
 use super::*;
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
-use kurisu_core::{Db, UpdateChannel};
+use kurisu_core::Db;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -86,7 +86,6 @@ impl Fixture {
             profile.path.clone(),
             runtime.handle().clone(),
             Arc::new(LocalPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         runtime
@@ -948,7 +947,6 @@ fn window_close_completes_admitted_reads_and_replays_deferred_refreshes_on_resum
         fixture.profile.path.clone(),
         fixture.runtime.handle().clone(),
         Arc::new(LocalPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());

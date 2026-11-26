@@ -151,31 +151,14 @@ pub struct Release {
     pub assets: HashMap<String, String>,
 }
 
-pub fn update_info(rel: &Release) -> Value {
-    serde_json::json!({
-        "available": is_newer(&rel.version, current_version()),
-        "can_install": platform_asset(rel).is_some(),
-        "restart_pending": update_applied(),
-        "version": rel.version,
-        "tag": rel.tag,
-        "html_url": rel.html_url,
-        "body": rel.body,
-        "current": current_version(),
-    })
-}
-
-/// Native artifacts keep a distinct name from the frozen bridge.
-pub fn platform_asset_channel(rel: &Release, channel: crate::UpdateChannel) -> Option<&str> {
+pub fn platform_asset(rel: &Release) -> Option<&str> {
     if update_applied() {
         return None;
     }
-    channel_asset(rel, channel)
+    native_asset(rel)
 }
 
-fn channel_asset(rel: &Release, channel: crate::UpdateChannel) -> Option<&str> {
-    if channel == crate::UpdateChannel::Legacy {
-        return legacy_asset(rel);
-    }
+fn native_asset(rel: &Release) -> Option<&str> {
     #[cfg(target_os = "linux")]
     {
         if std::env::consts::ARCH != "x86_64" {
@@ -199,74 +182,36 @@ fn channel_asset(rel: &Release, channel: crate::UpdateChannel) -> Option<&str> {
     }
 }
 
-pub fn update_info_channel(
-    rel: &Release,
-    channel: crate::UpdateChannel,
-) -> crate::models::UpdateInfo {
-    let mut info: crate::models::UpdateInfo =
-        serde_json::from_value(update_info(rel)).expect("update payload shape");
-    info.can_install = platform_asset_channel(rel, channel).is_some();
-    if channel == crate::UpdateChannel::Native {
-        info.available &= info.can_install;
+pub fn update_info(rel: &Release) -> crate::models::UpdateInfo {
+    let can_install = platform_asset(rel).is_some();
+    crate::models::UpdateInfo {
+        available: is_newer(&rel.version, current_version()) && can_install,
+        can_install,
+        restart_pending: update_applied(),
+        version: rel.version.clone(),
+        tag: rel.tag.clone(),
+        html_url: rel.html_url.clone(),
+        body: rel.body.clone(),
+        current: current_version().to_string(),
     }
-    info
 }
-pub async fn watch_updates(enabled: impl Fn() -> bool, notify: impl FnMut(Value)) {
+
+pub async fn watch_updates(
+    enabled: impl Fn() -> bool,
+    notify: impl FnMut(crate::models::UpdateInfo),
+) {
     poll_releases(enabled, fetch_latest_release, notify).await;
 }
 
-pub async fn watch_updates_channel(
-    enabled: impl Fn() -> bool,
-    channel: crate::UpdateChannel,
-    notify: impl FnMut(crate::models::UpdateInfo),
-) {
-    poll_releases_channel(
-        enabled,
-        || fetch_latest_release_channel(crate::UpdateChannel::Native),
-        channel,
-        notify,
-    )
-    .await;
-}
-
-async fn poll_releases_channel<F, Fut>(
+async fn poll_releases<F, Fut>(
     enabled: impl Fn() -> bool,
     fetch: F,
-    channel: crate::UpdateChannel,
     notify: impl FnMut(crate::models::UpdateInfo),
 ) where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<Release, String>>,
 {
-    poll_releases_with(
-        enabled,
-        fetch,
-        |rel| {
-            if channel == crate::UpdateChannel::Legacy {
-                bridge_update_info(rel)
-            } else {
-                update_info_channel(rel, channel)
-            }
-        },
-        |info| info.available,
-        notify,
-    )
-    .await;
-}
-
-async fn poll_releases<F, Fut>(enabled: impl Fn() -> bool, fetch: F, notify: impl FnMut(Value))
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Release, String>>,
-{
-    poll_releases_with(
-        enabled,
-        fetch,
-        update_info,
-        |info| info.get("available").and_then(Value::as_bool) == Some(true),
-        notify,
-    )
-    .await;
+    poll_releases_with(enabled, fetch, update_info, |info| info.available, notify).await;
 }
 
 async fn poll_releases_with<F, Fut, T>(
@@ -308,33 +253,7 @@ async fn poll_releases_with<F, Fut, T>(
 /// Compare versions because publication order can put older builds last.
 pub async fn fetch_latest_release() -> Result<Release, String> {
     pick_latest_release(&fetch_release_listing().await?)
-        .ok_or_else(|| "no published releases found".to_string())
-}
-
-pub async fn fetch_latest_release_channel(
-    channel: crate::UpdateChannel,
-) -> Result<Release, String> {
-    let data = fetch_release_listing().await?;
-    pick_latest_release_channel(&data, channel)
-        .ok_or_else(|| "no published release for this update channel".to_string())
-}
-
-pub async fn fetch_bridge_release() -> Result<Release, String> {
-    let data = fetch_release_listing().await?;
-    pick_latest_release_channel(&data, crate::UpdateChannel::Native)
-        .or_else(|| pick_latest_release(&data))
-        .ok_or_else(|| "no published releases found".to_string())
-}
-
-pub fn bridge_update_info(rel: &Release) -> crate::models::UpdateInfo {
-    let mut info = update_info_channel(rel, crate::UpdateChannel::Native);
-    info.available = bridge_update_available(rel, current_version());
-    info
-}
-
-fn bridge_update_available(rel: &Release, current: &str) -> bool {
-    platform_asset_channel(rel, crate::UpdateChannel::Native).is_some()
-        && !is_newer(current, &rel.version)
+        .ok_or_else(|| "no published release for this platform".to_string())
 }
 
 const MAX_LISTING_BYTES: usize = 4 * 1024 * 1024;
@@ -517,11 +436,7 @@ fn validate_fixture_update_url(url: &str, origin: &reqwest::Url) -> Result<(), S
 }
 
 fn pick_latest_release(data: &Value) -> Option<Release> {
-    pick_release(data, |_| true)
-}
-
-fn pick_latest_release_channel(data: &Value, channel: crate::UpdateChannel) -> Option<Release> {
-    pick_release(data, |rel| channel_asset(rel, channel).is_some())
+    pick_release(data, |rel| native_asset(rel).is_some())
 }
 
 fn pick_release(data: &Value, accepts: impl Fn(&Release) -> bool) -> Option<Release> {
@@ -593,20 +508,6 @@ pub fn update_applied() -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn windows_installer<'a>(names: impl Iterator<Item = &'a String>, arch: &str) -> Option<&'a str> {
-    let marker = match arch {
-        "x86_64" => "_x64-",
-        _ => return None,
-    };
-    let mut hits = names
-        .filter(|n| n.starts_with("Kurisu_") && n.ends_with("-setup.exe") && n.contains(marker));
-    match (hits.next(), hits.next()) {
-        (Some(only), None) => Some(only.as_str()),
-        _ => None,
-    }
-}
-
-#[cfg(any(windows, test))]
 fn native_windows_installer<'a>(
     names: impl Iterator<Item = &'a String>,
     arch: &str,
@@ -614,46 +515,11 @@ fn native_windows_installer<'a>(
     if arch != "x86_64" {
         return None;
     }
-    let names: Vec<_> = names
-        .filter(|name| name.starts_with("Kurisu-Native_"))
-        .collect();
-    for suffix in ["_x64-install.exe", "_x64-setup.exe"] {
-        let mut hits = names.iter().filter(|name| name.ends_with(suffix));
-        match (hits.next(), hits.next()) {
-            (Some(name), None) => return Some(name.as_str()),
-            (Some(_), Some(_)) => return None,
-            _ => {}
-        }
-    }
-    None
-}
-
-pub fn platform_asset(rel: &Release) -> Option<&str> {
-    if update_applied() {
-        return None;
-    }
-    legacy_asset(rel)
-}
-
-fn legacy_asset(rel: &Release) -> Option<&str> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_installer(rel.assets.keys(), std::env::consts::ARCH)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::consts::ARCH != "x86_64" {
-            return None;
-        }
-        rel.assets
-            .keys()
-            .find(|n| n.as_str() == "kurisu")
-            .map(String::as_str)
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        let _ = rel;
-        None
+    let mut hits = names
+        .filter(|name| name.starts_with("Kurisu-Native_") && name.ends_with("_x64-install.exe"));
+    match (hits.next(), hits.next()) {
+        (Some(name), None) => Some(name.as_str()),
+        _ => None,
     }
 }
 
@@ -1608,14 +1474,14 @@ mod tests {
             async move { download(&url, &target).await }
         });
         sent_rx.await.unwrap();
-        // Wait until the staging file has received the first chunk before cancelling.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        // Read through an open handle because NTFS directory metadata lags behind writes until close.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !std::fs::read_dir(&dir.0)
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| {
                 entry.file_name() != "payload.bin"
-                    && entry.metadata().is_ok_and(|meta| meta.len() >= 13)
+                    && std::fs::read(entry.path()).is_ok_and(|bytes| bytes.len() >= 13)
             })
         {
             assert!(
@@ -2036,10 +1902,20 @@ mod tests {
                         if attempt == 0 {
                             return Err("offline".into());
                         }
+                        let mut assets = HashMap::new();
+                        assets.insert(
+                            "kurisu-native".into(),
+                            "https://example.invalid/linux".into(),
+                        );
+                        assets.insert(
+                            format!("Kurisu-Native_{version}_x64-install.exe"),
+                            "https://example.invalid/windows".into(),
+                        );
                         Ok(Release {
                             tag: format!("v{version}"),
                             version,
                             body: "Release notes".into(),
+                            assets,
                             ..Release::default()
                         })
                     }
@@ -2054,10 +1930,10 @@ mod tests {
         tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
         tokio::task::yield_now().await;
         let notice = rx.try_recv().expect("retry should announce the release");
-        assert_eq!(notice["version"], "9999.0.0");
-        assert_eq!(notice["body"], "Release notes");
-        assert_eq!(notice["available"], true);
-        assert_eq!(notice["can_install"], false);
+        assert_eq!(notice.version, "9999.0.0");
+        assert_eq!(notice.body, "Release notes");
+        assert!(notice.available);
+        assert!(notice.can_install);
 
         tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
         tokio::task::yield_now().await;
@@ -2078,7 +1954,7 @@ mod tests {
         tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
-        assert_eq!(rx.try_recv().unwrap()["version"], "9999.0.1");
+        assert_eq!(rx.try_recv().unwrap().version, "9999.0.1");
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     }
@@ -2101,9 +1977,19 @@ mod tests {
                     let response = response.clone();
                     async move {
                         response.notified().await;
+                        let mut assets = HashMap::new();
+                        assets.insert(
+                            "kurisu-native".into(),
+                            "https://example.invalid/linux".into(),
+                        );
+                        assets.insert(
+                            "Kurisu-Native_9999.0.0_x64-install.exe".into(),
+                            "https://example.invalid/windows".into(),
+                        );
                         Ok(Release {
                             tag: "v9999.0.0".into(),
                             version: "9999.0.0".into(),
+                            assets,
                             ..Release::default()
                         })
                     }
@@ -2129,83 +2015,46 @@ mod tests {
             { "tag_name": "v9.9.9", "draft": true, "assets": [] },
             { "tag_name": "v8.8.8", "prerelease": true, "assets": [] }
         ]);
-        let rel = pick_latest_release(&listing).expect("a winner");
+        let rel = pick_release(&listing, |_| true).expect("a winner");
         assert_eq!(rel.version, "1.1.0");
         assert_eq!(rel.tag, "v1.1.0");
         let listing = serde_json::json!([
             { "tag_name": "v1.1.0", "assets": [] },
             { "tag_name": "v1.1.0.2", "assets": [] }
         ]);
-        let rel = pick_latest_release(&listing).expect("a winner");
+        let rel = pick_release(&listing, |_| true).expect("a winner");
         assert_eq!(rel.version, "1.1.0.2");
-        assert!(pick_latest_release(&serde_json::json!([
-            { "tag_name": "v9.9.9", "draft": true }
-        ]))
+        assert!(pick_release(
+            &serde_json::json!([{ "tag_name": "v9.9.9", "draft": true }]),
+            |_| true,
+        )
         .is_none());
-        assert!(pick_latest_release(&serde_json::json!([])).is_none());
-    }
-
-    #[test]
-    fn windows_installer_requires_arch_marker_and_a_unique_match() {
-        let mut rel = Release::default();
-        rel.assets
-            .insert("Kurisu_1.0.0_arm64-setup.exe".into(), "u1".into());
-        assert_eq!(windows_installer(rel.assets.keys(), "x86_64"), None);
-        rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u2".into());
-        assert_eq!(
-            windows_installer(rel.assets.keys(), "x86_64"),
-            Some("Kurisu_1.0.0_x64-setup.exe")
-        );
-        rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u3".into());
-        assert_eq!(
-            windows_installer(rel.assets.keys(), "x86_64"),
-            Some("Kurisu_1.0.0_x64-setup.exe")
-        );
-        rel.assets
-            .insert("Kurisu_1.0.0_x64-debug-setup.exe".into(), "u4".into());
-        assert_eq!(windows_installer(rel.assets.keys(), "x86_64"), None);
-        assert_eq!(windows_installer(rel.assets.keys(), "aarch64"), None);
-    }
-
-    #[test]
-    fn legacy_windows_selector_ignores_native_installers() {
-        let legacy = "Kurisu_1.0.0_x64-setup.exe".to_string();
-        let native = "Kurisu-Native_1.0.0_x64-setup.exe".to_string();
-        assert_eq!(
-            windows_installer([&legacy].into_iter(), "x86_64"),
-            Some(legacy.as_str())
-        );
-        assert_eq!(windows_installer([&native].into_iter(), "x86_64"), None);
-        assert_eq!(
-            windows_installer([&legacy, &native].into_iter(), "x86_64"),
-            Some(legacy.as_str())
-        );
-        let second_legacy = "Kurisu_1.0.1_x64-setup.exe".to_string();
-        assert_eq!(
-            windows_installer([&legacy, &second_legacy, &native].into_iter(), "x86_64"),
-            None
-        );
+        assert!(pick_release(&serde_json::json!([]), |_| true).is_none());
     }
 
     #[test]
     fn platform_asset_picks_this_platforms_asset() {
         let mut rel = Release::default();
+        rel.assets.insert(
+            "Kurisu-Native_1.0.0_x64-install.exe.sha256".into(),
+            "u2".into(),
+        );
+        rel.assets.insert("kurisu-native.exe".into(), "u3".into());
         rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe.sha256".into(), "u2".into());
-        rel.assets.insert("kurisu.exe".into(), "u3".into());
-        rel.assets.insert("kurisu.sha256".into(), "u4".into());
+            .insert("kurisu-native.sha256".into(), "u4".into());
         assert_eq!(platform_asset(&rel), None);
         rel.assets
-            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "u1".into());
-        rel.assets.insert("kurisu".into(), "u5".into());
+            .insert("Kurisu-Native_1.0.0_x64-install.exe".into(), "u1".into());
+        rel.assets.insert("kurisu-native".into(), "u5".into());
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        assert_eq!(platform_asset(&rel), Some("kurisu"));
+        assert_eq!(platform_asset(&rel), Some("kurisu-native"));
         #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
         assert_eq!(platform_asset(&rel), None);
         #[cfg(target_os = "windows")]
-        assert_eq!(platform_asset(&rel), Some("Kurisu_1.0.0_x64-setup.exe"));
+        assert_eq!(
+            platform_asset(&rel),
+            Some("Kurisu-Native_1.0.0_x64-install.exe")
+        );
     }
 
     #[test]
@@ -2300,138 +2149,59 @@ mod tests {
 #[cfg(test)]
 mod native_selector_tests {
     use super::*;
+
     #[test]
-    fn native_windows_names_preserve_the_original_published_selector() {
+    fn native_windows_installer_requires_unique_x64_install_asset() {
         let names = [
-            "Kurisu_1.0.0_x64-setup.exe".to_string(),
+            "Kurisu-Native_1.0.0_x64-setup.exe".to_string(),
             "Kurisu-Native_1.1.0_x64-install.exe".to_string(),
             "Kurisu-Native_1.1.0_x64-install.exe.sha256".to_string(),
         ];
-        let original: Vec<_> = names
-            .iter()
-            .filter(|name| name.ends_with("-setup.exe") && name.contains("_x64-"))
-            .collect();
-        assert_eq!(original, vec![&names[0]]);
         assert_eq!(
             native_windows_installer(names.iter(), "x86_64"),
             Some(names[1].as_str())
         );
         assert_eq!(native_windows_installer(names.iter(), "aarch64"), None);
+        assert_eq!(
+            native_windows_installer([&names[0]].into_iter(), "x86_64"),
+            None
+        );
         let mut names = names.to_vec();
         names.push("Kurisu-Native_1.1.1_x64-install.exe".into());
         assert_eq!(native_windows_installer(names.iter(), "x86_64"), None);
     }
 
     #[test]
-    fn native_windows_selector_accepts_old_candidates_only_as_a_fallback() {
-        let old = "Kurisu-Native_1.0.0.77_x64-setup.exe".to_string();
-        let new = "Kurisu-Native_1.1.0_x64-install.exe".to_string();
-        assert_eq!(
-            native_windows_installer([&old].into_iter(), "x86_64"),
-            Some(old.as_str())
-        );
-        assert_eq!(
-            native_windows_installer([&old, &new].into_iter(), "x86_64"),
-            Some(new.as_str())
-        );
-        let other = "Kurisu-Native_1.0.0.78_x64-setup.exe".to_string();
-        assert_eq!(
-            native_windows_installer([&old, &other].into_iter(), "x86_64"),
-            None
-        );
-    }
-
-    #[test]
-    fn skipped_bridge_handoff_installs_native_without_a_same_version_loop() {
-        let mut release = Release {
-            version: "1.1.0".into(),
-            ..Release::default()
-        };
-        release
-            .assets
-            .insert("kurisu".into(), "frozen-bridge".into());
-        release.assets.insert(
-            "Kurisu_1.0.0_x64-setup.exe".into(),
-            "frozen-bridge-windows".into(),
-        );
-        assert!(!bridge_update_available(&release, "1.0.0.78"));
-        release
-            .assets
-            .insert("kurisu-native".into(), "native".into());
-        release.assets.insert(
-            "Kurisu-Native_1.1.0_x64-install.exe".into(),
-            "native-windows".into(),
-        );
-        assert!(bridge_update_available(&release, "1.0.0.78"));
-        assert!(bridge_update_available(&release, "1.1.0"));
-        assert!(bridge_update_available(&release, "1.1.0.0"));
-        assert!(!bridge_update_available(&release, "1.1.0.1"));
-        assert!(!bridge_update_available(&release, "1.2.0"));
-        assert!(!is_newer(&release.version, "1.1.0"));
-        assert!(!is_newer(&release.version, "1.1.0.0"));
-        assert_eq!(
-            update_info_channel(&release, crate::UpdateChannel::Native).version,
-            "1.1.0"
-        );
+    fn native_release_selection_ignores_incomplete_and_unpublished_versions() {
         let listing = serde_json::json!([
-            {"tag_name": "v1.1.0", "assets": []},
-            {"tag_name": "v1.1.0.0", "assets": []},
-            {"tag_name": "v1.1.0.1", "assets": []}
-        ]);
-        assert_eq!(pick_latest_release(&listing).unwrap().version, "1.1.0.1");
-        let equal_listing = serde_json::json!([
-            {"tag_name": "v1.1.0", "assets": []},
-            {"tag_name": "v1.1.0.0", "assets": []}
-        ]);
-        assert_eq!(
-            pick_latest_release(&equal_listing).unwrap().version,
-            "1.1.0"
-        );
-    }
-
-    #[test]
-    fn native_release_selection_ignores_legacy_only_and_unpublished_versions() {
-        let listing = serde_json::json!([
-            {"tag_name": "v9.0.0", "assets": [{"name": "kurisu", "browser_download_url": "legacy"}]},
+            {"tag_name": "v9.0.0", "assets": [{"name": "kurisu", "browser_download_url": "other"}]},
             {"tag_name": "v8.0.0", "draft": true, "assets": [
                 {"name": "kurisu-native", "browser_download_url": "draft"},
                 {"name": "Kurisu-Native_8.0.0_x64-install.exe", "browser_download_url": "draft"}
             ]},
             {"tag_name": "v1.1.0", "assets": [
-                {"name": "kurisu", "browser_download_url": "bridge"},
-                {"name": "Kurisu_1.0.0_x64-setup.exe", "browser_download_url": "bridge"},
                 {"name": "kurisu-native", "browser_download_url": "native"},
                 {"name": "Kurisu-Native_1.1.0_x64-install.exe", "browser_download_url": "native"}
             ]}
         ]);
-        let release = pick_latest_release_channel(&listing, crate::UpdateChannel::Native).unwrap();
+        let release = pick_latest_release(&listing).unwrap();
         assert_eq!(release.version, "1.1.0");
-        assert_eq!(pick_latest_release(&listing).unwrap().version, "9.0.0");
     }
 
     #[test]
-    fn native_channel_never_selects_legacy_artifacts() {
+    fn platform_asset_ignores_non_native_artifacts() {
         let mut release = Release::default();
+        release.assets.insert("kurisu".into(), "other-linux".into());
         release
             .assets
-            .insert("kurisu".into(), "legacy-linux".into());
-        release
-            .assets
-            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "legacy-windows".into());
-        assert!(platform_asset_channel(&release, crate::UpdateChannel::Native).is_none());
+            .insert("Kurisu_1.0.0_x64-setup.exe".into(), "other-windows".into());
+        assert!(platform_asset(&release).is_none());
         #[cfg(target_os = "linux")]
         {
             release
                 .assets
                 .insert("kurisu-native".into(), "native-linux".into());
-            assert_eq!(
-                platform_asset_channel(&release, crate::UpdateChannel::Native),
-                Some("kurisu-native")
-            );
-            assert_eq!(
-                platform_asset_channel(&release, crate::UpdateChannel::Legacy),
-                Some("kurisu")
-            );
+            assert_eq!(platform_asset(&release), Some("kurisu-native"));
         }
         #[cfg(target_os = "windows")]
         {
@@ -2440,19 +2210,19 @@ mod native_selector_tests {
                 "native-windows".into(),
             );
             assert_eq!(
-                platform_asset_channel(&release, crate::UpdateChannel::Native),
+                platform_asset(&release),
                 Some("Kurisu-Native_1.0.0_x64-install.exe")
             );
             release.assets.insert(
                 "Kurisu-Native_1.0.1_x64-install.exe".into(),
                 "other-native".into(),
             );
-            assert!(platform_asset_channel(&release, crate::UpdateChannel::Native).is_none());
+            assert!(platform_asset(&release).is_none());
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn channel_watcher_announces_same_version_bridge_handoff_without_looping_native() {
+    async fn watcher_does_not_announce_same_version_release() {
         let mut release = Release {
             tag: format!("v{}", current_version()),
             version: current_version().to_string(),
@@ -2467,47 +2237,20 @@ mod native_selector_tests {
             "https://example.invalid/native-win".into(),
         );
 
-        let (legacy_tx, mut legacy_rx) = tokio::sync::mpsc::unbounded_channel();
-        let legacy_release = release.clone();
-        let legacy_task = tokio::spawn(poll_releases_channel(
-            || true,
-            move || {
-                let release = legacy_release.clone();
-                async move { Ok(release) }
-            },
-            crate::UpdateChannel::Legacy,
-            move |info| legacy_tx.send(info).unwrap(),
-        ));
-        tokio::task::yield_now().await;
-        let notice = legacy_rx
-            .try_recv()
-            .expect("legacy bridge watcher should announce same-version native handoff");
-        assert!(notice.available);
-        assert!(notice.can_install);
-        assert_eq!(notice.version, current_version());
-        tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
-        tokio::task::yield_now().await;
-        assert!(
-            legacy_rx.try_recv().is_err(),
-            "do not announce the same bridge release twice"
-        );
-        legacy_task.abort();
-
-        let (native_tx, mut native_rx) = tokio::sync::mpsc::unbounded_channel();
-        let native_task = tokio::spawn(poll_releases_channel(
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(poll_releases(
             || true,
             move || {
                 let release = release.clone();
                 async move { Ok(release) }
             },
-            crate::UpdateChannel::Native,
-            move |info| native_tx.send(info).unwrap(),
+            move |info| tx.send(info).unwrap(),
         ));
         tokio::task::yield_now().await;
         assert!(
-            native_rx.try_recv().is_err(),
-            "native watcher must not announce a same-version release"
+            rx.try_recv().is_err(),
+            "watcher must not announce a same-version release"
         );
-        native_task.abort();
+        task.abort();
     }
 }

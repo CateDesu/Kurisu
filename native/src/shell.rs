@@ -1526,7 +1526,6 @@ mod tests {
             path.clone(),
             runtime.handle().clone(),
             Arc::new(NativePlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let instance = Arc::new(InstanceGuard::acquire(&path).unwrap());
@@ -1730,7 +1729,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(NativePlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let instance = Arc::new(InstanceGuard::acquire(&dir.0).unwrap());

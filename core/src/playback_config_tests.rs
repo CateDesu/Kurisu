@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Db, ListEntry, Media, Platform, UpdateChannel, User};
+use crate::{Db, ListEntry, Media, Platform, User};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,7 +80,6 @@ impl Fixture {
             path.clone(),
             tokio::runtime::Handle::current(),
             Arc::new(LocalPlatform),
-            UpdateChannel::Native,
         );
         let fixture = Self {
             core,

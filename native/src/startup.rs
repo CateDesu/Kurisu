@@ -1,21 +1,12 @@
 use std::{
-    io::Write,
-    net::{Ipv4Addr, SocketAddr, TcpListener},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
 };
 
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Render, Role, Window, div, prelude::*, px, rgb,
 };
-use kurisu_core::{
-    Core, Services, UpdateChannel,
-    profile_transfer::{self, LegacyPlatform, PREFERENCES_FILE, TransferRequest},
-};
+use kurisu_core::{Core, Services, db_validate};
 
 use crate::{
     components::{button, heading},
@@ -31,25 +22,16 @@ mod recovery;
 struct DefaultPaths {
     native: PathBuf,
     previous_native: Option<PathBuf>,
-    legacy: Vec<PathBuf>,
-    backup: PathBuf,
 }
 
 fn default_paths() -> Result<DefaultPaths, String> {
-    let base = directories::BaseDirs::new().ok_or("No user data directory available")?;
     let native = directories::ProjectDirs::from("", "CateDesu", "kurisu-native")
         .ok_or("No user data directory available")?;
-    #[cfg(target_os = "windows")]
-    let platform = LegacyPlatform::Windows;
-    #[cfg(not(target_os = "windows"))]
-    let platform = LegacyPlatform::Linux;
     let previous = native.data_dir().to_path_buf();
     let destination = native.data_local_dir().to_path_buf();
     Ok(DefaultPaths {
         previous_native: (previous != destination).then_some(previous),
         native: destination,
-        legacy: profile_transfer::legacy_sources(base.data_local_dir(), platform),
-        backup: base.data_local_dir().join("kurisu-legacy-backup.db"),
     })
 }
 
@@ -60,13 +42,10 @@ fn prepare_profile_with(
     if let Some(path) = argument {
         return platform::data_dir(Some(path));
     }
-    prepare_default(resolve_default()?, legacy_stop_guard)
+    prepare_default(resolve_default()?)
 }
 
-fn prepare_default<G>(
-    paths: DefaultPaths,
-    stopped: impl FnOnce() -> Result<G, String>,
-) -> Result<PathBuf, String> {
+fn prepare_default(paths: DefaultPaths) -> Result<PathBuf, String> {
     let current = platform::has_native_profile(&paths.native)?;
     let previous = match paths.previous_native {
         Some(path) if platform::path_present(&path)? => {
@@ -86,146 +65,7 @@ fn prepare_default<G>(
     if let Some(path) = previous {
         return platform::data_dir(Some(path));
     }
-    if current {
-        return platform::data_dir(Some(paths.native));
-    }
-    let mut sources = Vec::new();
-    let mut missing = Vec::new();
-    let mut prepared = Vec::new();
-    for source in paths.legacy {
-        let parent = source.parent().ok_or("Legacy profile has no parent")?;
-        if platform::path_present(&source)? {
-            if platform::path_present(&parent.join(PREFERENCES_FILE))? {
-                prepared.push(source.clone());
-            }
-            sources.push(source);
-        } else if platform::path_present(parent)? {
-            missing.push(parent.to_path_buf());
-        }
-    }
-    let source = if prepared.len() == 1 {
-        prepared.pop()
-    } else if sources.len() > 1 {
-        return Err("More than one previous Kurisu profile was found. Open the transition release with the profile you want to move, then retry after resolving the duplicate profiles.".into());
-    } else if let Some(parent) = missing.first() {
-        return Err(format!(
-            "The previous Kurisu profile at {} is missing its database. Restore its database and sidecars before retrying. No empty profile was created.",
-            parent.display()
-        ));
-    } else {
-        sources.pop()
-    };
-    if source.is_none() && platform::path_present(&paths.backup)? {
-        return Err(format!(
-            "A previous Kurisu backup exists, but its original profile is missing. Preserve this backup and recover the profile before retrying. No empty profile was created. Backup: {}",
-            paths.backup.display()
-        ));
-    }
-    if let Some(source_db) = source {
-        let _stopped = stopped()?;
-        platform::create_private_dir(
-            paths
-                .native
-                .parent()
-                .ok_or("Native profile has no parent")?,
-        )?;
-        platform::create_private_dir(paths.backup.parent().ok_or("Backup has no parent")?)?;
-        let preferences = source_db
-            .parent()
-            .ok_or("Legacy profile has no parent")?
-            .join(PREFERENCES_FILE);
-        let request = TransferRequest {
-            source_db,
-            preferences,
-            backup_db: paths.backup.clone(),
-            destination: paths.native.clone(),
-        };
-        profile_transfer::transfer(&request).map_err(|error| {
-            format!(
-                "Could not move your previous Kurisu profile: {error:#}\nQuit the previous Kurisu, including its tray process. If preferences are missing, open the transition release once, then quit it and retry. Keep the original database and all its sidecars together. Backup location: {}",
-                paths.backup.display()
-            )
-        })?;
-    }
     platform::data_dir(Some(paths.native))
-}
-
-fn legacy_stop_guard() -> Result<LegacyStopGuard, String> {
-    stop_guard_at(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 39418)),
-        Duration::from_secs(10),
-    )
-}
-
-struct LegacyStopGuard {
-    running: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl LegacyStopGuard {
-    fn new(listener: TcpListener) -> Result<Self, String> {
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| error.to_string())?;
-        let running = Arc::new(AtomicBool::new(true));
-        let active = running.clone();
-        let worker = std::thread::Builder::new()
-            .name("kurisu-transfer-guard".into())
-            .spawn(move || {
-                while active.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            if stream.set_nonblocking(false).is_ok()
-                                && stream
-                                    .set_write_timeout(Some(Duration::from_millis(250)))
-                                    .is_ok()
-                            {
-                                // Old clients exit only after receiving Kurisu's ACK.
-                                let _ = stream.write_all(b"k");
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(_) => break,
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            running,
-            worker: Some(worker),
-        })
-    }
-}
-
-impl Drop for LegacyStopGuard {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-fn stop_guard_at(address: SocketAddr, wait: Duration) -> Result<LegacyStopGuard, String> {
-    let deadline = Instant::now() + wait;
-    loop {
-        match TcpListener::bind(address) {
-            Ok(guard) => return LegacyStopGuard::new(guard),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "The previous Kurisu may still be running. Quit it, including its tray process, then select Retry. Your profile has not been moved. Could not reserve {address}: {error}"
-                ));
-            }
-        }
-    }
 }
 
 struct Ready {
@@ -260,18 +100,13 @@ fn open_profile(
         }
         Err(InstanceError::Open(error)) => return Err(error),
     };
-    profile_transfer::validate_database(&data_dir.join("kurisu.db")).map_err(|error| {
+    db_validate::validate_database(&data_dir.join("kurisu.db")).map_err(|error| {
         format!(
             "The native profile could not be validated: {error:#}. Keep this profile and its sidecars for recovery before retrying. Profile: {}",
             data_dir.display()
         )
     })?;
-    let core = Core::open(
-        data_dir.clone(),
-        runtime,
-        Arc::new(NativePlatform),
-        UpdateChannel::Native,
-    )?;
+    let core = Core::open(data_dir.clone(), runtime, Arc::new(NativePlatform))?;
     if let Err(error) = instance.start_activation(&data_dir) {
         log::warn!("Could not enable profile window activation: {error}");
     }
@@ -427,7 +262,9 @@ impl Render for Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurisu_core::{Db, profile_transfer::UI_PREFERENCE_KEYS};
+    use kurisu_core::Db;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -532,7 +369,7 @@ mod tests {
                     .env("KURISU_RECOVERY_MATCH_EXACT", "1");
             } else {
                 child
-                    .env("KURISU_RECOVERY_MATCH", "/.kurisu-transfer-")
+                    .env("KURISU_RECOVERY_MATCH", "/.kurisu-validate-")
                     .env("KURISU_RECOVERY_AFTER", &ready);
             }
             let mut child = Process(
@@ -627,14 +464,11 @@ mod tests {
             child.0.kill().unwrap();
             child.0.wait().unwrap();
             std::fs::remove_file(&arm).unwrap();
-            // Default startup checks for candidates before calling data_dir.
             let defaults = DefaultPaths {
                 native: profile.clone(),
                 previous_native: None,
-                legacy: Vec::new(),
-                backup: sandbox.0.join("no-backup"),
             };
-            assert_eq!(prepare_default(defaults, || Ok(())).unwrap(), profile);
+            assert_eq!(prepare_default(defaults).unwrap(), profile);
             Process(command(&profile).spawn().unwrap()).success();
         }
 
@@ -678,96 +512,6 @@ mod tests {
         second.success();
         assert!(platform::has_native_profile(&profile).unwrap());
         assert!(!profile.join(".kurisu-native-init").exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn transferred_profile_syncs_before_startup() {
-        use recovery::{Process, Sandbox};
-        use std::process::Command;
-
-        const TEST: &str = "startup::tests::transferred_profile_syncs_before_startup";
-        if let Some(root) = std::env::var_os("KURISU_TRANSFER_FIXTURE") {
-            let paths = TestPaths(root.into());
-            let defaults = || {
-                let mut paths = paths.defaults();
-                paths.native = paths.native.with_file_name("published").join("native");
-                paths
-            };
-            paths.legacy(true);
-            let destination = defaults().native;
-            let error = prepare_default(defaults(), || Ok(())).unwrap_err();
-            assert!(error.contains("published native profile"), "{error}");
-            let backup = std::fs::read(defaults().backup).unwrap();
-            let database = std::fs::read(destination.join("kurisu.db")).unwrap();
-            std::fs::rename(paths.0.join("legacy"), paths.0.join("unavailable")).unwrap();
-            let prepare = || {
-                prepare_default(defaults(), || -> Result<(), String> {
-                    panic!("published transfer must not reopen the legacy profile")
-                })
-            };
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let open = || open_profile(Some(destination.clone()), runtime.handle().clone());
-            for error in [prepare().unwrap_err(), open().err().unwrap()] {
-                assert!(
-                    error.contains("Could not sync the parent directory"),
-                    "{error}"
-                );
-            }
-            assert!(!destination.join(".kurisu-native.lock").exists());
-            std::fs::remove_file(paths.0.join("arm")).unwrap();
-            assert_eq!(prepare().unwrap(), destination);
-            assert_eq!(std::fs::read(defaults().backup).unwrap(), backup);
-            assert_eq!(
-                std::fs::read(destination.join("kurisu.db")).unwrap(),
-                database
-            );
-            let OpenOutcome::Ready(first) = open().unwrap() else {
-                panic!("transferred profile should open after syncing its parent");
-            };
-            let arm = paths.0.join("arm");
-            std::fs::write(&arm, []).unwrap();
-            let error = open()
-                .err()
-                .expect("activation should wait for parent sync");
-            assert!(
-                error.contains("Could not sync the parent directory"),
-                "{error}"
-            );
-            assert!(!first.instance.has_pending_activation());
-            std::fs::remove_file(arm).unwrap();
-            std::thread::scope(|scope| {
-                let contender = scope.spawn(open);
-                first.instance.wait_for_pending_activations(1);
-                first.instance.acknowledge_activations();
-                assert!(matches!(
-                    contender.join().unwrap().unwrap(),
-                    OpenOutcome::Activated
-                ));
-            });
-            return;
-        }
-
-        let sandbox = Sandbox::new("transfer-parent");
-        let shim = sandbox.shim();
-        let root = sandbox.0.join("fixture");
-        std::fs::create_dir(&root).unwrap();
-        let arm = root.join("arm");
-        std::fs::write(&arm, []).unwrap();
-        Process(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env("KURISU_TRANSFER_FIXTURE", &root)
-                .env("LD_PRELOAD", &shim)
-                .env("KURISU_RECOVERY_OP", "sync")
-                .env("KURISU_RECOVERY_MATCH", root.join("published"))
-                .env("KURISU_RECOVERY_MATCH_EXACT", "1")
-                .env("KURISU_RECOVERY_AFTER", root.join("published/native"))
-                .env("KURISU_RECOVERY_ARM", arm)
-                .spawn()
-                .unwrap(),
-        )
-        .success();
     }
 
     #[cfg(target_os = "linux")]
@@ -822,7 +566,7 @@ mod tests {
                 command()
                     .env("LD_PRELOAD", &shim)
                     .env("KURISU_RECOVERY_OP", "create")
-                    .env("KURISU_RECOVERY_MATCH", "/.kurisu-transfer-")
+                    .env("KURISU_RECOVERY_MATCH", "/.kurisu-validate-")
                     .env("KURISU_RECOVERY_AFTER", &ready)
                     .env("KURISU_RECOVERY_ARM", &arm)
                     .env("KURISU_RECOVERY_GATE", &gate)
@@ -881,7 +625,7 @@ mod tests {
                 .env("KURISU_VALIDATION_HANDOFF_PROFILE", &profile)
                 .env("LD_PRELOAD", sandbox.shim())
                 .env("KURISU_RECOVERY_OP", "create")
-                .env("KURISU_RECOVERY_MATCH", "/.kurisu-transfer-")
+                .env("KURISU_RECOVERY_MATCH", "/.kurisu-validate-")
                 .env("KURISU_RECOVERY_ARM", &arm)
                 .env("KURISU_RECOVERY_GATE", &gate)
                 .spawn()
@@ -1544,38 +1288,6 @@ mod tests {
             DefaultPaths {
                 native: self.0.join("native"),
                 previous_native: None,
-                legacy: vec![self.0.join("legacy/kurisu.db")],
-                backup: self.0.join("backup.db"),
-            }
-        }
-
-        fn legacy(&self, preferences: bool) {
-            let profile = self.0.join("legacy");
-            std::fs::create_dir(&profile).unwrap();
-            let db = Db::open(&profile.join("kurisu.db")).unwrap();
-            db.set_setting("anilist_token", "controlled-token").unwrap();
-            db.set_setting("anilist_user_id", "7").unwrap();
-            db.0.lock().execute(
-                "INSERT INTO pending_change(account_id,media_id,payload) VALUES(7,42,'{\"progress\":3}')",
-                [],
-            ).unwrap();
-            drop(db);
-            if preferences {
-                let mut values = serde_json::Map::new();
-                for key in UI_PREFERENCE_KEYS {
-                    values.insert(key.into(), serde_json::Value::Null);
-                }
-                values.insert("kurisu.list.q".into(), "prepared query".into());
-                values.insert("kurisu.list.synced".into(), "1730000000123".into());
-                std::fs::write(
-                    profile.join(PREFERENCES_FILE),
-                    serde_json::to_vec(&serde_json::json!({
-                        "format": "kurisu-ui-preferences-v1",
-                        "preferences": values,
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
             }
         }
     }
@@ -1587,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_profile_never_discovers_legacy_state() {
+    fn explicit_profile_never_discovers_default_profile() {
         let paths = TestPaths::new();
         let destination = paths.0.join("isolated");
         let result = prepare_profile_with(Some(destination.clone()), || {
@@ -1658,27 +1370,18 @@ mod tests {
     }
 
     #[test]
-    fn existing_native_profile_keeps_candidate_data_without_legacy_checks() {
+    fn existing_native_profile_keeps_candidate_data() {
         let paths = TestPaths::new();
         let native = platform::data_dir(Some(paths.defaults().native)).unwrap();
         let db = Db::open(&native.join("kurisu.db")).unwrap();
         db.set_setting("anilist_token", "candidate-token").unwrap();
         drop(db);
-        let mut defaults = paths.defaults();
-        defaults.legacy = vec![PathBuf::from("/unreachable/Hentai profile/kurisu.db")];
-        assert_eq!(
-            prepare_default(defaults, || -> Result<(), String> {
-                panic!("must not import")
-            })
-            .unwrap(),
-            native
-        );
+        assert_eq!(prepare_default(paths.defaults()).unwrap(), native);
         let db = Db::open(&native.join("kurisu.db")).unwrap();
         assert_eq!(
             db.get_setting("anilist_token").unwrap().as_deref(),
             Some("candidate-token")
         );
-        assert!(!paths.0.join("backup.db").exists());
     }
 
     #[test]
@@ -1687,7 +1390,7 @@ mod tests {
         let previous = platform::data_dir(Some(paths.0.join("previous-native"))).unwrap();
         let mut defaults = paths.defaults();
         defaults.previous_native = Some(previous.clone());
-        assert_eq!(prepare_default(defaults, || Ok(())).unwrap(), previous);
+        assert_eq!(prepare_default(defaults).unwrap(), previous);
         assert!(!paths.defaults().native.exists());
     }
 
@@ -1699,127 +1402,19 @@ mod tests {
         let mut defaults = paths.defaults();
         defaults.previous_native = Some(previous.clone());
         assert!(
-            prepare_default(defaults, || Ok(()))
+            prepare_default(defaults)
                 .unwrap_err()
                 .contains("Two native profiles")
         );
         assert!(platform::has_native_profile(&current).unwrap());
         assert!(platform::has_native_profile(&previous).unwrap());
-        assert!(!paths.0.join("backup.db").exists());
     }
 
     #[test]
-    fn orphaned_backup_blocks_empty_startup_without_touching_backup() {
+    fn new_install_creates_profile() {
         let paths = TestPaths::new();
-        let backup = paths.0.join("backup.db");
-        std::fs::write(&backup, b"preserved previous backup").unwrap();
-        let error = prepare_default(paths.defaults(), || Ok(())).unwrap_err();
-        assert!(error.contains("original profile is missing"), "{error}");
-        assert!(!paths.defaults().native.exists());
-        assert_eq!(std::fs::read(backup).unwrap(), b"preserved previous backup");
-    }
-
-    #[test]
-    fn new_install_creates_profile_without_legacy_or_backup() {
-        let paths = TestPaths::new();
-        let native = prepare_default(paths.defaults(), || -> Result<(), String> {
-            panic!("fresh install has no source to lock")
-        })
-        .unwrap();
+        let native = prepare_default(paths.defaults()).unwrap();
         assert!(platform::has_native_profile(&native).unwrap());
-        assert!(!paths.0.join("backup.db").exists());
-    }
-
-    #[test]
-    fn automatic_transfer_preserves_source_backup_preferences_and_pending_changes() {
-        let paths = TestPaths::new();
-        paths.legacy(true);
-        let source = paths.0.join("legacy/kurisu.db");
-        let original = std::fs::read(&source).unwrap();
-        let native = prepare_default(paths.defaults(), || Ok(())).unwrap();
-        assert_eq!(std::fs::read(source).unwrap(), original);
-        assert!(paths.0.join("backup.db").is_file());
-        let db = Db::open(&native.join("kurisu.db")).unwrap();
-        assert_eq!(
-            db.get_setting("anilist_token").unwrap().as_deref(),
-            Some("controlled-token")
-        );
-        assert_eq!(
-            db.get_setting("native_preference:kurisu.list.q")
-                .unwrap()
-                .as_deref(),
-            Some("prepared query")
-        );
-        assert_eq!(
-            db.get_setting("native_preference:kurisu.list.synced")
-                .unwrap()
-                .as_deref(),
-            Some("1730000000")
-        );
-        let pending: i64 =
-            db.0.lock()
-                .query_row(
-                    "SELECT COUNT(*) FROM pending_change WHERE account_id=7 AND media_id=42",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-        assert_eq!(pending, 1);
-        db.set_setting("anilist_token", "native-only-token")
-            .unwrap();
-        drop(db);
-        let snapshot = std::fs::read(paths.0.join("backup.db")).unwrap();
-        std::fs::write(paths.0.join("inspect-backup.db"), &snapshot).unwrap();
-        let backup = Db::open(&paths.0.join("inspect-backup.db")).unwrap();
-        assert_eq!(
-            backup.get_setting("anilist_token").unwrap().as_deref(),
-            Some("controlled-token")
-        );
-        drop(backup);
-        assert_eq!(std::fs::read(paths.0.join("backup.db")).unwrap(), snapshot);
-        assert!(!paths.0.join("backup.db-wal").exists());
-        assert_eq!(
-            prepare_default(paths.defaults(), || Ok(())).unwrap(),
-            native
-        );
-    }
-
-    #[test]
-    fn missing_preferences_blocks_then_retry_transfers_without_empty_profile() {
-        let paths = TestPaths::new();
-        paths.legacy(false);
-        let error = prepare_default(paths.defaults(), || Ok(())).unwrap_err();
-        assert!(error.contains("preferences"), "{error}");
-        assert!(!paths.defaults().native.exists());
-        assert!(!paths.0.join("backup.db").exists());
-        let values: serde_json::Map<String, serde_json::Value> = UI_PREFERENCE_KEYS
-            .into_iter()
-            .map(|key| (key.into(), serde_json::Value::Null))
-            .collect();
-        std::fs::write(
-            paths.0.join("legacy").join(PREFERENCES_FILE),
-            serde_json::to_vec(
-                &serde_json::json!({"format":"kurisu-ui-preferences-v1","preferences":values}),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(prepare_default(paths.defaults(), || Ok(())).is_ok());
-    }
-
-    #[test]
-    fn running_legacy_blocks_before_transfer() {
-        let paths = TestPaths::new();
-        paths.legacy(true);
-        assert_eq!(
-            prepare_default(paths.defaults(), || Err::<(), _>(
-                "Quit legacy first".into()
-            ))
-            .unwrap_err(),
-            "Quit legacy first"
-        );
-        assert!(!paths.defaults().native.exists());
-        assert!(!paths.0.join("backup.db").exists());
     }
 
     #[test]
@@ -1828,12 +1423,12 @@ mod tests {
         let native = paths.defaults().native;
         std::fs::create_dir(&native).unwrap();
         std::fs::write(native.join(".kurisu-native-profile"), b"kurisu-native-v1\n").unwrap();
-        let error = prepare_default(paths.defaults(), || Ok(())).unwrap_err();
+        let error = prepare_default(paths.defaults()).unwrap_err();
         assert!(error.contains("missing"), "{error}");
         assert!(!native.join("kurisu.db").exists());
         std::fs::write(native.join("kurisu.db"), b"").unwrap();
         assert!(
-            prepare_default(paths.defaults(), || Ok(()))
+            prepare_default(paths.defaults())
                 .unwrap_err()
                 .contains("damaged")
         );
@@ -1908,52 +1503,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_legacy_database_and_duplicate_sources_block_empty_startup() {
-        let paths = TestPaths::new();
-        std::fs::create_dir(paths.0.join("legacy")).unwrap();
-        let error = prepare_default(paths.defaults(), || Ok(())).unwrap_err();
-        assert!(error.contains("missing its database"), "{error}");
-        assert!(!paths.defaults().native.exists());
-        std::fs::remove_dir(paths.0.join("legacy")).unwrap();
-        paths.legacy(true);
-        std::fs::create_dir(paths.0.join("legacy2")).unwrap();
-        std::fs::write(paths.0.join("legacy2/kurisu.db"), b"not inspected").unwrap();
-        std::fs::copy(
-            paths.0.join("legacy").join(PREFERENCES_FILE),
-            paths.0.join("legacy2").join(PREFERENCES_FILE),
-        )
-        .unwrap();
-        let mut defaults = paths.defaults();
-        defaults.legacy.push(paths.0.join("legacy2/kurisu.db"));
-        assert!(
-            prepare_default(defaults, || Ok(()))
-                .unwrap_err()
-                .contains("More than one")
-        );
-        assert!(!paths.defaults().native.exists());
-    }
-
-    #[test]
-    fn unique_prepared_source_wins_over_retained_old_database() {
-        let paths = TestPaths::new();
-        paths.legacy(true);
-        std::fs::create_dir(paths.0.join("older")).unwrap();
-        std::fs::write(paths.0.join("older/kurisu.db"), b"retained old database").unwrap();
-        let mut defaults = paths.defaults();
-        defaults.legacy.push(paths.0.join("older/kurisu.db"));
-        let native = prepare_default(defaults, || Ok(())).unwrap();
-        let db = Db::open(&native.join("kurisu.db")).unwrap();
-        assert_eq!(
-            db.get_setting("anilist_token").unwrap().as_deref(),
-            Some("controlled-token")
-        );
-        assert_eq!(
-            std::fs::read(paths.0.join("older/kurisu.db")).unwrap(),
-            b"retained old database"
-        );
-    }
-
-    #[test]
     fn second_launch_activates_existing_profile_without_starting_services() {
         let paths = TestPaths::new();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1974,11 +1523,10 @@ mod tests {
                 OpenOutcome::Activated
             ));
         });
-        assert_eq!(first.core.channel(), UpdateChannel::Native);
     }
 
     #[test]
-    fn damaged_native_schema_blocks_without_repairing_or_importing() {
+    fn damaged_native_schema_blocks_without_repairing() {
         let paths = TestPaths::new();
         let native = platform::data_dir(Some(paths.0.join("isolated"))).unwrap();
         let database = native.join("kurisu.db");
@@ -1997,35 +1545,5 @@ mod tests {
         };
         assert!(error.contains("could not be validated"), "{error}");
         assert_eq!(std::fs::read(database).unwrap(), original);
-        assert!(!paths.0.join("backup.db").exists());
-    }
-
-    #[test]
-    fn stopped_source_guard_holds_port_and_refuses_occupied_port() {
-        use std::{io::Read, net::TcpStream};
-        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = occupied.local_addr().unwrap();
-        assert!(stop_guard_at(address, Duration::ZERO).is_err());
-        drop(occupied);
-        let guard = stop_guard_at(address, Duration::ZERO).unwrap();
-        assert!(TcpListener::bind(address).is_err());
-        for _ in 0..2 {
-            let mut client = TcpStream::connect(address).unwrap();
-            client
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut ack = [0];
-            client.read_exact(&mut ack).unwrap();
-            assert_eq!(ack, *b"k");
-        }
-        let (stopped, complete) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            drop(guard);
-            let _ = stopped.send(());
-        });
-        complete
-            .recv_timeout(Duration::from_secs(2))
-            .expect("transfer guard must stop without waiting for another connection");
-        assert!(TcpListener::bind(address).is_ok());
     }
 }

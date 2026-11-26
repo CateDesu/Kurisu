@@ -33,7 +33,6 @@ fn logout_case(tc: &mut TestAppContext, read: &str, failure: &str, close: bool) 
         dir.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let user = runtime.block_on(core.current_user()).unwrap().unwrap();
@@ -192,13 +191,7 @@ fn oauth_case(tc: &mut TestAppContext, cancel: bool) {
         },
     )
     .unwrap();
-    let core = Core::open(
-        dir.0.clone(),
-        runtime.handle().clone(),
-        browser.clone(),
-        UpdateChannel::Native,
-    )
-    .unwrap();
+    let core = Core::open(dir.0.clone(), runtime.handle().clone(), browser.clone()).unwrap();
     let user = runtime.block_on(core.current_user()).unwrap().unwrap();
     let (view, cx) = tc.add_window_view(|win, cx| {
         Workspace::new_with_session_restore(core.clone(), win, cx, false)
@@ -351,13 +344,7 @@ fn settlement_case(tc: &mut TestAppContext, close_window: bool) {
             [&payload],
         )
         .unwrap();
-    let core = Core::open(
-        dir.0.clone(),
-        runtime.handle().clone(),
-        browser.clone(),
-        UpdateChannel::Native,
-    )
-    .unwrap();
+    let core = Core::open(dir.0.clone(), runtime.handle().clone(), browser.clone()).unwrap();
     assert_eq!(
         runtime.block_on(core.get_pending_changes()).unwrap().len(),
         1

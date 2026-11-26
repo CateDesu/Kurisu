@@ -105,12 +105,6 @@ impl CatalogRead {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ListPreferences {
-    Preserve,
-    Native { last_account: Option<i64> },
-}
-
 #[cfg(test)]
 thread_local! {
     static DURABLE_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -780,23 +774,23 @@ impl Db {
     }
 
     pub fn replace_account(&self, token: &str, user: &crate::models::User) -> Result<bool> {
-        self.replace_account_with_preferences(token, user, ListPreferences::Preserve)
+        self.replace_account_with_last_account(token, user, None)
     }
 
-    pub(crate) fn replace_account_with_preferences(
+    pub(crate) fn replace_account_with_last_account(
         &self,
         token: &str,
         user: &crate::models::User,
-        preferences: ListPreferences,
+        last_account: Option<i64>,
     ) -> Result<bool> {
-        self.replace_account_and_list(token, user, preferences, None)
+        self.replace_account_and_list(token, user, last_account, None)
     }
 
     pub(crate) fn replace_account_and_list(
         &self,
         token: &str,
         user: &crate::models::User,
-        preferences: ListPreferences,
+        last_account: Option<i64>,
         entries: Option<&[ListEntry]>,
     ) -> Result<bool> {
         let profile = serde_json::to_string(user)?;
@@ -827,34 +821,32 @@ impl Db {
         } else if previous_format != user.score_format {
             tx.execute("UPDATE list_entry SET score = NULL WHERE score != 0", [])?;
         }
-        if let ListPreferences::Native { last_account } = preferences {
-            let persisted_owner: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM settings WHERE key = ?",
-                    [LIST_OWNER_KEY],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            // Persisted ownership survives sign-out and restart without an open workspace.
-            let verified_owner = parse_valid_account_id(persisted_owner.as_deref());
-            let list_owner = verified_owner
-                .or_else(|| parse_valid_account_id(previous.as_deref()))
-                .or(last_account.filter(|id| crate::anilist::valid_account_id(*id)));
-            if (persisted_owner.is_some() && verified_owner.is_none())
-                || list_owner.is_some_and(|owner| owner != user.id)
-            {
-                tx.execute(
-                    "DELETE FROM settings WHERE key IN ('native_preference:kurisu.list.q',
-                     'native_preference:kurisu.list.filter', 'native_preference:kurisu.list.synced')",
-                    [],
-                )?;
-            }
-            if crate::anilist::valid_account_id(user.id) {
-                tx.execute(
-                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
-                    [LIST_OWNER_KEY, id.as_str()],
-                )?;
-            }
+        let persisted_owner: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?",
+                [LIST_OWNER_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // Persisted ownership survives sign-out and restart without an open workspace.
+        let verified_owner = parse_valid_account_id(persisted_owner.as_deref());
+        let list_owner = verified_owner
+            .or_else(|| parse_valid_account_id(previous.as_deref()))
+            .or(last_account.filter(|id| crate::anilist::valid_account_id(*id)));
+        if (persisted_owner.is_some() && verified_owner.is_none())
+            || list_owner.is_some_and(|owner| owner != user.id)
+        {
+            tx.execute(
+                "DELETE FROM settings WHERE key IN ('native_preference:kurisu.list.q',
+                 'native_preference:kurisu.list.filter', 'native_preference:kurisu.list.synced')",
+                [],
+            )?;
+        }
+        if crate::anilist::valid_account_id(user.id) {
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                [LIST_OWNER_KEY, id.as_str()],
+            )?;
         }
         for (key, value) in [
             (TOKEN_KEY, token),
@@ -1458,13 +1450,13 @@ mod tests {
                 db.set_setting(key, "old preference").unwrap();
             }
             assert!(db.get_setting("anilist_user_id").unwrap().is_none());
-            db.replace_account_with_preferences(
+            db.replace_account_with_last_account(
                 "new-token",
                 &crate::User {
                     id: 7,
                     ..Default::default()
                 },
-                ListPreferences::Native { last_account: None },
+                None,
             )
             .unwrap();
             for key in SCOPED_LIST_PREFERENCE_KEYS {
@@ -1504,18 +1496,11 @@ mod tests {
                 assert_eq!(db.get_setting(key).unwrap().as_deref(), value);
             }
         };
-        db.replace_account_with_preferences(
-            "first",
-            &user,
-            ListPreferences::Native { last_account: None },
-        )
-        .unwrap();
+        db.replace_account_with_last_account("first", &user, None)
+            .unwrap();
         assert_preferences(Some("original"));
         db.delete_setting("anilist_user_id").unwrap();
-        let previous = ListPreferences::Native {
-            last_account: Some(user.id),
-        };
-        db.replace_account_with_preferences("same", &user, previous)
+        db.replace_account_with_last_account("same", &user, Some(user.id))
             .unwrap();
         assert_preferences(Some("original"));
 
@@ -1529,11 +1514,7 @@ mod tests {
         ] {
             db.0.lock().execute_batch(trigger).unwrap();
             let error = db
-                .replace_account_with_preferences(
-                    "other",
-                    &other,
-                    ListPreferences::Native { last_account: None },
-                )
+                .replace_account_with_last_account("other", &other, None)
                 .unwrap_err();
             assert!(error.to_string().contains("injected failure"));
             assert_eq!(
@@ -1546,24 +1527,13 @@ mod tests {
                 .execute_batch("DROP TRIGGER fail_reset")
                 .unwrap();
         }
-        db.replace_account("legacy", &other).unwrap();
-        assert_eq!(db.saved_list_owner(), Some(user.id));
+        db.delete_setting("anilist_user_id").unwrap();
+        db.replace_account_with_last_account("same-after-restart", &user, None)
+            .unwrap();
         assert_preferences(Some("original"));
         db.delete_setting("anilist_user_id").unwrap();
-        db.replace_account_with_preferences(
-            "same-after-restart",
-            &user,
-            ListPreferences::Native { last_account: None },
-        )
-        .unwrap();
-        assert_preferences(Some("original"));
-        db.delete_setting("anilist_user_id").unwrap();
-        db.replace_account_with_preferences(
-            "other-after-restart",
-            &other,
-            ListPreferences::Native { last_account: None },
-        )
-        .unwrap();
+        db.replace_account_with_last_account("other-after-restart", &other, None)
+            .unwrap();
         assert_preferences(None);
         assert_eq!(
             db.get_setting("native_preference:kurisu.list.sort")

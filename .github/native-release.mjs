@@ -1,13 +1,11 @@
-import { readFileSync, appendFileSync, readdirSync, statSync, copyFileSync, constants, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, appendFileSync, readdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 const MAX_BUFFER = 64 * 1024 * 1024;
-export const transition = JSON.parse(readFileSync(new URL("release-transition.json", import.meta.url), "utf8"));
 
 export function version(tag) {
   if (!/^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(tag)) throw new Error("Use a stable numeric v-prefixed tag");
@@ -23,43 +21,21 @@ export function compare(left, right) {
   return index < 0 ? 0 : a[index] - b[index];
 }
 
-export function plan(kind, tag) {
-  if (kind !== "native") throw new Error("Only native releases can be built or published");
-  if (compare(tag, transition.bridgeTag) <= 0) throw new Error("Native release must be newer than the pinned bridge");
+export function plan(tag) {
+  version(tag);
   return { tag, ver: tag.slice(1) };
 }
 
-// This predicate is shipped in v1.0.0.77 and cannot be changed remotely.
-export function originalWindowsSelector(names) {
-  const hits = names.filter(name => name.endsWith("-setup.exe") && name.includes("_x64-"));
-  return hits.length === 1 ? hits[0] : null;
-}
-
-export function bridgeAssets(release) {
-  if (release.tag_name !== transition.bridgeTag || release.draft || release.prerelease) {
-    throw new Error("The pinned bridge must already be a published stable release");
-  }
-  const names = release.assets.map(asset => asset.name);
-  const installer = originalWindowsSelector(names);
-  if (!installer || !/^Kurisu_\d+\.\d+\.\d+(?:\.\d+)?_x64-setup\.exe$/.test(installer)) {
-    throw new Error("The frozen bridge must have exactly one legacy Windows installer");
-  }
-  const required = ["kurisu", "kurisu.exe", installer].flatMap(name => [name, `${name}.sha256`]);
-  if (names.length !== new Set(names).size || required.some(name => !names.includes(name))) {
-    throw new Error("The frozen bridge is missing a binary or existing checksum sidecar");
-  }
-  if (names.some(name => name.startsWith("kurisu-native") || name.startsWith("Kurisu-Native_"))) {
-    throw new Error("The final bridge release must contain legacy binaries only");
-  }
-  return required;
+export function requiredNativeAssets(tag) {
+  const ver = plan(tag).ver;
+  return ["kurisu-native", "kurisu-native.exe", `Kurisu-Native_${ver}_x64-install.exe`,
+    `Kurisu_${ver}_linux-x64.tar.gz`].flatMap(name => [name, `${name}.sha256`]);
 }
 
 export function nativeAssets(names, tag) {
-  const ver = plan("native", tag).ver;
-  const required = ["kurisu-native", "kurisu-native.exe", `Kurisu-Native_${ver}_x64-install.exe`,
-    `Kurisu_${ver}_linux-x64.tar.gz`].flatMap(name => [name, `${name}.sha256`]);
+  const required = requiredNativeAssets(tag);
   if (required.some(name => !names.includes(name))) throw new Error("Both native platforms and Linux bundle are required");
-  if (names.some(name => name.endsWith("-setup.exe"))) throw new Error("Native installers must not match the old updater");
+  if (names.some(name => !required.includes(name))) throw new Error("Unexpected release assets");
   return required;
 }
 
@@ -71,10 +47,6 @@ function run(program, args, cwd) {
 
 function repository() {
   return process.env.GITHUB_REPOSITORY || "CateDesu/Kurisu";
-}
-
-function gh(args) {
-  return run("gh", [...args, "--repo", repository()]);
 }
 
 function parseJsonLines(text) {
@@ -138,16 +110,6 @@ function verifiedAssets(release, expected) {
 
 const retryArtifacts = "Use the original verified build artifacts. In GitHub Actions, re-run failed jobs from the original Native release run.";
 
-function verifyPinnedBridgeInstaller(directory, installerName) {
-  if (!/^[0-9a-f]{64}$/.test(transition.bridgeInstallerSha256)) {
-    throw new Error("Pinned bridge installer SHA-256 is missing or invalid");
-  }
-  const actual = createHash("sha256").update(readFileSync(join(directory, installerName))).digest("hex");
-  if (actual !== transition.bridgeInstallerSha256) {
-    throw new Error("Bridge installer SHA-256 does not match the pinned transition digest");
-  }
-}
-
 function verifySidecars(directory, names) {
   const assets = new Map();
   for (const name of names.filter(name => !name.endsWith(".sha256"))) {
@@ -167,26 +129,6 @@ function verifySidecars(directory, names) {
   return assets;
 }
 
-function stageBridge(directory, names) {
-  const temporary = mkdtempSync(join(tmpdir(), "kurisu-release-bridge-"));
-  try {
-    gh(["release", "download", transition.bridgeTag, "--dir", temporary, ...names.flatMap(name => ["--pattern", name])]);
-    const verified = verifySidecars(temporary, names);
-    verifyPinnedBridgeInstaller(temporary, originalWindowsSelector(names));
-    for (const name of names) {
-      const path = join(directory, name);
-      if (!existsSync(path)) copyFileSync(join(temporary, name), path, constants.COPYFILE_EXCL);
-    }
-    const staged = verifySidecars(directory, names);
-    for (const [name, { digest }] of verified) {
-      if (staged.get(name).digest !== digest) throw new Error(`Staged asset differs from the pinned bridge: ${name}`);
-    }
-    return staged;
-  } finally {
-    rmSync(temporary, { recursive: true, force: true });
-  }
-}
-
 function verifyRemoteTagCommit(tag, expectedCommit) {
   // GitHub ignores target_commitish for an existing release tag.
   const git = `repos/${repository()}/git`;
@@ -200,12 +142,12 @@ function verifyRemoteTagCommit(tag, expectedCommit) {
 }
 
 function releaseNotes(tag) {
-  return `Kurisu ${tag.slice(1)}. Fresh Linux installs: download Kurisu_${tag.slice(1)}_linux-x64.tar.gz. Fresh Windows installs: download Kurisu-Native_${tag.slice(1)}_x64-install.exe. Ordinary upgrades need no Python. Existing native profiles remain separate from legacy profiles.\n\nLegacy assets named kurisu, kurisu.exe and Kurisu_*-setup.exe are the unchanged ${transition.bridgeTag} transition bridge for old updaters. They are kept intentionally; fresh installs should use the native downloads above. Keep the pinned bridge release for rollback. Changes made only in the native profile are not copied back to the legacy profile.`;
+  return `Kurisu ${tag.slice(1)}. Linux: download Kurisu_${tag.slice(1)}_linux-x64.tar.gz. Windows: download Kurisu-Native_${tag.slice(1)}_x64-install.exe.`;
 }
 
 async function main() {
-  const [command, kind, tag, directory] = process.argv.slice(2);
-  const result = plan(kind, tag);
+  const [command, tag, directory] = process.argv.slice(2);
+  const result = plan(tag);
   const commit = run("git", ["rev-parse", `refs/tags/${tag}^{commit}`]);
   const plannedCommit = process.env.RELEASE_COMMIT;
   if (command === "publish" && plannedCommit !== undefined) {
@@ -229,10 +171,8 @@ async function main() {
   const notes = releaseNotes(tag);
   const absoluteDirectory = run("realpath", [directory]);
   const paths = readdirSync(absoluteDirectory).filter(name => statSync(join(absoluteDirectory, name)).isFile());
-  const bridge = JSON.parse(run("gh", ["api", `${endpoint}/tags/${transition.bridgeTag}`]));
-  const legacy = bridgeAssets(bridge);
-  const names = nativeAssets(paths.filter(name => !legacy.includes(name)), tag);
-  const expected = new Map([...verifySidecars(absoluteDirectory, names), ...stageBridge(absoluteDirectory, legacy)]);
+  const names = nativeAssets(paths, tag);
+  const expected = verifySidecars(absoluteDirectory, names);
   const manifest = Array.from(expected, ([name, { size, digest }]) => [name, size, digest]);
   const fingerprint = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
   const marker = `${notes}\n\n<!-- Kurisu native release for ${commit} with assets `;

@@ -604,7 +604,7 @@ impl Workspace {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use kurisu_core::{Platform, UpdateChannel};
+    use kurisu_core::Platform;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -645,7 +645,6 @@ mod tests {
             path.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         (core, runtime, FixtureDir(path))

@@ -665,7 +665,7 @@ mod tests {
     fn notification_retry_keeps_rows_and_unread_until_correct_page(tc: &mut gpui::TestAppContext) {
         use std::time::{Duration, Instant};
 
-        use kurisu_core::{Core, Db, UpdateChannel, User};
+        use kurisu_core::{Core, Db, User};
         use serde_json::json;
 
         use crate::screens::fixture_server::{child_gate, serve};
@@ -740,7 +740,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         );
         let (view, cx) = tc.add_window_view(|window, cx| {
             Workspace::new_with_session_restore(core, window, cx, false)

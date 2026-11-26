@@ -156,7 +156,6 @@ fn confirmed_logout_survives_quit_and_preference_retry(cx: &mut TestAppContext) 
         directory.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -327,7 +326,6 @@ fn queued_list_preferences_cannot_follow_account_replacement(cx: &mut TestAppCon
         directory.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -399,7 +397,6 @@ fn failed_confirmed_logout_cancels_quit(cx: &mut TestAppContext) {
         directory.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -502,7 +499,6 @@ fn signed_out_restart_clears_list_preferences_for_replacement_and_blocks_logout_
         directory.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace, vcx) =
@@ -547,7 +543,6 @@ fn signed_out_restart_clears_list_preferences_for_replacement_and_blocks_logout_
         directory.0.clone(),
         runtime2.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace2, vcx2) =
@@ -584,7 +579,6 @@ fn signed_out_restart_clears_list_preferences_for_replacement_and_blocks_logout_
         directory.0.clone(),
         runtime3.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     let (workspace3, vcx3) =
@@ -678,7 +672,6 @@ fn mixed_list_owner_and_saved_account_resets_concurrent_preference_read(cx: &mut
         directory.0.clone(),
         runtime.handle().clone(),
         Arc::new(TestPlatform),
-        UpdateChannel::Native,
     )
     .unwrap();
     assert_eq!(runtime.block_on(core.saved_account_id()), Some(71));

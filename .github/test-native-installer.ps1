@@ -1,8 +1,3 @@
-param(
-    [Parameter(Mandatory)]
-    [string]$BridgeInstaller
-)
-
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'Installer proof runs only on a disposable GitHub hosted Windows runner'
@@ -19,8 +14,6 @@ if ($dependencies -match '(?i)\b(?:vcruntime|msvcp|concrt)\d[^\s]*\.dll\b') {
 }
 $installDirectory = Join-Path $env:RUNNER_TEMP 'Kurisu installer proof'
 $profiles = @(
-    (Join-Path $env:LOCALAPPDATA 'com.catedesu.kurisu'),
-    (Join-Path $env:LOCALAPPDATA 'CateDesu/kurisu/data'),
     (Join-Path $env:LOCALAPPDATA 'CateDesu/kurisu-native/data'),
     (Join-Path $env:APPDATA 'CateDesu/kurisu-native/data')
 )
@@ -41,9 +34,7 @@ for value in sys.argv[1:]:
     db.close()
     for path, content in saved.items():
         path.write_bytes(content)
-    (root / "kurisu-ui-preferences.json").write_text('{"synthetic":true}', encoding="utf-8")
-    if "kurisu-native" in root.parts:
-        (root / ".kurisu-native-profile").write_text("kurisu-native-v1\n", encoding="utf-8")
+    (root / ".kurisu-native-profile").write_text("kurisu-native-v1\n", encoding="utf-8")
 '@ | python - @profiles
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare disposable profile data' }
 $profileFiles = @{}
@@ -63,28 +54,10 @@ $key = 'HKCU:\Software\CateDesu\Kurisu'
 function Get-ProductDirectory {
     [Microsoft.Win32.Registry]::GetValue('HKEY_CURRENT_USER\Software\CateDesu\Kurisu', '', $null)
 }
-$transition = Get-Content .github/release-transition.json -Raw | ConvertFrom-Json
-$expectedBridgeHash = [string]$transition.bridgeInstallerSha256
-if ($expectedBridgeHash -cnotmatch '^[0-9a-f]{64}$') {
-    throw 'Pinned bridge installer SHA-256 is missing or invalid'
-}
-$bridgeSidecarPath = "$BridgeInstaller.sha256"
-if (-not (Test-Path -LiteralPath $bridgeSidecarPath -PathType Leaf)) {
-    throw 'Bridge installer checksum sidecar is missing'
-}
-$bridgeName = [Regex]::Escape((Split-Path -Path $BridgeInstaller -Leaf))
-$bridgeSidecar = (Get-Content -LiteralPath $bridgeSidecarPath -Raw).Trim()
-if ($bridgeSidecar -cnotmatch "^([0-9a-f]{64})  $bridgeName$") {
-    throw 'Bridge installer checksum sidecar format is invalid'
-}
-$actualBridgeHash = (Get-FileHash -LiteralPath $BridgeInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualBridgeHash -cne $expectedBridgeHash -or $actualBridgeHash -cne $Matches[1]) {
-    throw 'Bridge installer SHA-256 verification failed'
-}
-$legacy = Start-Process -FilePath $BridgeInstaller -ArgumentList "/S /D=$installDirectory" -Wait -PassThru
-if ($legacy.ExitCode -ne 0) { throw "Bridge installer exited $($legacy.ExitCode)" }
-if ((Get-ProductDirectory) -ne $installDirectory) { throw 'Bridge installation identity differs' }
-if (-not (Test-Path (Join-Path $installDirectory 'kurisu.exe'))) { throw 'Bridge executable missing' }
+$initial = Start-Process -FilePath $installer[0].FullName -ArgumentList "/S /D=$installDirectory" -Wait -PassThru
+if ($initial.ExitCode -ne 0) { throw "Native installer exited $($initial.ExitCode)" }
+if ((Get-ProductDirectory) -ne $installDirectory) { throw 'Installation identity differs' }
+if (-not (Test-Path (Join-Path $installDirectory 'kurisu.exe'))) { throw 'Executable missing' }
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Kurisu.lnk'
 $shortcutBefore = (Get-FileHash -LiteralPath $shortcut).Hash
 $uninstallSubKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Kurisu'
@@ -93,7 +66,7 @@ $registrationBefore = (Get-ItemProperty $uninstallKey | ConvertTo-Json -Compress
 $binaryBefore = (Get-FileHash (Join-Path $installDirectory 'kurisu.exe')).Hash
 $uninstaller = Join-Path $installDirectory 'uninstall.exe'
 $uninstallerBefore = (Get-FileHash $uninstaller).Hash
-$savedUninstaller = Join-Path $env:RUNNER_TEMP 'kurisu-bridge-uninstaller.exe'
+$savedUninstaller = Join-Path $env:RUNNER_TEMP 'kurisu-saved-uninstaller.exe'
 Move-Item $uninstaller $savedUninstaller
 $candidate = Join-Path $env:LOCALAPPDATA 'Programs/Kurisu Native'
 New-Item -ItemType Directory -Path $candidate -Force | Out-Null
@@ -216,7 +189,7 @@ try {
     if ($hadNotices) { Move-Item -LiteralPath $savedNotices -Destination $notices }
 }
 $stage = New-Item -ItemType Directory -Path (Join-Path $installDirectory '.kurisu-install.tmp')
-$staleBackup = Join-Path $stage.FullName 'PROFILE_TRANSFER.md.bak'
+$staleBackup = Join-Path $stage.FullName 'THIRD_PARTY_NOTICES.txt.bak'
 Set-Content -LiteralPath $staleBackup 'Stale backup'
 $held = [IO.File]::Open($staleBackup, 'Open', 'Read', 'ReadWrite')
 try {
@@ -233,15 +206,14 @@ Assert-UnchangedInstall
 $rollbackTarget = Join-Path $installDirectory 'LICENSE'
 $seededLicense = -not (Test-Path -LiteralPath $rollbackTarget -PathType Leaf)
 if ($seededLicense) { Set-Content -LiteralPath $rollbackTarget 'Retained license' }
-$placedFile = Join-Path $installDirectory 'PROFILE_TRANSFER.md'
-$savedTransfer = Join-Path $env:RUNNER_TEMP 'kurisu-bridge-transfer.md'
-$hadTransfer = Test-Path -LiteralPath $placedFile
-if ($hadTransfer) { Move-Item -LiteralPath $placedFile -Destination $savedTransfer }
+$placedFile = Join-Path $installDirectory 'kurisu.ico'
+$savedIcon = Join-Path $env:RUNNER_TEMP 'kurisu-retained.ico'
+Move-Item -LiteralPath $placedFile -Destination $savedIcon
 try {
     $licenseBefore = (Get-FileHash -LiteralPath $rollbackTarget).Hash
     # Simulate an interrupted swap that placed a previously absent file.
     $stage = New-Item -ItemType Directory -Path (Join-Path $installDirectory '.kurisu-install.tmp')
-    Set-Content -LiteralPath (Join-Path $stage.FullName '.swapping') -Encoding Ascii -Value '[absent]', 'PROFILE_TRANSFER.md=1'
+    Set-Content -LiteralPath (Join-Path $stage.FullName '.swapping') -Encoding Ascii -Value '[absent]', 'kurisu.ico=1'
     Set-Content -LiteralPath $placedFile 'Interrupted candidate'
     $backup = Join-Path $stage.FullName 'kurisu.exe.bak'
     Move-Item -LiteralPath $binary -Destination $backup
@@ -268,7 +240,7 @@ try {
         throw 'Interrupted installation retained a newly placed file after rollback'
     }
 } finally {
-    if ($hadTransfer) { Move-Item -LiteralPath $savedTransfer -Destination $placedFile -Force }
+    Move-Item -LiteralPath $savedIcon -Destination $placedFile -Force
     if ($seededLicense) { Remove-Item -LiteralPath $rollbackTarget }
 }
 Assert-UnchangedInstall
@@ -337,12 +309,11 @@ if ((Get-FileHash -LiteralPath $shortcut).Hash -ne $shortcutBefore) {
 }
 $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
 if ($link.TargetPath -ne $binary) { throw 'Kurisu shortcut does not target the normal executable' }
-$supportFiles = foreach ($name in 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'PROFILE_TRANSFER.md', 'kurisu.ico') {
+$supportFiles = foreach ($name in 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'kurisu.ico') {
     $path = Join-Path $installDirectory $name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing $name" }
     $path
 }
-if (Test-Path (Join-Path $installDirectory 'migrate.py')) { throw 'Ordinary installation must not need Python' }
 $uninstaller = Join-Path $installDirectory 'uninstall.exe'
 if ($registration.UninstallString -ne ('"{0}"' -f $uninstaller)) {
     throw "Unexpected registered uninstall command: $($registration.UninstallString)"
@@ -716,4 +687,4 @@ try {
     if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut }
 }
 Assert-RetainedProfiles
-Write-Output 'Native installer, legacy replacement, rollback, uninstall ownership and retained profile checks passed'
+Write-Output 'Native installer, upgrade, rollback, uninstall ownership and retained profile checks passed'

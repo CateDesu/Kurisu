@@ -1902,13 +1902,9 @@ async fn queued_incompatible_score_write_stays_conflicted_after_postflight_failu
             let (result, ()) = tokio::join!(flush_background(&state), auth_expired);
             assert_eq!(result.unwrap_err(), session_expired);
             assert!(!state.anilist.lock().has_token());
-            crate::commands::login_with_token(
-                "renewed-session".into(),
-                &state,
-                crate::db::ListPreferences::Preserve,
-            )
-            .await
-            .unwrap();
+            crate::commands::login_with_token("renewed-session".into(), &state, None)
+                .await
+                .unwrap();
         } else if mode == "viewer_other_account" {
             assert_eq!(
                 flush_background(&state).await.unwrap_err(),

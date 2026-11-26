@@ -1,12 +1,12 @@
 mod anilist;
 mod commands;
 mod db;
+pub mod db_validate;
 mod discord;
 mod library;
 pub mod models;
 mod mpvipc;
 mod playback;
-pub mod profile_transfer;
 mod recognize;
 mod rss;
 mod show_torrents;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 pub use anilist::valid_account_id;
-pub use commands::{check_bridge_update, install_bridge_update, TrackingConfig};
+pub use commands::TrackingConfig;
 pub use db::Db;
 pub use library::{library_binding_folder, LibraryBinding, LibraryBindingScope};
 pub use models::*;
@@ -32,12 +32,6 @@ pub trait Platform: Send + Sync {
     fn open_url(&self, url: &str) -> Result<(), String>;
     fn open_path(&self, path: &Path) -> Result<(), String>;
     fn reveal_path(&self, path: &Path) -> Result<(), String>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UpdateChannel {
-    Legacy,
-    Native,
 }
 
 #[derive(Clone, Debug)]
@@ -79,7 +73,6 @@ pub struct Core {
     state: Arc<commands::AppState>,
     runtime: tokio::runtime::Handle,
     platform: Arc<dyn Platform>,
-    channel: UpdateChannel,
     data_dir: PathBuf,
     latest_update: Arc<Mutex<Option<UpdateInfo>>>,
     failed_update: Arc<Mutex<Option<String>>>,
@@ -92,7 +85,6 @@ impl Core {
         data_dir: PathBuf,
         runtime: tokio::runtime::Handle,
         platform: Arc<dyn Platform>,
-        channel: UpdateChannel,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         #[cfg(unix)]
@@ -102,7 +94,7 @@ impl Core {
                 .map_err(|e| e.to_string())?;
         }
         let db = db::Db::open(&data_dir.join("kurisu.db")).map_err(|e| e.to_string())?;
-        Ok(Self::from_db(db, data_dir, runtime, platform, channel))
+        Ok(Self::from_db(db, data_dir, runtime, platform))
     }
 
     pub fn from_db(
@@ -110,7 +102,6 @@ impl Core {
         data_dir: PathBuf,
         runtime: tokio::runtime::Handle,
         platform: Arc<dyn Platform>,
-        channel: UpdateChannel,
     ) -> Self {
         let mut anilist = anilist::AniList::new();
         if let Ok(Some(token)) = db.saved_token() {
@@ -139,7 +130,6 @@ impl Core {
             }),
             runtime,
             platform,
-            channel,
             data_dir,
             latest_update: Arc::new(Mutex::new(None)),
             failed_update: Arc::new(Mutex::new(None)),
@@ -190,14 +180,11 @@ impl Core {
     pub(crate) fn state(&self) -> &commands::AppState {
         &self.state
     }
-    pub fn legacy_setting(&self, key: &str) -> Option<String> {
+    pub(crate) fn app_setting_sync(&self, key: &str) -> Option<String> {
         if !["close_to_tray", "auto_update"].contains(&key) {
             return None;
         }
         self.state.db.get_setting(key).ok().flatten()
-    }
-    pub fn channel(&self) -> UpdateChannel {
-        self.channel
     }
     pub fn emit(&self, kind: EventKind) {
         self.state.emit(kind);
@@ -457,9 +444,8 @@ impl Core {
             }
             let check = core.clone();
             let notify = core.clone();
-            updater::watch_updates_channel(
-                move || check.legacy_setting("auto_update").as_deref() != Some("0"),
-                core.channel,
+            updater::watch_updates(
+                move || check.app_setting_sync("auto_update").as_deref() != Some("0"),
                 move |info| {
                     *notify.latest_update.lock() = Some(info.clone());
                     notify.emit(EventKind::UpdateAvailable(info));
@@ -517,14 +503,7 @@ impl Core {
         self.login(None, None).await
     }
 
-    fn list_preferences(&self, last_account: Option<i64>) -> db::ListPreferences {
-        match self.channel {
-            UpdateChannel::Native => db::ListPreferences::Native { last_account },
-            UpdateChannel::Legacy => db::ListPreferences::Preserve,
-        }
-    }
-
-    /// An absent token starts browser sign-in. The native list owner can outlive sign-out.
+    /// An absent token starts browser sign-in. The list owner can outlive sign-out.
     pub async fn login(
         &self,
         token: Option<String>,
@@ -544,13 +523,12 @@ impl Core {
         token: Option<String>,
         last_account: Option<i64>,
     ) -> Result<User, String> {
-        let preferences = self.list_preferences(last_account);
         match token {
             Some(token) => {
-                commands::login_with_token_inner(token, &self.state, intent, preferences).await
+                commands::login_with_token_inner(token, &self.state, intent, last_account).await
             }
             None => {
-                commands::login_oauth(self.platform.as_ref(), &self.state, intent, preferences)
+                commands::login_oauth(self.platform.as_ref(), &self.state, intent, last_account)
                     .await
             }
         }
@@ -562,13 +540,13 @@ impl Core {
         commands::logout(&self.state).await
     }
     pub async fn current_user(&self) -> Result<Option<User>, String> {
-        commands::current_user_mode(&self.state, false, self.list_preferences(None)).await
+        commands::current_user_mode(&self.state, false, None).await
     }
     pub async fn saved_account_id(&self) -> Option<i64> {
         self.state.db.saved_list_owner()
     }
     pub async fn refresh_current_user(&self) -> Result<Option<User>, String> {
-        commands::current_user_mode(&self.state, true, self.list_preferences(None)).await
+        commands::current_user_mode(&self.state, true, None).await
     }
     pub async fn search_anime_page(&self, query: String, page: i64) -> Result<SearchPage, String> {
         commands::search_anime_page(query, page, &self.state).await
@@ -593,7 +571,7 @@ impl Core {
         commands::get_airing_schedule(start, end, &self.state).await
     }
     pub async fn sync_my_list(&self) -> Result<Vec<ListEntry>, String> {
-        commands::sync_my_list_mode(&self.state, self.list_preferences(None)).await
+        commands::sync_my_list_mode(&self.state, None).await
     }
     pub async fn local_entries(&self) -> Result<Vec<ListEntry>, String> {
         commands::local_entries(&self.state).await
@@ -751,10 +729,10 @@ impl Core {
         .await
     }
     pub async fn check_update(&self) -> Result<UpdateInfo, String> {
-        commands::check_update(self.channel).await
+        commands::check_update().await
     }
     pub async fn install_update(&self) -> Result<String, String> {
-        commands::install_update(self.data_dir.clone(), self.channel).await
+        commands::install_update(self.data_dir.clone()).await
     }
     pub async fn get_pending_changes(&self) -> Result<Vec<PendingChange>, String> {
         sync_queue::get_pending_changes(&self.state).await
@@ -838,7 +816,6 @@ mod core_tests {
             dir.clone(),
             tokio::runtime::Handle::current(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         (core, dir)
@@ -862,7 +839,6 @@ mod core_tests {
             PathBuf::new(),
             tokio::runtime::Handle::current(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
     }
 
@@ -1358,7 +1334,6 @@ mod core_tests {
             dir.clone(),
             tokio::runtime::Handle::current(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         assert!(!reopened.is_logged_in().await);
@@ -1486,7 +1461,6 @@ mod core_tests {
                     dir.clone(),
                     tokio::runtime::Handle::current(),
                     Arc::new(TestPlatform),
-                    UpdateChannel::Native,
                 )
                 .unwrap()
             };
@@ -1572,7 +1546,7 @@ mod core_tests {
     }
 
     #[tokio::test]
-    async fn saved_list_owner_prefers_persisted_owner_over_legacy_account_replacement() {
+    async fn saved_list_owner_prefers_persisted_owner_over_anilist_user_id() {
         let (core, dir) = open("saved-list-owner-precedence");
         let viewer_a = serde_json::json!({"data":{"Viewer":{"id":71,"name":"Alice"}}});
         let (api, _) = anilist::mock_api(vec![(200, viewer_a)]).await;
@@ -1581,17 +1555,7 @@ mod core_tests {
         core.set_workspace_preference("kurisu.list.q".into(), Some("alice query".into()), Some(71))
             .await
             .unwrap();
-        core.state
-            .db
-            .replace_account(
-                "legacy-tok-b",
-                &User {
-                    id: 72,
-                    name: "Bob".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        core.state.db.set_setting("anilist_user_id", "72").unwrap();
         assert_eq!(
             core.state
                 .db
@@ -1783,7 +1747,6 @@ mod core_tests {
                 dir.clone(),
                 tokio::runtime::Handle::current(),
                 Arc::new(TestPlatform),
-                UpdateChannel::Native,
             )
             .unwrap();
             assert_eq!(reopened.saved_account_id().await, Some(71));
@@ -1812,7 +1775,6 @@ mod core_tests {
                 dir.clone(),
                 tokio::runtime::Handle::current(),
                 Arc::new(TestPlatform),
-                UpdateChannel::Native,
             )
             .unwrap();
             assert_eq!(reopened.saved_account_id().await, Some(71));
@@ -2531,126 +2493,112 @@ mod core_tests {
     #[tokio::test]
     async fn sync_my_list_applies_native_preference_ownership_on_adoption_and_account_replacement()
     {
-        for channel in [UpdateChannel::Native, UpdateChannel::Legacy] {
-            for cold_adoption in [true, false] {
-                let viewer_b = serde_json::json!({
-                    "data": {
-                        "Viewer": {
-                            "id": 72,
-                            "name": "Bob",
-                            "mediaListOptions": { "scoreFormat": "POINT_100" }
-                        }
+        for cold_adoption in [true, false] {
+            let viewer_b = serde_json::json!({
+                "data": {
+                    "Viewer": {
+                        "id": 72,
+                        "name": "Bob",
+                        "mediaListOptions": { "scoreFormat": "POINT_100" }
                     }
-                });
-                let list_b = serde_json::json!({
-                    "data": {
-                        "MediaListCollection": {
-                            "user": { "id": 72 },
-                            "hasNextChunk": false,
-                            "lists": []
-                        }
-                    }
-                });
-                let replies = if cold_adoption {
-                    vec![(200, viewer_b.clone()), (200, list_b), (200, viewer_b)]
-                } else {
-                    vec![(200, list_b), (200, viewer_b)]
-                };
-                let (api, _) = anilist::mock_api(replies).await;
-                let db = Db::open(Path::new(":memory:")).unwrap();
-                db.replace_account_with_preferences(
-                    "tok-alice",
-                    &User {
-                        id: 71,
-                        name: "Alice".into(),
-                        score_format: Some("POINT_100".into()),
-                        ..Default::default()
-                    },
-                    db::ListPreferences::Native { last_account: None },
-                )
-                .unwrap();
-                for (key, value) in [
-                    ("native_preference:kurisu.list.q", "alice-search"),
-                    ("native_preference:kurisu.list.filter", "DROPPED"),
-                    ("native_preference:kurisu.list.synced", "12345"),
-                    ("native_preference:kurisu.list.sort", "title"),
-                ] {
-                    db.set_setting(key, value).unwrap();
                 }
-                if cold_adoption {
-                    db.delete_setting("anilist_user_id").unwrap();
-                    db.delete_setting("anilist_profile").unwrap();
-                    db.set_setting("anilist_token", "tok-bob").unwrap();
-                } else {
-                    db.replace_account(
-                        "tok-bob",
-                        &User {
-                            id: 72,
-                            name: "Bob".into(),
-                            score_format: Some("POINT_100".into()),
-                            ..Default::default()
-                        },
-                    )
+            });
+            let list_b = serde_json::json!({
+                "data": {
+                    "MediaListCollection": {
+                        "user": { "id": 72 },
+                        "hasNextChunk": false,
+                        "lists": []
+                    }
+                }
+            });
+            let replies = if cold_adoption {
+                vec![(200, viewer_b.clone()), (200, list_b), (200, viewer_b)]
+            } else {
+                vec![(200, list_b), (200, viewer_b)]
+            };
+            let (api, _) = anilist::mock_api(replies).await;
+            let db = Db::open(Path::new(":memory:")).unwrap();
+            db.replace_account_with_last_account(
+                "tok-alice",
+                &User {
+                    id: 71,
+                    name: "Alice".into(),
+                    score_format: Some("POINT_100".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            for (key, value) in [
+                ("native_preference:kurisu.list.q", "alice-search"),
+                ("native_preference:kurisu.list.filter", "DROPPED"),
+                ("native_preference:kurisu.list.synced", "12345"),
+                ("native_preference:kurisu.list.sort", "title"),
+            ] {
+                db.set_setting(key, value).unwrap();
+            }
+            if cold_adoption {
+                db.delete_setting("anilist_user_id").unwrap();
+                db.delete_setting("anilist_profile").unwrap();
+                db.set_setting("anilist_token", "tok-bob").unwrap();
+            } else {
+                let bob = User {
+                    id: 72,
+                    name: "Bob".into(),
+                    score_format: Some("POINT_100".into()),
+                    ..Default::default()
+                };
+                db.set_setting("anilist_token", "tok-bob").unwrap();
+                db.set_setting("anilist_user_id", "72").unwrap();
+                db.set_setting("anilist_profile", &serde_json::to_string(&bob).unwrap())
                     .unwrap();
-                }
-                let core = Core::from_db(
-                    db,
-                    PathBuf::new(),
-                    tokio::runtime::Handle::current(),
-                    Arc::new(TestPlatform),
-                    channel,
-                );
-                *core.state.anilist.lock() = api;
-                core.state.anilist.lock().set_token(Some("tok-bob".into()));
+            }
+            let core = Core::from_db(
+                db,
+                PathBuf::new(),
+                tokio::runtime::Handle::current(),
+                Arc::new(TestPlatform),
+            );
+            *core.state.anilist.lock() = api;
+            core.state.anilist.lock().set_token(Some("tok-bob".into()));
 
-                for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
-                    assert_eq!(
-                        core.get_preference(key.into()).await.unwrap(),
-                        None,
-                        "before sync channel={channel:?}, cold_adoption={cold_adoption}, key={key}"
-                    );
-                }
-
-                assert!(core.sync_my_list().await.unwrap().is_empty());
-                let expected = match channel {
-                    UpdateChannel::Native => [None, None, None],
-                    UpdateChannel::Legacy => [Some("alice-search"), Some("DROPPED"), Some("12345")],
-                };
-                for (key, want) in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"]
-                    .into_iter()
-                    .zip(expected)
-                {
-                    assert_eq!(
-                        core.state
-                            .db
-                            .get_setting(&format!("native_preference:{key}"))
-                            .unwrap()
-                            .as_deref(),
-                        want,
-                        "channel={channel:?}, cold_adoption={cold_adoption}, key={key}"
-                    );
-                    assert_eq!(
-                        core.get_preference(key.into()).await.unwrap(),
-                        None,
-                        "channel={channel:?}, cold_adoption={cold_adoption}, key={key}"
-                    );
-                }
+            for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
                 assert_eq!(
-                    core.get_preference("kurisu.list.sort".into())
-                        .await
-                        .unwrap()
-                        .as_deref(),
-                    Some("title")
-                );
-                assert_eq!(
-                    core.saved_account_id().await,
-                    Some(match channel {
-                        UpdateChannel::Native => 72,
-                        UpdateChannel::Legacy => 71,
-                    }),
-                    "channel={channel:?}, cold_adoption={cold_adoption}"
+                    core.get_preference(key.into()).await.unwrap(),
+                    None,
+                    "before sync cold_adoption={cold_adoption}, key={key}"
                 );
             }
+
+            assert!(core.sync_my_list().await.unwrap().is_empty());
+            for key in ["kurisu.list.q", "kurisu.list.filter", "kurisu.list.synced"] {
+                assert_eq!(
+                    core.state
+                        .db
+                        .get_setting(&format!("native_preference:{key}"))
+                        .unwrap(),
+                    None,
+                    "cold_adoption={cold_adoption}, key={key}"
+                );
+                assert_eq!(
+                    core.get_preference(key.into()).await.unwrap(),
+                    None,
+                    "cold_adoption={cold_adoption}, key={key}"
+                );
+            }
+            assert_eq!(
+                core.get_preference("kurisu.list.sort".into())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("title")
+            );
+            assert_eq!(
+                core.saved_account_id().await,
+                Some(72),
+                "cold_adoption={cold_adoption}"
+            );
         }
     }
 
@@ -2661,14 +2609,14 @@ mod core_tests {
         let (core, dir) = open("scoped-pref-read-guard");
         core.state
             .db
-            .replace_account_with_preferences(
+            .replace_account_with_last_account(
                 "tok-71",
                 &User {
                     id: 71,
                     name: "Alice".into(),
                     ..Default::default()
                 },
-                db::ListPreferences::Native { last_account: None },
+                None,
             )
             .unwrap();
         core.state.anilist.lock().set_token(Some("tok-71".into()));
@@ -2720,7 +2668,6 @@ mod core_tests {
             PathBuf::new(),
             tokio::runtime::Handle::current(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         );
         let initial = core.generation();
         assert!(!core.remote_write_active());

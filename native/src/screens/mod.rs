@@ -4299,8 +4299,8 @@ impl Render for Workspace {
 mod menu_focus_tests {
     use super::*;
     use gpui::{Focusable, Modifiers, MouseButton, TestAppContext, VisualTestContext};
+    use kurisu_core::Platform;
     use kurisu_core::models::ListEntry;
-    use kurisu_core::{Platform, UpdateChannel};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4343,7 +4343,6 @@ mod menu_focus_tests {
             path.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         (core, runtime, FixtureDir(path))
@@ -4587,7 +4586,6 @@ mod menu_focus_tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(crate::platform::NativePlatform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         assert_eq!(

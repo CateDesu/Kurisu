@@ -1858,7 +1858,7 @@ mod tests {
     use super::*;
     use gpui::{Entity, Modifiers, Subscription, TestAppContext, VisualTestContext};
     use kurisu_core::models::{Media, NowPlaying, User};
-    use kurisu_core::{Core, Event, EventKind, UpdateChannel};
+    use kurisu_core::{Core, Event, EventKind};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1901,7 +1901,6 @@ mod tests {
             path.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         (core, runtime, FixtureDir(path))
@@ -1965,7 +1964,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         )
         .unwrap();
         (core, runtime, dir, db, profile)
@@ -3604,7 +3602,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(TestPlatform),
-            UpdateChannel::Native,
         );
         let folder = dir.0.join("episodes");
         std::fs::create_dir(&folder).unwrap();

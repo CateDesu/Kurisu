@@ -1835,13 +1835,9 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let core = kurisu_core::Core::open(
-            path.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(path.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         (core, runtime, _dir)
     }
 
@@ -2131,7 +2127,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
         );
         let entry = runtime
             .block_on(core.update_entry(71, Some("CURRENT".into()), Some(12), None, None))
@@ -2300,13 +2295,9 @@ mod tests {
         db.replace_account("synthetic-token", &user).unwrap();
         db.upsert_media(total_entry("CURRENT", 0).media.as_ref().unwrap())
             .unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let queued = runtime
             .block_on(core.update_discovery_status(71, Some(47), None, "CURRENT".into()))
             .unwrap();
@@ -2416,13 +2407,9 @@ mod tests {
         let old = total_entry("CURRENT", 3);
         db.upsert_media(old.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&old).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| {
             Workspace::new_with_session_restore(core, window, cx, false)
         });
@@ -2542,13 +2529,9 @@ mod tests {
         let first = total_entry("CURRENT", 5);
         db.upsert_media(first.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&first).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         for _ in 0..32 {
             runtime
@@ -2640,13 +2623,9 @@ mod tests {
         let first = total_entry("CURRENT", 5);
         db.upsert_media(first.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&first).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         for _ in 0..32 {
             runtime
@@ -2771,7 +2750,6 @@ mod tests {
             directory.0.clone(),
             runtime.handle().clone(),
             Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
         )
         .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
@@ -3675,13 +3653,9 @@ mod tests {
         )
         .unwrap();
         drop(db);
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
@@ -3868,7 +3842,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
         );
         let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
         for (index, (requested, chosen, repeat, expected_status, expected_repeat)) in [
@@ -4028,13 +4001,9 @@ mod tests {
         };
         db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&entry).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
         let wait_for = |cx: &mut gpui::VisualTestContext, ready: &dyn Fn(&Workspace) -> bool| {
@@ -4497,13 +4466,9 @@ mod tests {
         };
         db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&entry).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
         let wait = |cx: &mut gpui::VisualTestContext, condition: &dyn Fn(&Workspace) -> bool| {
@@ -5087,13 +5052,9 @@ mod tests {
         );
         db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&entry).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
         let wait = |cx: &mut gpui::VisualTestContext, condition: &dyn Fn(&Workspace) -> bool| {
@@ -5487,13 +5448,9 @@ mod tests {
         };
         db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&entry).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::new(core.clone(), window, cx));
         let wait = |cx: &mut gpui::VisualTestContext, ready: &dyn Fn(&Workspace) -> bool| {
@@ -6230,7 +6187,6 @@ mod tests {
             dir.0.clone(),
             runtime.handle().clone(),
             Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
         );
         let (workspace, cx) = cx.add_window_view(|window, cx| {
             Workspace::new_with_session_restore(core, window, cx, false)
@@ -6420,13 +6376,9 @@ mod tests {
         let entry = total_entry("CURRENT", 3);
         db.upsert_media(entry.media.as_ref().unwrap()).unwrap();
         db.upsert_entry(&entry).unwrap();
-        let core = kurisu_core::Core::open(
-            dir.0.clone(),
-            runtime.handle().clone(),
-            Arc::new(Platform),
-            kurisu_core::UpdateChannel::Native,
-        )
-        .unwrap();
+        let core =
+            kurisu_core::Core::open(dir.0.clone(), runtime.handle().clone(), Arc::new(Platform))
+                .unwrap();
         let (workspace, cx) = cx.add_window_view(|window, cx| {
             Workspace::new_with_session_restore(core.clone(), window, cx, false)
         });
