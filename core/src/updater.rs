@@ -108,8 +108,21 @@ fn version_key(s: &str) -> (Vec<u64>, u8, u64) {
     (release, pre_rank, pre_num)
 }
 
+fn compare_version_keys(a: &(Vec<u64>, u8, u64), b: &(Vec<u64>, u8, u64)) -> std::cmp::Ordering {
+    let len = a.0.len().max(b.0.len());
+    for i in 0..len {
+        let lhs = a.0.get(i).copied().unwrap_or(0);
+        let rhs = b.0.get(i).copied().unwrap_or(0);
+        match lhs.cmp(&rhs) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    (a.1, a.2).cmp(&(b.1, b.2))
+}
+
 pub fn is_newer(remote: &str, current: &str) -> bool {
-    version_key(remote) > version_key(current)
+    compare_version_keys(&version_key(remote), &version_key(current)).is_gt()
 }
 
 /// Stamp the full rolling version to prevent repeat update offers.
@@ -207,9 +220,27 @@ pub async fn watch_updates_channel(
     channel: crate::UpdateChannel,
     notify: impl FnMut(crate::models::UpdateInfo),
 ) {
-    poll_releases_with(
+    poll_releases_channel(
         enabled,
         || fetch_latest_release_channel(crate::UpdateChannel::Native),
+        channel,
+        notify,
+    )
+    .await;
+}
+
+async fn poll_releases_channel<F, Fut>(
+    enabled: impl Fn() -> bool,
+    fetch: F,
+    channel: crate::UpdateChannel,
+    notify: impl FnMut(crate::models::UpdateInfo),
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Release, String>>,
+{
+    poll_releases_with(
+        enabled,
+        fetch,
         |rel| {
             if channel == crate::UpdateChannel::Legacy {
                 bridge_update_info(rel)
@@ -217,6 +248,7 @@ pub async fn watch_updates_channel(
                 update_info_channel(rel, channel)
             }
         },
+        |info| info.available,
         notify,
     )
     .await;
@@ -227,13 +259,21 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<Release, String>>,
 {
-    poll_releases_with(enabled, fetch, update_info, notify).await;
+    poll_releases_with(
+        enabled,
+        fetch,
+        update_info,
+        |info| info.get("available").and_then(Value::as_bool) == Some(true),
+        notify,
+    )
+    .await;
 }
 
 async fn poll_releases_with<F, Fut, T>(
     enabled: impl Fn() -> bool,
     fetch: F,
     select: impl Fn(&Release) -> T,
+    available: impl Fn(&T) -> bool,
     mut notify: impl FnMut(T),
 ) where
     F: Fn() -> Fut,
@@ -241,7 +281,7 @@ async fn poll_releases_with<F, Fut, T>(
 {
     let mut interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut notified_tag = String::new();
+    let mut notified_tag: Option<String> = None;
     loop {
         interval.tick().await;
         if !enabled() || update_applied() {
@@ -254,12 +294,13 @@ async fn poll_releases_with<F, Fut, T>(
                 continue;
             }
         };
-        if !enabled() || update_applied() || rel.tag == notified_tag {
+        if !enabled() || update_applied() || notified_tag.as_deref() == Some(rel.tag.as_str()) {
             continue;
         }
-        if is_newer(&rel.version, current_version()) {
-            notified_tag.clone_from(&rel.tag);
-            notify(select(&rel));
+        let info = select(&rel);
+        if available(&info) {
+            notified_tag = Some(rel.tag);
+            notify(info);
         }
     }
 }
@@ -296,20 +337,123 @@ fn bridge_update_available(rel: &Release, current: &str) -> bool {
         && !is_newer(current, &rel.version)
 }
 
+const MAX_LISTING_BYTES: usize = 4 * 1024 * 1024;
+const MAX_UPDATE_REDIRECTS: usize = 5;
+
+fn host_ip(parsed: &reqwest::Url) -> Option<std::net::IpAddr> {
+    parsed
+        .host_str()?
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .ok()
+}
+
+fn is_loopback_host(parsed: &reqwest::Url) -> bool {
+    parsed.host_str() == Some("localhost") || host_ip(parsed).is_some_and(|ip| ip.is_loopback())
+}
+
+fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || octets[0] == 0
+                || octets[0] >= 240
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || segments[0..6] == [0; 6]
+        }
+    }
+}
+
+fn is_local_update_target(parsed: &reqwest::Url) -> bool {
+    let host = parsed.host_str().unwrap_or("").trim_end_matches('.');
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host_ip(parsed).is_some_and(is_non_public_ip)
+}
+
+fn validate_update_url(parsed: &reqwest::Url, allow_loopback_http: bool) -> Result<(), String> {
+    if allow_loopback_http && parsed.scheme() == "http" && is_loopback_host(parsed) {
+        return Ok(());
+    }
+    if parsed.scheme() != "https" {
+        return Err("update URL must use https".into());
+    }
+    if is_local_update_target(parsed) {
+        return Err("update URL cannot target a local address".into());
+    }
+    Ok(())
+}
+
+fn validate_update_redirect(
+    previous: &[reqwest::Url],
+    next: &reqwest::Url,
+    allow_loopback_http: bool,
+) -> Result<(), String> {
+    validate_update_url(next, allow_loopback_http)?;
+    if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
+        return Err("https update cannot redirect to plain http".into());
+    }
+    if previous.iter().any(|url| !is_local_update_target(url)) && is_local_update_target(next) {
+        return Err("remote update cannot redirect to a local address".into());
+    }
+    Ok(())
+}
+
+fn ensure_complete_success(resp: reqwest::Response) -> Result<reqwest::Response, String> {
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!("HTTP {status}"));
+    }
+    Ok(resp)
+}
+
 async fn fetch_release_listing() -> Result<Value, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=100");
     #[cfg(feature = "test-support")]
     let url = fixture_release_endpoint()?.map_or(url, |url| url.to_string());
-    let data: Value = update_request(&url, Duration::from_secs(8))?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(data)
+    fetch_release_listing_from(&url).await
+}
+
+async fn fetch_release_listing_from(url: &str) -> Result<Value, String> {
+    let mut resp = ensure_complete_success(
+        update_request(url, Duration::from_secs(8))?
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_LISTING_BYTES as u64)
+    {
+        return Err(format!(
+            "release listing larger than {MAX_LISTING_BYTES} bytes"
+        ));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len().saturating_add(chunk.len()) > MAX_LISTING_BYTES {
+            return Err(format!(
+                "release listing exceeded {MAX_LISTING_BYTES} bytes"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| e.to_string())
 }
 
 fn update_request(url: &str, timeout: Duration) -> Result<reqwest::RequestBuilder, String> {
@@ -317,14 +461,30 @@ fn update_request(url: &str, timeout: Duration) -> Result<reqwest::RequestBuilde
         .user_agent(USER_AGENT)
         .timeout(timeout);
     #[cfg(feature = "test-support")]
-    let builder = if let Some(origin) = fixture_release_endpoint()? {
+    if let Some(origin) = fixture_release_endpoint()? {
         validate_fixture_update_url(url, &origin)?;
-        builder
+        let builder = builder
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        return Ok(builder.build().map_err(|e| e.to_string())?.get(url));
+    }
+    let allow_loopback_http = cfg!(test);
+    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    validate_update_url(&parsed, allow_loopback_http)?;
+    let builder = if cfg!(test) {
+        builder.no_proxy()
     } else {
         builder
     };
+    let builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+        if let Err(error) =
+            validate_update_redirect(attempt.previous(), attempt.url(), allow_loopback_http)
+        {
+            attempt.error(error)
+        } else {
+            reqwest::redirect::Policy::limited(MAX_UPDATE_REDIRECTS).redirect(attempt)
+        }
+    }));
     Ok(builder.build().map_err(|e| e.to_string())?.get(url))
 }
 
@@ -380,7 +540,10 @@ fn pick_release(data: &Value, accepts: impl Fn(&Release) -> bool) -> Option<Rele
             continue;
         }
         let key = version_key(&rel.version);
-        if best_key.as_ref().is_none_or(|k| key > *k) {
+        if best_key
+            .as_ref()
+            .is_none_or(|k| compare_version_keys(&key, k).is_gt())
+        {
             best_key = Some(key);
             best = Some(rel);
         }
@@ -498,13 +661,12 @@ fn legacy_asset(rel: &Release) -> Option<&str> {
 pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
     const MAX_SIDECAR_BYTES: usize = 4096;
     let url = rel.assets.get(&format!("{asset_name}.sha256"))?;
-    let mut resp = update_request(url, Duration::from_secs(15))
+    let resp = update_request(url, Duration::from_secs(15))
         .ok()?
         .send()
         .await
-        .ok()?
-        .error_for_status()
         .ok()?;
+    let mut resp = ensure_complete_success(resp).ok()?;
     if resp
         .content_length()
         .is_some_and(|n| n > MAX_SIDECAR_BYTES as u64)
@@ -515,10 +677,10 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > MAX_SIDECAR_BYTES {
+                if buf.len().saturating_add(chunk.len()) > MAX_SIDECAR_BYTES {
                     return None;
                 }
+                buf.extend_from_slice(&chunk);
             }
             Ok(None) => break,
             Err(_) => return None,
@@ -531,8 +693,38 @@ pub async fn fetch_sidecar(rel: &Release, asset_name: &str) -> Option<String> {
 const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
 #[cfg(any(windows, target_os = "linux"))]
+struct StagedPart {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+impl StagedPart {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+impl Drop for StagedPart {
+    fn drop(&mut self) {
+        // Close the file handle before unlinking so Windows can remove the staging file.
+        drop(self.file.take());
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
+    download_with_limit(url, dest, MAX_DOWNLOAD_BYTES).await
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn download_with_limit(url: &str, dest: &Path, max_bytes: u64) -> Result<(), String> {
+    use std::io::Write;
     let part = {
         let mut p = dest.as_os_str().to_os_string();
         p.push(format!(".part-{}", scratch_suffix()));
@@ -543,58 +735,91 @@ pub async fn download(url: &str, dest: &Path) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    let mut created = false;
-    let res: Result<(), String> = async {
-        let mut resp = update_request(url, Duration::from_secs(1800))?
+    let mut resp = ensure_complete_success(
+        update_request(url, Duration::from_secs(1800))?
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        let total = resp.content_length().unwrap_or(0);
-        if total > MAX_DOWNLOAD_BYTES {
-            return Err(format!(
-                "update download is implausibly large ({total} bytes)"
-            ));
-        }
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&part)
-            .await
-            .map_err(|e| e.to_string())?;
-        created = true;
-        let mut got: u64 = 0;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-            got += chunk.len() as u64;
-            if got > MAX_DOWNLOAD_BYTES {
-                return Err(format!(
-                    "update download exceeded {MAX_DOWNLOAD_BYTES} bytes"
-                ));
+            .map_err(|e| e.to_string())?,
+    )?;
+    let total = resp.content_length().unwrap_or(0);
+    if total > max_bytes {
+        return Err(format!(
+            "update download is implausibly large ({total} bytes)"
+        ));
+    }
+    let mut staged = Some(
+        tokio::task::spawn_blocking(move || -> io::Result<StagedPart> {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part)?;
+            Ok(StagedPart {
+                file: Some(file),
+                path: part,
+                armed: true,
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?,
+    );
+    let mut got: u64 = 0;
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                if let Some(staged) = staged.take() {
+                    let _ = tokio::task::spawn_blocking(move || drop(staged)).await;
+                }
+                return Err(error.to_string());
             }
+        };
+        let next = got.saturating_add(chunk.len() as u64);
+        if next > max_bytes {
+            if let Some(staged) = staged.take() {
+                let _ = tokio::task::spawn_blocking(move || drop(staged)).await;
+            }
+            return Err(format!("update download exceeded {max_bytes} bytes"));
         }
-        file.flush().await.map_err(|e| e.to_string())?;
-        file.sync_all().await.map_err(|e| e.to_string())?;
+        let mut part = staged.take().expect("staged part active during download");
+        let write = tokio::task::spawn_blocking(move || -> Result<StagedPart, String> {
+            part.file
+                .as_mut()
+                .expect("staged file open during download")
+                .write_all(&chunk)
+                .map_err(|e| e.to_string())?;
+            Ok(part)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        staged = Some(write?);
+        got = next;
+    }
+    if total != 0 && got < total {
+        if let Some(staged) = staged.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(staged)).await;
+        }
+        return Err(format!("download incomplete: {got} of {total} bytes"));
+    }
+    let mut part = staged.take().expect("staged part active for publish");
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut file = part.file.take().expect("staged file open for publish");
+        file.flush().map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        if total != 0 && got < total {
-            return Err(format!("download incomplete: {got} of {total} bytes"));
-        }
-        tokio::fs::rename(&part, dest)
-            .await
-            .map_err(|e| e.to_string())?;
+        std::fs::rename(&part.path, &dest).map_err(|e| e.to_string())?;
+        part.disarm();
         if let Some(parent) = dest.parent() {
-            if let Ok(d) = tokio::fs::File::open(parent).await {
-                let _ = d.sync_all().await;
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
             }
         }
         Ok(())
-    }
-    .await;
-    if res.is_err() && created {
-        let _ = tokio::fs::remove_file(&part).await;
-    }
-    res
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Return a rewound verified handle, or None on mismatch.
@@ -907,6 +1132,30 @@ fn lock_install_dir(dir: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(windows, target_os = "linux"))]
+    struct TempDir(PathBuf);
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                scratch_suffix()
+            ));
+            let dir = Self(path);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            dir
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[cfg(feature = "test-support")]
     #[test]
@@ -1328,6 +1577,407 @@ mod tests {
         }
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn cancelled_download_removes_partial_staging_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                req.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\npartial-chunk")
+                .await
+                .unwrap();
+            let _ = sent_tx.send(());
+            let _ = hold_rx.await;
+        });
+
+        let dir = TempDir::new("kurisu-download-cancel");
+        let target = dir.0.join("payload.bin");
+        std::fs::write(&target, b"previous download").unwrap();
+        let url = format!("http://{address}/update");
+        let task = tokio::spawn({
+            let target = target.clone();
+            async move { download(&url, &target).await }
+        });
+        sent_rx.await.unwrap();
+        // Wait until the staging file has received the first chunk before cancelling.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_name() != "payload.bin"
+                    && entry.metadata().is_ok_and(|meta| meta.len() >= 13)
+            })
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "staging file was not written"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(_hold_tx);
+        let _ = server.await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while std::fs::read_dir(&dir.0).unwrap().count() > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "staging file was not removed after cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+        let entries: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["payload.bin".to_string()]);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn staged_part_drop_closes_and_removes_only_when_armed() {
+        let dir = TempDir::new("kurisu-staged-part");
+        let armed_path = dir.0.join("armed.part");
+        let armed_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&armed_path)
+            .unwrap();
+        drop(StagedPart {
+            file: Some(armed_file),
+            path: armed_path.clone(),
+            armed: true,
+        });
+        assert!(!armed_path.exists());
+
+        let kept_path = dir.0.join("kept.part");
+        let kept_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&kept_path)
+            .unwrap();
+        drop(StagedPart {
+            file: Some(kept_file),
+            path: kept_path.clone(),
+            armed: false,
+        });
+        assert!(kept_path.exists());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn download_midstream_size_and_incomplete_errors_remove_staging_file() {
+        let dir = TempDir::new("kurisu-download-midstream");
+        let target = dir.0.join("payload.bin");
+        std::fs::write(&target, b"previous download").unwrap();
+
+        let oversize = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n6\r\nghijkl\r\n0\r\n\r\n".to_vec();
+        let (url, server) = serve_download(oversize).await;
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            download_with_limit(&url, &target, 8),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let _ = server.await;
+        assert!(err.contains("exceeded"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+
+        let incomplete =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\n0123456789"
+                .to_vec();
+        let (url, server) = serve_download(incomplete).await;
+        let err = tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+            .await
+            .unwrap()
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            err.contains("incomplete") || err.contains("decoding response body"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn no_content_responses_are_rejected_across_updater_endpoints() {
+        let response = b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_vec();
+        let dir = TempDir::new("kurisu-download-204");
+        let target = dir.0.join("payload.bin");
+        std::fs::write(&target, b"previous download").unwrap();
+
+        let (url, server) = serve_download(response.clone()).await;
+        let err = tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+            .await
+            .unwrap()
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(err.contains("204"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+        drop(dir);
+
+        let (sidecar_url, server) = serve_download(response.clone()).await;
+        let mut rel = Release::default();
+        rel.assets.insert("kurisu.sha256".into(), sidecar_url);
+        let sidecar = fetch_sidecar(&rel, "kurisu").await;
+        server.await.unwrap();
+        assert!(sidecar.is_none());
+
+        let (listing_url, server) = serve_download(response).await;
+        let err = fetch_release_listing_from(&listing_url).await.unwrap_err();
+        server.await.unwrap();
+        assert!(err.contains("204"), "{err}");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn live_update_requests_enforce_redirect_limit_and_disallowed_targets() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    while !req.ends_with(b"\r\n\r\n") {
+                        let Ok(byte) = socket.read_u8().await else {
+                            return;
+                        };
+                        req.push(byte);
+                    }
+                    let line = String::from_utf8_lossy(&req);
+                    let path = line
+                        .lines()
+                        .next()
+                        .and_then(|first| first.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = if let Some(rest) = path.strip_prefix("/limit/") {
+                        let hop: usize = rest.parse().unwrap_or(0);
+                        if hop < 5 {
+                            format!(
+                                "HTTP/1.1 302 Found\r\nLocation: http://{address}/limit/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                hop + 1
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                                .into()
+                        }
+                    } else if let Some(rest) = path.strip_prefix("/too-many/") {
+                        let hop: usize = rest.parse().unwrap_or(0);
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{address}/too-many/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            hop + 1
+                        )
+                    } else if path == "/bad-http" {
+                        "HTTP/1.1 302 Found\r\nLocation: http://example.invalid/update\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .into()
+                    } else {
+                        "HTTP/1.1 302 Found\r\nLocation: https://192.168.1.1/update\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .into()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir = TempDir::new("kurisu-download-redirects");
+        let target = dir.0.join("payload.bin");
+        std::fs::write(&target, b"previous download").unwrap();
+
+        let ok_url = format!("http://{address}/limit/0");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), fetch_release_listing_from(&ok_url))
+                .await
+                .unwrap()
+                .unwrap(),
+            serde_json::json!([])
+        );
+        tokio::time::timeout(Duration::from_secs(5), download(&ok_url, &target))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"[]");
+
+        std::fs::write(&target, b"previous download").unwrap();
+        for path in ["/too-many/0", "/bad-http", "/bad-lan"] {
+            let url = format!("http://{address}{path}");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), fetch_release_listing_from(&url))
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "{path}: listing should fail"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "{path}: download should fail"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"previous download");
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn partial_content_responses_are_rejected_by_download_and_sidecar() {
+        let dir = TempDir::new("kurisu-download-206");
+        let target = dir.0.join("payload.bin");
+        let response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload".to_vec();
+        let (url, server) = serve_download(response.clone()).await;
+        let err = tokio::time::timeout(Duration::from_secs(5), download(&url, &target))
+            .await
+            .unwrap()
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(err.contains("206"), "{err}");
+        assert!(!target.exists());
+        drop(dir);
+
+        let (sidecar_url, server) = serve_download(response).await;
+        let mut rel = Release::default();
+        rel.assets.insert("kurisu.sha256".into(), sidecar_url);
+        let sidecar = fetch_sidecar(&rel, "kurisu").await;
+        server.await.unwrap();
+        assert!(sidecar.is_none());
+    }
+
+    #[test]
+    fn update_url_and_redirect_policy_blocks_downgrades_and_local_targets() {
+        let remote = reqwest::Url::parse("https://github.com/CateDesu/Kurisu/releases").unwrap();
+        let cdn = reqwest::Url::parse("https://objects.githubusercontent.com/asset").unwrap();
+        assert!(validate_update_url(&remote, false).is_ok());
+        assert!(validate_update_redirect(std::slice::from_ref(&remote), &cdn, false).is_ok());
+        for allowed in [
+            "https://1.1.1.1/update",
+            "https://100.128.0.1/update",
+            "https://[2606:4700:4700::1111]/update",
+        ] {
+            let parsed = reqwest::Url::parse(allowed).unwrap();
+            assert!(
+                validate_update_url(&parsed, false).is_ok(),
+                "expected public URL acceptance for {allowed}"
+            );
+            assert!(
+                validate_update_redirect(std::slice::from_ref(&remote), &parsed, false).is_ok(),
+                "expected public redirect acceptance for {allowed}"
+            );
+        }
+
+        for blocked in [
+            "http://github.com/CateDesu/Kurisu/releases",
+            "http://127.0.0.1:8080/update",
+            "https://localhost/update",
+            "https://localhost./update",
+            "https://sub.localhost/update",
+            "https://127.0.0.1/update",
+            "https://[::1]/update",
+            "https://[::ffff:127.0.0.1]/update",
+            "https://0.0.0.0/update",
+            "https://0.1.2.3/update",
+            "https://10.0.0.1/update",
+            "https://100.64.0.1/update",
+            "https://100.127.255.254/update",
+            "https://169.254.169.254/update",
+            "https://172.16.0.1/update",
+            "https://192.0.2.1/update",
+            "https://192.168.1.1/update",
+            "https://198.51.100.1/update",
+            "https://203.0.113.1/update",
+            "https://224.0.0.1/update",
+            "https://240.0.0.1/update",
+            "https://255.255.255.255/update",
+            "https://[::]/update",
+            "https://[::10.0.0.1]/update",
+            "https://[::ffff:192.168.1.1]/update",
+            "https://[::ffff:169.254.169.254]/update",
+            "https://[fc00::1]/update",
+            "https://[fd12::1]/update",
+            "https://[fe80::1]/update",
+            "https://[ff02::1]/update",
+            "file:///tmp/kurisu",
+        ] {
+            let parsed = reqwest::Url::parse(blocked).unwrap();
+            assert!(
+                validate_update_url(&parsed, false).is_err(),
+                "expected URL rejection for {blocked}"
+            );
+            assert!(
+                validate_update_redirect(std::slice::from_ref(&remote), &parsed, false).is_err(),
+                "expected redirect rejection for {blocked}"
+            );
+        }
+        // Even with test loopback HTTP enabled, HTTPS must never downgrade or redirect locally.
+        for blocked in [
+            "http://127.0.0.1:8080/update",
+            "http://localhost/update",
+            "https://127.0.0.1/update",
+        ] {
+            let parsed = reqwest::Url::parse(blocked).unwrap();
+            assert!(
+                validate_update_redirect(std::slice::from_ref(&remote), &parsed, true).is_err(),
+                "expected downgrade/local redirect rejection for {blocked}"
+            );
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn release_listing_rejects_oversized_and_partial_responses() {
+        let partial =
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                .to_vec();
+        let (url, server) = serve_download(partial).await;
+        let err = fetch_release_listing_from(&url).await.unwrap_err();
+        server.await.unwrap();
+        assert!(err.contains("206"), "{err}");
+
+        let oversized_header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n[]",
+            MAX_LISTING_BYTES + 1
+        )
+        .into_bytes();
+        let (url, server) = serve_download(oversized_header).await;
+        let err = fetch_release_listing_from(&url).await.unwrap_err();
+        let _ = server.await;
+        assert!(err.contains("larger than"), "{err}");
+
+        let payload = vec![b' '; MAX_LISTING_BYTES + 16];
+        let mut chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        chunked.extend_from_slice(&payload);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (url, server) = serve_download(chunked).await;
+        let err = fetch_release_listing_from(&url).await.unwrap_err();
+        let _ = server.await;
+        assert!(err.contains("exceeded"), "{err}");
+    }
+
     #[test]
     fn version_parse_and_compare() {
         assert_eq!(version_key("v0.3.1").0, vec![0, 3, 1]);
@@ -1343,6 +1993,12 @@ mod tests {
         assert!(!is_newer("1.0.0-rc1", "1.0.0"));
         assert!(is_newer("1.0.0-rc2", "1.0.0-rc1"));
         assert!(is_newer("1.0.0.1", "1.0.0-rc9"));
+        assert!(!is_newer("1.1.0.0", "1.1.0"));
+        assert!(!is_newer("1.1.0", "1.1.0.0"));
+        assert!(is_newer("1.1.0.1", "1.1.0"));
+        assert!(!is_newer("1.1.0", "1.1.0.1"));
+        assert!(is_newer("1.1.0", "1.1.0.0-rc1"));
+        assert!(!is_newer("1.1.0.0-rc1", "1.1.0"));
     }
 
     #[test]
@@ -1603,6 +2259,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn verify_and_open_drop_allows_unlinking_on_windows() {
+        let dir = TempDir::new("kurisu-verify-drop");
+        let path = dir.0.join("installer.exe");
+        std::fs::write(&path, b"kurisu installer bytes").unwrap();
+        let digest = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(b"kurisu installer bytes"))
+        };
+        let verified = verify_and_open(&path, &digest).unwrap().unwrap();
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(verified);
+        assert!(std::fs::remove_file(&path).is_ok());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn elf_header_matches_running_arch() {
@@ -1692,10 +2364,27 @@ mod native_selector_tests {
         );
         assert!(bridge_update_available(&release, "1.0.0.78"));
         assert!(bridge_update_available(&release, "1.1.0"));
+        assert!(bridge_update_available(&release, "1.1.0.0"));
+        assert!(!bridge_update_available(&release, "1.1.0.1"));
         assert!(!bridge_update_available(&release, "1.2.0"));
         assert!(!is_newer(&release.version, "1.1.0"));
+        assert!(!is_newer(&release.version, "1.1.0.0"));
         assert_eq!(
             update_info_channel(&release, crate::UpdateChannel::Native).version,
+            "1.1.0"
+        );
+        let listing = serde_json::json!([
+            {"tag_name": "v1.1.0", "assets": []},
+            {"tag_name": "v1.1.0.0", "assets": []},
+            {"tag_name": "v1.1.0.1", "assets": []}
+        ]);
+        assert_eq!(pick_latest_release(&listing).unwrap().version, "1.1.0.1");
+        let equal_listing = serde_json::json!([
+            {"tag_name": "v1.1.0", "assets": []},
+            {"tag_name": "v1.1.0.0", "assets": []}
+        ]);
+        assert_eq!(
+            pick_latest_release(&equal_listing).unwrap().version,
             "1.1.0"
         );
     }
@@ -1760,5 +2449,65 @@ mod native_selector_tests {
             );
             assert!(platform_asset_channel(&release, crate::UpdateChannel::Native).is_none());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_watcher_announces_same_version_bridge_handoff_without_looping_native() {
+        let mut release = Release {
+            tag: format!("v{}", current_version()),
+            version: current_version().to_string(),
+            ..Release::default()
+        };
+        release.assets.insert(
+            "kurisu-native".into(),
+            "https://example.invalid/native".into(),
+        );
+        release.assets.insert(
+            format!("Kurisu-Native_{}_x64-install.exe", current_version()),
+            "https://example.invalid/native-win".into(),
+        );
+
+        let (legacy_tx, mut legacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let legacy_release = release.clone();
+        let legacy_task = tokio::spawn(poll_releases_channel(
+            || true,
+            move || {
+                let release = legacy_release.clone();
+                async move { Ok(release) }
+            },
+            crate::UpdateChannel::Legacy,
+            move |info| legacy_tx.send(info).unwrap(),
+        ));
+        tokio::task::yield_now().await;
+        let notice = legacy_rx
+            .try_recv()
+            .expect("legacy bridge watcher should announce same-version native handoff");
+        assert!(notice.available);
+        assert!(notice.can_install);
+        assert_eq!(notice.version, current_version());
+        tokio::time::advance(UPDATE_CHECK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "do not announce the same bridge release twice"
+        );
+        legacy_task.abort();
+
+        let (native_tx, mut native_rx) = tokio::sync::mpsc::unbounded_channel();
+        let native_task = tokio::spawn(poll_releases_channel(
+            || true,
+            move || {
+                let release = release.clone();
+                async move { Ok(release) }
+            },
+            crate::UpdateChannel::Native,
+            move |info| native_tx.send(info).unwrap(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            native_rx.try_recv().is_err(),
+            "native watcher must not announce a same-version release"
+        );
+        native_task.abort();
     }
 }

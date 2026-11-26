@@ -113,6 +113,8 @@ def _parse_preferences(content: bytes) -> dict[str, str | None]:
 def _native_preference_value(key: str, value: str | None) -> str | None:
     if key != "kurisu.list.synced" or value is None:
         return value
+    if "_" in value:
+        return None
     try:
         milliseconds = float(value)
     except ValueError:
@@ -256,6 +258,8 @@ def _validate_wal(database: Path, wal: Path) -> None:
             refuse("page size is invalid")
         with database.open("rb") as main:
             main_header = main.read(18)
+        if len(main_header) != 18:
+            refuse("database header is incomplete")
         main_size = int.from_bytes(main_header[16:18], "big")
         if page_size != (65536 if main_size == 1 else main_size):
             refuse("page size differs from the database")

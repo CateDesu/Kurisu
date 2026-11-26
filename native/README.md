@@ -61,7 +61,7 @@ cargo clippy --locked --manifest-path native/Cargo.toml --features fixture-runti
 
 Core tests use controlled MPV and D-Bus instances. Install MPV for playback regression tests and `dbus-daemon` for Linux MPRIS tests. Linux updater tests use `strip` from binutils to keep fixture executables small. Startup tests use disposable profiles and never discover the host's default profile. The frozen bridge source and its frontend checks remain at [v1.0.0.78](https://github.com/CateDesu/Kurisu/tree/v1.0.0.78).
 
-On Linux, check the pinned accessibility adapter with `cargo test --locked --manifest-path native/Cargo.toml -p accesskit_atspi_common --lib`. Local dependency patches are documented in `vendor/README.md`. A CI build does not replace native platform interaction tests.
+On Linux, check the pinned accessibility adapter with `cargo test --locked --manifest-path native/Cargo.toml -p accesskit_atspi_common --lib`. On Windows, check the patched window zoom helpers with `cargo test --locked --manifest-path native/Cargo.toml -p gpui-windows-gpui-unofficial --lib window::tests::test_zoom_toggle_helpers -- --exact`. Local dependency patches are documented in `vendor/README.md`. A CI build does not replace native platform interaction tests.
 
 ## Release transition
 

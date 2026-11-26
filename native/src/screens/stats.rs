@@ -104,7 +104,7 @@ impl Workspace {
                     } else {
                         "↻ Refresh"
                     },
-                    self.stats.loading,
+                    self.stats.loading || self.stopping || self.writes_fenced(),
                 )
                 .border_color(rgb(PANEL_2))
                 .rounded(px(4.))
@@ -420,4 +420,34 @@ fn stats_shows_a_single_release_year(cx: &mut gpui::TestAppContext) {
             node.role() == gpui::Role::Image && node.label() == Some("2025: 2")
         })
     );
+}
+
+#[cfg(test)]
+#[gpui::test]
+fn stats_refresh_is_disabled_while_fenced(cx: &mut gpui::TestAppContext) {
+    use gpui::AccessibleAction;
+    use kurisu_core::models::User;
+
+    let (core, _runtime, _dir) = super::workspace_tests::fixture();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| Workspace::new_with_session_restore(core, window, cx, false));
+    view.update_in(cx, |w, _, cx| {
+        w.profile = Some(User {
+            id: 7,
+            ..Default::default()
+        });
+        w.route = super::Route::Stats;
+        w.close_ready = true;
+        cx.notify();
+    });
+    cx.simulate_accessibility_activation();
+    cx.run_until_parked();
+    let tree = cx.take_accessibility_tree_update().unwrap();
+    let (_, refresh) = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("↻ Refresh"))
+        .expect("stats refresh button");
+    assert!(refresh.is_disabled());
+    assert!(!refresh.supports_action(AccessibleAction::Click));
 }

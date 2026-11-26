@@ -4,10 +4,11 @@ use std::{
 };
 
 use gpui::{
-    App, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight, KeyBinding,
-    MouseButton, Render, RenderImage, ResizeEdge, Role, Stateful, Subscription, Window, actions,
-    div, img, prelude::*, px, rgb, svg,
+    App, Context, Div, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, Render,
+    RenderImage, Role, Stateful, Subscription, Window, actions, div, img, prelude::*, px, rgb, svg,
 };
+#[cfg(not(target_os = "windows"))]
+use gpui::{CursorStyle, ResizeEdge};
 use kurisu_core::{Core, Platform, Services, User};
 use tray_icon::{
     Icon, MouseButton as TrayMouseButton, MouseButtonState, TrayIcon, TrayIconBuilder,
@@ -25,7 +26,9 @@ use crate::{
 
 actions!(kurisu_shell, [TabForward, TabBackward, Quit]);
 
+#[cfg(not(target_os = "windows"))]
 const RESIZE_BORDER: f32 = 12.;
+#[cfg(not(target_os = "windows"))]
 const RESIZE_CORNER: f32 = 20.;
 
 pub fn bind_keys(cx: &mut App) {
@@ -150,6 +153,7 @@ pub struct Shell {
     profile_error: Option<String>,
     profile_open_request: u64,
     offline: bool,
+    fenced: bool,
     modal_layer: Option<ModalLayer>,
     modal_prompt_revision: Option<u64>,
     modal_focus_epoch: u64,
@@ -167,6 +171,8 @@ pub struct Shell {
     profile_open_result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     #[cfg(test)]
     profile_opened_urls: Vec<String>,
+    #[cfg(test)]
+    tray_watcher_ticks: usize,
     close_intent: Option<CloseIntent>,
     close_epoch: u64,
     hidden_to_tray: bool,
@@ -196,6 +202,7 @@ impl Shell {
         let profile = workspace.read(cx).profile().cloned();
         let profile_avatar = workspace.read(cx).profile_avatar();
         let offline = workspace.read(cx).is_offline();
+        let fenced = workspace.read(cx).is_edits_fenced();
         let modal_layer = workspace.read(cx).active_modal();
         let modal_prompt_revision = workspace.read(cx).active_prompt_revision();
         let subscription =
@@ -207,6 +214,7 @@ impl Shell {
                 let next = workspace.read(cx).active_modal();
                 let prompt_revision = workspace.read(cx).active_prompt_revision();
                 let avatar = workspace.read(cx).profile_avatar();
+                let fenced = workspace.read(cx).is_edits_fenced();
                 let avatar_changed = match (&this.profile_avatar, &avatar) {
                     (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
                     (None, None) => false,
@@ -214,6 +222,10 @@ impl Shell {
                 };
                 if avatar_changed {
                     this.profile_avatar = avatar;
+                    cx.notify();
+                }
+                if fenced != this.fenced {
+                    this.fenced = fenced;
                     cx.notify();
                 }
                 let modal = (next, prompt_revision);
@@ -323,6 +335,7 @@ impl Shell {
             profile_error: None,
             profile_open_request: 0,
             offline,
+            fenced,
             modal_layer,
             modal_prompt_revision,
             modal_focus_epoch: 0,
@@ -339,6 +352,8 @@ impl Shell {
             profile_open_result: None,
             #[cfg(test)]
             profile_opened_urls: Vec::new(),
+            #[cfg(test)]
+            tray_watcher_ticks: 0,
             close_intent: None,
             close_epoch: 0,
             hidden_to_tray: false,
@@ -365,10 +380,17 @@ impl Shell {
                     .timer(Duration::from_millis(180))
                     .await;
                 let alive = this.update_in(cx, |this, window, cx| {
+                    #[cfg(test)]
+                    {
+                        this.tray_watcher_ticks += 1;
+                    }
                     if this.stopping {
-                        return;
+                        return false;
                     }
                     while let Ok(event) = MenuEvent::receiver().try_recv() {
+                        if this.stopping {
+                            return false;
+                        }
                         if let Some(tray) = &this.tray {
                             if event.id == tray.show_id {
                                 this.show_from_tray(window, cx);
@@ -378,8 +400,14 @@ impl Shell {
                             }
                         }
                     }
+                    if this.stopping {
+                        return false;
+                    }
                     this.accept_instance_activation(window, cx);
                     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                        if this.stopping {
+                            return false;
+                        }
                         let activate = this
                             .tray
                             .as_ref()
@@ -388,8 +416,9 @@ impl Shell {
                             this.toggle_from_tray(window, cx);
                         }
                     }
+                    !this.stopping
                 });
-                if alive.is_err() {
+                if !matches!(alive, Ok(true)) {
                     break;
                 }
             }
@@ -484,6 +513,7 @@ impl Shell {
                         Ok(value) if value.as_deref() == Some("1") && this.has_tray() => {
                             match this.hide_window_to_tray(window, cx) {
                                 Ok(()) => {
+                                    this.instance.decline_activations();
                                     this.clear_close_guard(window, cx);
                                 }
                                 Err(error) => this.close_failed(error, window, cx),
@@ -554,6 +584,9 @@ impl Shell {
     }
 
     fn toggle_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.stopping {
+            return false;
+        }
         match tray_window_action(
             self.hidden_to_tray,
             self.minimized_by_program,
@@ -577,6 +610,9 @@ impl Shell {
     }
 
     fn show_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.stopping {
+            return false;
+        }
         let platform_minimized = window.is_minimized();
         let needs_show = self.hidden_to_tray
             || platform_minimized == Some(true)
@@ -634,11 +670,10 @@ impl Shell {
         cx.notify();
     }
 
-    fn minimize_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn minimize_window(&mut self, window: &mut Window) {
         if self.closing || self.stopping {
             return;
         }
-        self.accept_instance_activation(window, cx);
         self.restore_activation = false;
         self.instance.decline_activations();
         self.minimized_by_program = true;
@@ -693,7 +728,7 @@ impl Shell {
     }
 
     fn logout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal_layer.is_some() {
+        if self.modal_layer.is_some() || self.fenced {
             return;
         }
         self.workspace
@@ -737,6 +772,8 @@ impl Shell {
                 .and_then(|result| result);
             let _ = this.update_in(cx, |this, _, cx| {
                 if this.stopping
+                    || this.closing
+                    || this.hidden_to_tray
                     || this.profile_open_request != request
                     || this.profile.as_ref().map(|user| user.id) != Some(account)
                 {
@@ -775,6 +812,7 @@ impl Shell {
     ) -> Stateful<Div> {
         div()
             .id(id)
+            .debug_selector(move || id.into())
             .role(Role::Button)
             .aria_label(label)
             .tab_stop(tab_stop)
@@ -813,6 +851,8 @@ impl Shell {
             .child(
                 div()
                     .id("title-drag")
+                    .debug_selector(|| "title-drag".into())
+                    .window_control_area(gpui::WindowControlArea::Drag)
                     .flex_1()
                     .h_full()
                     .flex()
@@ -838,9 +878,7 @@ impl Shell {
                             "minimize",
                             self.modal_layer.is_none(),
                         )
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.minimize_window(window, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, _| this.minimize_window(window))),
                     )
                     .child(
                         Self::title_button(
@@ -1048,14 +1086,13 @@ impl Shell {
                         .debug_selector(|| "profile-link".into())
                         .on_click(cx.listener(|this, _, window, cx| this.open_profile(window, cx))),
                 )
-                .child(
-                    div()
+                .child({
+                    let mut logout = div()
                         .id("logout")
+                        .debug_selector(|| "logout".into())
                         .role(Role::Button)
                         .aria_label("Log out")
-                        .focusable()
-                        .tab_stop(!modal_open)
-                        .cursor_pointer()
+                        .tab_stop(!modal_open && !self.fenced)
                         .px(px(4.))
                         .child(
                             svg()
@@ -1063,9 +1100,23 @@ impl Shell {
                                 .w(px(18.))
                                 .h(px(18.))
                                 .text_color(rgb(DIM)),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.logout(window, cx))),
-                )
+                        );
+                    if self.fenced {
+                        logout = logout
+                            .opacity(0.45)
+                            .aria_description("Unavailable")
+                            .a11y_synthetic_children(|builder| {
+                                crate::components::disable_control_node(builder.parent_node())
+                            })
+                            .capture_any_mouse_down(|_, _, cx| cx.stop_propagation());
+                    } else {
+                        logout = logout
+                            .focusable()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| this.logout(window, cx)));
+                    }
+                    logout
+                })
         } else {
             let status = if self.workspace.read(cx).is_restoring_session() {
                 "Loading account…"
@@ -1287,6 +1338,7 @@ fn show_from_tray(window: &mut Window, cx: &mut Context<Shell>) -> Result<(), St
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn window_resize_handles() -> impl Iterator<Item = Stateful<Div>> {
     [
         ResizeEdge::Top,
@@ -1333,6 +1385,7 @@ fn window_resize_handles() -> impl Iterator<Item = Stateful<Div>> {
         };
         handle
             .id(format!("window-resize-{edge:?}"))
+            .debug_selector(move || format!("window-resize-{edge:?}"))
             .cursor(match edge {
                 ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
                 ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
@@ -1359,93 +1412,94 @@ impl Render for Shell {
         } else {
             244.
         };
-        div()
-            .id("kurisu-shell")
-            .relative()
-            .role(Role::Application)
-            .aria_label("Kurisu")
-            .track_focus(&self.focus)
-            .size_full()
-            .border_1()
-            .border_color(rgb(EDGE))
+        let body = div()
             .flex()
-            .flex_col()
-            .bg(rgb(BASE))
-            .text_color(rgb(INK))
-            .font(sans_font())
-            .text_size(px(14.))
-            .on_action(
-                cx.listener(|this, _: &TabForward, window, cx| {
-                    this.advance_focus(true, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &TabBackward, window, cx| {
-                this.advance_focus(false, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &Quit, window, cx| {
-                this.request_close(CloseIntent::Quit, window, cx)
-            }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
-                    this.workspace.update(cx, |workspace, cx| {
-                        workspace.handle_escape(event, window, cx)
-                    });
-                }
-            }))
-            .child(self.titlebar(window, cx))
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .child(self.sidebar(width, window, cx))
             .child(
                 div()
-                    .flex()
+                    .relative()
                     .flex_1()
-                    .min_h_0()
+                    .min_w_0()
+                    .h_full()
                     .overflow_hidden()
-                    .child(self.sidebar(width, window, cx))
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(self.workspace.clone())
-                            .when(
-                                self.modal_layer.is_none()
-                                    && !matches!(
-                                        self.route,
-                                        Route::MyList
-                                            | Route::Now
-                                            | Route::Library
-                                            | Route::Stats
-                                            | Route::Search
-                                            | Route::Seasons
-                                            | Route::Calendar
-                                            | Route::Anime(_)
-                                    ),
-                                |area| {
-                                    area.child(
-                                        div()
-                                            .absolute()
-                                            .right(px(28.))
-                                            .top(px(20.))
-                                            .w(px(145.))
-                                            .h(px(85.))
-                                            .opacity(0.85)
-                                            .child(
-                                                svg()
-                                                    .path("icons/gearwork.svg")
-                                                    .absolute()
-                                                    .size_full()
-                                                    .text_color(rgb(ACCENT)),
-                                            ),
-                                    )
-                                },
+                    .child(self.workspace.clone())
+                    .when(
+                        self.modal_layer.is_none()
+                            && !matches!(
+                                self.route,
+                                Route::MyList
+                                    | Route::Now
+                                    | Route::Library
+                                    | Route::Stats
+                                    | Route::Search
+                                    | Route::Seasons
+                                    | Route::Calendar
+                                    | Route::Anime(_)
                             ),
-                    )
-                    .child(div().w(px(RESIZE_BORDER)).h_full().flex_shrink_0()),
-            )
-            .when(!window.is_maximized() && !window.is_fullscreen(), |root| {
-                root.children(window_resize_handles())
-            })
+                        |area| {
+                            area.child(
+                                div()
+                                    .absolute()
+                                    .right(px(28.))
+                                    .top(px(20.))
+                                    .w(px(145.))
+                                    .h(px(85.))
+                                    .opacity(0.85)
+                                    .child(
+                                        svg()
+                                            .path("icons/gearwork.svg")
+                                            .absolute()
+                                            .size_full()
+                                            .text_color(rgb(ACCENT)),
+                                    ),
+                            )
+                        },
+                    ),
+            );
+        #[cfg(not(target_os = "windows"))]
+        let body = body.child(div().w(px(RESIZE_BORDER)).h_full().flex_shrink_0());
+        let root =
+            div()
+                .id("kurisu-shell")
+                .relative()
+                .role(Role::Application)
+                .aria_label("Kurisu")
+                .track_focus(&self.focus)
+                .size_full()
+                .border_1()
+                .border_color(rgb(EDGE))
+                .flex()
+                .flex_col()
+                .bg(rgb(BASE))
+                .text_color(rgb(INK))
+                .font(sans_font())
+                .text_size(px(14.))
+                .on_action(cx.listener(|this, _: &TabForward, window, cx| {
+                    this.advance_focus(true, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &TabBackward, window, cx| {
+                    this.advance_focus(false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &Quit, window, cx| {
+                    this.request_close(CloseIntent::Quit, window, cx)
+                }))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.workspace.update(cx, |workspace, cx| {
+                            workspace.handle_escape(event, window, cx)
+                        });
+                    }
+                }))
+                .child(self.titlebar(window, cx))
+                .child(body);
+        #[cfg(not(target_os = "windows"))]
+        let root = root.when(!window.is_maximized() && !window.is_fullscreen(), |root| {
+            root.children(window_resize_handles())
+        });
+        root
     }
 }
 
@@ -1762,15 +1816,27 @@ mod tests {
         settle(cx);
         shell.read_with(cx, |s, _| assert!(s.profile_error.is_none()));
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        shell.update_in(cx, |s, win, cx| {
-            s.profile_open_result = Some(rx);
-            s.open_profile(win, cx);
-            s.stopping = true;
-        });
-        tx.send(Err("shutdown".into())).unwrap();
-        settle(cx);
-        shell.read_with(cx, |s, _| assert!(s.profile_error.is_none()));
+        for state in ["closing", "hidden_to_tray", "stopping"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            shell.update_in(cx, |s, win, cx| {
+                s.closing = false;
+                s.hidden_to_tray = false;
+                s.stopping = false;
+                s.profile_error = None;
+                s.profile_open_result = Some(rx);
+                s.open_profile(win, cx);
+                match state {
+                    "closing" => s.closing = true,
+                    "hidden_to_tray" => s.hidden_to_tray = true,
+                    _ => s.stopping = true,
+                }
+            });
+            tx.send(Err(format!("late {state} error"))).unwrap();
+            settle(cx);
+            shell.read_with(cx, |s, _| {
+                assert!(s.profile_error.is_none(), "error leaked during {state}");
+            });
+        }
 
         cx.update(|win, _| win.remove_window());
         drop(shell);

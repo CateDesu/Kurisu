@@ -29,6 +29,8 @@ pub(super) struct NotificationsState {
     page: i64,
     has_more: bool,
     request: u64,
+    #[cfg(test)]
+    open_result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
 }
 
 impl Default for NotificationsState {
@@ -44,6 +46,8 @@ impl Default for NotificationsState {
             page: 0,
             has_more: false,
             request: 0,
+            #[cfg(test)]
+            open_result: None,
         }
     }
 }
@@ -244,17 +248,23 @@ impl Workspace {
         let Some(item) = self.notifications.items.iter().find(|item| item.id == id) else {
             return;
         };
-        if let Some(media_id) = item.media_id {
+        if let Some(media_id) = item.media_id.filter(|id| *id > 0) {
             self.navigate(Route::Anime(media_id), window, cx);
             return;
         }
         let url = notification_url(item);
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
+        #[cfg(test)]
+        let controlled = self.notifications.open_result.take();
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = core
                 .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(controlled) = controlled {
+                        return controlled.await.map_err(|error| error.to_string())?;
+                    }
                     tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
                         .await
                         .map_err(|error| error.to_string())?
@@ -262,6 +272,7 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
                 if !this.stopping
+                    && !this.close_ready
                     && this.generation == generation
                     && this.profile.as_ref().map(|user| user.id) == account
                     && let Err(error) = joined(result)
@@ -281,6 +292,8 @@ impl Workspace {
     ) -> AnyElement {
         let state = &self.notifications;
         let disabled = state.loading || state.marking || self.offline;
+        let refresh_disabled = disabled || self.stopping || self.writes_fenced();
+        let mark_read_disabled = disabled || self.edits_fenced() || state.unread == Some(0);
         let mut content = div().flex_1().min_h_0().flex().flex_col().p(px(28.)).child(
             div()
                 .flex()
@@ -321,18 +334,18 @@ impl Workspace {
                                 } else {
                                     "↻ Refresh"
                                 },
-                                disabled,
+                                refresh_disabled,
                             )
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
+                            .when(!refresh_disabled, |button| {
+                                button.on_click(cx.listener(|this, _, window, cx| {
                                     if !this.notifications.loading
                                         && !this.notifications.marking
                                         && !this.offline
                                     {
                                         this.load_notifications(false, window, cx);
                                     }
-                                },
-                            )),
+                                }))
+                            }),
                         )
                         .child(
                             button(
@@ -342,11 +355,13 @@ impl Workspace {
                                 } else {
                                     "Mark all read"
                                 },
-                                disabled || state.unread == Some(0),
+                                mark_read_disabled,
                             )
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.mark_notifications_read(window, cx),
-                            )),
+                            .when(!mark_read_disabled, |button| {
+                                button.on_click(cx.listener(|this, _, window, cx| {
+                                    this.mark_notifications_read(window, cx)
+                                }))
+                            }),
                         ),
                 ),
         );
@@ -418,16 +433,18 @@ impl Workspace {
                         } else {
                             "Load older notifications"
                         },
-                        disabled,
+                        refresh_disabled,
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if !this.notifications.loading
-                            && !this.notifications.marking
-                            && !this.offline
-                        {
-                            this.load_notifications(true, window, cx);
-                        }
-                    })),
+                    .when(!refresh_disabled, |button| {
+                        button.on_click(cx.listener(|this, _, window, cx| {
+                            if !this.notifications.loading
+                                && !this.notifications.marking
+                                && !this.offline
+                            {
+                                this.load_notifications(true, window, cx);
+                            }
+                        }))
+                    }),
                 ),
             );
         }
@@ -585,22 +602,30 @@ fn notification_icon(kind: &str) -> &'static str {
 }
 
 fn notification_url(item: &Notification) -> String {
-    if let Some(id) = item.activity_id {
+    if let Some(id) = item.activity_id.filter(|id| *id > 0) {
         return format!("https://anilist.co/activity/{id}");
     }
     if let Some(raw) = &item.comment_url
+        && !raw.bytes().any(|b| b.is_ascii_control())
         && let Ok(url) = Url::parse(raw)
         && url.scheme() == "https"
         && url.host_str() == Some("anilist.co")
+        && url.port().is_none()
         && url.username().is_empty()
         && url.password().is_none()
     {
         return url.to_string();
     }
-    if let Some(id) = item.thread_id {
+    if let Some(id) = item.thread_id.filter(|id| *id > 0) {
         return format!("https://anilist.co/forum/thread/{id}");
     }
     if let Some(name) = &item.user_name
+        && !name.trim().is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'/' | b'\\'))
         && let Ok(mut url) = Url::parse("https://anilist.co/user")
     {
         if let Ok(mut path) = url.path_segments_mut() {
@@ -949,5 +974,204 @@ mod tests {
             notification_url(&following),
             "https://anilist.co/user/Alice"
         );
+    }
+
+    #[test]
+    fn notification_url_rejects_invalid_ids_ports_control_chars_and_usernames() {
+        let fallback = "https://anilist.co/notifications";
+        for bad_name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "a/b",
+            r"a\b",
+            "bad\nname",
+            "bad\x00name",
+        ] {
+            let item = Notification {
+                user_name: Some(bad_name.into()),
+                ..Default::default()
+            };
+            assert_eq!(notification_url(&item), fallback, "bad_name={bad_name:?}");
+        }
+
+        let bad_ids = Notification {
+            activity_id: Some(0),
+            thread_id: Some(-5),
+            ..Default::default()
+        };
+        assert_eq!(notification_url(&bad_ids), fallback);
+
+        let non_default_port = Notification {
+            comment_url: Some("https://anilist.co:8443/forum/thread/1/comment/2".into()),
+            ..Default::default()
+        };
+        assert_eq!(notification_url(&non_default_port), fallback);
+
+        let control_comment = Notification {
+            comment_url: Some("https://anilist.co/forum/thread/1\r\n/comment/2".into()),
+            ..Default::default()
+        };
+        assert_eq!(notification_url(&control_comment), fallback);
+
+        let default_port = Notification {
+            comment_url: Some("https://anilist.co:443/forum/thread/1/comment/2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            notification_url(&default_port),
+            "https://anilist.co/forum/thread/1/comment/2"
+        );
+
+        let normal_user = Notification {
+            activity_id: Some(-1),
+            thread_id: Some(0),
+            user_name: Some("KurisuMakise".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            notification_url(&normal_user),
+            "https://anilist.co/user/KurisuMakise"
+        );
+    }
+
+    #[gpui::test]
+    fn notifications_header_buttons_and_media_id_match_validation_and_fence_predicates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::fixture;
+        use gpui::AccessibleAction;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        view.update_in(cx, |w, win, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Notifications;
+            w.notifications.unread = Some(3);
+            w.notifications.has_more = true;
+            w.notifications.items = vec![Notification {
+                id: 50,
+                media_id: Some(0),
+                kind: "AIRING".into(),
+                ..Default::default()
+            }]
+            .into();
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            w.notifications.open_result = Some(rx);
+            w.open_notification(50, win, cx);
+            assert!(
+                w.notifications.open_result.is_none(),
+                "non-positive media_id should take the fallback URL path"
+            );
+            assert_eq!(
+                w.route,
+                Route::Notifications,
+                "non-positive media_id must not navigate to Route::Anime(0)"
+            );
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+
+        let button_node = |cx: &mut gpui::VisualTestContext, label: &str| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.label() == Some(label)).then_some(node))
+                .unwrap_or_else(|| panic!("missing button {label}"))
+        };
+
+        view.update_in(cx, |w, _, cx| {
+            w.update_busy = true;
+            cx.notify();
+        });
+        let refresh = button_node(cx, "↻ Refresh");
+        let mark_read = button_node(cx, "Mark all read");
+        assert!(!refresh.is_disabled());
+        assert!(refresh.supports_action(AccessibleAction::Click));
+        assert!(mark_read.is_disabled());
+        assert!(!mark_read.supports_action(AccessibleAction::Click));
+
+        view.update_in(cx, |w, _, cx| {
+            w.update_busy = false;
+            w.close_ready = true;
+            cx.notify();
+        });
+        let refresh = button_node(cx, "↻ Refresh");
+        let mark_read = button_node(cx, "Mark all read");
+        let more = button_node(cx, "Load older notifications");
+        assert!(refresh.is_disabled());
+        assert!(!refresh.supports_action(AccessibleAction::Click));
+        assert!(mark_read.is_disabled());
+        assert!(!mark_read.supports_action(AccessibleAction::Click));
+        assert!(more.is_disabled());
+        assert!(!more.supports_action(AccessibleAction::Click));
+
+        view.update_in(cx, |w, _, cx| {
+            w.close_ready = false;
+            w.notifications.unread = Some(0);
+            cx.notify();
+        });
+        let refresh = button_node(cx, "↻ Refresh");
+        let mark_read = button_node(cx, "Mark all read");
+        assert!(!refresh.is_disabled());
+        assert!(mark_read.is_disabled());
+    }
+
+    #[gpui::test]
+    fn open_notification_suppresses_late_error_on_close_ready_and_stopping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::{fixture, settle};
+
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        let item = Notification {
+            id: 51,
+            media_id: None,
+            kind: "ACTIVITY_MESSAGE".into(),
+            ..Default::default()
+        };
+        for case in ["close_ready", "stopping", "visible"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            view.update_in(cx, |w, win, cx| {
+                w.stopping = false;
+                w.close_ready = false;
+                w.notifications.error.clear();
+                w.profile = Some(kurisu_core::User {
+                    id: 7,
+                    ..Default::default()
+                });
+                w.notifications.items = vec![item.clone()].into();
+                w.notifications.open_result = Some(rx);
+                w.open_notification(51, win, cx);
+                match case {
+                    "close_ready" => w.close_ready = true,
+                    "stopping" => w.stopping = true,
+                    _ => {}
+                }
+            });
+            tx.send(Err(format!("open failed: {case}"))).unwrap();
+            settle(cx, &runtime);
+            view.read_with(cx, |w, _| {
+                if case == "visible" {
+                    assert_eq!(w.notifications.error, "open failed: visible");
+                } else {
+                    assert!(
+                        w.notifications.error.is_empty(),
+                        "late error leaked on {case}"
+                    );
+                }
+            });
+        }
     }
 }

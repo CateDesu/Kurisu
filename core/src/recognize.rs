@@ -2599,7 +2599,13 @@ pub(crate) fn has_conflicting_episode_markers(s: &str, source: &str) -> bool {
         let scope = marker
             .name("season")
             .and_then(|m| m.as_str().parse::<u32>().ok())
-            .or_else(|| preceding_season(source.get(previous_end.unwrap_or(0)..start)?));
+            .or_else(|| {
+                let mut prefix_start = previous_end.unwrap_or(0);
+                while prefix_start < start && !source.is_char_boundary(prefix_start) {
+                    prefix_start += 1;
+                }
+                preceding_season(source.get(prefix_start..start)?)
+            });
         previous_end = Some(from);
         if episode.replace(number).is_some_and(|last| last != number)
             || scope.is_some_and(|n| season.replace(n).is_some_and(|last| last != n))
@@ -4968,6 +4974,28 @@ mod tests {
             "K.Season.2.mkv",
         ] {
             assert_eq!(clean_title(file), "k 2", "{file}");
+        }
+    }
+
+    #[test]
+    fn conflicting_seasons_after_multibyte_bracketed_episode_are_rejected() {
+        let show = Matcher {
+            episodes: Some(12),
+            ..mk(1, "Show")
+        };
+        for file in [
+            "Show 【\u{3000}Season 2 E01】 Season 3 E01.mkv",
+            "Show 【第2期 Season 2 E01】 Season 3 E01.mkv",
+        ] {
+            assert_eq!(resolve_episode(&show, &[file]), None, "{file}");
+            assert!(excluded_playback_release(&show, file), "{file}");
+        }
+        for file in [
+            "Show 【\u{3000}Season 2 E01】 Season 2 E01.mkv",
+            "Show 【\u{3000}Season 2 E01】 E01.mkv",
+        ] {
+            assert_eq!(resolve_episode(&show, &[file]), Some(1), "{file}");
+            assert!(!excluded_playback_release(&show, file), "{file}");
         }
     }
 }

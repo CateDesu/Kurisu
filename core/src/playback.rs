@@ -780,33 +780,6 @@ async fn tick(
     };
     let progress = entry.progress;
 
-    // Auto ask runs in every mode and suppresses any later timed prompt for this track.
-    if cfg.auto_ask
-        && info.playing
-        && episode > progress
-        && !track.asked
-        && track.accumulated >= AUTO_ASK_DELAY
-    {
-        track.asked = true;
-        state.emit_tracking_offer(
-            origin,
-            EventKind::TrackingAsk(TrackingPrompt {
-                media_id,
-                episode,
-                title: info
-                    .matched_title
-                    .clone()
-                    .unwrap_or_else(|| info.title.clone()),
-                raw_title: info.title.clone(),
-                progress,
-            }),
-            track
-                .prompt_watch
-                .get_or_insert_with(PromptWatch::default)
-                .clone(),
-        );
-    }
-
     if track.push.as_ref().is_some_and(|push| push.is_finished()) {
         let result = track
             .push
@@ -846,6 +819,33 @@ async fn tick(
         }
     }
 
+    // Emit at most one prompt offer per track, and never while auto progress is active or done.
+    if cfg.auto_ask
+        && info.playing
+        && episode > progress
+        && !track.asked
+        && track.prompt_watch.is_none()
+        && !track.incremented
+        && track.push.is_none()
+        && track.accumulated >= AUTO_ASK_DELAY
+    {
+        track.asked = true;
+        state.emit_tracking_offer(
+            origin,
+            EventKind::TrackingAsk(TrackingPrompt {
+                media_id,
+                episode,
+                title: info
+                    .matched_title
+                    .clone()
+                    .unwrap_or_else(|| info.title.clone()),
+                raw_title: info.title.clone(),
+                progress,
+            }),
+            track.prompt_watch.insert(PromptWatch::default()).clone(),
+        );
+    }
+
     let gate = AutoGate {
         incremented: track.incremented,
         was_playing_before: was_playing_before || track.eof_after_playing,
@@ -867,6 +867,8 @@ async fn tick(
     match cfg.mode.as_str() {
         "prompt" if info.playing && episode > progress => {
             if track.prompt_watch.is_none()
+                && !track.incremented
+                && track.push.is_none()
                 && track.accumulated >= Duration::from_secs(cfg.prompt_seconds)
             {
                 state.emit_tracking_offer(

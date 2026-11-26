@@ -738,22 +738,45 @@ impl Workspace {
             return;
         };
         let url = info.html_url.clone();
+        let tag = info.tag.clone();
+        self.open_settings_update_release_with(
+            tag,
+            async move {
+                tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
+                    .await
+                    .map_err(|error| error.to_string())?
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn open_settings_update_release_with(
+        &mut self,
+        tag: String,
+        open: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let generation = self.generation;
         let account = self.profile.as_ref().map(|user| user.id);
+        let request = self.settings.update_request;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = core
-                .spawn(async move {
-                    tokio::task::spawn_blocking(move || NativePlatform.open_url(&url))
-                        .await
-                        .map_err(|error| error.to_string())?
-                })
-                .await;
+            let result = joined(core.spawn(open).await);
             let _ = this.update_in(cx, |this, _, cx| {
                 if !this.stopping
+                    && !this.close_ready
+                    && !this.restart_pending
                     && this.generation == generation
                     && this.profile.as_ref().map(|user| user.id) == account
-                    && let Err(error) = joined(result)
+                    && this.settings.update_request == request
+                    && this
+                        .settings
+                        .update
+                        .as_ref()
+                        .is_some_and(|update| update.tag == tag && !update.restart_pending)
+                    && let Err(error) = result
                 {
                     this.settings.update_error = error;
                     cx.notify();
@@ -803,13 +826,17 @@ impl Workspace {
                         .child("."),
                 )
                 .child(
-                    button("settings-logout", "Log out", self.auth_busy)
-                        .self_start()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if !this.auth_busy {
-                                this.request_logout(window, cx);
-                            }
-                        })),
+                    button(
+                        "settings-logout",
+                        "Log out",
+                        self.auth_busy || self.edits_fenced(),
+                    )
+                    .self_start()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !this.auth_busy && !this.edits_fenced() {
+                            this.request_logout(window, cx);
+                        }
+                    })),
                 );
         } else {
             account = account
@@ -824,7 +851,9 @@ impl Workspace {
                         } else {
                             "Sign in with AniList"
                         },
-                        self.auth_busy && !self.auth_retry_available(),
+                        self.stopping
+                            || self.writes_fenced()
+                            || self.auth_busy && !self.auth_retry_available(),
                     )
                     .debug_selector(|| "settings-sign-in".into())
                     .self_start()
@@ -1639,5 +1668,125 @@ mod tests {
         let safe = trim_utf8_bytes(&long, 512);
         assert!(safe.len() <= 512);
         assert!(safe.chars().all(|ch| ch == 'あ'));
+    }
+
+    #[gpui::test]
+    fn settings_logout_is_disabled_while_fenced(cx: &mut TestAppContext) {
+        use super::super::workspace_tests::fixture;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                name: "Alice".into(),
+                ..Default::default()
+            });
+            w.route = super::super::Route::Settings;
+            w.update_busy = true;
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (_, logout) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Log out"))
+            .expect("settings logout button node");
+        assert!(
+            logout.is_disabled(),
+            "logout should be disabled while fenced"
+        );
+        assert!(!logout.supports_action(AccessibleAction::Click));
+    }
+
+    #[gpui::test]
+    fn settings_release_open_ignores_stale_failure_and_sign_in_respects_fence(
+        cx: &mut TestAppContext,
+    ) {
+        use super::super::workspace_tests::{fixture, settle};
+
+        let sample_update = |tag: &str| UpdateInfo {
+            available: true,
+            tag: tag.into(),
+            version: tag.trim_start_matches('v').into(),
+            current: "1.0.0".into(),
+            html_url: format!("https://github.com/CateDesu/Kurisu/releases/tag/{tag}"),
+            can_install: false,
+            restart_pending: false,
+            body: String::new(),
+        };
+
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, win, cx| {
+            w.settings.update = Some(sample_update("v2.0.0"));
+            w.open_settings_update_release_with(
+                "v2.0.0".into(),
+                async move { rx.await.unwrap() },
+                win,
+                cx,
+            );
+            w.settings.update_request = w.settings.update_request.wrapping_add(1);
+            w.settings.update = Some(sample_update("v2.1.0"));
+        });
+        tx.send(Err("browser failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| assert!(w.settings.update_error.is_empty()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, win, cx| {
+            w.settings.update = Some(sample_update("v2.1.0"));
+            w.open_settings_update_release_with(
+                "v2.1.0".into(),
+                async move { rx.await.unwrap() },
+                win,
+                cx,
+            );
+            w.note_restart_pending();
+        });
+        tx.send(Err("browser failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| assert!(w.settings.update_error.is_empty()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, win, cx| {
+            w.restart_pending = false;
+            w.settings.update = Some(sample_update("v2.1.0"));
+            w.open_settings_update_release_with(
+                "v2.1.0".into(),
+                async move { rx.await.unwrap() },
+                win,
+                cx,
+            );
+        });
+        tx.send(Err("browser failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert_eq!(w.settings.update_error, "browser failed")
+        });
+
+        view.update_in(cx, |w, _, cx| {
+            w.restoring_session = false;
+            w.profile = None;
+            w.route = super::super::Route::Settings;
+            w.close_ready = true;
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (_, sign_in) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Sign in with AniList"))
+            .expect("settings sign-in button");
+        assert!(sign_in.is_disabled());
+        assert!(!sign_in.supports_action(AccessibleAction::Click));
     }
 }

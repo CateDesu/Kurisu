@@ -982,7 +982,7 @@ impl Workspace {
                             && saved
                                 .media
                                 .as_ref()
-                                .and_then(|media| media.episodes)
+                                .and_then(|media| media.known_episodes())
                                 .is_none_or(|total| saved.progress < total)
                         {
                             return Err(
@@ -1081,6 +1081,7 @@ impl Workspace {
                 .media_id
                 .and_then(|id| self.cover_images.get(&(id, 96, 140)).cloned());
             let mut controls = div().flex().flex_wrap().gap(px(7.));
+            let play_disabled = self.edits_fenced() || self.modal_open();
             if let Some((id, file)) = playing.media_id.zip(next) {
                 let episode = file.episode.unwrap_or(0);
                 controls = controls.child(
@@ -1090,19 +1091,21 @@ impl Workspace {
                             file.path
                         ),
                         format!("▶ Play Ep {episode}"),
-                        false,
+                        play_disabled,
                     )
                     .debug_selector(|| "watching-play-next".into())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        open_local(
-                            this,
-                            WatchingPlay::Playback(id),
-                            &file,
-                            generation,
-                            account,
-                            cx,
-                        )
-                    })),
+                    .when(!play_disabled, |button| {
+                        button.on_click(cx.listener(move |this, _, _, cx| {
+                            open_local(
+                                this,
+                                WatchingPlay::Playback(id),
+                                &file,
+                                generation,
+                                account,
+                                cx,
+                            )
+                        }))
+                    }),
                 );
             }
             if let Some((entry, episode)) = update_target {
@@ -1114,9 +1117,8 @@ impl Workspace {
                     EntryIdentity::Unverified => "unverified".into(),
                 };
                 let disabled = self.watching.updating
-                    || self.writes_fenced()
-                    || self.auth_busy
-                    || self.update_busy
+                    || self.edits_fenced()
+                    || self.modal_open()
                     || identity == EntryIdentity::Unverified;
                 controls = controls.child(
                     button(
@@ -1291,12 +1293,18 @@ impl Workspace {
             );
         }
         if !self.watching.error.is_empty() {
+            let retry_disabled = self.stopping || self.writes_fenced();
             page = page.child(
                 div()
                     .text_color(rgb(ERROR))
                     .child(self.watching.error.clone())
-                    .child(button("watching-retry", "Retry", false).on_click(
-                        cx.listener(|this, _, window, cx| this.load_watching(window, cx)),
+                    .child(button("watching-retry", "Retry", retry_disabled).when(
+                        !retry_disabled,
+                        |button| {
+                            button.on_click(
+                                cx.listener(|this, _, window, cx| this.load_watching(window, cx)),
+                            )
+                        },
                     )),
             );
         }
@@ -1385,6 +1393,8 @@ impl Workspace {
                                         .and_then(|user| user.score_format.clone());
                                     let generation = this.generation;
                                     let account = this.profile.as_ref().map(|user| user.id);
+                                    let play_disabled = this.edits_fenced() || this.modal_open();
+                                    let progress_disabled = play_disabled || this.watching.updating;
                                     (
                                         entry.clone(),
                                         pending,
@@ -1393,6 +1403,8 @@ impl Workspace {
                                         score_format,
                                         generation,
                                         account,
+                                        play_disabled,
+                                        progress_disabled,
                                     )
                                 })
                             });
@@ -1404,6 +1416,8 @@ impl Workspace {
                                 score_format,
                                 generation,
                                 account,
+                                play_disabled,
+                                progress_disabled,
                             ))) = data
                             else {
                                 return div().into_any();
@@ -1420,6 +1434,8 @@ impl Workspace {
                                     score_format.as_deref(),
                                     weak.clone(),
                                     (generation, account),
+                                    play_disabled,
+                                    progress_disabled,
                                 ))
                                 .into_any()
                         }
@@ -1553,6 +1569,7 @@ fn open_local(
             if !scope_matches(this, generation, account)
                 || this.core.generation() != generation
                 || this.stopping
+                || this.close_ready
             {
                 return;
             }
@@ -1564,6 +1581,7 @@ fn open_local(
     })
     .detach();
 }
+#[allow(clippy::too_many_arguments)]
 fn watching_row(
     entry: ListEntry,
     pending: Option<super::state::ProgressEdit>,
@@ -1572,10 +1590,15 @@ fn watching_row(
     score_format: Option<&str>,
     weak: WeakEntity<Workspace>,
     scope: (u64, Option<i64>),
+    play_disabled: bool,
+    progress_disabled: bool,
 ) -> AnyElement {
     let (generation, account) = scope;
     let id = entry.media_id;
-    let total = entry.media.as_ref().and_then(|media| media.episodes);
+    let total = entry
+        .media
+        .as_ref()
+        .and_then(|media| media.known_episodes());
     let title = title(&entry);
     let progress = pending.as_ref().map_or(entry.progress, |edit| edit.pending);
     let score = entry
@@ -1656,7 +1679,7 @@ fn watching_row(
         .child(info);
     let saving = pending.as_ref().is_some_and(|edit| edit.busy());
     let review = pending.as_ref().is_some_and(|edit| edit.requires_review);
-    let progress_locked = saving || review;
+    let progress_locked = saving || review || progress_disabled;
     let has_error = pending.as_ref().is_some_and(|edit| edit.error.is_some());
     let at_min = progress <= 0;
     let at_max = progress >= total.unwrap_or(9999);
@@ -1692,8 +1715,8 @@ fn watching_row(
     let stepper = div()
         .id(stepper_key)
         .debug_selector(move || format!("watching-stepper-{id}"))
-        .focusable()
-        .tab_stop(true)
+        .tab_stop(!progress_locked)
+        .when(!progress_locked, |stepper| stepper.focusable())
         .flex_shrink_0()
         .flex()
         .items_center()
@@ -1814,13 +1837,15 @@ fn watching_row(
             button(
                 format!("watching-play-{generation}-{id}-{episode}-{}", file.path),
                 format!("▶ Ep {episode}"),
-                false,
+                play_disabled,
             )
             .debug_selector(move || format!("watching-play-{id}"))
-            .on_click(move |_, _, app| {
-                let _ = weak_play.update(app, |this, cx| {
-                    open_local(this, WatchingPlay::Row(id), &file, generation, account, cx)
-                });
+            .when(!play_disabled, |button| {
+                button.on_click(move |_, _, app| {
+                    let _ = weak_play.update(app, |this, cx| {
+                        open_local(this, WatchingPlay::Row(id), &file, generation, account, cx)
+                    });
+                })
             }),
         );
     }
@@ -4271,6 +4296,209 @@ mod tests {
             assert_eq!(region.audit_visible(), &HashSet::from([(900, 40, 56)]));
             assert!(region.audit_nearby().is_empty());
             assert!(workspace.watching.cover_scheduled.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn watching_zero_total_stepper_and_fenced_play_and_retry_buttons(cx: &mut TestAppContext) {
+        use gpui::AccessibleAction;
+
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        let entry = ListEntry {
+            id: Some(77),
+            media_id: 9,
+            status: "CURRENT".into(),
+            progress: 0,
+            media: Some(Media {
+                id: 9,
+                title_english: Some("Zero Watching Show".into()),
+                episodes: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.route = Route::Now;
+            w.watching.loaded = true;
+            w.watching.error = "Could not load list".into();
+            w.watching.replace_rows(vec![entry.clone()]);
+            w.watching.playback_entry = Some(entry.clone());
+            let mut np = playing(9);
+            np.matched = Some("Zero Watching Show".into());
+            w.now_playing = Some(np);
+            w.library_files
+                .replace(vec![kurisu_core::models::LibraryFile {
+                    path: "/anime/ep01.mkv".into(),
+                    media_id: Some(9),
+                    matched: Some("Zero Watching Show".into()),
+                    episode: Some(1),
+                    bound: false,
+                }]);
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+
+        let find_node = |cx: &mut VisualTestContext, label: &str| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.label() == Some(label)).then_some(node))
+                .unwrap_or_else(|| panic!("missing node {label}"))
+        };
+
+        let plus = find_node(cx, "One more episode");
+        assert!(!plus.is_disabled());
+        assert!(plus.supports_action(AccessibleAction::Click));
+
+        let play_next = find_node(cx, "▶ Play Ep 1");
+        let play_row = find_node(cx, "▶ Ep 1");
+        let update_ep = find_node(cx, "Update to Ep 1");
+        let retry = find_node(cx, "Retry");
+        assert!(!play_next.is_disabled());
+        assert!(!play_row.is_disabled());
+        assert!(!update_ep.is_disabled());
+        assert!(!retry.is_disabled());
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.update_busy = true;
+            cx.notify();
+        });
+        let play_next = find_node(cx, "▶ Play Ep 1");
+        let play_row = find_node(cx, "▶ Ep 1");
+        let update_ep = find_node(cx, "Update to Ep 1");
+        let plus = find_node(cx, "One more episode");
+        let retry = find_node(cx, "Retry");
+        assert!(play_next.is_disabled());
+        assert!(!play_next.supports_action(AccessibleAction::Click));
+        assert!(play_row.is_disabled());
+        assert!(!play_row.supports_action(AccessibleAction::Click));
+        assert!(update_ep.is_disabled());
+        assert!(!update_ep.supports_action(AccessibleAction::Click));
+        assert!(plus.is_disabled());
+        assert!(!plus.supports_action(AccessibleAction::Click));
+        assert!(!retry.is_disabled());
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.update_busy = false;
+            w.watching.updating = true;
+            cx.notify();
+        });
+        assert!(find_node(cx, "One more episode").is_disabled());
+        assert!(find_node(cx, "Updating…").is_disabled());
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.watching.updating = false;
+            w.logout_confirming = true;
+            cx.notify();
+        });
+        assert!(find_node(cx, "One more episode").is_disabled());
+        assert!(find_node(cx, "Update to Ep 1").is_disabled());
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.logout_confirming = false;
+            w.stopping = true;
+            cx.notify();
+        });
+        assert!(find_node(cx, "Update to Ep 1").is_disabled());
+        assert!(find_node(cx, "One more episode").is_disabled());
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.stopping = false;
+            w.close_ready = true;
+            cx.notify();
+        });
+        let retry = find_node(cx, "Retry");
+        assert!(retry.is_disabled());
+        assert!(!retry.supports_action(AccessibleAction::Click));
+    }
+
+    #[gpui::test]
+    fn open_local_suppresses_late_launch_error_on_close_ready(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let (core, runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        let file = kurisu_core::models::LibraryFile {
+            path: "/anime/ep01.mkv".into(),
+            media_id: Some(9),
+            matched: Some("Show".into()),
+            episode: Some(1),
+            bound: false,
+        };
+        let entry = ListEntry {
+            id: Some(77),
+            media_id: 9,
+            status: "CURRENT".into(),
+            progress: 0,
+            ..Default::default()
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let done_hook = done.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.route = Route::Now;
+            w.watching.replace_rows(vec![entry.clone()]);
+            w.library_files.replace(vec![file.clone()]);
+            w.watching.launch_hook = Some(Box::new(move |_| {
+                let result = rx.recv().unwrap();
+                done_hook.store(true, Ordering::SeqCst);
+                result
+            }));
+            let generation = w.generation;
+            open_local(w, WatchingPlay::Row(9), &file, generation, Some(47), cx);
+            w.close_ready = true;
+        });
+        tx.send(Err("late tray close error".into())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "launch hook did not complete");
+            super::super::workspace_tests::settle(cx, &runtime);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..8 {
+            super::super::workspace_tests::settle(cx, &runtime);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        workspace.read_with(cx, |w, _| {
+            assert!(w.watching.launch_error.is_empty());
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        workspace.update_in(cx, |w, _, cx| {
+            w.close_ready = false;
+            w.watching.launch_hook = Some(Box::new(move |_| rx.recv().unwrap()));
+            let generation = w.generation;
+            open_local(w, WatchingPlay::Row(9), &file, generation, Some(47), cx);
+        });
+        tx.send(Err("visible player error".into())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.watching.launch_error.is_empty()) {
+            assert!(
+                Instant::now() < deadline,
+                "visible launch error did not surface"
+            );
+            super::super::workspace_tests::settle(cx, &runtime);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.watching.launch_error, "visible player error");
         });
     }
 }

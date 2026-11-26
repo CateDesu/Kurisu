@@ -125,14 +125,74 @@ fn reveal_with_file_manager(path: &Path) -> Result<RevealOutcome, String> {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn explorer_select_arg(path: &Path) -> Result<String, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "Path contains invalid UTF-8 for Explorer".to_owned())?;
+    let normalized = text.replace('/', r"\");
+    let stripped = if let Some(verbatim) = normalized.strip_prefix(r"\\?\") {
+        if verbatim.is_empty() {
+            return Err("Path contains unsupported characters for Explorer".into());
+        }
+        if let Some(unc) = verbatim
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case(r"UNC\"))
+            .and_then(|_| verbatim.get(4..))
+        {
+            if unc.trim_matches('\\').is_empty() {
+                return Err("Path contains unsupported characters for Explorer".into());
+            }
+            format!(r"\\{unc}")
+        } else {
+            let bytes = verbatim.as_bytes();
+            let drive_path = bytes.len() >= 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes.len() == 2 || bytes[2] == b'\\');
+            if drive_path {
+                verbatim.to_owned()
+            } else {
+                normalized
+            }
+        }
+    } else {
+        normalized
+    };
+    let trimmed = stripped.trim_end_matches('\\');
+    let target = if trimmed.len() == 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':'
+    {
+        format!(r"{trimmed}\")
+    } else {
+        trimmed.to_owned()
+    };
+    if target.is_empty()
+        || target
+            .bytes()
+            .any(|byte| byte == b'"' || byte.is_ascii_control())
+    {
+        return Err("Path contains unsupported characters for Explorer".into());
+    }
+    Ok(format!(r#"/select,"{target}""#))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn explorer_exit_succeeded(code: Option<i32>) -> bool {
+    // Explorer returns 1 after delegating selection to an existing shell process.
+    matches!(code, Some(0 | 1))
+}
+
 #[cfg(target_os = "windows")]
 fn reveal_with_file_manager(path: &Path) -> Result<RevealOutcome, String> {
-    let result = Command::new("explorer.exe")
-        .arg("/select,")
-        .arg(path)
-        .status();
+    use std::os::windows::process::CommandExt;
+
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let arg = explorer_select_arg(&absolute)?;
+    let result = Command::new("explorer.exe").raw_arg(arg).status();
     match result {
-        Ok(status) if status.success() => Ok(RevealOutcome::Selected),
+        Ok(status) if explorer_exit_succeeded(status.code()) => Ok(RevealOutcome::Selected),
         Ok(status) => Err(format!("Explorer could not select file: {status}")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(RevealOutcome::Unsupported)
@@ -728,6 +788,9 @@ impl AssetSource for Assets {
             "back",
             "logout",
             "x",
+            "minimize",
+            "maximize",
+            "restore",
             "gearwork",
             "gearwork-heading",
             "gearwork-heading-accent",
@@ -1010,5 +1073,75 @@ mod tests {
             0o600
         );
         drop(reopened);
+    }
+
+    #[test]
+    fn assets_list_includes_all_bundled_icons() {
+        let listed = Assets.list("icons").unwrap();
+        for name in [
+            "list.svg",
+            "minimize.svg",
+            "maximize.svg",
+            "restore.svg",
+            "x.svg",
+            "wordmark-compact.svg",
+        ] {
+            assert!(
+                listed.iter().any(|entry| entry.as_ref() == name),
+                "missing {name} in Assets::list(\"icons\")"
+            );
+        }
+        for entry in &listed {
+            let loaded = Assets.load(&format!("icons/{entry}")).unwrap();
+            assert!(
+                loaded.as_ref().is_some_and(|bytes| !bytes.is_empty()),
+                "listed icon icons/{entry} failed to load"
+            );
+        }
+    }
+
+    #[test]
+    fn explorer_select_formats_quoted_paths_and_accepts_handoff_exit_code() {
+        assert_eq!(
+            explorer_select_arg(Path::new(r"C:\Anime\Kaguya, Love is War\ep 01.mkv")).unwrap(),
+            r#"/select,"C:\Anime\Kaguya, Love is War\ep 01.mkv""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new("C:/Anime/Show/ep01.mkv")).unwrap(),
+            r#"/select,"C:\Anime\Show\ep01.mkv""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new(r"\\?\C:\Anime\Show\ep01.mkv")).unwrap(),
+            r#"/select,"C:\Anime\Show\ep01.mkv""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new(r"\\?\UNC\nas\anime\ep01.mkv")).unwrap(),
+            r#"/select,"\\nas\anime\ep01.mkv""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new(r"C:\Anime\Show\")).unwrap(),
+            r#"/select,"C:\Anime\Show""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new(r"C:\")).unwrap(),
+            r#"/select,"C:\""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new(r"\\?\C:\")).unwrap(),
+            r#"/select,"C:\""#
+        );
+        assert_eq!(
+            explorer_select_arg(Path::new(r"\\?\Volume{1234}\ep01.mkv")).unwrap(),
+            r#"/select,"\\?\Volume{1234}\ep01.mkv""#
+        );
+        assert!(explorer_select_arg(Path::new(r#"C:\Anime\bad"name.mkv"#)).is_err());
+        assert!(explorer_select_arg(Path::new("C:\\Anime\\bad\nname.mkv")).is_err());
+        assert!(explorer_select_arg(Path::new(r"\\?\")).is_err());
+        assert!(explorer_select_arg(Path::new(r"\\?\UNC\")).is_err());
+
+        assert!(explorer_exit_succeeded(Some(0)));
+        assert!(explorer_exit_succeeded(Some(1)));
+        assert!(!explorer_exit_succeeded(Some(2)));
+        assert!(!explorer_exit_succeeded(None));
     }
 }

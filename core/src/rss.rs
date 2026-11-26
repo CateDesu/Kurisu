@@ -126,14 +126,38 @@ fn is_loopback_host(parsed: &reqwest::Url) -> bool {
     parsed.host_str() == Some("localhost") || host_ip(parsed).is_some_and(|ip| ip.is_loopback())
 }
 
+fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || octets[0] == 0
+                || octets[0] >= 240
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || segments[0..6] == [0; 6]
+        }
+    }
+}
+
 fn is_local_redirect_target(parsed: &reqwest::Url) -> bool {
     let host = parsed.host_str().unwrap_or("").trim_end_matches('.');
     host == "localhost"
         || host.ends_with(".localhost")
-        || host_ip(parsed).is_some_and(|ip| {
-            let ip = ip.to_canonical();
-            ip.is_loopback() || ip.is_unspecified()
-        })
+        || host_ip(parsed).is_some_and(is_non_public_ip)
 }
 
 fn validate_feed_url(parsed: &reqwest::Url) -> Result<()> {
@@ -154,7 +178,7 @@ fn validate_redirect(previous: &[reqwest::Url], next: &reqwest::Url) -> Result<(
     if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
         return Err(anyhow!("https feed cannot redirect to plain http"));
     }
-    if previous.iter().any(|url| !is_loopback_host(url)) && is_local_redirect_target(next) {
+    if previous.iter().any(|url| !is_local_redirect_target(url)) && is_local_redirect_target(next) {
         return Err(anyhow!("remote feed cannot redirect to a local address"));
     }
     Ok(())
@@ -2075,7 +2099,27 @@ mod tests {
             "https://sub.localhost/rss",
             "https://[::ffff:127.0.0.1]/rss",
             "https://0.0.0.0/rss",
+            "https://0.1.2.3/rss",
+            "https://10.0.0.1/rss",
+            "https://100.64.0.1/rss",
+            "https://100.127.255.254/rss",
+            "https://169.254.169.254/rss",
+            "https://172.16.0.1/rss",
+            "https://192.0.2.1/rss",
+            "https://192.168.1.1/rss",
+            "https://198.51.100.1/rss",
+            "https://203.0.113.1/rss",
+            "https://224.0.0.1/rss",
+            "https://240.0.0.1/rss",
+            "https://255.255.255.255/rss",
             "https://[::]/rss",
+            "https://[::10.0.0.1]/rss",
+            "https://[::ffff:192.168.1.1]/rss",
+            "https://[::ffff:169.254.169.254]/rss",
+            "https://[fc00::1]/rss",
+            "https://[fd12::1]/rss",
+            "https://[fe80::1]/rss",
+            "https://[ff02::1]/rss",
         ] {
             let target = reqwest::Url::parse(blocked).unwrap();
             assert!(
@@ -2086,6 +2130,30 @@ mod tests {
         assert!(validate_redirect(
             std::slice::from_ref(&tls_local),
             &reqwest::Url::parse("http://localhost/rss").unwrap()
+        )
+        .is_err());
+        for allowed in [
+            "https://1.1.1.1/rss",
+            "https://100.128.0.1/rss",
+            "https://[2606:4700:4700::1111]/rss",
+        ] {
+            let target = reqwest::Url::parse(allowed).unwrap();
+            assert!(
+                validate_redirect(std::slice::from_ref(&remote), &target).is_ok(),
+                "{allowed}"
+            );
+        }
+        let lan = reqwest::Url::parse("https://192.168.1.50/rss").unwrap();
+        let lan_next = reqwest::Url::parse("https://192.168.1.50/feed").unwrap();
+        assert!(validate_redirect(std::slice::from_ref(&lan), &lan_next).is_ok());
+        assert!(validate_redirect(
+            std::slice::from_ref(&lan),
+            &reqwest::Url::parse("http://192.168.1.50/feed").unwrap()
+        )
+        .is_err());
+        assert!(validate_redirect(
+            &[lan, remote.clone()],
+            &reqwest::Url::parse("https://169.254.169.254/latest").unwrap()
         )
         .is_err());
         assert!(validate_redirect(&[remote], &tls_remote).is_ok());

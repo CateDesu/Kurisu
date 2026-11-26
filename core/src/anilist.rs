@@ -292,7 +292,9 @@ impl AniList {
             .timeout(Duration::from_secs(25));
         #[cfg(test)]
         let http = http.no_proxy();
-        let response = http
+        const MAX_EXCHANGE_BYTES: usize = 64 * 1024;
+        const INVALID_RESPONSE: &str = "Kurisu's sign-in service returned an invalid response.";
+        let mut response = http
             .build()?
             .post(endpoint)
             .header("Accept", "application/json")
@@ -312,10 +314,25 @@ impl AniList {
         struct TokenResponse {
             access_token: String,
         }
-        let token: TokenResponse = response
-            .json()
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_EXCHANGE_BYTES as u64)
+        {
+            return Err(anyhow!(INVALID_RESPONSE));
+        }
+        let mut buf = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| anyhow!("Kurisu's sign-in service returned an invalid response."))?;
+            .map_err(|_| anyhow!(INVALID_RESPONSE))?
+        {
+            if buf.len().saturating_add(chunk.len()) > MAX_EXCHANGE_BYTES {
+                return Err(anyhow!(INVALID_RESPONSE));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let token: TokenResponse =
+            serde_json::from_slice(&buf).map_err(|_| anyhow!(INVALID_RESPONSE))?;
         if token.access_token.trim().is_empty() || token.access_token.len() > 16384 {
             return Err(anyhow!(
                 "Kurisu's sign-in service returned an invalid access token."
@@ -727,7 +744,8 @@ impl AniList {
         let mut has_next = true;
         for page in 1..=20 {
             if page > 1 {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.until_replaced(tokio::time::sleep(Duration::from_millis(300)))
+                    .await?;
             }
             let r: R = self
                 .gql(
@@ -744,8 +762,9 @@ impl AniList {
                 .page_info
                 .and_then(|p| p.has_next_page)
                 .ok_or_else(|| anyhow!("AniList returned a null pageInfo.hasNextPage"))?;
-            let mut media = media.into_iter().flatten().peekable();
-            if media.peek().is_none() && (page > 1 || has_next) {
+            let expected_items = !media.is_empty() || page > 1 || has_next;
+            let mut media = media.into_iter().flatten().filter(|m| m.id > 0).peekable();
+            if media.peek().is_none() && expected_items {
                 anyhow::bail!(
                     "AniList stopped returning entries during this season. Try again later."
                 );
@@ -801,6 +820,7 @@ impl AniList {
             .into_iter()
             .flatten()
             .filter_map(|rec| rec.media_recommendation)
+            .filter(|media| media.id > 0)
             .map(Media::from)
             .collect())
     }
@@ -988,7 +1008,11 @@ impl AniList {
             &mut unavailable_sections,
             |edge: RelEdge| {
                 let node = edge.node?;
-                Some((node.kind?, node.media, edge.relation_type))
+                let kind = node.kind?;
+                if matches!(kind, MediaKind::Anime) && node.media.id <= 0 {
+                    return None;
+                }
+                Some((kind, node.media, edge.relation_type))
             },
         )?
         .into_iter()
@@ -1982,7 +2006,7 @@ impl AniList {
                         (!parts.is_empty()).then(|| parts.join(" "))
                     }),
                     created_at: n.created_at.map(i64::from),
-                    media_id: n.media.as_ref().and_then(|m| m.id),
+                    media_id: n.media.as_ref().and_then(|m| m.id).filter(|id| *id > 0),
                     media_title: n
                         .media
                         .as_ref()
@@ -1994,10 +2018,10 @@ impl AniList {
                         .and_then(|m| m.cover_image.as_ref())
                         .and_then(|c| c.medium.clone()),
                     episode: n.episode,
-                    activity_id: n.activity_id,
-                    thread_id: n.thread.as_ref().and_then(|t| t.id),
+                    activity_id: n.activity_id.filter(|id| *id > 0),
+                    thread_id: n.thread.as_ref().and_then(|t| t.id).filter(|id| *id > 0),
                     thread_title: n.thread.as_ref().and_then(|t| t.title.clone()),
-                    comment_id: n.comment_id,
+                    comment_id: n.comment_id.filter(|id| *id > 0),
                     comment_url: n.comment.and_then(|c| c.site_url),
                     reason: n.reason,
                     deleted_media_title: n.deleted_media_title,
@@ -4061,5 +4085,172 @@ mod feature_tests {
         let request = requests.recv().await.unwrap();
         assert_eq!(request["variables"], json!({"id":22,"notes":"New note"}));
         assert!(!request["query"].as_str().unwrap().contains("progress:"));
+    }
+
+    #[tokio::test]
+    async fn non_positive_ids_are_filtered_across_discovery_detail_and_notifications() {
+        let mut zero_media = mock_media(0);
+        zero_media["id"] = json!(0);
+        let mut negative_media = mock_media(-5);
+        negative_media["id"] = json!(-5);
+        let valid_media = mock_media(42);
+
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"Page":{
+                "pageInfo":{"hasNextPage":false},
+                "media":[zero_media.clone(), negative_media.clone()]
+            }}}),
+        )])
+        .await;
+        assert!(api.season_all("SPRING", 2026).await.is_err());
+
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"Page":{
+                "pageInfo":{"hasNextPage":false},
+                "media":[zero_media.clone(), valid_media.clone(), negative_media.clone()]
+            }}}),
+        )])
+        .await;
+        let season = api.season_all("SPRING", 2026).await.unwrap();
+        assert_eq!(season.iter().map(|m| m.id).collect::<Vec<_>>(), vec![42]);
+
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{"Page":{"recommendations":[
+                {"mediaRecommendation": zero_media.clone()},
+                {"mediaRecommendation": negative_media.clone()},
+                {"mediaRecommendation": valid_media.clone()}
+            ]}}}),
+        )])
+        .await;
+        let recs = api.recommendations(1).await.unwrap();
+        assert_eq!(recs.iter().map(|m| m.id).collect::<Vec<_>>(), vec![42]);
+
+        let detail_with_relation = |kind: &str, rel_id: i64| {
+            let mut rel_media = mock_media(rel_id);
+            rel_media["id"] = json!(rel_id);
+            rel_media["type"] = json!(kind);
+            let mut root = mock_media(7);
+            root["bannerImage"] = json!(null);
+            root["genres"] = json!([]);
+            root["duration"] = json!(24);
+            root["source"] = json!("ORIGINAL");
+            root["studios"] = json!({"nodes":[]});
+            root["relations"] = json!({"edges":[{"relationType":"SEQUEL","node":rel_media}]});
+            root["characters"] = json!({"edges":[]});
+            root["staff"] = json!({"edges":[]});
+            json!({"data":{"Media":root}})
+        };
+        let (api, _) = mock_api(vec![
+            (200, detail_with_relation("ANIME", 0)),
+            (200, detail_with_relation("ANIME", -5)),
+            (200, detail_with_relation("MANGA", 0)),
+        ])
+        .await;
+        let bad_zero = api.media_detail(7).await.unwrap();
+        assert!(bad_zero.relations.is_empty());
+        assert!(bad_zero
+            .unavailable_sections
+            .iter()
+            .any(|s| s == "relations"));
+        let bad_neg = api.media_detail(7).await.unwrap();
+        assert!(bad_neg.relations.is_empty());
+        assert!(bad_neg
+            .unavailable_sections
+            .iter()
+            .any(|s| s == "relations"));
+        let manga_zero = api.media_detail(7).await.unwrap();
+        assert!(manga_zero.relations.is_empty());
+        assert!(!manga_zero
+            .unavailable_sections
+            .iter()
+            .any(|s| s == "relations"));
+
+        let (api, _) = mock_api(vec![(
+            200,
+            json!({"data":{
+                "Viewer":{"unreadNotificationCount":1},
+                "Page":{
+                    "pageInfo":{"currentPage":1,"hasNextPage":false},
+                    "notifications":[{
+                        "__typename":"ThreadCommentReplyNotification",
+                        "id":99,
+                        "type":"THREAD_COMMENT_REPLY",
+                        "createdAt":1700000000,
+                        "context":"replied",
+                        "media":{"id":0,"title":{"userPreferred":"Zero"},"coverImage":{"medium":null}},
+                        "activityId":-5,
+                        "thread":{"id":0,"title":"Thread"},
+                        "commentId":-1,
+                        "comment":{"siteUrl":null},
+                        "user":{"name":"Alice","avatar":{"large":null}}
+                    }]
+                }
+            }}),
+        )])
+        .await;
+        let page = api.notifications_page(1).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        let item = &page.items[0];
+        assert_eq!(item.id, 99);
+        assert_eq!(item.media_id, None);
+        assert_eq!(item.activity_id, None);
+        assert_eq!(item.thread_id, None);
+        assert_eq!(item.comment_id, None);
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_oversized_content_length_and_streamed_bodies() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn spawn_exchange_server(
+            response: Vec<u8>,
+        ) -> (AniList, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap() > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let _ = reader.get_mut().write_all(&response).await;
+                let _ = reader.get_mut().shutdown().await;
+            });
+            let mut api = AniList::new();
+            api.endpoint = Some(format!("http://{addr}/exchange"));
+            (api, handle)
+        }
+
+        let oversized_len =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 70000\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        let (api, server) = spawn_exchange_server(oversized_len).await;
+        let err = api.exchange_code("code-1").await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Kurisu's sign-in service returned an invalid response."
+        );
+        server.await.unwrap();
+
+        let chunk = "a".repeat(20 * 1024);
+        let chunk_frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+        let mut streamed =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        for _ in 0..4 {
+            streamed.extend_from_slice(chunk_frame.as_bytes());
+        }
+        streamed.extend_from_slice(b"0\r\n\r\n");
+        let (api, server) = spawn_exchange_server(streamed).await;
+        let err = api.exchange_code("code-2").await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Kurisu's sign-in service returned an invalid response."
+        );
+        server.await.unwrap();
     }
 }

@@ -4237,6 +4237,7 @@ fn active_barrier_save_failure_exposes_discard_barrier_even_with_inactive_drafts
         cx.debug_bounds("discard-barrier").is_some(),
         "Close BarrierError hid Close without saving behind inactive account drafts"
     );
+    assert!(cx.debug_bounds("retry-barrier").is_some());
     let cancel = cx.debug_bounds("cancel-failed-barrier").unwrap();
     cx.simulate_click(cancel.center(), gpui::Modifiers::default());
 
@@ -4249,6 +4250,7 @@ fn active_barrier_save_failure_exposes_discard_barrier_even_with_inactive_drafts
         cx.debug_bounds("discard-barrier").is_some(),
         "Logout BarrierError hid Continue without saving behind inactive account drafts"
     );
+    assert!(cx.debug_bounds("retry-barrier").is_some());
     let cancel = cx.debug_bounds("cancel-failed-barrier").unwrap();
     cx.simulate_click(cancel.center(), gpui::Modifiers::default());
 
@@ -4262,6 +4264,8 @@ fn active_barrier_save_failure_exposes_discard_barrier_even_with_inactive_drafts
     });
     cx.update(|win, app| win.draw(app).clear(app));
     assert!(cx.debug_bounds("discard-barrier").is_none());
+    assert!(cx.debug_bounds("retry-barrier").is_none());
+    assert!(cx.debug_bounds("cancel-failed-barrier").is_some());
 }
 
 #[gpui::test]

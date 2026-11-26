@@ -1939,3 +1939,683 @@ async fn queued_incompatible_score_write_stays_conflicted_after_postflight_failu
         assert!(requests.try_recv().is_err(), "{mode}");
     }
 }
+
+#[tokio::test]
+async fn rewinding_offline_playback_finale_at_same_total_does_not_leak_rewatch() {
+    for mode in [
+        "base_decrement",
+        "base_manual_edit",
+        "prior_edit_manual_edit",
+        "manual_repeat_preserved",
+    ] {
+        let mut remote_base = entry("REPEATING", 11);
+        remote_base["repeat"] = json!(4);
+        let mut saved = entry("CURRENT", if mode == "base_decrement" { 11 } else { 10 });
+        saved["repeat"] = json!(match mode {
+            "manual_repeat_preserved" => 9,
+            _ => 4,
+        });
+        let replies = if mode == "prior_edit_manual_edit" {
+            vec![
+                (503, json!({"errors":[{"message":"Offline"}]})),
+                lookup(Some(12), remote(3)),
+                mutation(saved),
+            ]
+        } else {
+            vec![
+                lookup(Some(12), remote_base.clone()),
+                (503, json!({"errors":[{"message":"Offline"}]})),
+                lookup(Some(12), remote_base),
+                mutation(saved),
+            ]
+        };
+        let (api, mut requests) = anilist::mock_api(replies).await;
+        let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+        seed(&state);
+        if mode == "prior_edit_manual_edit" {
+            crate::commands::save_entry_inner(
+                &state,
+                1,
+                Some("REPEATING".into()),
+                Some(11),
+                None,
+                Some(4),
+            )
+            .await
+            .unwrap();
+        } else {
+            let mut base = state.db.get_entry(1).unwrap().unwrap();
+            base.status = "REPEATING".into();
+            base.progress = 11;
+            base.repeat = 4;
+            state.db.upsert_entry(&base).unwrap();
+        }
+
+        let watched = crate::commands::watcher_set_progress(&state, 1, 12, Some("test-session"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (watched.status.as_str(), watched.progress, watched.repeat),
+            ("COMPLETED", 12, 5),
+            "{mode}"
+        );
+        if mode == "manual_repeat_preserved" {
+            crate::commands::save_entry_inner(&state, 1, None, None, None, Some(9))
+                .await
+                .unwrap();
+        }
+
+        let rewound = if mode == "base_decrement" {
+            crate::commands::set_progress_inner(&state, 1, 11, Some(12))
+                .await
+                .unwrap()
+        } else {
+            crate::commands::save_entry_inner(
+                &state,
+                1,
+                Some("CURRENT".into()),
+                Some(10),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        };
+        let expected_repeat = if mode == "manual_repeat_preserved" {
+            9
+        } else {
+            4
+        };
+        assert_eq!(rewound.repeat, expected_repeat, "{mode}");
+        assert_eq!(
+            state.db.get_entry(1).unwrap().unwrap().repeat,
+            expected_repeat,
+            "{mode}"
+        );
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert_eq!(
+            pending.patch.repeat,
+            match mode {
+                "prior_edit_manual_edit" => Some(4),
+                "manual_repeat_preserved" => Some(9),
+                _ => None,
+            },
+            "{mode}"
+        );
+
+        assert!(sync_pending_changes(&state).await.unwrap().is_empty());
+        let recorded = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+        let vars = &recorded.last().unwrap()["variables"];
+        assert_eq!(
+            vars.get("repeat").cloned(),
+            match mode {
+                "prior_edit_manual_edit" => Some(json!(4)),
+                "manual_repeat_preserved" => Some(json!(9)),
+                _ => None,
+            },
+            "{mode}: {vars}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rewinding_offline_automatic_completion_restores_list_repeat() {
+    for list_synced in [false, true] {
+        for mode in ["decrement", "status_change"] {
+            let (api, _) =
+                anilist::mock_api(vec![(503, json!({"errors":[{"message":"Offline"}]}))]).await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            let mut base = state.db.get_entry(1).unwrap().unwrap();
+            base.status = "REPEATING".into();
+            base.progress = 11;
+            base.repeat = 4;
+            base.updated_at = Some(100);
+            state.db.upsert_entry(&base).unwrap();
+
+            let completed = crate::commands::set_progress_inner(&state, 1, 12, Some(11))
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    completed.status.as_str(),
+                    completed.progress,
+                    completed.repeat
+                ),
+                ("COMPLETED", 12, 5),
+                "list_synced={list_synced}, mode={mode}"
+            );
+
+            let expected_repeat = if list_synced {
+                let mut refreshed = base.clone();
+                refreshed.repeat = 6;
+                refreshed.updated_at = Some(101);
+                state.db.replace_list_snapshot(&[refreshed]).unwrap();
+                overlay(&state).unwrap();
+                6
+            } else {
+                4
+            };
+
+            let updated = if mode == "decrement" {
+                crate::commands::set_progress_inner(&state, 1, 11, Some(12))
+                    .await
+                    .unwrap()
+            } else {
+                crate::commands::save_entry_inner(
+                    &state,
+                    1,
+                    Some("PAUSED".into()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+            };
+            assert_eq!(
+                updated.repeat, expected_repeat,
+                "list_synced={list_synced}, mode={mode}"
+            );
+            assert_eq!(
+                state.db.get_entry(1).unwrap().unwrap().repeat,
+                expected_repeat,
+                "list_synced={list_synced}, mode={mode}"
+            );
+            assert_eq!(
+                state.db.pending_change(7, 1).unwrap().unwrap().patch.repeat,
+                None,
+                "list_synced={list_synced}, mode={mode}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn offline_completed_dynamic_progress_restores_when_reopened_or_total_clears() {
+    for list_synced in [false, true] {
+        for mode in ["reopen", "clear_total"] {
+            let (api, _) =
+                anilist::mock_api(vec![(503, json!({"errors":[{"message":"Offline"}]}))]).await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+            state.db.cache_episode_total(1, None).unwrap();
+            let mut base = state.db.get_entry(1).unwrap().unwrap();
+            base.status = "CURRENT".into();
+            base.progress = 5;
+            base.updated_at = Some(100);
+            state.db.upsert_entry(&base).unwrap();
+
+            let completed = crate::commands::save_entry_inner(
+                &state,
+                1,
+                Some("COMPLETED".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (completed.status.as_str(), completed.progress),
+                ("COMPLETED", 5)
+            );
+            assert_eq!(
+                state
+                    .db
+                    .pending_change(7, 1)
+                    .unwrap()
+                    .unwrap()
+                    .patch
+                    .progress,
+                None
+            );
+
+            state.db.cache_episode_total(1, Some(12)).unwrap();
+            assert_eq!(
+                current_entry(&state, 1).unwrap().unwrap().progress,
+                12,
+                "list_synced={list_synced}, mode={mode}"
+            );
+
+            let expected_progress = if list_synced {
+                let mut refreshed = base.clone();
+                refreshed.progress = 7;
+                refreshed.updated_at = Some(101);
+                refreshed.media.as_mut().unwrap().episodes = Some(12);
+                state.db.replace_list_snapshot(&[refreshed]).unwrap();
+                7
+            } else {
+                5
+            };
+            overlay(&state).unwrap();
+            assert_eq!(
+                state.db.get_entry(1).unwrap().unwrap().progress,
+                12,
+                "list_synced={list_synced}, mode={mode}"
+            );
+
+            if mode == "reopen" {
+                let reopened = crate::commands::save_entry_inner(
+                    &state,
+                    1,
+                    Some("PAUSED".into()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    (reopened.status.as_str(), reopened.progress),
+                    ("PAUSED", expected_progress),
+                    "list_synced={list_synced}"
+                );
+                assert_eq!(
+                    state.db.get_entry(1).unwrap().unwrap().progress,
+                    expected_progress,
+                    "list_synced={list_synced}"
+                );
+            } else {
+                state.db.cache_episode_total(1, None).unwrap();
+                assert_eq!(
+                    current_entry(&state, 1).unwrap().unwrap().progress,
+                    expected_progress,
+                    "list_synced={list_synced}"
+                );
+                overlay(&state).unwrap();
+                assert_eq!(
+                    state.db.get_entry(1).unwrap().unwrap().progress,
+                    expected_progress,
+                    "list_synced={list_synced}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unconfirmed_queue_write_records_retry_and_notifies_when_episode_cache_fails() {
+    let (api, _) = anilist::mock_api(vec![
+        lookup(Some(12), remote(3)),
+        mutation(entry("COMPLETED", 13)),
+        lookup(Some(13), entry("COMPLETED", 12)),
+    ])
+    .await;
+    let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+    seed(&state);
+    stage(
+        &state,
+        1,
+        Patch {
+            status: Some("COMPLETED".into()),
+            progress: Some(12),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    state
+        .db
+        .0
+        .lock()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_episode_cache BEFORE UPDATE ON media
+             WHEN NEW.episodes = 13
+             BEGIN SELECT RAISE(ABORT, 'episode cache blocked'); END;",
+        )
+        .unwrap();
+    let mut events = state.events.subscribe();
+
+    let err = flush_background(&state).await.unwrap_err();
+    assert!(err.contains("episode cache blocked"), "{err}");
+    let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+    assert!(pending.error.is_some(), "unconfirmed retry error missing");
+    assert_eq!(
+        state
+            .db
+            .get_setting("pending_retry_cursor:7")
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(
+            event.kind,
+            crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+        )
+    });
+    assert!(notified, "PendingChanged should be emitted on fallback");
+}
+
+#[tokio::test]
+async fn current_entry_projects_completed_adjustment_with_explicit_progress() {
+    let (api, _) = anilist::mock_api(vec![(503, json!({"errors":[{"message":"Offline"}]}))]).await;
+    let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+    seed(&state);
+    let mut base = state.db.get_entry(1).unwrap().unwrap();
+    base.status = "CURRENT".into();
+    base.progress = 5;
+    state.db.upsert_entry(&base).unwrap();
+
+    let completed =
+        crate::commands::save_entry_inner(&state, 1, Some("COMPLETED".into()), None, None, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        (completed.status.as_str(), completed.progress),
+        ("COMPLETED", 12)
+    );
+    assert_eq!(
+        state
+            .db
+            .pending_change(7, 1)
+            .unwrap()
+            .unwrap()
+            .patch
+            .progress,
+        Some(12)
+    );
+
+    state.db.cache_episode_total(1, Some(13)).unwrap();
+    assert_eq!(current_entry(&state, 1).unwrap().unwrap().progress, 13);
+    assert!(
+        crate::commands::watcher_set_progress(&state, 1, 13, Some("test-session"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+    assert!(!pending.is_playback());
+    assert_eq!(pending.patch.progress, Some(12));
+
+    overlay(&state).unwrap();
+    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 13);
+
+    state.db.cache_episode_total(1, None).unwrap();
+    let expected = pending.progress_for_total(None).unwrap();
+    assert_eq!(expected, 12);
+    assert_eq!(
+        current_entry(&state, 1).unwrap().unwrap().progress,
+        expected
+    );
+    overlay(&state).unwrap();
+    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, expected);
+}
+
+#[tokio::test]
+async fn status_only_manual_edit_after_offline_playback_finale_unwinds_auto_repeat() {
+    for mode in [
+        "clean_base",
+        "list_synced",
+        "prior_manual_repeat",
+        "explicit_manual_repeat",
+        "legacy_playback_flag",
+    ] {
+        for next_status in ["PAUSED", "DROPPED", "PLANNING", "CURRENT"] {
+            let mut remote_base = entry("REPEATING", 11);
+            remote_base["repeat"] = json!(4);
+            remote_base["updatedAt"] = json!(100);
+            let mut remote_synced = entry("REPEATING", 11);
+            remote_synced["repeat"] = json!(6);
+            remote_synced["updatedAt"] = json!(101);
+            let expected_repeat = match mode {
+                "list_synced" => 6,
+                "explicit_manual_repeat" => 9,
+                _ => 4,
+            };
+            let mut saved = entry(next_status, 12);
+            saved["repeat"] = json!(expected_repeat);
+            let replies = match mode {
+                "prior_manual_repeat" => vec![
+                    (503, json!({"errors":[{"message":"Offline"}]})),
+                    lookup(Some(12), remote(3)),
+                    mutation(saved),
+                ],
+                "list_synced" => vec![
+                    lookup(Some(12), remote_base.clone()),
+                    (503, json!({"errors":[{"message":"Offline"}]})),
+                    lookup(Some(12), remote_synced.clone()),
+                    lookup(Some(12), remote_synced),
+                    mutation(saved),
+                ],
+                _ => vec![
+                    lookup(Some(12), remote_base.clone()),
+                    (503, json!({"errors":[{"message":"Offline"}]})),
+                    lookup(Some(12), remote_base),
+                    mutation(saved),
+                ],
+            };
+            let (api, mut requests) = anilist::mock_api(replies).await;
+            let state = state(api, Db::open(Path::new(":memory:")).unwrap());
+            seed(&state);
+
+            if mode == "prior_manual_repeat" {
+                crate::commands::save_entry_inner(
+                    &state,
+                    1,
+                    Some("REPEATING".into()),
+                    Some(11),
+                    None,
+                    Some(4),
+                )
+                .await
+                .unwrap();
+            } else {
+                let mut base = state.db.get_entry(1).unwrap().unwrap();
+                base.status = "REPEATING".into();
+                base.progress = 11;
+                base.repeat = 4;
+                base.updated_at = Some(100);
+                state.db.upsert_entry(&base).unwrap();
+            }
+
+            let watched =
+                crate::commands::watcher_set_progress(&state, 1, 12, Some("test-session"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                (watched.status.as_str(), watched.progress, watched.repeat),
+                ("COMPLETED", 12, 5),
+                "{mode} -> {next_status}"
+            );
+
+            if mode == "list_synced" {
+                let mut refreshed = state.db.get_entry(1).unwrap().unwrap();
+                refreshed.status = "REPEATING".into();
+                refreshed.progress = 11;
+                refreshed.repeat = 6;
+                refreshed.updated_at = Some(101);
+                state.db.replace_list_snapshot(&[refreshed]).unwrap();
+                overlay(&state).unwrap();
+            } else if mode == "explicit_manual_repeat" {
+                crate::commands::save_entry_inner(&state, 1, None, None, None, Some(9))
+                    .await
+                    .unwrap();
+            } else if mode == "legacy_playback_flag" {
+                let mut pending = state.db.pending_change(7, 1).unwrap().unwrap();
+                pending.patch.playback = None;
+                pending.playback = true;
+                state.db.put_pending(7, &pending).unwrap();
+            }
+
+            let edited = crate::commands::save_entry_inner(
+                &state,
+                1,
+                Some(next_status.into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (edited.status.as_str(), edited.progress, edited.repeat),
+                (next_status, 12, expected_repeat),
+                "{mode} -> {next_status}"
+            );
+            assert_eq!(
+                state.db.get_entry(1).unwrap().unwrap().repeat,
+                expected_repeat,
+                "{mode} -> {next_status}"
+            );
+            let expected_patch_repeat = match mode {
+                "prior_manual_repeat" => Some(4),
+                "explicit_manual_repeat" => Some(9),
+                _ => None,
+            };
+            let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+            assert_eq!(
+                pending.patch.repeat, expected_patch_repeat,
+                "{mode} -> {next_status}"
+            );
+
+            if mode == "list_synced" {
+                let remaining = sync_pending_changes(&state).await.unwrap();
+                assert_eq!(remaining.len(), 1, "{mode} -> {next_status}");
+                assert!(remaining[0].conflict, "{mode} -> {next_status}");
+                resolve_pending_inner(1, true, &state).await.unwrap();
+                assert!(state.db.pending(7).unwrap().is_empty());
+            } else {
+                assert!(
+                    sync_pending_changes(&state).await.unwrap().is_empty(),
+                    "{mode} -> {next_status}"
+                );
+            }
+            let recorded = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+            let vars = &recorded.last().unwrap()["variables"];
+            assert_eq!(
+                vars["status"],
+                json!(next_status),
+                "{mode} -> {next_status}"
+            );
+            assert_eq!(vars["progress"], json!(12), "{mode} -> {next_status}");
+            assert_eq!(
+                vars.get("repeat").cloned(),
+                expected_patch_repeat.map(|r| json!(r)),
+                "{mode} -> {next_status}: {vars}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_absence_cleans_up_pending_delete_on_concurrent_auth_change() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    use std::time::Duration;
+
+    for (case, reply) in [
+        ("switch_account_none", lookup(Some(12), json!(null))),
+        (
+            "switch_account_not_found",
+            (
+                404,
+                json!({"errors": [{"message": "Not Found.", "status": 404}]}),
+            ),
+        ),
+        ("same_account_relogin", lookup(Some(12), json!(null))),
+        ("token_changed", lookup(Some(12), json!(null))),
+    ] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (mut api, mut requests) =
+            anilist::mock_api_gated(vec![reply], Some(gate.clone())).await;
+        api.set_token(Some("test-session".into()));
+        api.record_viewer(7);
+        let state = Arc::new(state(api, Db::open(Path::new(":memory:")).unwrap()));
+        seed(&state);
+        state.db.delete_entry(1).unwrap();
+        let (_, pending, _) = stage(
+            &state,
+            1,
+            Patch {
+                progress: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!pending.deleting && !pending.needs_cleanup_only());
+
+        let delete_state = state.clone();
+        let delete_task =
+            tokio::spawn(async move { crate::commands::delete_entry_cmd(1, &delete_state).await });
+
+        let req = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(req["query"].as_str().unwrap().contains("mediaListEntry"));
+
+        let changer = {
+            let _db_guard = state.db.0.lock();
+            gate.add_permits(1);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while state.entry_lock.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{case}: delete did not reach staged_absence"
+                );
+                std::thread::yield_now();
+            }
+
+            let changer_state = state.clone();
+            let mut lock_fut = Box::pin(changer_state.entry_lock.clone().lock_owned());
+            assert!(lock_fut
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            tokio::spawn(async move {
+                let _entry = lock_fut.await;
+                match case {
+                    "switch_account_none" | "switch_account_not_found" => {
+                        changer_state.begin_auth_intent();
+                        changer_state
+                            .anilist
+                            .lock()
+                            .set_token(Some("other-session".into()));
+                        changer_state
+                            .db
+                            .replace_account(
+                                "other-session",
+                                &crate::models::User {
+                                    id: 8,
+                                    name: "Other".into(),
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                    }
+                    "same_account_relogin" => {
+                        changer_state.begin_auth_intent();
+                    }
+                    "token_changed" => {
+                        changer_state
+                            .anilist
+                            .lock()
+                            .set_token(Some("other-session".into()));
+                    }
+                    _ => unreachable!(),
+                }
+            })
+        };
+
+        let err = tokio::time::timeout(Duration::from_secs(2), delete_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        changer.await.unwrap();
+        let expected_err = if case == "token_changed" {
+            "Your AniList account changed. Try again."
+        } else {
+            "A newer sign-in or sign-out replaced this attempt."
+        };
+        assert_eq!(err, expected_err, "{case}");
+        assert!(
+            state.db.pending_change(7, 1).unwrap().is_none(),
+            "{case}: orphaned deleting pending row remained"
+        );
+    }
+}

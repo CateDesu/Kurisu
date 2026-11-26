@@ -14,7 +14,7 @@ use super::search::{
 use super::state::{STATUSES, status_label};
 use super::{Workspace, covers::CoverOwner, joined};
 use crate::components::input::{TextInput, TextInputEvent};
-use crate::components::{button, eyebrow, select};
+use crate::components::{button, eyebrow, select_with_disabled};
 use crate::contracts::Route;
 use crate::theme::{DIM, EDGE, ERROR, PANEL, PANEL_2};
 
@@ -400,7 +400,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.modal_open() {
+        if self.modal_open() || self.edits_fenced() {
             self.seasons.season_open = false;
             self.seasons.format_open = false;
             self.seasons.list_open = false;
@@ -436,11 +436,13 @@ impl Workspace {
             }
             self.seasons.columns = columns;
         }
+        let reads_fenced = self.stopping || self.writes_fenced();
+        let load_disabled = self.seasons.loading || reads_fenced;
         let actions = div()
             .flex()
             .gap(px(7.))
             .child(
-                button("season-prev", "← Prev", self.seasons.loading)
+                button("season-prev", "← Prev", load_disabled)
                     .h(px(34.))
                     .px(px(10.))
                     .py(px(6.))
@@ -449,7 +451,7 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| this.shift_season(-1, window, cx))),
             )
             .child(
-                button("season-next", "Next →", self.seasons.loading)
+                button("season-next", "Next →", load_disabled)
                     .h(px(34.))
                     .px(px(10.))
                     .py(px(6.))
@@ -488,14 +490,20 @@ impl Workspace {
                 Some(actions),
                 f32::from(window.viewport_size().width) <= 960.,
             ));
-        let mut season_select = select("season-jump", "Season")
+        let fenced = self.edits_fenced();
+        let mut season_select = select_with_disabled("season-jump", "Season", fenced)
             .relative()
-            .track_focus(&self.season_jump_focus)
-            .aria_expanded(self.seasons.season_open)
+            .when(!fenced, |control| {
+                control.track_focus(&self.season_jump_focus)
+            })
+            .aria_expanded(!fenced && self.seasons.season_open)
             .debug_selector(|| "season-jump".into())
             .w_full()
             .child(format!("{} ▾", season_name(&self.seasons.selected_season)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.edits_fenced() {
+                    return;
+                }
                 if let Some(value) = arrow_choice(
                     &this.seasons.selected_season,
                     &SEASONS,
@@ -508,6 +516,9 @@ impl Workspace {
                 }
             }))
             .on_click(cx.listener(|this, _, window, cx| {
+                if this.edits_fenced() {
+                    return;
+                }
                 if this.season_jump_focus_subscription.is_none() {
                     let focus = this.season_jump_focus.clone();
                     this.season_jump_focus_subscription =
@@ -523,7 +534,7 @@ impl Workspace {
                 this.seasons.list_open = false;
                 cx.notify();
             }));
-        if self.seasons.season_open {
+        if !fenced && self.seasons.season_open {
             let mut choices = div()
                 .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                 .absolute()
@@ -581,7 +592,7 @@ impl Workspace {
             );
         }
         jump = jump.child(
-            button("season-go", "Go to season", self.seasons.loading)
+            button("season-go", "Go to season", load_disabled)
                 .on_click(cx.listener(|this, _, window, cx| this.jump_season(window, cx))),
         );
         page = page.child(jump);
@@ -623,7 +634,7 @@ impl Workspace {
                     .p(px(8.))
                     .child(div().flex_1().min_w_0().child(self.seasons.error.clone()))
                     .child(
-                        button("season-retry", "Retry", self.seasons.loading)
+                        button("season-retry", "Retry", load_disabled)
                             .h(px(20.))
                             .px(px(0.))
                             .py(px(0.))
@@ -650,15 +661,25 @@ impl Workspace {
             );
         }
         if !self.list.loaded && !self.list.error.is_empty() {
-            page =
-                page.child(
-                    div()
-                        .text_color(rgb(ERROR))
-                        .child(format!("Could not read your list: {}", self.list.error))
-                        .child(button("season-list-retry", "Retry list", false).on_click(
-                            cx.listener(|this, _, window, cx| this.load_list(window, cx)),
-                        )),
-                );
+            let list_retry_disabled = self.list.loading || self.list.syncing || reads_fenced;
+            page = page.child(
+                div()
+                    .text_color(rgb(ERROR))
+                    .child(format!("Could not read your list: {}", self.list.error))
+                    .child(
+                        button("season-list-retry", "Retry list", list_retry_disabled)
+                            .debug_selector(|| "season-list-retry".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if !this.list.loading
+                                    && !this.list.syncing
+                                    && !this.stopping
+                                    && !this.writes_fenced()
+                                {
+                                    this.load_list(window, cx);
+                                }
+                            })),
+                    ),
+            );
         }
         if self.seasons.loading {
             page = page.child(div().py(px(20.)).text_color(rgb(DIM)).child("Loading…"));
@@ -741,15 +762,21 @@ impl Workspace {
         } else {
             self.seasons.format_filter.replace('_', " ")
         };
-        let mut control = select("season-format", "Filter by format")
+        let fenced = self.edits_fenced();
+        let mut control = select_with_disabled("season-format", "Filter by format", fenced)
             .relative()
             .w(px(160.))
-            .track_focus(&self.season_format_focus)
-            .aria_expanded(self.seasons.format_open)
+            .when(!fenced, |control| {
+                control.track_focus(&self.season_format_focus)
+            })
+            .aria_expanded(!fenced && self.seasons.format_open)
             .debug_selector(|| "season-format".into())
             .w_full()
             .child(format!("{label} ▾"))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.edits_fenced() {
+                    return;
+                }
                 let options = [
                     "ALL", "TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC",
                 ];
@@ -764,6 +791,9 @@ impl Workspace {
                 }
             }))
             .on_click(cx.listener(|this, _, window, cx| {
+                if this.edits_fenced() {
+                    return;
+                }
                 if this.season_format_focus_subscription.is_none() {
                     let focus = this.season_format_focus.clone();
                     this.season_format_focus_subscription =
@@ -779,7 +809,7 @@ impl Workspace {
                 this.seasons.list_open = false;
                 cx.notify();
             }));
-        if self.seasons.format_open {
+        if !fenced && self.seasons.format_open {
             let mut options = div()
                 .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                 .absolute()
@@ -827,52 +857,62 @@ impl Workspace {
             "UNLISTED" => "Not on my list",
             status => status_label(status),
         };
-        let mut control = select("season-list-status", "Filter by list status")
-            .relative()
-            .w(px(176.))
-            .track_focus(&self.season_status_focus)
-            .aria_expanded(self.seasons.list_open)
-            .debug_selector(|| "season-list-status".into())
-            .w_full()
-            .child(format!("{label} ▾"))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                let options = [
-                    "ALL",
-                    "UNLISTED",
-                    "CURRENT",
-                    "PLANNING",
-                    "COMPLETED",
-                    "PAUSED",
-                    "DROPPED",
-                    "REPEATING",
-                ];
-                if let Some(value) =
-                    arrow_choice(&this.seasons.list_filter, &options, &event.keystroke.key)
-                {
-                    cx.stop_propagation();
-                    this.seasons.list_filter = value.into();
-                    this.seasons.list_open = false;
-                    this.refresh_season_visible();
+        let fenced = self.edits_fenced();
+        let mut control =
+            select_with_disabled("season-list-status", "Filter by list status", fenced)
+                .relative()
+                .w(px(176.))
+                .when(!fenced, |control| {
+                    control.track_focus(&self.season_status_focus)
+                })
+                .aria_expanded(!fenced && self.seasons.list_open)
+                .debug_selector(|| "season-list-status".into())
+                .w_full()
+                .child(format!("{label} ▾"))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if this.edits_fenced() {
+                        return;
+                    }
+                    let options = [
+                        "ALL",
+                        "UNLISTED",
+                        "CURRENT",
+                        "PLANNING",
+                        "COMPLETED",
+                        "PAUSED",
+                        "DROPPED",
+                        "REPEATING",
+                    ];
+                    if let Some(value) =
+                        arrow_choice(&this.seasons.list_filter, &options, &event.keystroke.key)
+                    {
+                        cx.stop_propagation();
+                        this.seasons.list_filter = value.into();
+                        this.seasons.list_open = false;
+                        this.refresh_season_visible();
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.edits_fenced() {
+                        return;
+                    }
+                    if this.season_status_focus_subscription.is_none() {
+                        let focus = this.season_status_focus.clone();
+                        this.season_status_focus_subscription =
+                            Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
+                                if this.seasons.list_open {
+                                    this.seasons.list_open = false;
+                                    cx.notify();
+                                }
+                            }));
+                    }
+                    this.seasons.list_open = !this.seasons.list_open;
+                    this.seasons.season_open = false;
+                    this.seasons.format_open = false;
                     cx.notify();
-                }
-            }))
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.season_status_focus_subscription.is_none() {
-                    let focus = this.season_status_focus.clone();
-                    this.season_status_focus_subscription =
-                        Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
-                            if this.seasons.list_open {
-                                this.seasons.list_open = false;
-                                cx.notify();
-                            }
-                        }));
-                }
-                this.seasons.list_open = !this.seasons.list_open;
-                this.seasons.season_open = false;
-                this.seasons.format_open = false;
-                cx.notify();
-            }));
-        if self.seasons.list_open {
+                }));
+        if !fenced && self.seasons.list_open {
             let mut options = div()
                 .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                 .absolute()
@@ -1019,5 +1059,156 @@ mod tests {
             "UNLISTED",
             Some("PLANNING")
         ));
+    }
+
+    #[gpui::test]
+    fn seasons_controls_disable_and_menus_close_while_fenced(cx: &mut gpui::TestAppContext) {
+        use super::super::workspace_tests::fixture;
+        use gpui::AccessibleAction;
+        use kurisu_core::models::User;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Seasons;
+            w.seasons.loaded_once = true;
+            w.seasons.season_open = true;
+            w.seasons.format_open = true;
+            w.seasons.list_open = true;
+            w.update_busy = true;
+            w.close_ready = true;
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        view.read_with(cx, |w, _| {
+            assert!(!w.seasons.season_open);
+            assert!(!w.seasons.format_open);
+            assert!(!w.seasons.list_open);
+        });
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        for label in ["← Prev", "Next →", "Go to season"] {
+            let (_, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing seasons button {label}"));
+            assert!(
+                node.is_disabled(),
+                "{label} should be disabled while fenced"
+            );
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
+        for label in ["Season", "Filter by format", "Filter by list status"] {
+            let (_, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing seasons combobox {label}"));
+            assert!(node.is_disabled(), "{label} should disable while fenced");
+            assert_eq!(node.is_expanded(), Some(false));
+            assert!(!node.supports_action(AccessibleAction::Click));
+            assert!(!node.supports_action(AccessibleAction::Focus));
+        }
+
+        view.update_in(cx, |w, _, cx| {
+            w.close_ready = false;
+            cx.notify();
+        });
+        cx.update(|win, app| win.draw(app).clear(app));
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        for label in ["Season", "Filter by format", "Filter by list status"] {
+            let (_, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing seasons combobox {label}"));
+            assert!(
+                node.is_disabled(),
+                "{label} should remain disabled while update_busy"
+            );
+            assert_eq!(node.is_expanded(), Some(false));
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
+
+        view.update_in(cx, |w, _, cx| {
+            w.update_busy = false;
+            w.list.loaded = false;
+            w.list.error = "offline".into();
+            cx.notify();
+        });
+        cx.update(|win, app| win.draw(app).clear(app));
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        for label in ["Season", "Filter by format", "Filter by list status"] {
+            let (_, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing seasons combobox {label}"));
+            assert!(!node.is_disabled(), "{label} should re-enable after fence");
+        }
+        let (retry_id, retry_enabled) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Retry list"))
+            .map(|(id, node)| (*id, node))
+            .expect("missing seasons Retry list button");
+        assert!(!retry_enabled.is_disabled());
+        let retry_bounds = cx
+            .debug_bounds("season-list-retry")
+            .expect("season-list-retry bounds");
+        let before_request = view.update_in(cx, |w, _, _| {
+            w.list.loading = true;
+            w.list_request
+        });
+        cx.simulate_click(retry_bounds.center(), gpui::Modifiers::default());
+        view.read_with(cx, |w, _| {
+            assert_eq!(
+                w.list_request, before_request,
+                "disabled Retry list must not restart load_list while already loading"
+            );
+        });
+        view.update_in(cx, |w, _, _| {
+            w.list.loading = false;
+            w.barrier = Some(super::super::BarrierAction::Install);
+        });
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::Click,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: retry_id,
+            data: None,
+        });
+        view.read_with(cx, |w, _| {
+            assert_eq!(
+                w.list_request, before_request,
+                "fenced Retry list must not start load_list during a barrier"
+            );
+            assert!(w.list_read.is_none());
+        });
+
+        view.update_in(cx, |w, _, cx| {
+            w.barrier = None;
+            w.list.syncing = true;
+            cx.notify();
+        });
+        cx.update(|win, app| win.draw(app).clear(app));
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (_, retry_list) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Retry list"))
+            .expect("missing seasons Retry list button");
+        assert!(retry_list.is_disabled());
+        assert!(!retry_list.supports_action(AccessibleAction::Click));
     }
 }

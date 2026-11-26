@@ -522,7 +522,7 @@ impl ProgressEdit {
         Self {
             saved: progress,
             pending: progress,
-            total,
+            total: total.filter(|total| *total > 0),
             remote_progress: None,
             requires_review: false,
             due: None,
@@ -554,7 +554,7 @@ impl ProgressEdit {
         if self.in_flight || self.deleting || self.requires_review {
             return false;
         }
-        let limit = self.total.unwrap_or(9999).max(0);
+        let limit = self.total.filter(|total| *total > 0).unwrap_or(9999);
         if delta > 0 && self.pending >= limit {
             return false;
         }
@@ -575,7 +575,7 @@ impl ProgressEdit {
     }
 
     pub fn absorb(&mut self, progress: i64, total: Option<i64>) {
-        self.total = total;
+        self.total = total.filter(|total| *total > 0);
         if self.deleting || self.in_flight {
             return;
         }
@@ -619,7 +619,10 @@ impl ProgressEdit {
     }
 
     fn absorb_entry(&mut self, entry: &ListEntry) {
-        let total = entry.media.as_ref().and_then(|media| media.episodes);
+        let total = entry
+            .media
+            .as_ref()
+            .and_then(|media| media.known_episodes());
         let identity = entry.identity();
         if self.busy() {
             self.total = total;
@@ -864,7 +867,7 @@ impl ProgressRegistry {
             .or_insert_with(|| {
                 let mut edit = ProgressEdit::new(
                     entry.progress,
-                    entry.media.as_ref().and_then(|m| m.episodes),
+                    entry.media.as_ref().and_then(|m| m.known_episodes()),
                 );
                 edit.identity = entry.identity();
                 edit
@@ -1066,7 +1069,10 @@ impl EditorState {
     }
 
     pub fn total(&self) -> Option<i64> {
-        self.media.as_ref().and_then(|m| m.episodes)
+        self.media
+            .as_ref()
+            .and_then(|m| m.episodes)
+            .filter(|total| *total > 0)
     }
 
     pub fn refresh_entry_progress(
@@ -1081,7 +1087,7 @@ impl EditorState {
         let changed_total = entry.media.as_ref().and_then(|media| {
             let total = media
                 .episodes
-                .filter(|total| Some(*total) != self.total())?;
+                .filter(|total| *total > 0 && Some(*total) != self.total())?;
             self.media.get_or_insert_with(|| media.clone()).episodes = Some(total);
             Some(total)
         });
@@ -2643,5 +2649,34 @@ mod tests {
         let kept = registry.edit(2, 7).unwrap();
         assert!(!kept.requires_review);
         assert!(!kept.dirty());
+    }
+
+    #[test]
+    fn zero_episode_total_is_treated_as_unknown_by_editor_and_stepper() {
+        let item = entry(7, "Show", "CURRENT", 5, Some(0));
+        let mut editor = EditorState::new(item.clone());
+        assert_eq!(editor.total(), None);
+        editor.choose_status("COMPLETED");
+        assert_eq!(editor.progress, 5);
+
+        let mut direct = ProgressEdit::new(2, Some(0));
+        assert_eq!(direct.total, None);
+        direct.absorb(2, Some(12));
+        assert_eq!(direct.total, Some(12));
+        direct.absorb(2, Some(0));
+        assert_eq!(direct.total, None);
+        direct.absorb(2, Some(-4));
+        assert_eq!(direct.total, None);
+
+        let mut registry = ProgressRegistry::default();
+        let edit = registry.entry(1, &item);
+        assert_eq!(edit.total, None);
+        assert!(edit.step(1, Instant::now()));
+        assert_eq!(edit.pending, 6);
+        let updated = entry(7, "Show", "CURRENT", 5, Some(12));
+        registry.entry(1, &updated);
+        assert_eq!(registry.edit(1, 7).unwrap().total, Some(12));
+        registry.entry(1, &item);
+        assert_eq!(registry.edit(1, 7).unwrap().total, None);
     }
 }

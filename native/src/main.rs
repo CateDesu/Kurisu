@@ -87,6 +87,8 @@ fn main() {
         );
     }
     if let Err(error) = kurisu_native::run(data_dir) {
+        #[cfg(target_os = "windows")]
+        attach_parent_console_if_needed();
         eprintln!("Kurisu could not start: {error}");
         std::process::exit(1);
     }

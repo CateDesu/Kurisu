@@ -541,7 +541,9 @@ fn validate_wal(database: &Path, wal: &Path) -> Result<()> {
         refuse()
     );
     let mut main = [0; 18];
-    File::open(database)?.read_exact(&mut main)?;
+    File::open(database)?
+        .read_exact(&mut main)
+        .map_err(|_| refuse())?;
     let main_size = u16::from_be_bytes([main[16], main[17]]);
     ensure!(
         page_size
@@ -686,6 +688,7 @@ fn populate(
     values: BTreeMap<String, Option<String>>,
     request: &TransferRequest,
 ) -> Result<()> {
+    regular_file(backup)?;
     let database = stage.join("kurisu.db");
     ensure!(
         copy_matches(backup, &database, backup_digest)?,
@@ -1137,6 +1140,22 @@ mod tests {
         assert!(!stage.0.join(MARKER).exists());
         assert!(!stage.0.join(RECEIPT).exists());
         assert!(!request.destination.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let linked = fixture.root.0.join("linked-backup.db");
+            symlink(&request.backup_db, &linked).unwrap();
+            let link_stage = Stage::new(&fixture.root.0).unwrap();
+            let values =
+                load_preferences(&read_preferences(&request.preferences).unwrap()).unwrap();
+            let error = populate(&linked, &expected, &link_stage.0, values, request).unwrap_err();
+            assert!(
+                error.to_string().contains("Links and reparse points"),
+                "{error}"
+            );
+            assert!(!link_stage.0.join("kurisu.db").exists());
+        }
     }
 
     #[test]
@@ -1169,6 +1188,7 @@ mod tests {
         for input in [
             None,
             Some(""),
+            Some("1_000"),
             Some("NaN"),
             Some("inf"),
             Some("-1"),
@@ -1279,17 +1299,17 @@ mod tests {
                 assert_eq!(first.len(), 32);
             } else {
                 assert_eq!(first, "fixture-creation");
-                assert_eq!(
-                    crate::Db::open(&installed)
-                        .unwrap()
-                        .get_entry(7)
-                        .unwrap()
-                        .unwrap()
-                        .queued_creation
-                        .as_deref(),
-                    Some(first.as_str())
-                );
             }
+            assert_eq!(
+                crate::Db::open(&installed)
+                    .unwrap()
+                    .get_entry(7)
+                    .unwrap()
+                    .unwrap()
+                    .queued_creation
+                    .as_deref(),
+                Some(first.as_str())
+            );
             assert_eq!(key(), first);
             assert_eq!(fingerprints(&request.source_db).unwrap(), original);
         }
@@ -1641,7 +1661,14 @@ mod tests {
 
     #[test]
     fn wal_damage_and_reset_tails_stop_before_publication() {
-        for kind in ["header", "truncated", "salt", "checksum", "page_size"] {
+        for kind in [
+            "header",
+            "truncated",
+            "salt",
+            "checksum",
+            "page_size",
+            "short_main",
+        ] {
             let fixture = Fixture::new();
             with_wal(&fixture);
             let r = &fixture.request;
@@ -1655,11 +1682,16 @@ mod tests {
                 "salt" => bytes[40] ^= 1,
                 "checksum" => bytes[60] ^= 1,
                 "page_size" => bytes[10] ^= 1,
+                "short_main" => fs::write(&r.source_db, b"SQLite format 3\x00\x01").unwrap(),
                 _ => unreachable!(),
             }
             fs::write(&wal, bytes).unwrap();
             let before = fingerprints(&r.source_db).unwrap();
-            assert!(transfer(r).is_err(), "{kind}");
+            let error = transfer(r).unwrap_err().to_string();
+            assert!(
+                error.contains("WAL is incomplete, damaged or unsupported"),
+                "{kind}: {error}"
+            );
             assert_eq!(before, fingerprints(&r.source_db).unwrap(), "{kind}");
             assert!(!r.backup_db.exists(), "{kind}");
             assert!(!r.destination.exists(), "{kind}");

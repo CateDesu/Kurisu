@@ -129,7 +129,7 @@ impl Db {
         let conn = Connection::open(path)?;
         // Writes default to NORMAL. Queued list changes and watch history use durable_write.
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+            "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
         Self::migrate(&conn)?;
         // The database and WAL can contain the plaintext AniList token.
@@ -278,6 +278,30 @@ impl Db {
                    AND json_extract(payload, '$.patch.creation_key') IS NULL",
                 [],
             )?;
+            let active_account: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'anilist_user_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(account_id) = parse_valid_account_id(active_account.as_deref()) {
+                conn.execute(
+                    "UPDATE list_entry AS e
+                     SET queued_creation = json_extract(p.payload, '$.patch.creation_key')
+                     FROM pending_change AS p
+                     WHERE p.account_id = ?1
+                       AND p.media_id = e.media_id
+                       AND e.entry_id IS NULL
+                       AND e.queued_creation IS NULL
+                       AND json_valid(p.payload)
+                       AND json_type(p.payload, '$.base') = 'null'
+                       AND COALESCE(json_extract(p.payload, '$.deleting'), 0) = 0
+                       AND COALESCE(json_extract(p.payload, '$.missing_media'), 0) = 0
+                       AND json_type(p.payload, '$.patch.creation_key') = 'text'",
+                    [account_id],
+                )?;
+            }
         }
         if version <= 8 {
             // Selected nulls have different semantics from episode-only rows.
@@ -1202,6 +1226,7 @@ fn mark_catalog_reads(
 }
 
 fn write_episode_total(conn: &Connection, media_id: i64, episodes: Option<i64>) -> Result<bool> {
+    let episodes = episodes.filter(|total| *total > 0);
     let changed = cached_episode_total(conn, media_id)? != Some(episodes);
     if changed {
         let written = conn.execute(
@@ -2719,6 +2744,66 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn schema_7_migration_backfills_queued_creation_for_active_account_only() {
+        struct TempDb(std::path::PathBuf);
+        impl TempDb {
+            fn new(path: std::path::PathBuf) -> Self {
+                Self::remove(&path);
+                Self(path)
+            }
+            fn remove(path: &std::path::Path) {
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                }
+            }
+        }
+        impl Drop for TempDb {
+            fn drop(&mut self) {
+                Self::remove(&self.0);
+            }
+        }
+
+        let temp = TempDb::new(temp_db_path("v7-queued-creation-backfill"));
+        let path = &temp.0;
+        build_db_at_version(path, 7);
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO settings (key, value) VALUES ('anilist_user_id', '7');
+                 INSERT INTO list_entry (media_id, entry_id, status, progress, repeat)
+                 VALUES (1, NULL, 'CURRENT', 2, 0),
+                        (2, NULL, 'CURRENT', 3, 0),
+                        (3, NULL, 'CURRENT', 4, 0),
+                        (4, NULL, 'CURRENT', 5, 0);
+                 INSERT INTO pending_change (account_id, media_id, payload) VALUES
+                 (7, 1, '{\"media_id\":1,\"base\":null,\"patch\":{\"status\":\"CURRENT\",\"progress\":2},\"conflict\":false}'),
+                 (8, 2, '{\"media_id\":2,\"base\":null,\"patch\":{\"status\":\"CURRENT\",\"progress\":3},\"conflict\":false}'),
+                 (7, 3, '{\"media_id\":3,\"deleting\":true,\"base\":null,\"patch\":{},\"conflict\":false}'),
+                 (7, 4, '{\"media_id\":4,\"missing_media\":true,\"base\":null,\"patch\":{},\"conflict\":true}');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(path).unwrap();
+        let active_key = db
+            .pending_change(7, 1)
+            .unwrap()
+            .unwrap()
+            .patch
+            .creation_key
+            .unwrap();
+        assert_eq!(active_key.len(), 32);
+        assert_eq!(
+            db.get_entry(1).unwrap().unwrap().queued_creation.as_deref(),
+            Some(active_key.as_str())
+        );
+        assert_eq!(db.get_entry(2).unwrap().unwrap().queued_creation, None);
+        assert_eq!(db.get_entry(3).unwrap().unwrap().queued_creation, None);
+        assert_eq!(db.get_entry(4).unwrap().unwrap().queued_creation, None);
+        assert_eq!(db.get_entry(7).unwrap().unwrap().queued_creation, None);
+    }
 }
 
 #[cfg(test)]
@@ -2796,5 +2881,24 @@ mod durability_tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn write_episode_total_normalizes_non_positive_totals_to_none() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        assert!(db.cache_episode_total(42, Some(12)).unwrap());
+        assert_eq!(db.episode_total(42).unwrap(), Some(12));
+
+        assert!(db.cache_episode_total(42, Some(0)).unwrap());
+        assert_eq!(db.episode_total(42).unwrap(), None);
+        assert_eq!(db.cached_episode_total(42).unwrap(), Some(None));
+        let raw: Option<i64> =
+            db.0.lock()
+                .query_row("SELECT episodes FROM media WHERE id = 42", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(raw, None);
+
+        assert!(!db.cache_episode_total(42, Some(-3)).unwrap());
+        assert!(!db.cache_episode_total(42, None).unwrap());
     }
 }

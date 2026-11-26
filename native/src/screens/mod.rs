@@ -401,6 +401,7 @@ pub struct Workspace {
     stopping: bool,
     barrier: Option<BarrierAction>,
     barrier_blocked_by_inactive_drafts: bool,
+    barrier_can_retry: bool,
     close_ready: bool,
     route_entry_deferred: bool,
     barrier_error: String,
@@ -627,6 +628,7 @@ impl Workspace {
             stopping: false,
             barrier: None,
             barrier_blocked_by_inactive_drafts: false,
+            barrier_can_retry: false,
             close_ready: false,
             route_entry_deferred: false,
             barrier_error: String::new(),
@@ -708,6 +710,16 @@ impl Workspace {
 
     pub(super) fn edits_fenced(&self) -> bool {
         self.stopping || self.writes_fenced() || self.auth_busy || self.update_busy
+    }
+
+    pub fn is_edits_fenced(&self) -> bool {
+        self.edits_fenced()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_update_busy_for_test(&mut self, busy: bool, cx: &mut Context<Self>) {
+        self.update_busy = busy;
+        cx.notify();
     }
 
     pub(crate) fn set_tray_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
@@ -824,6 +836,9 @@ impl Workspace {
             Route::Search if route != Route::Search => self.leave_search(),
             Route::Seasons if route != Route::Seasons => self.leave_seasons(),
             Route::Calendar if route != Route::Calendar => self.leave_calendar(),
+            Route::Torrents if route != Route::Torrents => {
+                self.torrents.dismiss_menu();
+            }
             _ => {}
         }
         if !matches!(route, Route::Anime(_)) {
@@ -1808,6 +1823,7 @@ impl Workspace {
             self.prompt_event = None;
             self.prompt_busy = false;
             self.prompt_error.clear();
+            self.logout_confirming = false;
             self.now_playing = None;
             self.list_sync_flash = None;
             self.scroll_memory.clear();
@@ -1962,6 +1978,9 @@ impl Workspace {
                 .await,
             );
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.stopping {
+                    return;
+                }
                 let initial_load = !this.preferences_loaded;
                 this.preferences_loaded = true;
                 let values = result.unwrap_or_else(|error| {
@@ -2436,13 +2455,7 @@ impl Workspace {
     }
 
     fn sync_list(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.writes_fenced()
-            || self.auth_busy
-            || self.update_busy
-            || self.profile.is_none()
-            || self.offline
-            || self.list.syncing
-        {
+        if self.edits_fenced() || self.profile.is_none() || self.offline || self.list.syncing {
             return;
         }
         self.last_sync_attempt = Some(Instant::now());
@@ -3303,6 +3316,7 @@ impl Workspace {
                     Ok(None) => return,
                     Err(error) => {
                         this.pending_error = error.to_string();
+                        cx.notify();
                         return;
                     }
                 };
@@ -3348,6 +3362,7 @@ impl Workspace {
         self.active_writes += 1;
         cx.notify();
         let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
@@ -3360,7 +3375,9 @@ impl Workspace {
                 if this.stopping {
                     return;
                 }
-                if generation != this.generation {
+                if generation != this.generation
+                    || account != this.profile.as_ref().map(|user| user.id)
+                {
                     this.check_barrier(window, cx);
                     return;
                 }
@@ -3398,6 +3415,7 @@ impl Workspace {
         self.active_writes += 1;
         cx.notify();
         let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
@@ -3410,7 +3428,9 @@ impl Workspace {
                 if this.stopping {
                     return;
                 }
-                if generation != this.generation {
+                if generation != this.generation
+                    || account != this.profile.as_ref().map(|user| user.id)
+                {
                     this.check_barrier(window, cx);
                     return;
                 }
@@ -3536,26 +3556,28 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let worker = core.clone();
             let result = core
-                .spawn(async move {
-                    (
-                        worker.take_pending_update().await,
-                        worker.take_update_failed().await,
-                    )
-                })
+                .spawn(async move { worker.take_pending_update().await })
                 .await;
             let _ = this.update_in(cx, |this, _window, cx| {
-                if let Ok((info, error)) = result {
-                    if let Some(info) = info {
-                        this.show_update(info);
-                    }
-                    if let Some(error) = error {
-                        this.update_failed = error;
-                    }
+                if this.stopping {
+                    return;
+                }
+                if let Ok(Some(info)) = result {
+                    this.show_update(info);
+                }
+                if let Some(error) = this.core.pending_update_failed() {
+                    this.update_failed = error;
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    pub(super) fn dismiss_update_failed(&mut self, cx: &mut Context<Self>) {
+        self.update_failed.clear();
+        self.core.clear_update_failed();
+        cx.notify();
     }
 
     fn note_restart_pending(&mut self) {
@@ -3671,6 +3693,7 @@ impl Workspace {
         }
         self.capture_fenced_inputs(cx);
         self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier_can_retry = false;
         self.barrier = Some(match self.barrier {
             Some(BarrierAction::Logout | BarrierAction::LogoutThenClose(_)) => {
                 BarrierAction::LogoutThenClose(intent)
@@ -3754,6 +3777,7 @@ impl Workspace {
         }
         self.capture_fenced_inputs(cx);
         self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier_can_retry = false;
         self.barrier = Some(action);
         self.barrier_error.clear();
         self.check_barrier(window, cx);
@@ -3767,6 +3791,7 @@ impl Workspace {
             cx.emit(WorkspaceEvent::CloseCancelled);
         }
         self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier_can_retry = false;
         self.clear_fenced_inputs_if_idle(cx);
         self.queued_login = None;
         self.barrier_error.clear();
@@ -3779,10 +3804,12 @@ impl Workspace {
 
     fn check_barrier(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier_can_retry = false;
         let Some(action) = self.barrier else {
             return;
         };
         if !self.query_error.is_empty() {
+            self.barrier_can_retry = true;
             self.barrier_error = format!(
                 "Could not save the list search: {}. Kurisu is still open.",
                 self.query_error
@@ -3793,17 +3820,20 @@ impl Workspace {
         self.save_query(window, cx);
         self.save_preferences(window, cx);
         if let Some(error) = self.preference_error_message() {
+            self.barrier_can_retry = true;
             self.barrier_error = format!("{error} Kurisu is still open.");
             cx.notify();
             return;
         }
         if let Some(error) = self.settings.tracking_save_error() {
+            self.barrier_can_retry = true;
             self.barrier_error =
                 format!("Could not save playback tracking: {error}. Kurisu is still open.");
             cx.notify();
             return;
         }
         if let Some((label, error)) = self.settings.app_setting_save_error() {
+            self.barrier_can_retry = true;
             self.barrier_error = format!("Could not save {label}: {error}. Kurisu is still open.");
             cx.notify();
             return;
@@ -3817,6 +3847,7 @@ impl Workspace {
             return;
         }
         if let Some(error) = self.progress.first_settled_error(self.generation) {
+            self.barrier_can_retry = true;
             self.barrier_error = format!("Could not save progress: {error}. Kurisu is still open.");
             cx.notify();
             return;
@@ -3848,6 +3879,7 @@ impl Workspace {
             .filter(|editor| !editor.error.is_empty())
             .map(|editor| editor.error.as_str())
         {
+            self.barrier_can_retry = true;
             self.barrier_error = format!("Could not save entry: {error}. Kurisu is still open.");
             cx.notify();
             return;
@@ -3864,9 +3896,18 @@ impl Workspace {
                 .filter(|editor| !editor.busy && !editor.error.is_empty())
                 .map(|editor| editor.error.as_str())
             {
+                self.barrier_can_retry = true;
                 self.barrier_error =
                     format!("Could not save entry: {error}. Kurisu is still open.");
             }
+            cx.notify();
+            return;
+        }
+        if matches!(action, BarrierAction::Close(_) | BarrierAction::Install)
+            && let Some((error, can_retry)) = self.library_screen.barrier_error()
+        {
+            self.barrier_can_retry = can_retry;
+            self.barrier_error = error;
             cx.notify();
             return;
         }
@@ -3909,6 +3950,7 @@ impl Workspace {
             return;
         }
         self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier_can_retry = false;
         self.query_pending = None;
         self.query_error.clear();
         for write in self.preference_writes.values_mut() {
@@ -3926,12 +3968,15 @@ impl Workspace {
         if self.editor.as_ref().is_some_and(|editor| !editor.busy) {
             self.close_editor(cx);
         }
+        if self.library_screen.discard_barrier_draft() {
+            self.cancel_reads("library-binding");
+        }
         self.barrier_error.clear();
         self.check_barrier(window, cx);
     }
 
     fn retry_barrier(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.barrier.is_none() {
+        if self.barrier.is_none() || !self.barrier_can_retry {
             return;
         }
         self.barrier_error.clear();
@@ -3945,6 +3990,7 @@ impl Workspace {
         }
         self.retry_tracking_settings(window, cx);
         self.retry_app_settings(window, cx);
+        self.retry_library_bind(window, cx);
         self.retry_preferences_inner(window, cx);
     }
 
@@ -3968,6 +4014,7 @@ impl Workspace {
             return;
         }
         self.barrier_blocked_by_inactive_drafts = false;
+        self.barrier_can_retry = false;
         let active = self.profile.as_ref().map(|user| user.id);
         self.progress_drafts
             .retain(|account, _| Some(*account) == active);
@@ -3994,7 +4041,8 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.close_ready
+        if self.stopping
+            || self.close_ready
             || self.barrier.is_some()
             || self.auth_busy && !self.auth_retry_available()
         {
@@ -4179,6 +4227,7 @@ impl Workspace {
         self.capture_fenced_inputs(cx);
         self.update_busy = true;
         self.update_failed.clear();
+        self.core.clear_update_failed();
         self.active_writes += 1;
         let core = self.core.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -4511,5 +4560,204 @@ mod menu_focus_tests {
                 _ => !workspace.seasons.list_open,
             }));
         }
+    }
+
+    #[gpui::test]
+    fn pending_actions_ignore_stale_results_after_same_generation_expiry(cx: &mut TestAppContext) {
+        let (_unused_core, runtime, dir) = workspace_tests::fixture();
+        drop(_unused_core);
+        let db = kurisu_core::Db::open(&dir.0.join("kurisu.db")).unwrap();
+        db.replace_account(
+            "test-session",
+            &User {
+                id: 7,
+                name: "Alice".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.0.lock()
+            .execute(
+                "INSERT INTO pending_change(account_id, media_id, payload) VALUES (7, 42, ?)",
+                [r#"{"media_id":42,"deleting":false,"deletion_id":null,"base":null,"patch":{"status":"CURRENT","progress":5,"score":null,"repeat":null},"error":"Conflict","conflict":true,"missing_media":true}"#],
+            )
+            .unwrap();
+        drop(db);
+        let core = Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(crate::platform::NativePlatform),
+            kurisu_core::UpdateChannel::Native,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.block_on(core.sync_pending_changes()).unwrap().len(),
+            1
+        );
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                name: "Alice".into(),
+                ..Default::default()
+            });
+            w.pending = vec![PendingChange {
+                media_id: 42,
+                title: "Steins;Gate".into(),
+                status: Some("CURRENT".into()),
+                progress: Some(5),
+                score: None,
+                repeat: None,
+                conflict: true,
+                missing_media: true,
+                error: Some("Conflict".into()),
+            }];
+            let generation = w.generation;
+            w.retry_pending(window, cx);
+            assert!(w.pending_busy);
+            w.set_profile_at(None, generation, window, cx);
+            assert_eq!(w.generation, generation);
+            assert!(w.pending.is_empty());
+            assert!(w.pending_error.is_empty());
+        });
+        workspace_tests::settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.active_writes, 0);
+            assert!(w.profile.is_none());
+            assert!(w.pending.is_empty());
+            assert!(w.pending_error.is_empty());
+            assert!(!w.pending_busy);
+            assert!(!w.list_refresh_queued);
+        });
+
+        workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                name: "Alice".into(),
+                ..Default::default()
+            });
+            w.pending = vec![PendingChange {
+                media_id: 42,
+                title: "Steins;Gate".into(),
+                status: Some("CURRENT".into()),
+                progress: Some(5),
+                score: None,
+                repeat: None,
+                conflict: true,
+                missing_media: true,
+                error: Some("Conflict".into()),
+            }];
+            let generation = w.generation;
+            w.resolve_pending(42, false, window, cx);
+            assert!(w.pending_busy);
+            w.set_profile_at(None, generation, window, cx);
+            assert_eq!(w.generation, generation);
+        });
+        workspace_tests::settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.active_writes, 0);
+            assert!(w.profile.is_none());
+            assert!(w.pending.is_empty());
+            assert!(w.pending_error.is_empty());
+            assert!(!w.pending_busy);
+            assert!(!w.list_refresh_queued);
+        });
+    }
+
+    #[cfg(feature = "fixture-runtime")]
+    #[gpui::test]
+    fn update_failed_dismiss_clears_core_recovery_and_stopping_ignores_load(
+        cx: &mut TestAppContext,
+    ) {
+        let (core, runtime, _dir) = workspace_tests::fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+
+        let message = "Update failed distinctly".to_string();
+        core.set_failed_update_for_test(Some(message.clone()));
+        core.emit(EventKind::UpdateFailed(message.clone()));
+        workspace_tests::settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.update_failed, message);
+        });
+        assert!(core.recovery_events().iter().any(|event| matches!(
+            &event.kind,
+            EventKind::UpdateFailed(text) if text == &message
+        )));
+
+        cx.update(|win, app| win.draw(app).clear(app));
+        let dismiss = cx
+            .debug_bounds("dismiss-update-error")
+            .expect("Got it button must render");
+        cx.simulate_click(dismiss.center(), Modifiers::default());
+        workspace.read_with(cx, |w, _| {
+            assert!(w.update_failed.is_empty());
+        });
+        assert!(core.pending_update_failed().is_none());
+        assert!(
+            !core
+                .recovery_events()
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::UpdateFailed(_)))
+        );
+
+        let second = "Second update failure".to_string();
+        core.set_failed_update_for_test(Some(second.clone()));
+        core.emit(EventKind::UpdateFailed(second.clone()));
+        workspace_tests::settle(cx, &runtime);
+        workspace.update_in(cx, |w, window, cx| {
+            assert_eq!(w.update_failed, second);
+            w.escape_active_modal(window, cx);
+            assert!(w.update_failed.is_empty());
+        });
+        assert!(core.pending_update_failed().is_none());
+        assert!(
+            !core
+                .recovery_events()
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::UpdateFailed(_)))
+        );
+
+        let pending = "Pending notice across stop".to_string();
+        core.set_failed_update_for_test(Some(pending.clone()));
+        workspace.update_in(cx, |w, window, cx| {
+            w.load_update_notice(window, cx);
+            w.stopping = true;
+        });
+        workspace_tests::settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert!(w.update_failed.is_empty());
+        });
+        assert_eq!(
+            core.pending_update_failed().as_deref(),
+            Some(pending.as_str())
+        );
+
+        workspace.update_in(cx, |w, window, cx| {
+            w.stopping = false;
+            w.load_update_notice(window, cx);
+        });
+        workspace_tests::settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(w.update_failed, pending);
+        });
+        assert_eq!(
+            core.pending_update_failed().as_deref(),
+            Some(pending.as_str())
+        );
+
+        workspace.update_in(cx, |w, window, cx| {
+            w.load_update_notice(window, cx);
+            w.dismiss_update_failed(cx);
+        });
+        workspace_tests::settle(cx, &runtime);
+        workspace.read_with(cx, |w, _| {
+            assert!(w.update_failed.is_empty());
+        });
+        assert!(core.pending_update_failed().is_none());
     }
 }

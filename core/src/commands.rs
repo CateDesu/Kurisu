@@ -1121,6 +1121,38 @@ pub(crate) async fn current_user_mode(
     Ok(Some(u))
 }
 
+fn catalog_origin_guard<'a>(
+    state: &'a AppState,
+    origin: crate::EventOrigin,
+    expected_token: &Option<String>,
+) -> Result<tokio::sync::watch::Ref<'a, u64>, String> {
+    if expected_token.is_some() {
+        write_origin_guard(state, origin, expected_token)
+    } else {
+        signed_out_origin_guard(state, origin)
+    }
+}
+
+async fn catalog_read_err(
+    state: &AppState,
+    origin: crate::EventOrigin,
+    expected_token: &Option<String>,
+    error: anyhow::Error,
+) -> String {
+    if error.is::<anilist::UnsentRequest>() {
+        return AUTH_REPLACED.into();
+    }
+    if expected_token.is_some() && anilist::is_auth_rejection(&error) {
+        let _remote = state.remote_lock.lock().await;
+        let _guard = state.entry_lock.lock().await;
+        if let Err(session_err) = check_write_session(state, expected_token) {
+            return session_err;
+        }
+        return write_err(state, origin, expected_token, &error);
+    }
+    error.to_string()
+}
+
 pub async fn search_anime_page(
     query: String,
     page: i64,
@@ -1129,68 +1161,106 @@ pub async fn search_anime_page(
     if query.trim().is_empty() || !(1..=10000).contains(&page) {
         return Err("invalid search or page".into());
     }
-    let al = state.anilist.lock().clone();
+    let origin = state.origin();
+    let al = state
+        .anilist
+        .lock()
+        .for_intent(&state.auth_intent, origin.generation);
+    let expected_token = al.token();
     let read = state.db.catalog_read();
-    let mut result = al
-        .search_page(query.trim(), page, 25)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut result = match al.search_page(query.trim(), page, 25).await {
+        Ok(result) => result,
+        Err(e) => return Err(catalog_read_err(state, origin, &expected_token, e).await),
+    };
     let _write = state.entry_lock.lock().await;
+    let _intent = catalog_origin_guard(state, origin, &expected_token)?;
     state.cache_media_batch(&read, &mut result.items);
     Ok(result)
 }
 
 pub async fn get_season(season: String, year: i64, state: &AppState) -> Result<Vec<Media>, String> {
-    let al = state.anilist.lock().clone();
+    let origin = state.origin();
+    let al = state
+        .anilist
+        .lock()
+        .for_intent(&state.auth_intent, origin.generation);
+    let expected_token = al.token();
     let read = state.db.catalog_read();
-    let mut media = al
-        .season_all(&season, year)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut media = match al.season_all(&season, year).await {
+        Ok(media) => media,
+        Err(e) => return Err(catalog_read_err(state, origin, &expected_token, e).await),
+    };
     let _write = state.entry_lock.lock().await;
+    let _intent = catalog_origin_guard(state, origin, &expected_token)?;
     state.cache_media_batch(&read, &mut media);
     Ok(media)
 }
 
 pub async fn get_recommendations(media_id: i64, state: &AppState) -> Result<Vec<Media>, String> {
-    let al = state.anilist.lock().clone();
+    let origin = state.origin();
+    let al = state
+        .anilist
+        .lock()
+        .for_intent(&state.auth_intent, origin.generation);
+    let expected_token = al.token();
     let read = state.db.catalog_read();
-    let mut media = al
-        .recommendations(media_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut media = match al.recommendations(media_id).await {
+        Ok(media) => media,
+        Err(e) => return Err(catalog_read_err(state, origin, &expected_token, e).await),
+    };
     let _write = state.entry_lock.lock().await;
+    let _intent = catalog_origin_guard(state, origin, &expected_token)?;
     state.cache_media_batch(&read, &mut media);
     Ok(media)
 }
 
 pub async fn get_media(id: i64, state: &AppState) -> Result<Media, String> {
+    let origin = state.origin();
+    let al = state
+        .anilist
+        .lock()
+        .for_intent(&state.auth_intent, origin.generation);
+    let expected_token = al.token();
     let read = state.db.catalog_read();
     if let Some(m) = state.db.get_media(id).map_err(|e| e.to_string())? {
         return Ok(m);
     }
-    let al = state.anilist.lock().clone();
     let result = al.media_by_id(id).await;
+    let mut v = match result {
+        Ok(v) => v,
+        Err(e) if e.is::<anilist::UnsentRequest>() => return Err(AUTH_REPLACED.into()),
+        Err(e) if expected_token.is_some() && anilist::is_auth_rejection(&e) => {
+            let _remote = state.remote_lock.lock().await;
+            let _guard = state.entry_lock.lock().await;
+            check_write_session(state, &expected_token)?;
+            return Err(write_err(state, origin, &expected_token, &e));
+        }
+        Err(e) => {
+            let _write = state.entry_lock.lock().await;
+            let _intent = catalog_origin_guard(state, origin, &expected_token)?;
+            if read.removed_media().contains(&id) {
+                return Err(MEDIA_GONE.into());
+            }
+            if anilist::media_not_found(&e) {
+                if read.has_newer_media(id) {
+                    if let Some(media) = state
+                        .db
+                        .cached_catalog_media(id)
+                        .map_err(|e| e.to_string())?
+                    {
+                        return Ok(media);
+                    }
+                }
+                return Err(MEDIA_GONE.into());
+            }
+            return Err(e.to_string());
+        }
+    };
     let _write = state.entry_lock.lock().await;
+    let _intent = catalog_origin_guard(state, origin, &expected_token)?;
     if read.removed_media().contains(&id) {
         return Err(MEDIA_GONE.into());
     }
-    let mut v = match result {
-        Ok(v) => v,
-        Err(e) if anilist::media_not_found(&e) => {
-            if read.has_newer_media(id) {
-                if let Some(media) = state
-                    .db
-                    .cached_catalog_media(id)
-                    .map_err(|e| e.to_string())?
-                {
-                    return Ok(media);
-                }
-            }
-            return Err(MEDIA_GONE.into());
-        }
-        Err(e) => return Err(e.to_string()),
-    };
     read.preserve_newer(&state.db, [&mut v]);
     state.db.upsert_media(&v).map_err(|e| e.to_string())?;
     read.record_write(&state.db, CatalogUpdate::Metadata, std::iter::once(v.id));
@@ -1210,13 +1280,7 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
         .lock()
         .for_intent(&state.auth_intent, origin.generation);
     let expected_token = al.token();
-    let check_origin = || {
-        if expected_token.is_some() {
-            write_origin_guard(state, origin, &expected_token)
-        } else {
-            signed_out_origin_guard(state, origin)
-        }
-    };
+    let check_origin = || catalog_origin_guard(state, origin, &expected_token);
     let key = format!("media_detail:{id}");
     let cached = || {
         state
@@ -1227,6 +1291,13 @@ async fn get_media_detail_inner(id: i64, state: &AppState) -> Result<MediaDetail
             .and_then(|v| serde_json::from_str::<MediaDetail>(&v).ok())
             .filter(|detail| {
                 detail.media.id == id && (detail.cached_at.is_some() || detail.media.has_metadata())
+            })
+            .map(|mut detail| {
+                detail.media.episodes = detail.media.known_episodes();
+                for relation in &mut detail.relations {
+                    relation.media.episodes = relation.media.known_episodes();
+                }
+                detail
             })
     };
     let read = state.db.catalog_read();
@@ -1394,15 +1465,14 @@ pub async fn get_airing_schedule(
         .anilist
         .lock()
         .for_intent(&state.auth_intent, origin.generation);
-    let token = al.token();
+    let expected_token = al.token();
     let read = state.db.catalog_read();
     let mut items = match al.airing_schedule(start, end).await {
         Ok(items) => items,
-        Err(e) if e.is::<anilist::UnsentRequest>() => return Err(AUTH_REPLACED.into()),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(catalog_read_err(state, origin, &expected_token, e).await),
     };
     let _write = state.entry_lock.lock().await;
-    let _intent = write_origin_guard(state, origin, &token)?;
+    let _intent = catalog_origin_guard(state, origin, &expected_token)?;
     let removed = read.removed_media();
     items.retain(|item| !removed.contains(&item.media.id));
     read.preserve_newer(&state.db, items.iter_mut().map(|item| &mut item.media));
@@ -2043,9 +2113,11 @@ async fn save_entry_inner_checked_impl(
                     media_id,
                     episodes,
                 )?;
-                let entry = remote.map(|remote| crate::sync_queue::remote_entry(media_id, remote));
-                if let Some(entry) = entry.as_ref().filter(|_| expects_absent) {
+                let mut entry =
+                    remote.map(|remote| crate::sync_queue::remote_entry(media_id, remote));
+                if let Some(entry) = entry.as_mut().filter(|_| expects_absent) {
                     let intent = write_origin_guard(state, origin, &expected_token)?;
+                    entry.media = state.db.get_media(media_id).map_err(|e| e.to_string())?;
                     state.db.upsert_entry(entry).map_err(|e| e.to_string())?;
                     drop(intent);
                     state.refresh_matchers();
@@ -2239,7 +2311,9 @@ async fn save_entry_unlocked(
     let token = al.token();
     check_write_origin(state, origin, &token)?;
     let account = entry_account(state, origin)?;
-    let before = crate::sync_queue::current_entry(state, media_id).map_err(|e| e.to_string())?;
+    let mut before =
+        crate::sync_queue::current_entry(state, media_id).map_err(|e| e.to_string())?;
+    let before_identity = before.as_ref().map(ListEntry::identity);
     let check_prompt = || -> Result<(), String> {
         if let EntrySave::Prompt { event, total, .. } = source {
             if !state.event_is_current(event)
@@ -2251,7 +2325,7 @@ async fn save_entry_unlocked(
                 || crate::sync_queue::current_entry(state, media_id)
                     .map_err(|e| e.to_string())?
                     .is_none_or(|entry| {
-                        Some(entry.identity()) != before.as_ref().map(ListEntry::identity)
+                        Some(entry.identity()) != before_identity
                             || progress.is_some_and(|target| entry.progress >= target)
                     })
             {
@@ -2274,9 +2348,14 @@ async fn save_entry_unlocked(
             Err(PROMPT_CHANGED.to_string())
         }
     };
-    let mut staged =
-        crate::sync_queue::prepare_entry(state, media_id, patch, playback_episode, before.as_ref())
-            .map_err(|e| e.to_string())?;
+    let mut staged = crate::sync_queue::prepare_entry_for_local(
+        state,
+        media_id,
+        patch,
+        playback_episode,
+        before.as_mut(),
+    )
+    .map_err(|e| e.to_string())?;
     if let Some((account, pending, _)) = staged
         .as_ref()
         .filter(|(_, pending, already_pending)| *already_pending || pending.conflict)
@@ -2505,9 +2584,27 @@ async fn save_entry_unlocked(
                     pending
                 };
                 if error.format_mismatch || error.retryable {
-                    return crate::sync_queue::commit_pending_projection(
+                    return match crate::sync_queue::commit_pending_projection(
                         state, origin, intent, *account, &pending, before,
-                    );
+                    ) {
+                        Ok(entry) => Ok(entry),
+                        Err(commit_error) if pending.conflict || dispatched => {
+                            if let Err(pending_err) = state.db.put_pending(*account, &pending) {
+                                let label = if pending.conflict {
+                                    "failed to mark pending change conflicted"
+                                } else {
+                                    "failed to record pending change error"
+                                };
+                                return Err(format!("{commit_error}; {label}: {pending_err}"));
+                            }
+                            state.emit_from(
+                                origin,
+                                crate::EventKind::PendingChanged(Some(vec![media_id])),
+                            );
+                            Err(commit_error)
+                        }
+                        Err(commit_error) => Err(commit_error),
+                    };
                 }
                 state
                     .db
@@ -2635,15 +2732,49 @@ async fn save_entry_unlocked(
             if rejected.is_some() || missing_entry {
                 match write_origin_guard(state, origin, &token) {
                     Ok(intent) => {
-                        if let Some(total) = rejected.and_then(|r| r.total) {
-                            state
-                                .db
-                                .cache_episode_total(media_id, total)
-                                .map_err(|e| e.to_string())?;
-                        }
-                        return crate::sync_queue::commit_pending_projection(
-                            state, origin, intent, *account, pending, before,
+                        let mut episodes_changed = false;
+                        let cache_err = match rejected.and_then(|r| r.total) {
+                            Some(total) => match state.db.cache_episode_total(media_id, total) {
+                                Ok(changed) => {
+                                    episodes_changed = changed;
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            },
+                            None => None,
+                        };
+                        let error = if let Some(error) = cache_err {
+                            if let Err(conflict_err) = state.db.put_pending(*account, pending) {
+                                return Err(format!(
+                                    "{error}; failed to mark pending change conflicted: {conflict_err}"
+                                ));
+                            }
+                            drop(intent);
+                            error.to_string()
+                        } else {
+                            match crate::sync_queue::commit_pending_projection(
+                                state, origin, intent, *account, pending, before,
+                            ) {
+                                Ok(entry) => return Ok(entry),
+                                Err(error) => {
+                                    let fallback = state.db.put_pending(*account, pending);
+                                    if episodes_changed {
+                                        state.refresh_matchers();
+                                    }
+                                    if let Err(conflict_err) = fallback {
+                                        return Err(format!(
+                                            "{error}; failed to mark pending change conflicted: {conflict_err}"
+                                        ));
+                                    }
+                                    error
+                                }
+                            }
+                        };
+                        state.emit_from(
+                            origin,
+                            crate::EventKind::PendingChanged(Some(vec![media_id])),
                         );
+                        return Err(error);
                     }
                     Err(error) => {
                         state
@@ -2684,15 +2815,9 @@ async fn save_entry_unlocked(
                 .map_err(|e| e.to_string())?;
                 return Err(MEDIA_GONE.to_string());
             }
-            if let Some(unconfirmed) = e.downcast_ref::<anilist::UnconfirmedEntryWrite>() {
-                crate::sync_queue::cache_reported_episodes(
-                    state,
-                    origin,
-                    &token,
-                    media_id,
-                    unconfirmed.0,
-                )?;
-            }
+            let unconfirmed_episodes = e
+                .downcast_ref::<anilist::UnconfirmedEntryWrite>()
+                .and_then(|unconfirmed| unconfirmed.0);
             if let Some((account, mut pending, _)) = staged {
                 if anilist::is_retryable(&e) {
                     let _prompt = if dispatched {
@@ -2703,10 +2828,69 @@ async fn save_entry_unlocked(
                     };
                     let intent = write_origin_guard(state, origin, &token)?;
                     pending.error = Some(e.to_string());
-                    return crate::sync_queue::commit_pending_projection(
+                    let mut episodes_changed = false;
+                    let cache_err = match unconfirmed_episodes {
+                        Some(total) => match state.db.cache_episode_total(media_id, total) {
+                            Ok(changed) => {
+                                episodes_changed = changed;
+                                None
+                            }
+                            Err(error) => Some(error.to_string()),
+                        },
+                        None => None,
+                    };
+                    if let Some(error) = cache_err {
+                        if dispatched {
+                            if let Err(pending_err) = state.db.put_pending(account, &pending) {
+                                return Err(format!(
+                                    "{error}; failed to record pending change error: {pending_err}"
+                                ));
+                            }
+                            drop(intent);
+                            state.emit_from(
+                                origin,
+                                crate::EventKind::PendingChanged(Some(vec![media_id])),
+                            );
+                        }
+                        return Err(error);
+                    }
+                    return match crate::sync_queue::commit_pending_projection(
                         state, origin, intent, account, &pending, before,
-                    );
+                    ) {
+                        Ok(entry) => Ok(entry),
+                        Err(commit_error) if dispatched => {
+                            let fallback = state.db.put_pending(account, &pending);
+                            if episodes_changed {
+                                state.refresh_matchers();
+                            }
+                            if let Err(pending_err) = fallback {
+                                return Err(format!(
+                                    "{commit_error}; failed to record pending change error: {pending_err}"
+                                ));
+                            }
+                            state.emit_from(
+                                origin,
+                                crate::EventKind::PendingChanged(Some(vec![media_id])),
+                            );
+                            Err(commit_error)
+                        }
+                        Err(commit_error) => {
+                            if episodes_changed {
+                                state.refresh_matchers();
+                            }
+                            Err(commit_error)
+                        }
+                    };
                 }
+            }
+            if let Some(unconfirmed) = e.downcast_ref::<anilist::UnconfirmedEntryWrite>() {
+                crate::sync_queue::cache_reported_episodes(
+                    state,
+                    origin,
+                    &token,
+                    media_id,
+                    unconfirmed.0,
+                )?;
             }
             return Err(e.to_string());
         }
@@ -3033,6 +3217,7 @@ async fn set_progress_inner_with_origin(
         automatic_completion,
         ..Default::default()
     };
+    validate_entry_values(patch.progress, patch.score, patch.repeat)?;
     let entry = if let Some(error) = lookup_error {
         let intent = write_origin_guard(state, origin, &expected_token)?;
         let (account, mut pending, _) =
@@ -3449,6 +3634,7 @@ async fn delete_entry_with_target(
         None => state.db.remove_pending(account, media_id),
     };
     let mut staged = false;
+    let mut staged_absence = false;
     let mut confirmed_removed = false;
     let mut retain_failure = false;
     let mut unsent = false;
@@ -3483,8 +3669,14 @@ async fn delete_entry_with_target(
                     Ok(Some(remote.id))
                 }
                 Ok(Some(_)) => Err(anyhow::anyhow!("AniList entry identity changed or was not saved before removal. Choose which version to keep.")),
-                Ok(None) => Ok(None),
-                Err(e) if anilist::media_not_found(&e) => Ok(None),
+                Ok(None) => {
+                    confirmed_removed = true;
+                    Ok(None)
+                }
+                Err(e) if anilist::media_not_found(&e) => {
+                    confirmed_removed = true;
+                    Ok(None)
+                }
                 Err(e) => Err(e),
             }
         } else {
@@ -3502,6 +3694,7 @@ async fn delete_entry_with_target(
                 let _intent =
                     write_origin_guard(state, origin, &token).map_err(anyhow::Error::msg)?;
                 state.db.put_pending(account, &deletion)?;
+                staged_absence = true;
             }
             return Ok(());
         };
@@ -3562,10 +3755,29 @@ async fn delete_entry_with_target(
     .await;
     let _write = state.entry_lock.lock().await;
     if let Err(error) = result {
+        let auth_rejected = anilist::is_auth_rejection(&error);
         let mut settle = |replaced: bool| {
             let Some(account) = account.filter(|_| staged || retain_failure && !replaced) else {
                 return Ok(false);
             };
+            if auth_rejected && !replaced && !could_have_deleted {
+                if let Some(previous) = queued.as_ref().filter(|pending| pending.deleting) {
+                    let mut retained = previous.clone();
+                    retained.record_retry_error(SESSION_EXPIRED);
+                    state.db.put_pending(account, &retained)?;
+                    return Ok(true);
+                }
+                if staged {
+                    restore_previous(account).or_else(|restore_error| {
+                        deletion.conflict = true;
+                        deletion.error = Some(SESSION_EXPIRED.into());
+                        state.db.put_pending(account, &deletion)?;
+                        Err(restore_error)
+                    })?;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
             if staged && (unsent || replaced && !could_have_deleted) {
                 restore_previous(account).or_else(|restore_error| {
                     deletion.conflict = true;
@@ -3586,7 +3798,7 @@ async fn delete_entry_with_target(
             }
             Ok(true)
         };
-        let (settlement, failure) = if anilist::is_auth_rejection(&error) {
+        let (settlement, failure) = if auth_rejected {
             match clear_rejected_session_after(state, origin, &token, || settle(false)) {
                 Some((result, failure)) => (result, failure.message().to_string().into()),
                 None => (settle(true), EntryFlushError::Batch(AUTH_REPLACED.into())),
@@ -3624,16 +3836,24 @@ async fn delete_entry_with_target(
             return Err(origin_error.clone().into());
         }
     }
-    state
-        .db
-        .durable_write(|tx| {
-            Db::delete_entry_from(tx, media_id)?;
-            if let Some(account) = account {
-                Db::delete_pending_from(tx, account, media_id)?;
+    if let Err(error) = state.db.durable_write(|tx| {
+        Db::delete_entry_from(tx, media_id)?;
+        if let Some(account) = account {
+            Db::delete_pending_from(tx, account, media_id)?;
+        }
+        Ok(())
+    }) {
+        if staged_absence {
+            if let Ok(intent) = origin_result {
+                drop(intent);
+                state.emit_from(
+                    origin,
+                    crate::EventKind::PendingChanged(Some(vec![media_id])),
+                );
             }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
+        }
+        return Err(error.to_string().into());
+    }
     match origin_result {
         Ok(intent) => {
             drop(intent);
@@ -3860,21 +4080,29 @@ pub async fn fetch_torrents(state: &AppState) -> Result<TorrentFetch, String> {
         .map_err(|e| e.to_string())?;
     let failures = fetched.failures;
     let raw = fetched.items;
-    let seen = state.db.rss_seen_set().map_err(|e| e.to_string())?;
-    let matchers = state.matchers.lock().clone();
-    let (progress_by_id, total_by_id): (
-        std::collections::HashMap<i64, i64>,
-        std::collections::HashMap<i64, Option<i64>>,
-    ) = if matchers.is_empty() {
-        (Default::default(), Default::default())
-    } else {
-        let list = state.db.entries_with_media().map_err(|e| e.to_string())?;
-        let p = list.iter().map(|e| (e.media_id, e.progress)).collect();
-        let t = list
-            .into_iter()
-            .map(|e| (e.media_id, e.media.as_ref().and_then(|m| m.episodes)))
-            .collect();
-        (p, t)
+    let (seen, matchers, progress_by_id, total_by_id) = {
+        let _guard = state.entry_lock.lock().await;
+        let seen = state.db.rss_seen_set().map_err(|e| e.to_string())?;
+        let matchers = if state.anilist.lock().has_token() {
+            state.matchers.lock().clone()
+        } else {
+            Arc::new(Vec::new())
+        };
+        let (progress_by_id, total_by_id): (
+            std::collections::HashMap<i64, i64>,
+            std::collections::HashMap<i64, Option<i64>>,
+        ) = if matchers.is_empty() {
+            (Default::default(), Default::default())
+        } else {
+            let list = state.db.entries_with_media().map_err(|e| e.to_string())?;
+            let p = list.iter().map(|e| (e.media_id, e.progress)).collect();
+            let t = list
+                .into_iter()
+                .map(|e| (e.media_id, e.media.as_ref().and_then(|m| m.episodes)))
+                .collect();
+            (p, t)
+        };
+        (seen, matchers, progress_by_id, total_by_id)
     };
     let mut items: Vec<TorrentItem> = raw
         .into_iter()
@@ -4737,12 +4965,13 @@ async fn install_update_with(
 
         #[cfg(windows)]
         let outcome = (|| {
-            // Hold the verified handle through spawn to prevent replacement.
-            if let Err(e) = std::process::Command::new(&tmp).spawn() {
+            // Hold the verified handle through spawn, then close it before cleanup.
+            let spawned = std::process::Command::new(&tmp).spawn();
+            drop(verified);
+            if let Err(e) = spawned {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!("could not launch the installer: {e}"));
             }
-            drop(verified);
             Ok("restarting".to_string())
         })();
         #[cfg(target_os = "linux")]
@@ -8225,7 +8454,9 @@ mod feature_cache_tests {
                 total_search(Some(13)),
             ])
             .await;
-            api.set_token(None);
+            if !search {
+                api.set_token(None);
+            }
             *state.anilist.lock() = api;
             if !commit {
                 state
@@ -16051,6 +16282,812 @@ mod persistence_tests {
                 Some(70.0),
                 "{mode}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_foreground_write_stays_conflicted_when_cache_write_fails() {
+        for fail_media in [true, false] {
+            let mut clamped = remote();
+            clamped["status"] = json!("COMPLETED");
+            clamped["progress"] = json!(10);
+            let (api, mut requests) = anilist::mock_api(vec![
+                (200, json!({"data":{"SaveMediaListEntry":clamped}})),
+                (
+                    200,
+                    json!({"data":{"Media":{"id":1,"episodes":10,"mediaListEntry":clamped}}}),
+                ),
+            ])
+            .await;
+            let state = state(api);
+            let mut entry = state.db.get_entry(1).unwrap().unwrap();
+            entry.status = "CURRENT".into();
+            entry.progress = 11;
+            state.db.upsert_entry(&entry).unwrap();
+            let trigger = if fail_media {
+                "CREATE TRIGGER fail_cache BEFORE UPDATE ON media
+                 BEGIN SELECT RAISE(FAIL, 'media cache write failed'); END;"
+            } else {
+                "CREATE TRIGGER fail_cache BEFORE INSERT ON list_entry
+                 BEGIN SELECT RAISE(FAIL, 'entry cache write failed'); END;"
+            };
+            state.db.0.lock().execute_batch(trigger).unwrap();
+
+            let mut events = state.events.subscribe();
+            let error = save_entry_inner(&state, 1, None, Some(12), None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(if fail_media {
+                    "media cache write failed"
+                } else {
+                    "entry cache write failed"
+                }),
+                "{error}"
+            );
+            assert!(requests.try_recv().is_ok());
+            assert!(requests.try_recv().is_ok());
+            assert!(requests.try_recv().is_err());
+            let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+                matches!(
+                    event.kind,
+                    crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+                )
+            });
+            assert!(notified, "fail_media={fail_media}");
+            let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+            assert!(pending.conflict, "fail_media={fail_media}");
+            assert!(
+                pending.rejected_progress.is_some(),
+                "fail_media={fail_media}"
+            );
+
+            state
+                .db
+                .0
+                .lock()
+                .execute_batch("DROP TRIGGER fail_cache")
+                .unwrap();
+            crate::sync_queue::flush_background(&state).await.unwrap();
+            assert!(
+                requests.try_recv().is_err(),
+                "background sync must not replay a refused write (fail_media={fail_media})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_guarded_progress_rejects_out_of_range_progress() {
+        let (api, mut requests) =
+            anilist::mock_api(vec![(503, json!({"errors":[{"message":"Unavailable"}]}))]).await;
+        let state = state(api);
+        state
+            .db
+            .upsert_media(&Media {
+                id: 1,
+                title_english: Some("Steins;Gate".into()),
+                episodes: None,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.status = "CURRENT".into();
+        entry.progress = i64::from(i32::MAX);
+        state.db.upsert_entry(&entry).unwrap();
+
+        let error = set_progress_inner_with_origin(
+            &state,
+            1,
+            i64::from(i32::MAX) + 1,
+            Some(i64::from(i32::MAX)),
+            Some((Some(7), crate::EntryIdentity::Remote(22))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("Progress must be between 0 and 2147483647"),
+            "{error}"
+        );
+        assert!(requests.try_recv().is_ok());
+        assert!(requests.try_recv().is_err());
+        assert!(state.db.pending_change(7, 1).unwrap().is_none());
+        assert_eq!(
+            state.db.get_entry(1).unwrap().unwrap().progress,
+            i64::from(i32::MAX)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_torrents_waits_for_entry_lock_and_ignores_signed_out_matchers() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (api, _) = anilist::mock_api(vec![]).await;
+        let state = state(api);
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let feed = format!("http://{address}/feed");
+        state
+            .db
+            .set_setting("rss_feeds", &json!([feed]).to_string())
+            .unwrap();
+        state
+            .db
+            .upsert_media(&Media {
+                id: 1,
+                title_english: Some("Steins;Gate".into()),
+                episodes: Some(24),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut entry = state.db.get_entry(1).unwrap().unwrap();
+        entry.status = "CURRENT".into();
+        entry.progress = 2;
+        state.db.upsert_entry(&entry).unwrap();
+        state.refresh_matchers();
+
+        let body = "<rss><channel><item><title>[Group] Steins;Gate - 03 [1080p].mkv</title>\
+                    <link>https://example.invalid/3</link><guid>ep-3</guid></item></channel></rss>";
+        let first_served = Arc::new(tokio::sync::Notify::new());
+        let served_notify = first_served.clone();
+        let responder = tokio::spawn(async move {
+            for index in 0..2 {
+                let (socket, _) = server.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                while socket.read_line(&mut line).await.unwrap() > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                if index == 0 {
+                    served_notify.notify_one();
+                }
+            }
+        });
+
+        let guard = state.entry_lock.lock().await;
+        let worker = state.clone();
+        let mut fetch = tokio::spawn(async move { fetch_torrents(&worker).await });
+        first_served.notified().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !fetch.is_finished(),
+            "fetch_torrents must wait for entry_lock before reading matchers and list progress"
+        );
+        entry.progress = 3;
+        state.db.upsert_entry(&entry).unwrap();
+        drop(guard);
+
+        let result = (&mut fetch).await.unwrap().unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].media_id, Some(1));
+        assert!(
+            !result.items[0].is_new,
+            "episode 3 should not be marked new after progress reached 3"
+        );
+
+        state.anilist.lock().set_token(None);
+        let signed_out = fetch_torrents(&state).await.unwrap();
+        assert_eq!(signed_out.items.len(), 1);
+        assert!(signed_out.items[0].media_id.is_none());
+        assert!(!signed_out.items[0].is_new);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_save_score_format_mismatch_projection_failure_falls_back_to_put_pending() {
+        let mut saved = remote();
+        saved["score"] = json!(80);
+        let (api, _) = anilist::mock_api(vec![
+            (200, score_profile("POINT_100")),
+            (200, json!({"data":{"SaveMediaListEntry":saved}})),
+            (200, score_profile("POINT_10_DECIMAL")),
+        ])
+        .await;
+        let state = state(api);
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_entry_projection BEFORE INSERT ON list_entry
+                 BEGIN SELECT RAISE(ABORT, 'list_entry projection blocked'); END;",
+            )
+            .unwrap();
+        let mut events = state.events.subscribe();
+
+        let err = save_entry_inner(&state, 1, None, None, Some(80.0), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("list_entry projection blocked"), "{err}");
+
+        let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.conflict);
+        assert!(pending.error.is_some());
+        let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event.kind,
+                crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+            )
+        });
+        assert!(
+            notified,
+            "PendingChanged must be emitted after fallback put_pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_save_refreshes_matchers_when_projection_fails_after_episode_total_change() {
+        for fail_fallback in [false, true] {
+            let mut saved = remote();
+            saved["status"] = json!("COMPLETED");
+            saved["progress"] = json!(11);
+            let confirm = json!({"data":{"Media":{
+                "id":1,"episodes":13,
+                "mediaListEntry":{"id":22,"mediaId":1,"status":"COMPLETED","progress":11,"score":70,"repeat":2,"updatedAt":101}
+            }}});
+            let (api, _) = anilist::mock_api(vec![
+                (200, json!({"data":{"SaveMediaListEntry":saved}})),
+                (200, confirm),
+            ])
+            .await;
+            let state = state(api);
+            state
+                .db
+                .upsert_media(&Media {
+                    id: 1,
+                    title_english: Some("Steins;Gate".into()),
+                    episodes: Some(12),
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut entry = state.db.get_entry(1).unwrap().unwrap();
+            entry.status = "CURRENT".into();
+            entry.progress = 3;
+            state.db.upsert_entry(&entry).unwrap();
+            state.refresh_matchers();
+            assert_eq!(state.matchers.lock()[0].episodes, Some(12));
+
+            let sql = if fail_fallback {
+                "CREATE TEMP TRIGGER fail_entry_projection BEFORE INSERT ON list_entry
+                 BEGIN SELECT RAISE(ABORT, 'list_entry blocked'); END;
+                 CREATE TEMP TRIGGER fail_pending_fallback BEFORE INSERT ON pending_change
+                 WHEN NEW.payload LIKE '%\"conflict\":true%'
+                 BEGIN SELECT RAISE(ABORT, 'pending fallback blocked'); END;"
+            } else {
+                "CREATE TEMP TRIGGER fail_entry_projection BEFORE INSERT ON list_entry
+                 BEGIN SELECT RAISE(ABORT, 'list_entry blocked'); END;"
+            };
+            state.db.0.lock().execute_batch(sql).unwrap();
+
+            let err = save_entry_inner(&state, 1, Some("COMPLETED".into()), Some(15), None, None)
+                .await
+                .unwrap_err();
+            if fail_fallback {
+                assert!(
+                    err.contains("pending fallback blocked")
+                        && err.contains("failed to mark pending change conflicted"),
+                    "{err}"
+                );
+            } else {
+                assert!(err.contains("list_entry blocked"), "{err}");
+                assert!(state.db.pending_change(7, 1).unwrap().unwrap().conflict);
+            }
+            assert_eq!(state.db.episode_total(1).unwrap(), Some(13));
+            assert_eq!(
+                state.matchers.lock()[0].episodes,
+                Some(13),
+                "fail_fallback={fail_fallback}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_catalog_reads_expire_session_on_401_and_protect_replacement_session() {
+        let auth_err = || (401, json!({"errors":[{"message":"Invalid token"}]}));
+        for kind in ["search", "season", "recs", "media", "schedule"] {
+            let (api, _) = anilist::mock_api(vec![auth_err()]).await;
+            let state = state(api);
+            let (_, pending, _) = crate::sync_queue::stage(
+                &state,
+                1,
+                crate::sync_queue::Patch {
+                    progress: Some(11),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            state.db.put_pending(7, &pending).unwrap();
+            let mut events = state.events.subscribe();
+
+            let err = match kind {
+                "search" => search_anime_page("test".into(), 1, &state)
+                    .await
+                    .unwrap_err(),
+                "season" => get_season("SPRING".into(), 2026, &state).await.unwrap_err(),
+                "recs" => get_recommendations(1, &state).await.unwrap_err(),
+                "media" => get_media(999, &state).await.unwrap_err(),
+                "schedule" => get_airing_schedule(100, 200, &state).await.unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert_eq!(err, SESSION_EXPIRED, "{kind}");
+            assert!(state.anilist.lock().token().is_none(), "{kind}");
+            assert_eq!(
+                state.db.pending(7).unwrap().len(),
+                1,
+                "pending queue must stay intact on 401 for {kind}"
+            );
+            let expired = std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event.kind, crate::EventKind::AuthExpired));
+            assert!(expired, "AuthExpired missing for {kind}");
+
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (api, mut requests) =
+                anilist::mock_api_gated(vec![auth_err()], Some(gate.clone())).await;
+            let state = state_with_api(api);
+            let worker = state.clone();
+            let task = tokio::spawn(async move {
+                match kind {
+                    "search" => search_anime_page("test".into(), 1, &worker)
+                        .await
+                        .map(|_| ()),
+                    "season" => get_season("SPRING".into(), 2026, &worker).await.map(|_| ()),
+                    "recs" => get_recommendations(1, &worker).await.map(|_| ()),
+                    "media" => get_media(999, &worker).await.map(|_| ()),
+                    "schedule" => get_airing_schedule(100, 200, &worker).await.map(|_| ()),
+                    _ => unreachable!(),
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .anilist
+                .lock()
+                .set_token(Some("replacement-token".into()));
+            gate.add_permits(1);
+            let err = task.await.unwrap().unwrap_err();
+            assert_eq!(err, "Your AniList account changed. Try again.", "{kind}");
+            assert_eq!(
+                state.anilist.lock().token().as_deref(),
+                Some("replacement-token"),
+                "late 401 expired replacement session for {kind}"
+            );
+        }
+
+        fn state_with_api(api: AniList) -> Arc<AppState> {
+            state(api)
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_intent_cancels_catalog_reads_and_season_page_sleep() {
+        for kind in ["search", "recs", "media"] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (api, mut requests) =
+                anilist::mock_api_gated(vec![(200, json!({"data":{}}))], Some(gate.clone())).await;
+            let state = state(api);
+            let worker = state.clone();
+            let mut task = tokio::spawn(async move {
+                match kind {
+                    "search" => search_anime_page("test".into(), 1, &worker)
+                        .await
+                        .map(|_| ()),
+                    "recs" => get_recommendations(1, &worker).await.map(|_| ()),
+                    "media" => get_media(999, &worker).await.map(|_| ()),
+                    _ => unreachable!(),
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            state.begin_auth_intent();
+            let result = tokio::time::timeout(Duration::from_millis(750), &mut task).await;
+            gate.add_permits(1);
+            assert_eq!(
+                result
+                    .expect("catalog read waited for the old session")
+                    .unwrap()
+                    .unwrap_err(),
+                AUTH_REPLACED,
+                "{kind}"
+            );
+        }
+
+        let page1 = (
+            200,
+            json!({"data":{"Page":{
+                "pageInfo":{"hasNextPage":true},
+                "media":[anilist::mock_media(10)]
+            }}}),
+        );
+        let page2 = (
+            200,
+            json!({"data":{"Page":{
+                "pageInfo":{"hasNextPage":false},
+                "media":[anilist::mock_media(11)]
+            }}}),
+        );
+        let (api, mut requests) = anilist::mock_api(vec![page1, page2]).await;
+        let state = state(api);
+        let worker = state.clone();
+        let mut task =
+            tokio::spawn(async move { get_season("SPRING".into(), 2026, &worker).await });
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Let page 1 finish and enter the 300ms pause before page 2.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        state.begin_auth_intent();
+        let result = tokio::time::timeout(Duration::from_millis(200), &mut task)
+            .await
+            .expect("get_season did not cancel inter-page sleep promptly")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), AUTH_REPLACED);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            requests.try_recv().is_err(),
+            "page 2 should not have been requested after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_media_detail_normalizes_non_positive_episode_totals() {
+        let (api, _) =
+            anilist::mock_api(vec![(503, json!({"errors":[{"message":"Unavailable"}]}))]).await;
+        let state = state(api);
+        let detail = MediaDetail {
+            media: Media {
+                id: 77,
+                title_english: Some("Zero Total Show".into()),
+                episodes: Some(0),
+                ..Default::default()
+            },
+            relations: vec![crate::models::MediaRelation {
+                relation: "SEQUEL".into(),
+                media: Media {
+                    id: 78,
+                    title_english: Some("Zero Total Sequel".into()),
+                    episodes: Some(-4),
+                    ..Default::default()
+                },
+            }],
+            cached_at: Some(1_700_000_000),
+            characters: vec![],
+            staff: vec![],
+            warning: None,
+            unavailable_sections: vec![],
+        };
+        state
+            .db
+            .set_setting("media_detail:77", &serde_json::to_string(&detail).unwrap())
+            .unwrap();
+
+        let loaded = get_media_detail(77, &state).await.unwrap();
+        assert!(loaded.warning.is_some());
+        assert_eq!(loaded.media.episodes, None);
+        assert_eq!(loaded.relations.len(), 1);
+        assert_eq!(loaded.relations[0].media.episodes, None);
+    }
+
+    #[tokio::test]
+    async fn update_discovery_status_hydrates_media_when_remote_entry_already_exists() {
+        let lookup = json!({"data":{"Media":{
+            "id":1,"episodes":12,
+            "mediaListEntry":{"id":22,"mediaId":1,"status":"CURRENT","progress":4,"score":70,"repeat":0,"updatedAt":150}
+        }}});
+        let (api, _) = anilist::mock_api(vec![(200, lookup)]).await;
+        let state = state(api);
+        state
+            .db
+            .upsert_media(&Media {
+                id: 1,
+                title_english: Some("Steins;Gate".into()),
+                episodes: Some(12),
+                ..Default::default()
+            })
+            .unwrap();
+        state.db.delete_entry(1).unwrap();
+        let mut events = state.events.subscribe();
+
+        let err = save_entry_inner_checked_impl(
+            &state,
+            1,
+            Some("PLANNING".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(EntryWriteTarget::Discovery {
+                account_id: Some(7),
+                identity: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, DISCOVERY_ENTRY_CHANGED);
+
+        let updated =
+            std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event.kind {
+                crate::EventKind::EpisodeUpdated(entry) => Some(entry),
+                _ => None,
+            });
+        let entry = updated.expect("EpisodeUpdated event should be emitted");
+        assert_eq!(entry.media_id, 1);
+        assert_eq!(
+            entry
+                .media
+                .as_ref()
+                .and_then(|m| m.title_english.as_deref()),
+            Some("Steins;Gate")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatched_retryable_save_records_error_and_notifies_when_local_cache_fails() {
+        for mode in ["post_viewer_503", "save_503", "unconfirmed_episode_cache"] {
+            let replies = match mode {
+                "post_viewer_503" => {
+                    let mut saved = remote();
+                    saved["score"] = json!(80);
+                    vec![
+                        (
+                            200,
+                            json!({"data":{"Viewer":{"id":7,"name":"User",
+                                "mediaListOptions":{"scoreFormat":"POINT_100"}}}}),
+                        ),
+                        (200, json!({"data":{"SaveMediaListEntry":saved}})),
+                        (503, json!({"errors":[{"message":"Viewer unavailable"}]})),
+                    ]
+                }
+                "save_503" => vec![(503, json!({"errors":[{"message":"AniList unavailable"}]}))],
+                "unconfirmed_episode_cache" => {
+                    let mut saved = remote();
+                    saved["status"] = json!("COMPLETED");
+                    saved["progress"] = json!(13);
+                    let mut readback = remote();
+                    readback["status"] = json!("COMPLETED");
+                    readback["progress"] = json!(12);
+                    vec![
+                        (200, json!({"data":{"SaveMediaListEntry":saved}})),
+                        (
+                            200,
+                            json!({"data":{"Media":{"id":1,"episodes":13,"mediaListEntry":readback}}}),
+                        ),
+                    ]
+                }
+                _ => unreachable!(),
+            };
+            let (api, _) = anilist::mock_api(replies).await;
+            let state = state(api);
+            let sql = if mode == "unconfirmed_episode_cache" {
+                "CREATE TEMP TRIGGER fail_cache BEFORE UPDATE ON media
+                 WHEN NEW.episodes = 13
+                 BEGIN SELECT RAISE(ABORT, 'media blocked'); END;"
+            } else {
+                "CREATE TEMP TRIGGER fail_cache BEFORE INSERT ON list_entry
+                 BEGIN SELECT RAISE(ABORT, 'list_entry blocked'); END;"
+            };
+            state.db.0.lock().execute_batch(sql).unwrap();
+            let mut events = state.events.subscribe();
+
+            let err = match mode {
+                "post_viewer_503" => save_entry_inner(&state, 1, None, None, Some(80.0), None)
+                    .await
+                    .unwrap_err(),
+                "save_503" => save_entry_inner(&state, 1, None, Some(4), None, None)
+                    .await
+                    .unwrap_err(),
+                "unconfirmed_episode_cache" => {
+                    save_entry_inner(&state, 1, Some("COMPLETED".into()), None, None, None)
+                        .await
+                        .unwrap_err()
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                err.contains(if mode == "unconfirmed_episode_cache" {
+                    "media blocked"
+                } else {
+                    "list_entry blocked"
+                }),
+                "{mode}: {err}"
+            );
+            let pending = state.db.pending_change(7, 1).unwrap().unwrap();
+            assert!(!pending.conflict, "{mode}");
+            assert!(pending.error.is_some(), "{mode}: error not recorded");
+            let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+                matches!(
+                    event.kind,
+                    crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+                )
+            });
+            assert!(notified, "{mode}: PendingChanged should be emitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_queued_add_removal_notifies_when_local_cleanup_fails() {
+        let absent = (
+            200,
+            json!({"data":{"Media":{"id":1,"mediaListEntry":null}}}),
+        );
+        let (api, _) = anilist::mock_api(vec![absent]).await;
+        let state = state(api);
+        state.db.delete_entry(1).unwrap();
+        let (_, pending, _) = crate::sync_queue::stage(
+            &state,
+            1,
+            crate::sync_queue::Patch {
+                progress: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        crate::sync_queue::local_entry(&state, &pending).unwrap();
+        state
+            .db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_absent_removal BEFORE DELETE ON pending_change
+                 BEGIN SELECT RAISE(FAIL, 'fixture absence cleanup failure'); END;",
+            )
+            .unwrap();
+        let mut events = state.events.subscribe();
+
+        let error = delete_entry_inner(1, &state).await.unwrap_err();
+        assert!(error.contains("fixture absence cleanup failure"), "{error}");
+        let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event.kind,
+                crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+            )
+        });
+        assert!(
+            notified,
+            "PendingChanged should be emitted after staging absence"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_auth_rejection_preserves_prior_queue_and_avoids_phantom_conflict() {
+        let auth_401 = (401, json!({"errors":[{"message":"Invalid token"}]}));
+        for mode in [
+            "clean_delete_401",
+            "clean_lookup_401",
+            "queued_edit_delete_401",
+            "queued_add_lookup_401",
+            "queued_delete_flush_401",
+        ] {
+            let replies = if mode == "queued_delete_flush_401" {
+                vec![
+                    auth_401.clone(),
+                    (
+                        200,
+                        json!({"data":{"Viewer":{"id":7,"name":"User",
+                            "mediaListOptions":{"scoreFormat":"POINT_100"}}}}),
+                    ),
+                    (
+                        200,
+                        json!({"data":{"DeleteMediaListEntry":{"deleted":true}}}),
+                    ),
+                ]
+            } else {
+                vec![auth_401.clone()]
+            };
+            let (api, _) = anilist::mock_api(replies).await;
+            let state = state(api);
+            match mode {
+                "clean_lookup_401" => {
+                    state.db.delete_entry(1).unwrap();
+                }
+                "queued_edit_delete_401" => {
+                    crate::sync_queue::stage(
+                        &state,
+                        1,
+                        crate::sync_queue::Patch {
+                            progress: Some(4),
+                            score: Some(80.0),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                }
+                "queued_add_lookup_401" => {
+                    state.db.delete_entry(1).unwrap();
+                    crate::sync_queue::stage(
+                        &state,
+                        1,
+                        crate::sync_queue::Patch {
+                            progress: Some(4),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                }
+                "queued_delete_flush_401" => {
+                    let pending = crate::sync_queue::Pending {
+                        media_id: 1,
+                        deleting: true,
+                        deletion_id: Some(22),
+                        base: state.db.get_entry(1).unwrap(),
+                        patch: Default::default(),
+                        error: None,
+                        retry_error: None,
+                        conflict: false,
+                        missing_media: false,
+                        score_format: None,
+                        playback: false,
+                        base_score_format: None,
+                        rejected_progress: None,
+                        rejected_total: None,
+                    };
+                    state.db.put_pending(7, &pending).unwrap();
+                }
+                _ => {}
+            }
+            let mut events = state.events.subscribe();
+
+            let err = if mode == "queued_delete_flush_401" {
+                crate::sync_queue::flush_background(&state)
+                    .await
+                    .unwrap_err()
+            } else {
+                delete_entry_inner(1, &state).await.unwrap_err()
+            };
+            assert_eq!(err, SESSION_EXPIRED, "{mode}");
+            assert!(!state.anilist.lock().has_token(), "{mode}");
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event.kind, crate::EventKind::AuthExpired)),
+                "{mode}: AuthExpired expected"
+            );
+
+            let pending = state.db.pending_change(7, 1).unwrap();
+            match mode {
+                "clean_delete_401" | "clean_lookup_401" => {
+                    assert!(pending.is_none(), "{mode}: phantom deletion created");
+                }
+                "queued_edit_delete_401" => {
+                    let pending = pending.expect("queued edit should survive 401 delete");
+                    assert!(!pending.deleting && !pending.conflict, "{mode}");
+                    assert_eq!(pending.patch.progress, Some(4), "{mode}");
+                    assert_eq!(pending.patch.score, Some(80.0), "{mode}");
+                }
+                "queued_add_lookup_401" => {
+                    let pending = pending.expect("queued add should survive 401 lookup");
+                    assert!(!pending.deleting && !pending.conflict, "{mode}");
+                    assert_eq!(pending.patch.progress, Some(4), "{mode}");
+                }
+                "queued_delete_flush_401" => {
+                    let pending = pending.expect("pending delete should remain queued");
+                    assert!(pending.deleting, "{mode}");
+                    assert!(!pending.conflict, "{mode}: 401 must not mark conflict");
+                    assert_eq!(pending.error.as_deref(), Some(SESSION_EXPIRED), "{mode}");
+                    login_with_token("renewed-token".into(), &state, ListPreferences::Preserve)
+                        .await
+                        .unwrap();
+                    crate::sync_queue::flush_background(&state).await.unwrap();
+                    assert!(state.db.pending_change(7, 1).unwrap().is_none());
+                    assert!(state.db.get_entry(1).unwrap().is_none());
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }

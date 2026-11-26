@@ -137,6 +137,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --locked --manifest-path native/Cargo.toml -p accesskit_atspi_common --lib
 
+      - name: Windows window zoom regressions
+        if: runner.os == 'Windows'
+        run: cargo test --locked --manifest-path native/Cargo.toml -p gpui-windows-gpui-unofficial --lib window::tests::test_zoom_toggle_helpers -- --exact
+
       - name: Core Clippy
         run: cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
 

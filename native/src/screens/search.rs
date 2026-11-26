@@ -369,6 +369,8 @@ impl Workspace {
             }
             self.search.columns = columns;
         }
+        let reads_fenced = self.stopping || self.writes_fenced();
+        let search_disabled = self.search.searching || reads_fenced;
         let actions = self.search.input.clone().map(|input| {
             div()
                 .w(px(288.))
@@ -384,7 +386,7 @@ impl Workspace {
                         } else {
                             "Search"
                         },
-                        self.search.searching,
+                        search_disabled,
                     )
                     .w(px(78.))
                     .h(px(40.))
@@ -443,9 +445,19 @@ impl Workspace {
             );
         }
         if !self.list.loaded && !self.list.error.is_empty() {
+            let list_retry_disabled = self.list.loading || self.list.syncing || reads_fenced;
             page = page.child(
-                button("search-list-retry", "Retry list", false)
-                    .on_click(cx.listener(|this, _, window, cx| this.load_list(window, cx))),
+                button("search-list-retry", "Retry list", list_retry_disabled)
+                    .debug_selector(|| "search-list-retry".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !this.list.loading
+                            && !this.list.syncing
+                            && !this.stopping
+                            && !this.writes_fenced()
+                        {
+                            this.load_list(window, cx);
+                        }
+                    })),
             );
         }
         if self.search.searched
@@ -514,7 +526,7 @@ impl Workspace {
                         } else {
                             "Load more anime"
                         },
-                        self.search.searching,
+                        search_disabled,
                     )
                     .on_click(cx.listener(|this, _, window, cx| this.run_search(true, window, cx))),
                 ),
@@ -604,6 +616,34 @@ impl Workspace {
     }
 }
 
+fn discovery_metadata(media: &Media, show_year: bool) -> Vec<String> {
+    let mut metadata = Vec::new();
+    if let Some(format) = media.format.as_ref() {
+        metadata.push(format.replace('_', " "));
+    }
+    if show_year && let Some(year) = media.season_year {
+        metadata.push(year.to_string());
+    }
+    if let Some(episodes) = media.known_episodes() {
+        metadata.push(format!("{episodes} eps"));
+    }
+    if let Some(score) = media.average_score.filter(|score| *score > 0) {
+        metadata.push(format!("★ {score}"));
+    }
+    metadata
+}
+
+fn discovery_badge(media: &Media, entry: &ListEntry) -> String {
+    let mut badge = status_label(&entry.status).to_string();
+    if entry.progress > 0 {
+        badge.push_str(&media.known_episodes().map_or_else(
+            || format!(" · {}", entry.progress),
+            |total| format!(" · {}/{total}", entry.progress),
+        ));
+    }
+    badge
+}
+
 pub(super) fn media_card(
     media: Media,
     entry: Option<ListEntry>,
@@ -615,29 +655,8 @@ pub(super) fn media_card(
 ) -> AnyElement {
     let id = media.id;
     let title = media.display_title();
-    let mut metadata = Vec::new();
-    if let Some(format) = media.format.as_ref() {
-        metadata.push(format.replace('_', " "));
-    }
-    if show_year && let Some(year) = media.season_year {
-        metadata.push(year.to_string());
-    }
-    if let Some(episodes) = media.episodes {
-        metadata.push(format!("{episodes} eps"));
-    }
-    if let Some(score) = media.average_score.filter(|score| *score > 0) {
-        metadata.push(format!("★ {score}"));
-    }
-    let badge = entry.as_ref().map(|entry| {
-        let mut badge = status_label(&entry.status).to_string();
-        if entry.progress > 0 {
-            badge.push_str(&media.episodes.map_or_else(
-                || format!(" · {}", entry.progress),
-                |total| format!(" · {}/{total}", entry.progress),
-            ));
-        }
-        badge
-    });
+    let metadata = discovery_metadata(&media, show_year);
+    let badge = entry.as_ref().map(|entry| discovery_badge(&media, entry));
     let cover_element: AnyElement = if let Some(image) = cover {
         img(image)
             .w_full()
@@ -1065,5 +1084,130 @@ mod tests {
         );
         assert_eq!(merged[1].display_title(), "Updated");
         assert_eq!((page, more), (2, true));
+    }
+
+    #[test]
+    fn discovery_card_metadata_and_badge_omit_non_positive_episode_totals() {
+        let mut media = Media {
+            id: 5,
+            format: Some("TV".into()),
+            episodes: Some(0),
+            ..Default::default()
+        };
+        let entry = ListEntry {
+            media_id: 5,
+            status: "CURRENT".into(),
+            progress: 3,
+            ..Default::default()
+        };
+        assert_eq!(discovery_metadata(&media, false), vec!["TV"]);
+        assert_eq!(discovery_badge(&media, &entry), "Watching · 3");
+        media.episodes = Some(-2);
+        assert_eq!(discovery_metadata(&media, false), vec!["TV"]);
+        assert_eq!(discovery_badge(&media, &entry), "Watching · 3");
+        media.episodes = Some(12);
+        assert_eq!(discovery_metadata(&media, false), vec!["TV", "12 eps"]);
+        assert_eq!(discovery_badge(&media, &entry), "Watching · 3/12");
+    }
+
+    #[gpui::test]
+    fn search_controls_disable_while_fenced(cx: &mut gpui::TestAppContext) {
+        use super::super::BarrierAction;
+        use super::super::workspace_tests::fixture;
+        use gpui::AccessibleAction;
+        use kurisu_core::models::User;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Search;
+            w.enter_search(window, cx);
+            w.search.has_more = true;
+            w.list.loaded = false;
+            w.list.error = "offline".into();
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let retry_bounds = cx
+            .debug_bounds("search-list-retry")
+            .expect("search-list-retry bounds");
+        let before_request = view.update_in(cx, |w, _, _| {
+            w.list.loading = true;
+            w.list_request
+        });
+        cx.simulate_click(retry_bounds.center(), gpui::Modifiers::default());
+        view.read_with(cx, |w, _| {
+            assert_eq!(
+                w.list_request, before_request,
+                "disabled Retry list must not restart load_list while already loading"
+            );
+        });
+
+        let button_entry = |cx: &mut gpui::VisualTestContext, label: &str| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find(|(_, node)| node.role() == gpui::Role::Button && node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing search button {label}"))
+        };
+        let button_node = |cx: &mut gpui::VisualTestContext, label: &str| button_entry(cx, label).1;
+
+        view.update_in(cx, |w, _, cx| {
+            w.list.loading = false;
+            cx.notify();
+        });
+        let (retry_id, retry_enabled) = button_entry(cx, "Retry list");
+        assert!(!retry_enabled.is_disabled());
+        let before_request = view.update_in(cx, |w, _, _| {
+            w.barrier = Some(BarrierAction::Install);
+            w.list_request
+        });
+        cx.simulate_accessibility_action(gpui::accesskit::ActionRequest {
+            action: AccessibleAction::Click,
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: retry_id,
+            data: None,
+        });
+        view.read_with(cx, |w, _| {
+            assert_eq!(
+                w.list_request, before_request,
+                "fenced Retry list must not start load_list during a barrier"
+            );
+            assert!(w.list_read.is_none());
+        });
+
+        view.update_in(cx, |w, _, cx| {
+            w.barrier = None;
+            w.list.loading = false;
+            w.list.syncing = true;
+            cx.notify();
+        });
+        let retry_list = button_node(cx, "Retry list");
+        assert!(retry_list.is_disabled());
+        assert!(!retry_list.supports_action(AccessibleAction::Click));
+
+        view.update_in(cx, |w, _, cx| {
+            w.list.syncing = false;
+            w.close_ready = true;
+            cx.notify();
+        });
+        for label in ["Search", "Retry list", "Load more anime"] {
+            let node = button_node(cx, label);
+            assert!(
+                node.is_disabled(),
+                "{label} should be disabled while fenced"
+            );
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
     }
 }

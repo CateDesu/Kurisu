@@ -183,6 +183,10 @@ impl Core {
     pub async fn hold_remote_lock_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.state.remote_lock.clone().lock_owned().await
     }
+    #[cfg(feature = "test-support")]
+    pub fn set_failed_update_for_test(&self, message: Option<String>) {
+        *self.failed_update.lock() = message;
+    }
     pub(crate) fn state(&self) -> &commands::AppState {
         &self.state
     }
@@ -780,14 +784,23 @@ impl Core {
     ) -> Result<(), String> {
         sync_queue::resolve_pending_change(media_id, keep_local, &self.state).await
     }
-    pub async fn take_update_failed(&self) -> Option<String> {
-        {
-            let failed = self.failed_update.lock().take();
-            if failed.is_some() {
+    pub fn pending_update_failed(&self) -> Option<String> {
+        self.failed_update.lock().clone()
+    }
+    pub fn clear_update_failed(&self) {
+        let had = self.failed_update.lock().take().is_some();
+        if had {
+            drop(self.runtime.spawn_blocking(|| {
                 let _ = updater::take_update_failed();
-            }
-            failed
+            }));
         }
+    }
+    pub async fn take_update_failed(&self) -> Option<String> {
+        let failed = self.failed_update.lock().take();
+        if failed.is_some() {
+            let _ = tokio::task::spawn_blocking(updater::take_update_failed).await;
+        }
+        failed
     }
     pub async fn take_pending_update(&self) -> Option<UpdateInfo> {
         self.latest_update.lock().take()
@@ -1206,12 +1219,17 @@ mod core_tests {
             assert!(core.state.matchers.lock().is_empty());
 
             gate.add_permits(1);
-            let results = tokio::time::timeout(wait, search)
+            let error = tokio::time::timeout(wait, search)
                 .await
                 .unwrap()
                 .unwrap()
-                .unwrap();
-            assert!(results.items.iter().any(|item| item.id == 1));
+                .unwrap_err();
+            let expected = if expired {
+                "Your AniList account changed. Try again."
+            } else {
+                "A newer sign-in or sign-out replaced this attempt."
+            };
+            assert_eq!(error, expected, "expired={expired}");
             assert!(
                 core.state.matchers.lock().is_empty(),
                 "search restored signed-out recognition, expired={expired}"
@@ -2918,5 +2936,109 @@ mod core_tests {
             events.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn update_failed_clear_and_take_consume_recovery_and_marker_only_when_present() {
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        const CHILD: &str = "KURISU_TEST_UPDATE_FAILED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let dir = TempDir(std::env::temp_dir().join(format!(
+                "kurisu-update-failed-child-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+            std::fs::create_dir(&dir.0).unwrap();
+            let child = dir.0.join(exe.file_name().unwrap());
+            std::fs::copy(&exe, &child).unwrap();
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(&child)
+                    .args([
+                        "--exact",
+                        "core_tests::update_failed_clear_and_take_consume_recovery_and_marker_only_when_present",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .output()
+            })
+            .await
+            .unwrap();
+            drop(dir);
+            let output = output.unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        updater::init_install_path().unwrap();
+        let install_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let marker = install_dir.join(updater::FAILED_MARKER);
+        std::fs::write(&marker, b"failed").unwrap();
+        assert!(updater::sweep_install_dir());
+
+        let _data_cleanup;
+        let (core, data_dir) = open("update-failed-lifecycle");
+        _data_cleanup = TempDir(data_dir);
+        assert!(core.pending_update_failed().is_none());
+        core.clear_update_failed();
+        assert!(core.take_update_failed().await.is_none());
+        assert!(marker.exists());
+
+        *core.failed_update.lock() = Some(updater::FAILED_MESSAGE.to_string());
+        assert_eq!(
+            core.pending_update_failed().as_deref(),
+            Some(updater::FAILED_MESSAGE)
+        );
+        assert!(core.recovery_events().iter().any(|event| matches!(
+            &event.kind,
+            EventKind::UpdateFailed(message) if message == updater::FAILED_MESSAGE
+        )));
+
+        core.clear_update_failed();
+        assert!(core.pending_update_failed().is_none());
+        assert!(!core
+            .recovery_events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::UpdateFailed(_))));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "clear_update_failed did not remove the failure marker"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        std::fs::write(&marker, b"failed-again").unwrap();
+        assert!(updater::sweep_install_dir());
+        *core.failed_update.lock() = Some(updater::FAILED_MESSAGE.to_string());
+        assert_eq!(
+            core.take_update_failed().await.as_deref(),
+            Some(updater::FAILED_MESSAGE)
+        );
+        assert!(core.pending_update_failed().is_none());
+        assert!(!core
+            .recovery_events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::UpdateFailed(_))));
+        assert!(!marker.exists());
     }
 }

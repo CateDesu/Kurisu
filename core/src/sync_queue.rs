@@ -25,6 +25,8 @@ pub(crate) struct CompletionBaseline {
     id: i64,
     updated_at: Option<i64>,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<i64>,
     repeat: i64,
 }
 
@@ -248,8 +250,10 @@ impl Pending {
         let Some(playback) = &self.patch.playback else {
             return Some(crate::commands::playback_fields(&base, total, progress));
         };
-        // A clamped prompt confirms its displayed progress without completing the show.
-        let (status, repeat) = if playback.episode != progress && total == Some(progress) {
+        // Clamped prompts and manual edits away from completed skip automatic completion.
+        let (status, repeat) = if (playback.episode != progress && total == Some(progress))
+            || (playback.manual_status && self.patch.status.as_deref() != Some("COMPLETED"))
+        {
             (None, None)
         } else {
             crate::commands::playback_fields(&base, total, progress)
@@ -300,6 +304,26 @@ impl Pending {
             playback.episode = episode;
             self.playback = false;
         } else if patch.progress.is_some() || patch.status.as_deref() == Some("COMPLETED") {
+            let unwind = patch
+                .progress
+                .is_some_and(|progress| Some(progress) != total)
+                || patch
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status != "COMPLETED");
+            if unwind {
+                if let Some(playback) = &self.patch.playback {
+                    if !playback.manual_status {
+                        self.patch.status.clone_from(&playback.prior_status);
+                    }
+                    if !playback.manual_repeat {
+                        self.patch.repeat = playback.prior_repeat;
+                    }
+                } else if self.playback {
+                    self.patch.status = None;
+                    self.patch.repeat = None;
+                }
+            }
             self.patch.playback = None;
             self.playback = false;
         } else if self.is_playback() && (patch.status.is_some() || patch.repeat.is_some()) {
@@ -353,7 +377,12 @@ impl Pending {
             {
                 previous.repeat = patch.repeat.or(previous.repeat);
                 self.patch.automatic_completion = Some(previous);
-            } else if patch.status.as_deref() != Some("COMPLETED") || total != self.patch.progress {
+            } else if patch.status.as_deref() != Some("COMPLETED")
+                || patch
+                    .progress
+                    .is_some_and(|progress| Some(progress) != total)
+                || total != self.patch.progress
+            {
                 self.patch.status = previous.status;
                 self.patch.repeat = previous.repeat;
             }
@@ -605,13 +634,19 @@ impl Db {
                     COALESCE(p.payload -> '$.patch.completion_baseline', 'null') AS previous,
                     CASE WHEN e.entry_id IS NOT NULL THEN json_object(
                         'id', e.entry_id, 'updated_at', e.updated_at,
-                        'status', e.status, 'repeat', e.repeat) ELSE 'null' END AS baseline
+                        'status', e.status, 'progress', e.progress, 'repeat', e.repeat) ELSE 'null' END AS baseline
                 FROM pending_change p LEFT JOIN list_entry e ON e.media_id = p.media_id
                 WHERE p.account_id = (SELECT value FROM settings WHERE key = 'anilist_user_id')
                   AND CASE WHEN json_valid(p.payload) THEN
                       json_extract(p.payload, '$.playback') = 1
                       OR json_type(p.payload, '$.patch.playback') = 'object'
                       OR json_type(p.payload, '$.patch.automatic_completion') = 'object'
+                      OR (
+                          COALESCE(json_extract(p.payload, '$.deleting'), 0) = 0
+                          AND COALESCE(json_extract(p.payload, '$.missing_media'), 0) = 0
+                          AND json_extract(p.payload, '$.patch.status') = 'COMPLETED'
+                          AND json_extract(p.payload, '$.patch.progress') IS NULL
+                      )
                   END
              ), changed AS (
                 SELECT media_id, account_id, baseline FROM baselines WHERE previous IS NOT baseline
@@ -942,6 +977,27 @@ pub(crate) fn prepare_entry(
     playback_episode: Option<i64>,
     current: Option<&ListEntry>,
 ) -> Result<Option<(i64, Pending, bool)>> {
+    prepare_entry_inner(state, media_id, patch, playback_episode, current, None)
+}
+
+pub(crate) fn prepare_entry_for_local(
+    state: &AppState,
+    media_id: i64,
+    patch: Patch,
+    playback_episode: Option<i64>,
+    current: Option<&mut ListEntry>,
+) -> Result<Option<(i64, Pending, bool)>> {
+    prepare_entry_inner(state, media_id, patch, playback_episode, None, current)
+}
+
+fn prepare_entry_inner(
+    state: &AppState,
+    media_id: i64,
+    patch: Patch,
+    playback_episode: Option<i64>,
+    remote_current: Option<&ListEntry>,
+    local_current: Option<&mut ListEntry>,
+) -> Result<Option<(i64, Pending, bool)>> {
     let Some(account) = account_id(&state.db) else {
         return Ok(None);
     };
@@ -987,17 +1043,23 @@ pub(crate) fn prepare_entry(
     if pending.error.as_deref() == Some(ENTRY_REPLACED) {
         anyhow::bail!(ENTRY_REPLACED);
     }
-    if already_pending
-        && patch.automatic_completion.is_some()
+    let current = local_current.as_deref().or(remote_current);
+    let entering_dynamic_completion = (patch.automatic_completion.is_some()
+        || playback_episode.is_some()
+        || (patch.status.as_deref() == Some("COMPLETED")
+            && patch.progress.is_none()
+            && pending.patch.progress.is_none()))
         && pending.patch.automatic_completion.is_none()
         && !pending.is_playback()
-    {
+        && !(pending.allows_completion_adjustment() && pending.patch.progress.is_none());
+    if already_pending && entering_dynamic_completion {
         // A list refresh can advance the cached entry while an unrelated edit is queued.
         pending.patch.completion_baseline = current.and_then(|entry| {
             Some(CompletionBaseline {
                 id: entry.id?,
                 updated_at: entry.updated_at,
                 status: entry.status.clone(),
+                progress: Some(entry.progress),
                 repeat: entry.repeat,
             })
         });
@@ -1021,6 +1083,11 @@ pub(crate) fn prepare_entry(
         }
     }
     let total = state.db.episode_total(media_id)?;
+    let previous = already_pending.then(|| {
+        let mut previous = pending.clone();
+        previous.apply_playback_total(total);
+        previous
+    });
     if !pending.is_playback() && pending.patch.progress.is_some() {
         pending.patch.reopen_completed(total, pending.base.as_ref());
     }
@@ -1069,7 +1136,67 @@ pub(crate) fn prepare_entry(
             pending.retry_error = None;
         }
     }
+    if let (Some(previous), Some(entry)) = (previous.as_ref(), local_current) {
+        unwind_projected_entry(previous, &pending, entry);
+    }
+    if !pending.is_playback()
+        && pending.patch.automatic_completion.is_none()
+        && !(pending.allows_completion_adjustment() && pending.patch.progress.is_none())
+    {
+        pending.patch.completion_baseline = None;
+    }
     Ok(Some((account, pending, already_pending)))
+}
+
+fn unwind_projected_entry(previous: &Pending, pending: &Pending, entry: &mut ListEntry) {
+    let snapshot = previous
+        .patch
+        .completion_baseline
+        .as_ref()
+        .filter(|base| entry.id == Some(base.id) && entry.updated_at == base.updated_at);
+    let matches_base = snapshot.is_some()
+        || previous.base.as_ref().map_or_else(
+            || entry.id.is_none() && entry.queued_creation == previous.patch.creation_key,
+            |base| entry.id == base.id && entry.updated_at == base.updated_at,
+        );
+    if !matches_base {
+        return;
+    }
+    if (previous.patch.automatic_completion.is_some() || previous.is_playback())
+        && pending.patch.automatic_completion.is_none()
+        && !pending.is_playback()
+    {
+        if pending.patch.status.is_none() && Some(&entry.status) == previous.patch.status.as_ref() {
+            entry.status = snapshot.map(|base| base.status.clone()).unwrap_or_else(|| {
+                previous
+                    .base
+                    .as_ref()
+                    .map_or_else(|| "CURRENT".into(), |base| base.status.clone())
+            });
+        }
+        if pending.patch.repeat.is_none() && Some(entry.repeat) == previous.patch.repeat {
+            entry.repeat = snapshot.map_or_else(
+                || previous.base.as_ref().map_or(0, |base| base.repeat),
+                |base| base.repeat,
+            );
+        }
+    }
+    if previous.allows_completion_adjustment()
+        && previous.patch.progress.is_none()
+        && pending.patch.progress.is_none()
+        && !pending.allows_completion_adjustment()
+    {
+        let restored_progress = if let Some(base) = snapshot {
+            base.progress
+        } else if let Some(base) = previous.base.as_ref() {
+            Some(base.progress)
+        } else {
+            Some(0)
+        };
+        if let Some(progress) = restored_progress {
+            entry.progress = progress;
+        }
+    }
 }
 
 fn correction_error(progress: i64, total: Option<i64>) -> Option<&'static str> {
@@ -1191,6 +1318,19 @@ fn apply_display_patch(
             }
         } else {
             patch.progress = pending.progress_for_total(total);
+            if pending.allows_completion_adjustment() && patch.progress.is_none() {
+                let restored_progress = if let Some(base) = snapshot {
+                    base.progress
+                } else if let Some(base) = pending.base.as_ref() {
+                    (entry.id == base.id && entry.updated_at == base.updated_at)
+                        .then_some(base.progress)
+                } else {
+                    (entry.id.is_none() && entry.queued_creation == patch.creation_key).then_some(0)
+                };
+                if let Some(progress) = restored_progress {
+                    entry.progress = progress;
+                }
+            }
         }
     }
     // A base snapshot can outlive both the account cache and its score scale.
@@ -1247,7 +1387,9 @@ pub(crate) fn current_entry(state: &AppState, media_id: i64) -> Result<Option<Li
     if let Some(account) = account_id(&state.db) {
         if let Some(pending) = state.db.pending_change(account, media_id)? {
             if overlay_allowed(state, account, &pending, stored.as_ref())?
-                && (pending.is_playback() || pending.patch.automatic_completion.is_some())
+                && (pending.is_playback()
+                    || pending.patch.automatic_completion.is_some()
+                    || (stored.is_some() && pending.allows_completion_adjustment()))
                 && !pending.deleting
                 && !pending.missing_media
             {
@@ -1442,20 +1584,42 @@ pub(crate) fn commit_missing_media(
     pending: Option<(i64, Pending)>,
     remove_media: bool,
 ) -> Result<()> {
-    let pending = pending.filter(|(_, pending)| !pending.needs_cleanup_only());
+    let pending = pending
+        .filter(|(_, pending)| !pending.needs_cleanup_only())
+        .map(|(account, mut pending)| {
+            pending.mark_media_missing();
+            (account, pending)
+        });
     if pending.is_none() && !remove_media {
         return Ok(());
     }
-    state
-        .db
-        .commit_media_removal(remove_media.then_some(media_id), |tx| {
-            if let Some((account, mut pending)) = pending {
-                pending.mark_media_missing();
-                Db::write_pending(tx, account, &pending)?;
+    if let Err(removal_err) =
+        state
+            .db
+            .commit_media_removal(remove_media.then_some(media_id), |tx| {
+                if let Some((account, pending)) = &pending {
+                    Db::write_pending(tx, *account, pending)?;
+                }
+                tx.execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
+                Ok(())
+            })
+    {
+        if !remove_media {
+            if let Some((account, pending)) = &pending {
+                let fallback_err = state.db.put_pending(*account, pending).err();
+                drop(intent);
+                state.clear_tracking_prompt_for_media(origin, media_id);
+                state.refresh_matchers();
+                entry_changed_from(state, origin, media_id);
+                if let Some(conflict_err) = fallback_err {
+                    return Err(anyhow::anyhow!(
+                        "{removal_err}; failed to mark pending change missing: {conflict_err}"
+                    ));
+                }
             }
-            tx.execute("DELETE FROM list_entry WHERE media_id = ?", [media_id])?;
-            Ok(())
-        })?;
+        }
+        return Err(removal_err);
+    }
     drop(intent);
     state.clear_tracking_prompt_for_media(origin, media_id);
     state.refresh_matchers();
@@ -1992,15 +2156,13 @@ pub(crate) async fn prepare_score_confirmation(
     if let Some(total) = total {
         let _entry = state.entry_lock.lock().await;
         match crate::commands::write_origin_guard(state, origin, token) {
-            Ok(intent) => match state.db.cache_episode_total(media_id, total) {
-                Ok(true) => {
+            Ok(intent) => {
+                // Downstream settlement retries the cache write and persists conflicts.
+                if let Ok(true) = state.db.cache_episode_total(media_id, total) {
                     drop(intent);
                     state.refresh_matchers();
                 }
-                Err(error) if result.is_err() => return Err(error.to_string()),
-                // Confirmed saves retry the cache write during acknowledgement.
-                _ => {}
-            },
+            }
             Err(error) => {
                 if result.is_ok() {
                     return Err(error);
@@ -2552,17 +2714,21 @@ async fn send_pending(
                 .map_err(|e| e.to_string())?;
             crate::commands::check_write_origin(state, origin, &token)?;
             if let Some(rejected) = rejected {
-                cache_reported_episodes(state, origin, &token, pending.media_id, rejected.total)?;
+                let cache_result = cache_reported_episodes(
+                    state,
+                    origin,
+                    &token,
+                    pending.media_id,
+                    rejected.total,
+                );
                 entry_changed_from(state, origin, pending.media_id);
+                cache_result?;
                 return Ok(Some(e.to_string()));
             }
             entry_changed_from(state, origin, pending.media_id);
             Err(e.to_string().into())
         }
         Err(e) => {
-            if let Some(unconfirmed) = e.downcast_ref::<anilist::UnconfirmedEntryWrite>() {
-                cache_reported_episodes(state, origin, &token, pending.media_id, unconfirmed.0)?;
-            }
             let ((), write_error) =
                 crate::commands::settle_write_error(state, origin, &token, &e, |message| {
                     pending.record_retry_error(message);
@@ -2576,7 +2742,20 @@ async fn send_pending(
                         .map_err(|e| e.to_string())
                 })?;
             if !anilist::is_auth_rejection(&e) {
+                let cache_result = e
+                    .downcast_ref::<anilist::UnconfirmedEntryWrite>()
+                    .map(|unconfirmed| {
+                        cache_reported_episodes(
+                            state,
+                            origin,
+                            &token,
+                            pending.media_id,
+                            unconfirmed.0,
+                        )
+                    })
+                    .transpose();
                 entry_changed_from(state, origin, pending.media_id);
+                cache_result?;
             }
             Err(EntryFlushError::from_remote(&e, write_error))
         }
@@ -9309,5 +9488,242 @@ mod tests {
         let _entry = keep_app.entry_lock.lock().await;
         keep_anilist_entry(&keep_app, origin, &token, 7, 1, None, None).unwrap();
         assert!(keep_app.retained_tracking_prompt().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_score_confirmation_cache_failure_still_settles_conflict_and_emits_pending_changed(
+    ) {
+        let preflight = json!({"data":{"Media":{
+            "id":1,"episodes":12,
+            "mediaListEntry":{"id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,"repeat":0,"updatedAt":100}
+        }}});
+        let refused_save = json!({"data":{"SaveMediaListEntry":{
+            "id":22,"mediaId":1,"status":"COMPLETED","progress":13,"score":50,"repeat":0,"updatedAt":101
+        }}});
+        let confirm = json!({"data":{"Media":{
+            "id":1,"episodes":13,
+            "mediaListEntry":{"id":22,"mediaId":1,"status":"COMPLETED","progress":13,"score":50,"repeat":0,"updatedAt":101}
+        }}});
+        let (api, _) = anilist::mock_api(vec![
+            (200, viewer("POINT_100")),
+            (200, preflight),
+            (200, viewer("POINT_100")),
+            (200, refused_save),
+            (200, confirm),
+            (200, viewer("POINT_100")),
+        ])
+        .await;
+        let app = Arc::new(state(api, Db::open(Path::new(":memory:")).unwrap()));
+        seed(&app);
+        app.db
+            .put_pending(
+                7,
+                &Pending {
+                    media_id: 1,
+                    deleting: false,
+                    deletion_id: None,
+                    base: app.db.get_entry(1).unwrap(),
+                    playback: false,
+                    base_score_format: Some("POINT_100".into()),
+                    rejected_progress: None,
+                    retry_error: None,
+                    rejected_total: None,
+                    patch: Patch {
+                        status: Some("COMPLETED".into()),
+                        progress: Some(12),
+                        score: Some(85.0),
+                        ..Default::default()
+                    },
+                    score_format: Some("POINT_100".into()),
+                    conflict: false,
+                    missing_media: false,
+                    error: None,
+                },
+            )
+            .unwrap();
+        app.db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_media_cache BEFORE UPDATE ON media
+                 BEGIN SELECT RAISE(ABORT, 'media cache write failed'); END;",
+            )
+            .unwrap();
+        let mut events = app.events.subscribe();
+
+        let err = match flush_from(&app, app.origin()).await.unwrap_err() {
+            EntryFlushError::Entry(msg) | EntryFlushError::Batch(msg) => msg,
+        };
+        assert!(err.contains("media cache write failed"), "{err}");
+
+        let pending = app.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.conflict);
+        assert!(pending.error.is_some());
+        let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event.kind,
+                crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+            )
+        });
+        assert!(
+            notified,
+            "PendingChanged must be emitted even when episode cache fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_missing_media_falls_back_to_put_pending_when_list_entry_delete_fails() {
+        let preflight = json!({"data":{"Media":{"id":1,"episodes":12,"mediaListEntry":null}}});
+        let (api, _) = anilist::mock_api(vec![
+            (200, preflight),
+            (404, json!({"errors":[{"message":"Not Found"}]})),
+        ])
+        .await;
+        let app = Arc::new(state(api, Db::open(Path::new(":memory:")).unwrap()));
+        seed(&app);
+        app.db.delete_entry(1).unwrap();
+        app.db
+            .upsert_entry(&ListEntry {
+                id: None,
+                media_id: 1,
+                status: "CURRENT".into(),
+                progress: 1,
+                queued_creation: Some("create-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        app.db
+            .put_pending(
+                7,
+                &Pending {
+                    media_id: 1,
+                    deleting: false,
+                    deletion_id: None,
+                    base: None,
+                    playback: false,
+                    base_score_format: None,
+                    rejected_progress: None,
+                    retry_error: None,
+                    rejected_total: None,
+                    patch: Patch {
+                        status: Some("CURRENT".into()),
+                        progress: Some(1),
+                        creation_key: Some("create-1".into()),
+                        ..Default::default()
+                    },
+                    score_format: None,
+                    conflict: false,
+                    missing_media: false,
+                    error: None,
+                },
+            )
+            .unwrap();
+        app.emit(crate::EventKind::TrackingPrompt(crate::TrackingPrompt {
+            media_id: 1,
+            episode: 2,
+            title: "Test show".into(),
+            raw_title: "Test show - 02".into(),
+            progress: 1,
+        }));
+        assert!(app.retained_tracking_prompt().is_some());
+        app.db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_entry_delete BEFORE DELETE ON list_entry
+                 BEGIN SELECT RAISE(ABORT, 'list_entry delete failed'); END;",
+            )
+            .unwrap();
+        let mut events = app.events.subscribe();
+
+        let err = match flush_from(&app, app.origin()).await.unwrap_err() {
+            EntryFlushError::Entry(msg) | EntryFlushError::Batch(msg) => msg,
+        };
+        assert!(err.contains("list_entry delete failed"), "{err}");
+
+        let pending = app.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.missing_media);
+        assert!(pending.conflict);
+        assert!(app.retained_tracking_prompt().is_none());
+        let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event.kind,
+                crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+            )
+        });
+        assert!(
+            notified,
+            "PendingChanged must be emitted after fallback put_pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_refused_write_emits_pending_changed_even_when_episode_cache_fails() {
+        let preflight = json!({"data":{"Media":{
+            "id":1,"episodes":12,
+            "mediaListEntry":{"id":22,"mediaId":1,"status":"CURRENT","progress":3,"score":0,"repeat":0,"updatedAt":100}
+        }}});
+        let refused_save = json!({"data":{"SaveMediaListEntry":{
+            "id":22,"mediaId":1,"status":"COMPLETED","progress":11,"score":0,"repeat":0,"updatedAt":101
+        }}});
+        let confirm = json!({"data":{"Media":{
+            "id":1,"episodes":13,
+            "mediaListEntry":{"id":22,"mediaId":1,"status":"COMPLETED","progress":11,"score":0,"repeat":0,"updatedAt":101}
+        }}});
+        let (api, _) =
+            anilist::mock_api(vec![(200, preflight), (200, refused_save), (200, confirm)]).await;
+        let app = Arc::new(state(api, Db::open(Path::new(":memory:")).unwrap()));
+        seed(&app);
+        app.db
+            .put_pending(
+                7,
+                &Pending {
+                    media_id: 1,
+                    deleting: false,
+                    deletion_id: None,
+                    base: app.db.get_entry(1).unwrap(),
+                    playback: false,
+                    base_score_format: Some("POINT_100".into()),
+                    rejected_progress: None,
+                    retry_error: None,
+                    rejected_total: None,
+                    patch: Patch {
+                        status: Some("COMPLETED".into()),
+                        progress: Some(15),
+                        ..Default::default()
+                    },
+                    score_format: Some("POINT_100".into()),
+                    conflict: false,
+                    missing_media: false,
+                    error: None,
+                },
+            )
+            .unwrap();
+        app.db
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_media_cache BEFORE UPDATE ON media
+                 BEGIN SELECT RAISE(ABORT, 'episode cache blocked'); END;",
+            )
+            .unwrap();
+        let mut events = app.events.subscribe();
+
+        let err = match flush_from(&app, app.origin()).await.unwrap_err() {
+            EntryFlushError::Entry(msg) | EntryFlushError::Batch(msg) => msg,
+        };
+        assert!(err.contains("episode cache blocked"), "{err}");
+        let pending = app.db.pending_change(7, 1).unwrap().unwrap();
+        assert!(pending.conflict);
+        let notified = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event.kind,
+                crate::EventKind::PendingChanged(Some(ref ids)) if ids == &[1]
+            )
+        });
+        assert!(
+            notified,
+            "PendingChanged must be emitted before cache error returns"
+        );
     }
 }

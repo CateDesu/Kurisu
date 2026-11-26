@@ -1,4 +1,4 @@
-// Modified for Kurisu: simulate test-window accessibility activation, actions, and tree updates, and run test teardown on drop.
+// Modified for Kurisu: simulate test-window accessibility activation, actions, tree updates, and window control queries, and run test teardown on drop.
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
     BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DisplayId, DrawPhase,
@@ -1172,6 +1172,21 @@ impl VisualTestContext {
     /// selectors; see [`crate::InteractiveElement::debug_selector`].
     pub fn debug_bounds(&mut self, selector: &'static str) -> Option<Bounds<Pixels>> {
         self.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
+    }
+
+    /// Returns the rendered window control area at the given window position.
+    pub fn window_control_area_at(
+        &mut self,
+        position: Point<Pixels>,
+    ) -> Option<crate::WindowControlArea> {
+        self.update(|window, _| {
+            let hit = window.rendered_frame.hit_test(position);
+            window
+                .rendered_frame
+                .window_control_hitboxes
+                .iter()
+                .find_map(|(area, hitbox)| hit.ids.contains(&hitbox.id).then_some(*area))
+        })
     }
 
     /// Draw an element to the window. Useful for simulating events or actions

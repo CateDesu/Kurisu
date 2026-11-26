@@ -342,9 +342,15 @@ impl Workspace {
         if self.route == Route::Now {
             self.refresh_playback_cover();
         }
-        if matches!(self.route, Route::Anime(_)) {
-            self.requeue_detail_covers();
+        match self.route {
+            Route::Anime(_) => self.requeue_detail_covers(),
+            Route::MyList => self.mark_list_cover_refresh(),
+            _ => self.refresh_route_covers(),
         }
+        if self.cover_owner_active(&CoverOwner::LibraryDialog) {
+            self.refresh_library_link_covers();
+        }
+        self.refresh_avatar_cover();
         true
     }
 
@@ -467,58 +473,63 @@ impl Workspace {
                         maintenance = cx.background_executor().timer(Duration::from_millis(120));
                     },
                 }
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        let mut changed = this.ensure_cover_scale(window.scale_factor());
-                        if changed {
-                            if this.route == Route::MyList {
-                                let start = this.list_widget.logical_scroll_top().item_ix;
-                                let range = MyListSlot::media_range(
-                                    start..start.saturating_add(32),
-                                    this.visible_ids.len(),
-                                );
-                                this.prefetch_covers(range, window, cx);
-                                this.mark_list_cover_refresh();
-                                this.schedule_list_cover_refresh(window, cx);
-                            } else {
-                                this.refresh_route_covers();
-                            }
-                        }
-                        if this
-                            .cover_regions
-                            .keys()
-                            .any(|owner| !this.cover_owner_active(owner))
-                        {
-                            this.retain_cover_route();
-                        }
-                        this.refresh_avatar_cover();
-                        let ready = this.covers.poll();
-                        for item in ready {
-                            let keys: Vec<_> = this
-                                .cover_tickets
-                                .iter()
-                                .filter_map(|(key, ticket)| {
-                                    (*ticket == item.ticket && this.cover_is_visible(key))
-                                        .then_some(*key)
-                                })
-                                .collect();
-                            for key in keys {
-                                if let Some(image) = this.covers.image(&item.ticket) {
-                                    this.cover_images.insert(key, image);
-                                    changed = true;
-                                }
-                            }
-                        }
-                        if changed {
-                            cx.notify();
-                        }
+                match this.update_in(cx, |this, window, cx| {
+                    if this.stopping {
                         for image in this.covers.take_disposed() {
                             cx.drop_image(image, Some(window));
                         }
-                    })
-                    .is_err()
-                {
-                    break;
+                        return true;
+                    }
+                    let mut changed = this.ensure_cover_scale(window.scale_factor());
+                    if this.route == Route::MyList
+                        && (changed || this.list_cover_revision != this.list_cover_reconciled)
+                    {
+                        let start = this.list_widget.logical_scroll_top().item_ix;
+                        let range = MyListSlot::media_range(
+                            start..start.saturating_add(32),
+                            this.visible_ids.len(),
+                        );
+                        this.prefetch_covers(range, window, cx);
+                        if changed {
+                            this.mark_list_cover_refresh();
+                        }
+                        this.schedule_list_cover_refresh(window, cx);
+                    }
+                    if this
+                        .cover_regions
+                        .keys()
+                        .any(|owner| !this.cover_owner_active(owner))
+                    {
+                        this.retain_cover_route();
+                    }
+                    this.refresh_avatar_cover();
+                    let ready = this.covers.poll();
+                    for item in ready {
+                        let keys: Vec<_> = this
+                            .cover_tickets
+                            .iter()
+                            .filter_map(|(key, ticket)| {
+                                (*ticket == item.ticket && this.cover_is_visible(key))
+                                    .then_some(*key)
+                            })
+                            .collect();
+                        for key in keys {
+                            if let Some(image) = this.covers.image(&item.ticket) {
+                                this.cover_images.insert(key, image);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                    for image in this.covers.take_disposed() {
+                        cx.drop_image(image, Some(window));
+                    }
+                    false
+                }) {
+                    Ok(true) | Err(_) => break,
+                    Ok(false) => {}
                 }
             }
         })
@@ -551,12 +562,22 @@ impl Workspace {
             if let Some(url) = detail.media.banner_image.as_deref() {
                 visible.push(((id, 800, 192), url.to_owned()));
             }
-            for (index, character) in detail.characters.iter().enumerate() {
+            for (index, character) in detail
+                .characters
+                .iter()
+                .enumerate()
+                .take(super::detail::DETAIL_PERSON_LIMIT)
+            {
                 if let Some(url) = character.image.as_deref() {
                     visible.push(((-1 - index as i64, 112, 160), url.to_owned()));
                 }
             }
-            for (index, person) in detail.staff.iter().enumerate() {
+            for (index, person) in detail
+                .staff
+                .iter()
+                .enumerate()
+                .take(super::detail::DETAIL_PERSON_LIMIT)
+            {
                 if let Some(url) = person.image.as_deref() {
                     visible.push(((-200_001 - index as i64, 112, 160), url.to_owned()));
                 }
@@ -853,6 +874,126 @@ mod tests {
             );
             w.request_cover(7, "invalid-list", 46, 63);
             assert_ne!(w.cover_tickets[&(7, 46, 63)], scaled);
+        });
+    }
+
+    #[gpui::test]
+    fn ensure_cover_scale_requeues_active_route_library_dialog_and_avatar(cx: &mut TestAppContext) {
+        use kurisu_core::models::ListEntry;
+
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(core, window, cx));
+        workspace.update_in(cx, |w, window, cx| {
+            w.auth_intent += 1;
+            w.profile = Some(User {
+                id: 51,
+                avatar: Some("https://example.invalid/avatar.png".into()),
+                ..Default::default()
+            });
+            w.switch_route(Route::Search, window, cx);
+            w.search.results = vec![Media {
+                id: 301,
+                cover_medium: Some("https://example.invalid/search-301.png".into()),
+                ..Default::default()
+            }];
+            w.search.rows = Some(gpui::ListState::new(
+                1,
+                gpui::ListAlignment::Top,
+                gpui::px(0.),
+            ));
+            w.refresh_search_covers();
+            w.refresh_avatar_cover();
+            let old_search = w.cover_tickets[&(301, 174, 176)].clone();
+            let old_avatar = w.cover_tickets[&AVATAR_KEY].clone();
+
+            let next_scale = w.cover_scale + 0.5;
+            assert!(w.ensure_cover_scale(next_scale));
+            assert_ne!(w.cover_tickets[&(301, 174, 176)], old_search);
+            assert_ne!(w.cover_tickets[&AVATAR_KEY], old_avatar);
+
+            w.route = Route::MyList;
+            w.list_cover_reconciled = w.list_cover_revision;
+            assert!(w.ensure_cover_scale(next_scale + 0.5));
+            assert_ne!(
+                w.list_cover_revision, w.list_cover_reconciled,
+                "MyList must mark a cover refresh when scale changes"
+            );
+
+            w.route = Route::Library;
+            w.open_library_link_dialog_for_test(
+                vec![ListEntry {
+                    media_id: 401,
+                    media: Some(Media {
+                        id: 401,
+                        title_english: Some("Linked Show".into()),
+                        cover_medium: Some("https://example.invalid/link-401.png".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                "/anime/ep01.mkv".into(),
+                window,
+                cx,
+            );
+            let old_dialog = w.cover_tickets[&(401, 32, 44)].clone();
+            assert!(w.ensure_cover_scale(next_scale + 1.0));
+            assert_ne!(w.cover_tickets[&(401, 32, 44)], old_dialog);
+            assert!(w.cover_tickets.contains_key(&AVATAR_KEY));
+        });
+    }
+
+    #[gpui::test]
+    fn detail_covers_limit_character_and_staff_portraits_to_rendered_cards(
+        cx: &mut TestAppContext,
+    ) {
+        use kurisu_core::models::{MediaCharacter, MediaDetail, MediaStaff};
+
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        workspace.update_in(cx, |w, _, _| {
+            w.profile = Some(User {
+                id: 52,
+                ..Default::default()
+            });
+            w.route = Route::Anime(88);
+            let request = w.detail.start(88);
+            let characters = (0..50)
+                .map(|index| MediaCharacter {
+                    name: format!("Char {index}"),
+                    image: Some(format!("https://example.invalid/char-{index}.png")),
+                    ..Default::default()
+                })
+                .collect();
+            let staff = (0..50)
+                .map(|index| MediaStaff {
+                    name: format!("Staff {index}"),
+                    image: Some(format!("https://example.invalid/staff-{index}.png")),
+                    ..Default::default()
+                })
+                .collect();
+            w.detail.finish_detail(
+                88,
+                request,
+                Ok(MediaDetail {
+                    media: Media {
+                        id: 88,
+                        ..Default::default()
+                    },
+                    relations: vec![],
+                    characters,
+                    staff,
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            w.requeue_detail_covers();
+            assert!(w.cover_tickets.contains_key(&(-40, 112, 160)));
+            assert!(!w.cover_tickets.contains_key(&(-41, 112, 160)));
+            assert!(w.cover_tickets.contains_key(&(-200_040, 112, 160)));
+            assert!(!w.cover_tickets.contains_key(&(-200_041, 112, 160)));
         });
     }
 }

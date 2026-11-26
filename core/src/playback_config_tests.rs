@@ -898,3 +898,179 @@ async fn manual_progress_records_history_only_after_qualifying_playback() {
     assert!(tracking_events(&mut events).is_empty());
     assert!(requests.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn short_prompt_delay_suppresses_later_auto_ask_and_keeps_confirmation_valid() {
+    let f = Fixture::new();
+    let state = f.core.state();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (mut api, mut requests) = crate::anilist::mock_api_gated(
+        vec![
+            (
+                200,
+                json!({"data":{"Media":{
+                    "id":1,"episodes":12,
+                    "mediaListEntry":{
+                        "id":22,"mediaId":1,"status":"CURRENT","progress":1,"repeat":0,"score":0
+                    }
+                }}}),
+            ),
+            (
+                200,
+                json!({"data":{"SaveMediaListEntry":{
+                    "id":22,"mediaId":1,"status":"CURRENT","progress":2,"repeat":0,"score":0
+                }}}),
+            ),
+        ],
+        Some(gate.clone()),
+    )
+    .await;
+    api.record_viewer(7);
+    *state.anilist.lock() = api;
+    TrackingConfig {
+        mode: "prompt".into(),
+        prompt_seconds: 5,
+        auto_ask: true,
+        discord_enabled: false,
+        ..TrackingConfig::default()
+    }
+    .save(&state.db)
+    .unwrap();
+    let mut events = f.core.subscribe();
+    let work = PlaybackWork::default();
+    let mut active = None;
+    f.tick(&work, &mut active).await.unwrap();
+    active.as_mut().unwrap().accumulated = Duration::from_secs(6);
+    f.tick(&work, &mut active).await.unwrap();
+    assert!(matches!(
+        tracking_events(&mut events).as_slice(),
+        [EventKind::TrackingPrompt(prompt)] if prompt.media_id == 1 && prompt.episode == 2
+    ));
+    let offer = state.retained_tracking_prompt().unwrap();
+    let confirm = {
+        let core = f.core.clone();
+        let offer = offer.clone();
+        tokio::spawn(async move { core.confirm_tracking_prompt(offer, 2).await })
+    };
+    let first = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first["variables"]["mediaId"], 1);
+
+    active.as_mut().unwrap().accumulated = Duration::from_secs(20);
+    f.tick(&work, &mut active).await.unwrap();
+    assert!(
+        tracking_events(&mut events).is_empty(),
+        "auto_ask must not emit after TrackingPrompt for the same episode"
+    );
+    assert_eq!(
+        state.retained_tracking_prompt().and_then(|e| e.prompt_id),
+        offer.prompt_id
+    );
+
+    gate.add_permits(2);
+    let confirmed = tokio::time::timeout(Duration::from_secs(5), confirm)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        confirmed.is_ok(),
+        "prompt confirmation failed: {confirmed:?}"
+    );
+    let second = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second["query"]
+        .as_str()
+        .unwrap()
+        .contains("SaveMediaListEntry"));
+    assert_eq!(second["variables"]["progress"], 2);
+    assert!(state.db.pending(7).unwrap().is_empty());
+    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 2);
+}
+
+#[tokio::test]
+async fn inflight_auto_push_suppresses_auto_ask() {
+    let f = Fixture::new();
+    let state = f.core.state();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (mut api, mut requests) = crate::anilist::mock_api_gated(
+        vec![
+            (
+                200,
+                json!({"data":{"Media":{
+                    "id":1,"episodes":12,
+                    "mediaListEntry":{
+                        "id":22,"mediaId":1,"status":"CURRENT","progress":1,"repeat":0,"score":0
+                    }
+                }}}),
+            ),
+            (
+                200,
+                json!({"data":{"SaveMediaListEntry":{
+                    "id":22,"mediaId":1,"status":"CURRENT","progress":2,"repeat":0,"score":0
+                }}}),
+            ),
+        ],
+        Some(gate.clone()),
+    )
+    .await;
+    api.record_viewer(7);
+    *state.anilist.lock() = api;
+    TrackingConfig {
+        mode: "auto".into(),
+        auto_percent: 80,
+        auto_ask: true,
+        discord_enabled: false,
+        ..TrackingConfig::default()
+    }
+    .save(&state.db)
+    .unwrap();
+    let mut short = f.sample();
+    short.length_us = 20_000_000;
+    short.position_us = 18_000_000;
+    let mut events = f.core.subscribe();
+    let work = PlaybackWork::default();
+    let mut active = None;
+    f.tick_sample(&work, &mut active, Some(short.clone()))
+        .await
+        .unwrap();
+    active.as_mut().unwrap().accumulated = Duration::from_secs(6);
+    f.tick_sample(&work, &mut active, Some(short.clone()))
+        .await
+        .unwrap();
+    assert!(active.as_ref().unwrap().push.is_some());
+    let _ = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    active.as_mut().unwrap().accumulated = Duration::from_secs(20);
+    f.tick_sample(&work, &mut active, Some(short))
+        .await
+        .unwrap();
+    assert!(
+        tracking_events(&mut events).is_empty(),
+        "auto_ask must not fire while an automatic progress push is in flight"
+    );
+    assert!(state.retained_tracking_prompt().is_none());
+
+    gate.add_permits(2);
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), work.join_retired(false))
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second["query"]
+        .as_str()
+        .unwrap()
+        .contains("SaveMediaListEntry"));
+    assert_eq!(second["variables"]["progress"], 2);
+    assert!(state.db.pending(7).unwrap().is_empty());
+    assert_eq!(state.db.get_entry(1).unwrap().unwrap().progress, 2);
+}

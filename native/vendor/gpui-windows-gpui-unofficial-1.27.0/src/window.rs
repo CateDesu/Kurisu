@@ -1,4 +1,4 @@
-// Modified for Kurisu: hide and restore the retained Windows window.
+// Modified for Kurisu: hide, restore, and zoom toggle the retained Windows window.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{
@@ -971,9 +971,11 @@ impl PlatformWindow for WindowsWindow {
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {
-                ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE).ok().log_err();
+                ShowWindowAsync(self.0.hwnd, zoom_show_command(self.state.is_maximized()))
+                    .ok()
+                    .log_err();
             } else if let Some(mut status) = self.state.initial_placement.take() {
-                status.state = WindowOpenState::Maximized;
+                status.state = toggled_zoom_open_state(status.state);
                 self.state.initial_placement.set(Some(status));
             }
         }
@@ -1438,11 +1440,22 @@ struct WindowOpenStatus {
     state: WindowOpenState,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowOpenState {
     Maximized,
     Fullscreen,
     Windowed,
+}
+
+fn zoom_show_command(is_maximized: bool) -> SHOW_WINDOW_CMD {
+    if is_maximized { SW_NORMAL } else { SW_MAXIMIZE }
+}
+
+fn toggled_zoom_open_state(state: WindowOpenState) -> WindowOpenState {
+    match state {
+        WindowOpenState::Maximized => WindowOpenState::Windowed,
+        WindowOpenState::Windowed | WindowOpenState::Fullscreen => WindowOpenState::Maximized,
+    }
 }
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");
@@ -1759,6 +1772,28 @@ mod tests {
         assert_eq!(
             state.update(MouseButton::Right, point(DevicePixels(10), DevicePixels(0))),
             1
+        );
+    }
+
+    #[test]
+    fn test_zoom_toggle_helpers() {
+        use super::{
+            SW_MAXIMIZE, SW_NORMAL, WindowOpenState, toggled_zoom_open_state, zoom_show_command,
+        };
+
+        assert_eq!(zoom_show_command(false), SW_MAXIMIZE);
+        assert_eq!(zoom_show_command(true), SW_NORMAL);
+        assert_eq!(
+            toggled_zoom_open_state(WindowOpenState::Windowed),
+            WindowOpenState::Maximized
+        );
+        assert_eq!(
+            toggled_zoom_open_state(WindowOpenState::Maximized),
+            WindowOpenState::Windowed
+        );
+        assert_eq!(
+            toggled_zoom_open_state(WindowOpenState::Fullscreen),
+            WindowOpenState::Maximized
         );
     }
 }

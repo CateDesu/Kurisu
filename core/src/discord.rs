@@ -208,7 +208,10 @@ fn state_line(episode: Option<i64>, total: Option<i64>, playing: bool) -> String
     let base = match episode {
         Some(ep) => format!(
             "Episode {ep}/{}",
-            total.map(|t| t.to_string()).unwrap_or_else(|| "-".into())
+            total
+                .filter(|t| *t > 0)
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into())
         ),
         None => return if playing { "Watching" } else { "Paused" }.to_string(),
     };
@@ -662,6 +665,8 @@ mod tests {
     fn state_line_shows_episode_out_of_total() {
         assert_eq!(state_line(Some(6), Some(10), true), "Episode 6/10");
         assert_eq!(state_line(Some(6), None, true), "Episode 6/-");
+        assert_eq!(state_line(Some(6), Some(0), true), "Episode 6/-");
+        assert_eq!(state_line(Some(6), Some(-2), false), "Episode 6/- · Paused");
         assert_eq!(
             state_line(Some(6), Some(10), false),
             "Episode 6/10 · Paused"

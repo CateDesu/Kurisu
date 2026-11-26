@@ -185,6 +185,16 @@ os._exit(0)
                 wal.write_bytes(content)
                 self.assert_wal_refused()
 
+    def test_truncated_main_database_header_refuses_wal_validation(self):
+        wal = self.make_wal()
+        header = bytearray(struct.pack(">6I", 0x377f0682, 3007000, 65536, 0, 1, 2))
+        header.extend(struct.pack(">2I", *MIGRATE._wal_checksum(bytes(header), "<", (0, 0))))
+        wal.write_bytes(bytes(header))
+        self.source.write_bytes(b"SQLite format 3\x00\x01")
+        with self.assertRaisesRegex(MIGRATE.TransferError, "database header is incomplete"):
+            MIGRATE._validate_wal(self.source, wal)
+        self.assert_wal_refused()
+
     def test_damaged_or_incomplete_wal_frames_refuse_publication(self):
         wal = self.make_wal()
         original = wal.read_bytes()
@@ -394,7 +404,7 @@ os._exit(0)
 
     def test_invalid_legacy_sync_time_uses_native_default(self):
         self.make_source()
-        for number, value in enumerate((None, "", "invalid", "0", "-1", "Infinity", "NaN")):
+        for number, value in enumerate((None, "", "invalid", "0", "-1", "1_000", "Infinity", "NaN")):
             with self.subTest(value=value):
                 self.values["kurisu.list.synced"] = value
                 self.write_export()

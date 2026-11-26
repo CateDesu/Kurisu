@@ -398,3 +398,71 @@ fn rss_enter_respects_final_close_and_cancel(tc: &mut TestAppContext) {
     f.wait(cx, |cx| shell.read_with(cx, |s, _| s.close_test_quit));
     assert_eq!(f.runtime.block_on(f.core.get_rss_feeds()).unwrap(), saved);
 }
+
+#[gpui::test]
+fn itemless_torrent_opener_error_is_suppressed_while_close_ready_or_stopping(
+    tc: &mut TestAppContext,
+) {
+    {
+        let f = Fixture::new(tc);
+        let (workspace, cx) = tc.add_window_view(|win, cx| Workspace::new(f.core.clone(), win, cx));
+        workspace.update(cx, |w, cx| w.close_test_list(cx));
+        let opener = workspace.update_in(cx, |w, win, cx| w.test_open_torrent(None, win, cx));
+        workspace.update_in(cx, |w, win, cx| {
+            w.request_close(CloseIntent::Window, win, cx);
+            assert!(w.close_test_state().0);
+        });
+        opener.send(Err("late close_ready error".into())).unwrap();
+        for _ in 0..16 {
+            cx.run_until_parked();
+            f.runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        assert!(workspace.read_with(cx, |w, _| w.test_torrent_error().is_empty()));
+
+        let opener = workspace.update_in(cx, |w, win, cx| {
+            w.resume_after_close_visibility(true, win, cx);
+            assert!(!w.close_test_state().0);
+            w.test_open_torrent(None, win, cx)
+        });
+        opener.send(Err("visible opener error".into())).unwrap();
+        for _ in 0..16 {
+            cx.run_until_parked();
+            f.runtime.block_on(async { tokio::task::yield_now().await });
+        }
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.test_torrent_error().to_owned()),
+            "Could not open link: visible opener error"
+        );
+        cx.update(|win, _| win.remove_window());
+    }
+
+    let f = Fixture::new(tc);
+    let instance = Arc::new(InstanceGuard::acquire(&f.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            f.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    let workspace = f.load(&shell, cx);
+    workspace.update(cx, |w, cx| w.close_test_list(cx));
+    let opener = workspace.update_in(cx, |w, win, cx| w.test_open_torrent(None, win, cx));
+    let (quit, gate) = tokio::sync::oneshot::channel();
+    shell.update(cx, |s, _| {
+        s.close_test_gate = Some(gate);
+        s.tray = None;
+    });
+    assert!(!cx.simulate_close());
+    f.wait(cx, |cx| shell.read_with(cx, |s, _| s.stopping));
+    opener.send(Err("late stopping error".into())).unwrap();
+    for _ in 0..16 {
+        cx.run_until_parked();
+        f.runtime.block_on(async { tokio::task::yield_now().await });
+    }
+    assert!(workspace.read_with(cx, |w, _| w.test_torrent_error().is_empty()));
+    quit.send(()).unwrap();
+    f.wait(cx, |cx| shell.read_with(cx, |s, _| s.close_test_quit));
+}

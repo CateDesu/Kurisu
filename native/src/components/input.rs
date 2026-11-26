@@ -175,6 +175,8 @@ impl TextInput {
         let len = content.len();
         self.content = content.into();
         self.selected_range = len..len;
+        self.selection_reversed = false;
+        self.is_selecting = false;
         self.marked_range = None;
         self.last_lines.clear();
         self.last_display.clear();
@@ -193,6 +195,9 @@ impl TextInput {
             return;
         }
         self.disabled = disabled;
+        if disabled {
+            self.is_selecting = false;
+        }
         self.focus_handle = self.focus_handle.clone().tab_stop(!disabled);
         cx.notify();
     }
@@ -314,7 +319,11 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_selecting {
+        if !self.disabled && self.is_selecting {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.is_selecting = false;
+                return;
+            }
             self.select_to(self.index_for_mouse_position(event.position), window, cx);
         }
     }
@@ -552,7 +561,9 @@ impl TextInput {
     }
 
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
+        let start = self.offset_from_utf16(range_utf16.start);
+        let end = self.offset_from_utf16(range_utf16.end);
+        start.min(end)..start.max(end)
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
@@ -701,6 +712,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if self.masked {
+            return None;
+        }
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
@@ -724,8 +738,11 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         self.selected_range = self.range_from_utf16(&range_utf16);
-        self.selection_reversed = false;
+        self.selection_reversed = range_utf16.end < range_utf16.start;
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -749,6 +766,9 @@ impl EntityInputHandler for TextInput {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         self.marked_range = None;
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
@@ -764,6 +784,13 @@ impl EntityInputHandler for TextInput {
         if self.disabled {
             return;
         }
+        let sanitized;
+        let new_text = if !self.multiline && new_text.contains(['\r', '\n']) {
+            sanitized = new_text.replace(['\r', '\n'], " ");
+            sanitized.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -792,6 +819,13 @@ impl EntityInputHandler for TextInput {
         if self.disabled {
             return;
         }
+        let sanitized;
+        let new_text = if !self.multiline && new_text.contains(['\r', '\n']) {
+            sanitized = new_text.replace(['\r', '\n'], " ");
+            sanitized.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -808,6 +842,9 @@ impl EntityInputHandler for TextInput {
         }
         let insertion_start_utf16 = self.offset_to_utf16(range.start);
         let inserted_length_utf16 = new_text.encode_utf16().count();
+        let selection_reversed = new_selected_range_utf16
+            .as_ref()
+            .is_some_and(|selected| selected.end < selected.start);
         self.selected_range = new_selected_range_utf16
             .map(|selected| {
                 self.range_from_utf16(
@@ -816,7 +853,7 @@ impl EntityInputHandler for TextInput {
                 )
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
-        self.selection_reversed = false;
+        self.selection_reversed = selection_reversed;
 
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(TextInputEvent::Changed(self.content.to_string()));
@@ -868,6 +905,9 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Bounds<Pixels>> {
+        if self.last_display != self.display_text() {
+            return Vec::new();
+        }
         let range = self.range_from_utf16(&range_utf16);
         let display_range = self.display_offset(range.start)..self.display_offset(range.end);
         if display_range.is_empty() {
@@ -1075,7 +1115,8 @@ impl Element for TextElement {
                 .lines
                 .iter()
                 .map(|line| line.wrap_boundaries().len() + 1)
-                .sum();
+                .sum::<usize>()
+                .max(1);
             if input.last_visual_lines != visual_lines {
                 input.last_visual_lines = visual_lines;
                 _cx.notify();
@@ -1393,6 +1434,124 @@ mod tests {
             parent.set_value(input.accessible_value().to_string());
             snapshot.write_parent(&mut parent, NodeId(9));
             assert_eq!(parent.value(), Some(""));
+        });
+        input.update_in(cx, |input, window, cx| {
+            let mut actual = None;
+            assert_eq!(input.text_for_range(0..8, &mut actual, window, cx), None);
+            assert_eq!(actual, None);
+        });
+    }
+
+    #[gpui::test]
+    fn reversed_utf16_ranges_and_single_line_ime_newlines_stay_safe(cx: &mut TestAppContext) {
+        let (input, cx) =
+            cx.add_window_view(|window, cx| TextInput::new("A🙂漢", "Notes", window, cx));
+        let reversed = |start, end| Range { start, end };
+        input.update_in(cx, |input, window, cx| {
+            let mut actual = None;
+            assert_eq!(
+                input
+                    .text_for_range(reversed(4, 1), &mut actual, window, cx)
+                    .as_deref(),
+                Some("🙂漢")
+            );
+            assert_eq!(actual, Some(1..4));
+
+            input.set_selected_text_range(reversed(4, 1), window, cx);
+            assert_eq!(input.selected_range, 1.."A🙂漢".len());
+            assert!(input.selection_reversed);
+            input.copy(&Copy, window, cx);
+
+            input.replace_text_in_range(Some(reversed(4, 1)), "x\r\ny", window, cx);
+            assert_eq!(input.value(), "Ax  y");
+
+            input.replace_and_mark_text_in_range(
+                Some(reversed(5, 1)),
+                "m\nn",
+                Some(reversed(3, 1)),
+                window,
+                cx,
+            );
+            assert_eq!(input.value(), "Am n");
+            assert_eq!(input.marked_range, Some(1..4));
+            assert_eq!(input.selected_range, 2..4);
+            assert!(input.selection_reversed);
+        });
+    }
+
+    #[gpui::test]
+    fn selection_bounds_rejects_stale_layout_and_disabled_blocks_drag_and_ime_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (input, cx) =
+            cx.add_window_view(|window, cx| TextInput::new("hello world", "Notes", window, cx));
+        cx.run_until_parked();
+        input.update_in(cx, |input, window, cx| {
+            let bounds = input.last_bounds.expect("painted bounds");
+            assert!(
+                !input
+                    .selection_bounds_for_range(0..5, bounds, window, cx)
+                    .is_empty()
+            );
+
+            input.replace_text_in_range(Some(0..11), "hi", window, cx);
+            assert!(
+                input
+                    .selection_bounds_for_range(0..2, bounds, window, cx)
+                    .is_empty()
+            );
+
+            input.selected_range = 1..1;
+            input.marked_range = Some(0..2);
+            input.is_selecting = true;
+            input.set_disabled(true, cx);
+            assert!(!input.is_selecting);
+
+            input.on_mouse_move(
+                &MouseMoveEvent {
+                    position: bounds.origin,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            input.set_selected_text_range(0..2, window, cx);
+            input.unmark_text(window, cx);
+            assert_eq!(input.selected_range, 1..1);
+            assert_eq!(input.marked_range, Some(0..2));
+        });
+    }
+
+    #[gpui::test]
+    fn mouse_move_without_left_button_ends_drag_selection(cx: &mut TestAppContext) {
+        let (input, cx) =
+            cx.add_window_view(|window, cx| TextInput::new("hello world", "Notes", window, cx));
+        cx.run_until_parked();
+        input.update_in(cx, |input, window, cx| {
+            let bounds = input.last_bounds.expect("painted bounds");
+            input.on_mouse_down(
+                &MouseDownEvent {
+                    position: point(bounds.right(), bounds.center().y),
+                    button: MouseButton::Left,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(input.is_selecting);
+            let anchor = input.selected_range.clone();
+
+            input.on_mouse_move(
+                &MouseMoveEvent {
+                    position: point(bounds.left(), bounds.center().y),
+                    pressed_button: None,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(!input.is_selecting);
+            assert_eq!(input.selected_range, anchor);
         });
     }
 }

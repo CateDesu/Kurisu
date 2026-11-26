@@ -621,7 +621,7 @@ fn minimizing_cancels_a_pending_restore_without_blocking_the_next_launch(tc: &mu
         cx.executor().advance_clock(Duration::from_millis(180));
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.restore_activation));
-        shell.update_in(cx, |shell, window, cx| shell.minimize_window(window, cx));
+        shell.update_in(cx, |shell, window, _| shell.minimize_window(window));
         assert!(matches!(
             contender.join().unwrap(),
             Err(crate::platform::InstanceError::Declined)
@@ -1056,5 +1056,238 @@ fn window_close_completes_admitted_reads_and_replays_deferred_refreshes_on_resum
     assert!(
         !retry_button.is_disabled(),
         "Calendar retry stayed disabled after failed window close resume"
+    );
+}
+
+#[gpui::test]
+fn title_drag_carries_drag_control_area_and_resize_handles_match_platform(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    let _workspace = fixture.load(&shell, cx);
+    draw(cx);
+    let drag_bounds = cx
+        .debug_bounds("title-drag")
+        .expect("title-drag must render");
+    let min_bounds = cx
+        .debug_bounds("minimize")
+        .expect("minimize button must render");
+    assert_eq!(
+        cx.window_control_area_at(drag_bounds.center()),
+        Some(gpui::WindowControlArea::Drag)
+    );
+    assert_eq!(cx.window_control_area_at(min_bounds.center()), None);
+    let has_top_resize = cx.debug_bounds("window-resize-Top").is_some();
+    assert_eq!(has_top_resize, cfg!(not(target_os = "windows")));
+}
+
+#[gpui::test]
+fn sidebar_logout_button_disables_while_workspace_edits_are_fenced(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    let workspace = fixture.load(&shell, cx);
+    shell.update(cx, |s, cx| {
+        s.profile = Some(kurisu_core::User {
+            id: 7,
+            name: "Tester".into(),
+            ..Default::default()
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_accessibility_activation();
+    cx.run_until_parked();
+    let find_logout = |cx: &mut VisualTestContext| {
+        draw(cx);
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        tree.nodes
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.role() == Role::Button && node.label() == Some("Log out")).then_some(node)
+            })
+            .expect("Log out button must render")
+    };
+
+    let initial = find_logout(cx);
+    assert!(!initial.is_disabled());
+    assert!(initial.supports_action(gpui::AccessibleAction::Click));
+
+    workspace.update(cx, |w, cx| w.set_update_busy_for_test(true, cx));
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.fenced && s.modal_layer.is_none()));
+    let fenced = find_logout(cx);
+    assert!(fenced.is_disabled());
+    assert_eq!(fenced.description(), Some("Unavailable"));
+    assert!(!fenced.supports_action(gpui::AccessibleAction::Click));
+    assert!(!fenced.supports_action(gpui::AccessibleAction::Focus));
+
+    workspace.update(cx, |w, cx| w.set_update_busy_for_test(false, cx));
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| !s.fenced));
+    let restored = find_logout(cx);
+    assert!(!restored.is_disabled());
+    assert!(restored.supports_action(gpui::AccessibleAction::Click));
+}
+
+#[gpui::test]
+fn minimizing_visible_window_declines_queued_launch_instead_of_acknowledging(
+    tc: &mut TestAppContext,
+) {
+    let fixture = Fixture::new(tc);
+    let path = &fixture.profile.path;
+    let mut instance = InstanceGuard::acquire(path).unwrap();
+    instance.start_activation(path).unwrap();
+    let instance = Arc::new(instance);
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance.clone(),
+            win,
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.close_test_has_tray = true;
+    });
+    cx.run_until_parked();
+
+    std::thread::scope(|scope| {
+        let contender = scope.spawn(|| InstanceGuard::acquire(path));
+        instance.wait_for_pending_activations(1);
+        shell.update_in(cx, |shell, window, _| shell.minimize_window(window));
+        assert!(matches!(
+            contender.join().unwrap(),
+            Err(crate::platform::InstanceError::Declined)
+        ));
+        assert!(!instance.has_pending_activation());
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.minimized_by_program);
+            assert!(!shell.restore_activation);
+        });
+    });
+}
+
+#[gpui::test]
+fn closing_to_tray_declines_queued_launch_and_stays_hidden(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    fixture.db.set_setting("close_to_tray", "1").unwrap();
+    let path = &fixture.profile.path;
+    let mut instance = InstanceGuard::acquire(path).unwrap();
+    instance.start_activation(path).unwrap();
+    let instance = Arc::new(instance);
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance.clone(),
+            win,
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.close_test_has_tray = true;
+    });
+    let _workspace = fixture.load(&shell, cx);
+
+    std::thread::scope(|scope| {
+        let contender = scope.spawn(|| InstanceGuard::acquire(path));
+        instance.wait_for_pending_activations(1);
+        assert!(!cx.simulate_close());
+        fixture.wait(cx, |cx| {
+            shell.read_with(cx, |s, _| !s.closing && s.hidden_to_tray)
+        });
+        assert!(matches!(
+            contender.join().unwrap(),
+            Err(crate::platform::InstanceError::Declined)
+        ));
+        cx.executor().advance_clock(Duration::from_millis(180));
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |s, _| s.hidden_to_tray));
+    });
+}
+
+#[gpui::test]
+fn tray_actions_are_ignored_once_shell_is_stopping(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    shell.update(cx, |s, cx| {
+        s.close_test_has_tray = true;
+        s.hidden_to_tray = true;
+        s.close_test_gate = Some(gate);
+        s.stop_and_quit(cx);
+    });
+    cx.run_until_parked();
+    shell.update_in(cx, |s, window, cx| {
+        assert!(!s.show_from_tray(window, cx));
+        assert!(!s.toggle_from_tray(window, cx));
+        assert!(s.hidden_to_tray);
+    });
+    release.send(()).unwrap();
+    fixture.wait(cx, |cx| shell.read_with(cx, |s, _| s.close_test_quit));
+}
+
+#[gpui::test]
+fn watch_tray_exits_loop_once_shell_is_stopping(tc: &mut TestAppContext) {
+    let fixture = Fixture::new(tc);
+    let instance = Arc::new(InstanceGuard::acquire(&fixture.profile.path).unwrap());
+    let (shell, cx) = tc.add_window_view(|win, cx| {
+        Shell::new(
+            fixture.core.clone(),
+            Arc::new(Mutex::new(None)),
+            instance,
+            win,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(180));
+    cx.run_until_parked();
+    let ticks_before_stop = shell.read_with(cx, |s, _| s.tray_watcher_ticks);
+    assert!(ticks_before_stop >= 1, "watch_tray must tick while running");
+
+    shell.update(cx, |s, _| s.stopping = true);
+    cx.executor().advance_clock(Duration::from_millis(180));
+    cx.run_until_parked();
+    let ticks_at_stop = shell.read_with(cx, |s, _| s.tray_watcher_ticks);
+    assert_eq!(ticks_at_stop, ticks_before_stop + 1);
+
+    for _ in 0..5 {
+        cx.executor().advance_clock(Duration::from_millis(180));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        shell.read_with(cx, |s, _| s.tray_watcher_ticks),
+        ticks_at_stop,
+        "watch_tray must stop polling once stopping is set"
     );
 }

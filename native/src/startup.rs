@@ -175,9 +175,10 @@ impl LegacyStopGuard {
                 while active.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            if stream
-                                .set_write_timeout(Some(Duration::from_millis(250)))
-                                .is_ok()
+                            if stream.set_nonblocking(false).is_ok()
+                                && stream
+                                    .set_write_timeout(Some(Duration::from_millis(250)))
+                                    .is_ok()
                             {
                                 // Old clients exit only after receiving Kurisu's ACK.
                                 let _ = stream.write_all(b"k");

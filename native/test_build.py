@@ -30,6 +30,23 @@ class BuildVersionTests(unittest.TestCase):
         ]
         self.assertEqual(BUILD.latest_stable(releases), "1.0.0.77")
 
+    def test_latest_stable_compares_zero_padded_versions(self):
+        equal = [
+            {"tagName": "v1.1.0", "isDraft": False, "isPrerelease": False},
+            {"tagName": "v1.1.0.0", "isDraft": False, "isPrerelease": False},
+        ]
+        self.assertEqual(BUILD.latest_stable(equal), "1.1.0")
+        newer = [
+            {"tagName": "v1.1.0", "isDraft": False, "isPrerelease": False},
+            {"tagName": "v1.1.0.1", "isDraft": False, "isPrerelease": False},
+        ]
+        self.assertEqual(BUILD.latest_stable(newer), "1.1.0.1")
+        major = [
+            {"tagName": "v1.0.9.9", "isDraft": False, "isPrerelease": False},
+            {"tagName": "v1.1.0", "isDraft": False, "isPrerelease": False},
+        ]
+        self.assertEqual(BUILD.latest_stable(major), "1.1.0")
+
     def test_missing_release_never_falls_back_to_package_version(self):
         with self.assertRaises(ValueError):
             BUILD.latest_stable([])

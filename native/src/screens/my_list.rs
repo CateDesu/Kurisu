@@ -8,7 +8,9 @@ use std::sync::Arc;
 use super::Workspace;
 use super::state::{STATUSES, SortKey, list_title, status_label};
 use crate::components::scrollbar::list_scrollbar;
-use crate::components::{button, eyebrow, select_with_disabled, tracked_mono};
+use crate::components::{
+    button, disable_control_node, eyebrow, select_with_disabled, tracked_mono,
+};
 use crate::contracts::Route;
 use crate::theme::{
     ACCENT, BASE, BLUE, DIM, EDGE, ERROR, INK, OCHRE, PANEL, PANEL_2, RUST, SAGE, mono_font,
@@ -122,6 +124,7 @@ impl Workspace {
     ) -> AnyElement {
         if self.sort_open
             && (self.modal_open()
+                || self.edits_fenced()
                 || self.route != Route::MyList
                 || (self.sort_menu_focus_subscription.is_some()
                     && !self.sort_menu_focus.contains_focused(window, cx)))
@@ -306,9 +309,11 @@ impl Workspace {
                                     .profile
                                     .as_ref()
                                     .and_then(|user| user.score_format.clone());
-                                (entry, pending, cover, format)
+                                let step_disabled = this.edits_fenced() || this.modal_open();
+                                (entry, pending, cover, format, step_disabled)
                             });
-                            let Ok((Some(entry), pending, cover, format)) = data else {
+                            let Ok((Some(entry), pending, cover, format, step_disabled)) = data
+                            else {
                                 return div().into_any();
                             };
                             div()
@@ -321,6 +326,7 @@ impl Workspace {
                                     cover,
                                     format.as_deref(),
                                     compact,
+                                    step_disabled,
                                     weak.clone(),
                                 ))
                                 .into_any()
@@ -361,54 +367,63 @@ impl Workspace {
             .border_b_1()
             .border_color(rgb(EDGE))
             .mb(px(16.));
+        let edits_fenced = self.edits_fenced();
         for status in STATUSES {
             let count = self.list.count(status);
             let selected = self.list.filter == status;
             let color = tab_color(status);
-            tabs = tabs.child(
-                div()
-                    .id(format!("tab-{status}"))
-                    .debug_selector(move || format!("tab-{status}"))
-                    .role(gpui::Role::Button)
-                    .aria_label(format!("{} {count}", status_label(status)))
-                    .aria_toggled(gpui::accesskit::Toggled::from(selected))
+            let mut tab = div()
+                .id(format!("tab-{status}"))
+                .debug_selector(move || format!("tab-{status}"))
+                .role(gpui::Role::Button)
+                .aria_label(format!("{} {count}", status_label(status)))
+                .aria_toggled(gpui::accesskit::Toggled::from(selected))
+                .tab_stop(!edits_fenced)
+                .flex()
+                .items_baseline()
+                .whitespace_nowrap()
+                .gap(px(6.))
+                .pt(px(10.))
+                .pb(px(12.))
+                .border_b_2()
+                .border_color(rgb(if selected { color } else { BASE }))
+                .mb(px(-1.))
+                .text_color(rgb(if !edits_fenced && selected { INK } else { DIM }))
+                .opacity(if edits_fenced { 0.5 } else { 1. })
+                .child(
+                    div()
+                        .w(px(5.))
+                        .h(px(5.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(rgb(color))
+                        .bg(rgb(if selected { color } else { BASE }))
+                        .self_center(),
+                )
+                .child(status_label(status))
+                .child(
+                    div()
+                        .font(mono_font())
+                        .text_size(px(13.))
+                        .text_color(rgb(color))
+                        .pl(px(3.))
+                        .child(count.to_string()),
+                );
+            if edits_fenced {
+                tab = tab
+                    .aria_description("Unavailable")
+                    .a11y_synthetic_children(|builder| disable_control_node(builder.parent_node()))
+                    .capture_any_mouse_down(|_, _, cx| cx.stop_propagation());
+            } else {
+                tab = tab
                     .focusable()
-                    .tab_stop(true)
                     .focus_visible(|style| style.bg(rgb(PANEL)).border_color(rgb(ACCENT)))
                     .cursor_pointer()
-                    .flex()
-                    .items_baseline()
-                    .whitespace_nowrap()
-                    .gap(px(6.))
-                    .pt(px(10.))
-                    .pb(px(12.))
-                    .border_b_2()
-                    .border_color(rgb(if selected { color } else { BASE }))
-                    .mb(px(-1.))
-                    .text_color(rgb(if selected { INK } else { DIM }))
-                    .child(
-                        div()
-                            .w(px(5.))
-                            .h(px(5.))
-                            .rounded(px(3.))
-                            .border_1()
-                            .border_color(rgb(color))
-                            .bg(rgb(if selected { color } else { BASE }))
-                            .self_center(),
-                    )
-                    .child(status_label(status))
-                    .child(
-                        div()
-                            .font(mono_font())
-                            .text_size(px(13.))
-                            .text_color(rgb(color))
-                            .pl(px(3.))
-                            .child(count.to_string()),
-                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_filter(status, window, cx)
-                    })),
-            );
+                    }));
+            }
+            tabs = tabs.child(tab);
         }
         let query_focus = self.list_query.read(cx).focus_handle(cx);
         let search = div()
@@ -466,10 +481,9 @@ impl Workspace {
         }
         let mut sort_select = select_with_disabled("sort-select", "Sort list", sort_disabled)
             .aria_value(sort.label())
-            .aria_description(format!("Selected sort: {}", sort.label()))
             .relative()
             .debug_selector(|| "sort-select".into())
-            .aria_expanded(self.sort_open)
+            .aria_expanded(!sort_disabled && self.sort_open)
             .w(px(144.))
             .h(px(42.))
             .flex()
@@ -480,6 +494,7 @@ impl Workspace {
             .child(div().text_color(rgb(DIM)).child("▾"));
         if !sort_disabled {
             sort_select = sort_select
+                .aria_description(format!("Selected sort: {}", sort.label()))
                 .track_focus(&self.sort_menu_focus)
                 .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                     match event.keystroke.key.as_str() {
@@ -571,7 +586,8 @@ impl Workspace {
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.flip_sort(window, cx))),
             )
-            .child(
+            .child({
+                let sync_disabled = self.list.syncing || self.offline || self.edits_fenced();
                 button(
                     "sync-list",
                     if self.list.syncing {
@@ -579,7 +595,7 @@ impl Workspace {
                     } else {
                         "⟳ Sync"
                     },
-                    self.list.syncing || self.offline,
+                    sync_disabled,
                 )
                 .w(px(80.))
                 .h(px(42.))
@@ -588,8 +604,10 @@ impl Workspace {
                 .justify_center()
                 .bg(rgb(BASE))
                 .text_color(rgb(ACCENT))
-                .on_click(cx.listener(|this, _, window, cx| this.sync_list(window, cx))),
-            );
+                .when(!sync_disabled, |button| {
+                    button.on_click(cx.listener(|this, _, window, cx| this.sync_list(window, cx)))
+                })
+            });
         let title_count = self.list.len();
         let episodes = self.list.tracked_episodes();
         let visible_count = self.visible_ids.len();
@@ -733,7 +751,8 @@ impl Workspace {
                     .items_center()
                     .gap(px(10.))
                     .child("Showing your saved list offline.")
-                    .child(
+                    .child({
+                        let reconnect_disabled = self.reconnect_busy || self.edits_fenced();
                         button(
                             "reconnect-list",
                             if self.reconnect_busy {
@@ -741,12 +760,14 @@ impl Workspace {
                             } else {
                                 "Reconnect"
                             },
-                            self.reconnect_busy,
+                            reconnect_disabled,
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.reconnect_account(true, window, cx)
-                        })),
-                    )
+                        .when(!reconnect_disabled, |button| {
+                            button.on_click(cx.listener(|this, _, window, cx| {
+                                this.reconnect_account(true, window, cx)
+                            }))
+                        })
+                    })
                     .when(!self.auth_error.is_empty(), |row| {
                         row.child(div().text_color(rgb(ERROR)).child(self.auth_error.clone()))
                     }),
@@ -966,6 +987,7 @@ impl Workspace {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list_row(
     index: usize,
     entry: ListEntry,
@@ -973,6 +995,7 @@ fn render_list_row(
     cover: Option<Arc<RenderImage>>,
     score_format: Option<&str>,
     compact: bool,
+    step_disabled: bool,
     weak: WeakEntity<Workspace>,
 ) -> AnyElement {
     let id = entry.media_id;
@@ -1023,12 +1046,14 @@ fn render_list_row(
         };
         meta.push((label, BLUE));
     }
-    let total = media.and_then(|m| m.episodes);
+    let total = media.and_then(|m| m.known_episodes());
     let progress = pending.as_ref().map_or(entry.progress, |edit| edit.pending);
     let saving = pending.as_ref().is_some_and(|edit| edit.in_flight);
     let deleting = pending.as_ref().is_some_and(|edit| edit.deleting);
-    let stepper_locked =
-        saving || deleting || pending.as_ref().is_some_and(|edit| edit.requires_review);
+    let stepper_locked = saving
+        || deleting
+        || step_disabled
+        || pending.as_ref().is_some_and(|edit| edit.requires_review);
     let at_min = progress <= 0;
     let at_max = progress >= total.unwrap_or(9999);
     let cover_view: AnyElement = if let Some(image) = cover {
@@ -1073,8 +1098,8 @@ fn render_list_row(
     let mut stepper = div()
         .id(format!("stepper-{id}"))
         .debug_selector(move || format!("stepper-{id}"))
-        .focusable()
-        .tab_stop(true)
+        .tab_stop(!stepper_locked)
+        .when(!stepper_locked, |stepper| stepper.focusable())
         .on_key_down(move |event, window, app| {
             let delta = match event.keystroke.key.as_str() {
                 "left" | "down" | "arrowleft" | "arrowdown" => -1,
@@ -1649,5 +1674,133 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(!workspace.read_with(cx, |workspace, _| workspace.sort_open));
+    }
+
+    #[gpui::test]
+    fn zero_total_stepper_stays_enabled_and_fenced_toolbar_controls_disable_a11y(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::AccessibleAction;
+
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(800.)));
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                ..Default::default()
+            });
+            w.offline = true;
+            w.list.replace(
+                vec![ListEntry {
+                    id: Some(101),
+                    media_id: 9,
+                    status: "CURRENT".into(),
+                    progress: 0,
+                    media: Some(Media {
+                        id: 9,
+                        title_english: Some("Zero Total Show".into()),
+                        episodes: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                super::super::now_seconds(),
+            );
+            w.reset_list_widget();
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+
+        let find_node = |cx: &mut gpui::VisualTestContext, label: &str| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.label() == Some(label)).then_some(node))
+                .unwrap_or_else(|| panic!("missing node {label}"))
+        };
+
+        let plus = find_node(cx, "One more episode");
+        assert!(!plus.is_disabled());
+        assert!(plus.supports_action(AccessibleAction::Click));
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.sort_preferences_loaded = false;
+            w.sort_open = true;
+            w.update_busy = true;
+            cx.notify();
+        });
+        let sort = find_node(cx, "Sort list");
+        assert!(sort.is_disabled());
+        assert_eq!(sort.description(), Some("Unavailable"));
+        assert_eq!(sort.is_expanded(), Some(false));
+
+        let reconnect = find_node(cx, "Reconnect");
+        assert!(reconnect.is_disabled());
+        assert!(!reconnect.supports_action(AccessibleAction::Click));
+
+        workspace.update_in(cx, |w, win, cx| {
+            w.offline = false;
+            w.sync_list(win, cx);
+            assert!(!w.list.syncing, "sync_list must ignore calls while fenced");
+            assert_eq!(w.active_writes, 0);
+            cx.notify();
+        });
+        let sync = find_node(cx, "⟳ Sync");
+        assert!(sync.is_disabled());
+        assert!(!sync.supports_action(AccessibleAction::Click));
+
+        for label in [
+            "Watching 1",
+            "Completed 0",
+            "One less episode",
+            "One more episode",
+        ] {
+            let node = find_node(cx, label);
+            assert!(node.is_disabled(), "{label} should disable while fenced");
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
+        assert_eq!(
+            find_node(cx, "Watching 1").description(),
+            Some("Unavailable")
+        );
+        assert!(!find_node(cx, "Watching 1").supports_action(AccessibleAction::Focus));
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.update_busy = false;
+            w.list.replace(
+                vec![ListEntry {
+                    id: Some(101),
+                    media_id: 9,
+                    status: "CURRENT".into(),
+                    progress: 2,
+                    media: Some(Media {
+                        id: 9,
+                        title_english: Some("Zero Total Show".into()),
+                        episodes: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                super::super::now_seconds(),
+            );
+            w.reset_list_widget();
+            cx.notify();
+        });
+        assert!(!find_node(cx, "Watching 1").is_disabled());
+        assert!(!find_node(cx, "One less episode").is_disabled());
+        assert!(!find_node(cx, "One more episode").is_disabled());
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.logout_confirming = true;
+            cx.notify();
+        });
+        assert!(find_node(cx, "One less episode").is_disabled());
+        assert!(find_node(cx, "One more episode").is_disabled());
     }
 }

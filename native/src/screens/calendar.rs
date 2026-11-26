@@ -215,10 +215,12 @@ impl Workspace {
                         return;
                     }
                     this.calendar.preference_loading = false;
-                    this.calendar.preference_loaded = true;
-                    if let Ok(Some(value)) = result {
-                        this.calendar.watching_only = value != "0";
-                        this.refresh_calendar_visible();
+                    if let Ok(value) = result {
+                        this.calendar.preference_loaded = true;
+                        if let Some(value) = value {
+                            this.calendar.watching_only = value != "0";
+                            this.refresh_calendar_visible();
+                        }
                     }
                     cx.notify();
                 });
@@ -259,6 +261,7 @@ impl Workspace {
         if self.calendar.loaded_range != Some((start, end)) {
             self.calendar.items.clear();
             self.calendar.loaded_range = None;
+            self.calendar.loaded_once = false;
             self.refresh_calendar_visible();
         }
         let generation = self.generation;
@@ -290,9 +293,9 @@ impl Workspace {
                     }
                     return;
                 }
-                this.calendar.loaded_once = true;
                 match result {
                     Ok(items) => {
+                        this.calendar.loaded_once = true;
                         let anchor = this.calendar.scroll_anchor();
                         this.calendar.items = items;
                         this.calendar.loaded_range = Some((start, end));
@@ -414,6 +417,9 @@ impl Workspace {
         let (start, end) = week_dates(self.calendar.anchor, self.calendar.offset);
         let last = end.pred_opt().unwrap_or(end);
         let range = format!("{} – {}", start.format("%b %-d"), last.format("%b %-d"));
+        let reads_fenced = self.stopping || self.writes_fenced();
+        let edits_fenced = self.edits_fenced();
+        let load_disabled = self.calendar.loading || reads_fenced;
         let actions = div()
             .flex()
             .flex_wrap()
@@ -424,7 +430,7 @@ impl Workspace {
                     .border_1()
                     .border_color(rgb(EDGE))
                     .child(
-                        button("calendar-mine", "Watching", false)
+                        button("calendar-mine", "Watching", edits_fenced)
                             .h(px(33.))
                             .px(px(10.))
                             .py(px(5.))
@@ -439,7 +445,7 @@ impl Workspace {
                             })),
                     )
                     .child(
-                        button("calendar-all", "All", false)
+                        button("calendar-all", "All", edits_fenced)
                             .h(px(33.))
                             .px(px(10.))
                             .py(px(5.))
@@ -455,7 +461,7 @@ impl Workspace {
                     ),
             )
             .child(
-                button("calendar-prev", "←", self.calendar.loading)
+                button("calendar-prev", "←", load_disabled)
                     .h(px(35.))
                     .px(px(8.))
                     .py(px(6.))
@@ -466,26 +472,22 @@ impl Workspace {
                     ),
             )
             .child(
-                button(
-                    "calendar-today",
-                    "Today",
-                    self.calendar.loading || start == today(),
-                )
-                .h(px(35.))
-                .px(px(8.))
-                .py(px(6.))
-                .bg(rgb(PANEL_2))
-                .border_color(rgb(PANEL_2))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if !this.calendar.loading
-                        && week_dates(this.calendar.anchor, this.calendar.offset).0 != today()
-                    {
-                        this.reset_calendar_today(window, cx);
-                    }
-                })),
+                button("calendar-today", "Today", load_disabled || start == today())
+                    .h(px(35.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .bg(rgb(PANEL_2))
+                    .border_color(rgb(PANEL_2))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !this.calendar.loading
+                            && week_dates(this.calendar.anchor, this.calendar.offset).0 != today()
+                        {
+                            this.reset_calendar_today(window, cx);
+                        }
+                    })),
             )
             .child(
-                button("calendar-refresh", "Refresh", self.calendar.loading)
+                button("calendar-refresh", "Refresh", load_disabled)
                     .h(px(35.))
                     .px(px(8.))
                     .py(px(6.))
@@ -498,7 +500,7 @@ impl Workspace {
                     })),
             )
             .child(
-                button("calendar-next", "→", self.calendar.loading)
+                button("calendar-next", "→", load_disabled)
                     .h(px(35.))
                     .px(px(8.))
                     .py(px(6.))
@@ -549,7 +551,7 @@ impl Workspace {
                             .child(self.calendar.error.clone()),
                     )
                     .child(
-                        button("calendar-retry", "Retry", self.calendar.loading)
+                        button("calendar-retry", "Retry", load_disabled)
                             .h(px(20.))
                             .px(px(0.))
                             .py(px(0.))
@@ -565,6 +567,7 @@ impl Workspace {
             );
         }
         if !self.list.loaded && !self.list.error.is_empty() {
+            let list_retry_disabled = self.list.loading || self.list.syncing || reads_fenced;
             page = page.child(
                 div()
                     .flex()
@@ -586,7 +589,7 @@ impl Workspace {
                             .child(format!("Could not read your list: {}", self.list.error)),
                     )
                     .child(
-                        button("calendar-list-retry", "Retry list", self.list.loading)
+                        button("calendar-list-retry", "Retry list", list_retry_disabled)
                             .h(px(20.))
                             .px(px(0.))
                             .py(px(0.))
@@ -594,7 +597,11 @@ impl Workspace {
                             .border_color(rgb(ERROR_BG))
                             .text_color(rgb(ACCENT))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if !this.list.loading {
+                                if !this.list.loading
+                                    && !this.list.syncing
+                                    && !this.stopping
+                                    && !this.writes_fenced()
+                                {
                                     this.load_list(window, cx);
                                 }
                             })),
@@ -670,13 +677,7 @@ impl Workspace {
                         .gap(px(8.))
                         .text_size(px(11.))
                         .text_color(rgb(DIM))
-                        .child(format!(
-                            "Ep {}{}",
-                            item.episode,
-                            item.media
-                                .episodes
-                                .map_or_else(String::new, |total| format!("/{total}"))
-                        ));
+                        .child(calendar_episode_label(item.episode, &item.media));
                     if let Some(entry) = entry {
                         meta = meta
                             .child(
@@ -768,6 +769,15 @@ impl Workspace {
         }
         page.into_any()
     }
+}
+
+fn calendar_episode_label(episode: i64, media: &kurisu_core::models::Media) -> String {
+    format!(
+        "Ep {episode}{}",
+        media
+            .known_episodes()
+            .map_or_else(String::new, |total| format!("/{total}"))
+    )
 }
 
 #[cfg(test)]
@@ -1121,5 +1131,134 @@ mod tests {
         assert!(calendar_matches(&item, false, None));
         assert!(calendar_matches(&item, true, Some("CURRENT")));
         assert!(!calendar_matches(&item, true, Some("PLANNING")));
+    }
+
+    #[test]
+    fn calendar_episode_label_omits_non_positive_episode_totals() {
+        let mut media = Media {
+            id: 1,
+            episodes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(calendar_episode_label(4, &media), "Ep 4");
+        media.episodes = Some(-1);
+        assert_eq!(calendar_episode_label(4, &media), "Ep 4");
+        media.episodes = Some(24);
+        assert_eq!(calendar_episode_label(4, &media), "Ep 4/24");
+    }
+
+    #[gpui::test]
+    fn calendar_initial_load_and_preference_failures_retry_on_reentry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Calendar;
+            w.enter_calendar(window, cx);
+            w.read_aborts["calendar-preference"][0].abort();
+            w.read_aborts["calendar"][0].abort();
+        });
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(!w.calendar.loading);
+            assert!(!w.calendar.error.is_empty());
+            assert!(
+                !w.calendar.loaded_once,
+                "failed initial calendar load must remain retryable on re-entry"
+            );
+            assert!(
+                !w.calendar.preference_loaded,
+                "failed calendar preference read must remain retryable on re-entry"
+            );
+        });
+        let (pref_before, cal_before) = view.update_in(cx, |w, window, cx| {
+            let pref = w.calendar.preference_request;
+            let cal = w.calendar.request;
+            w.switch_route(Route::MyList, window, cx);
+            w.switch_route(Route::Calendar, window, cx);
+            (pref, cal)
+        });
+        view.read_with(cx, |w, _| {
+            assert!(w.calendar.preference_request > pref_before);
+            assert!(w.calendar.request > cal_before);
+        });
+    }
+
+    #[gpui::test]
+    fn calendar_controls_respect_read_and_edit_fences(cx: &mut gpui::TestAppContext) {
+        use gpui::AccessibleAction;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.route = Route::Calendar;
+            w.calendar.loaded_once = true;
+            w.calendar.preference_loaded = true;
+            w.calendar.error = "network".into();
+            w.list.loaded = false;
+            w.list.error = "list error".into();
+            w.update_busy = true;
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let button_node = |cx: &mut gpui::VisualTestContext, label: &str| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.label() == Some(label)).then_some(node))
+                .unwrap_or_else(|| panic!("missing calendar button {label}"))
+        };
+        for label in ["Watching", "All"] {
+            let node = button_node(cx, label);
+            assert!(node.is_disabled(), "{label} should disable on edits_fenced");
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
+        assert!(!button_node(cx, "Refresh").is_disabled());
+        assert!(!button_node(cx, "Retry list").is_disabled());
+
+        view.update_in(cx, |w, _, cx| {
+            w.list.syncing = true;
+            cx.notify();
+        });
+        let retry_list = button_node(cx, "Retry list");
+        assert!(retry_list.is_disabled());
+        assert!(!retry_list.supports_action(AccessibleAction::Click));
+
+        view.update_in(cx, |w, _, cx| {
+            w.list.syncing = false;
+            w.update_busy = false;
+            w.close_ready = true;
+            cx.notify();
+        });
+        for label in [
+            "Watching",
+            "All",
+            "←",
+            "Refresh",
+            "→",
+            "Retry",
+            "Retry list",
+        ] {
+            let node = button_node(cx, label);
+            assert!(node.is_disabled(), "{label} should disable on close_ready");
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
     }
 }

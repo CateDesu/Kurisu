@@ -7,13 +7,60 @@ use crate::components::{button, dialog, eyebrow, heading};
 use crate::theme::{ACCENT, BASE, DIM, EDGE, ERROR, PANEL, PANEL_2};
 
 impl Workspace {
+    fn open_update_modal_release(
+        &mut self,
+        url: String,
+        tag: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_update_release_with(
+            tag,
+            async move {
+                tokio::task::spawn_blocking(move || crate::platform::NativePlatform.open_url(&url))
+                    .await
+                    .map_err(|error| error.to_string())?
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn open_update_release_with(
+        &mut self,
+        tag: String,
+        open: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
+        let core = self.core.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = super::joined(core.spawn(open).await);
+            let _ = this.update_in(cx, |this, _, cx| {
+                if !this.stopping
+                    && !this.close_ready
+                    && this.generation == generation
+                    && this.profile.as_ref().map(|user| user.id) == account
+                    && this
+                        .update
+                        .as_ref()
+                        .is_some_and(|update| update.tag == tag && !update.restart_pending)
+                    && let Err(error) = result
+                {
+                    this.update_failed = error;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn escape_active_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_modal() {
             Some(ModalLayer::Barrier | ModalLayer::BarrierError) => self.cancel_barrier(window, cx),
-            Some(ModalLayer::UpdateFailed) => {
-                self.update_failed.clear();
-                cx.notify();
-            }
+            Some(ModalLayer::UpdateFailed) => self.dismiss_update_failed(cx),
             Some(ModalLayer::Update) if !self.update_busy => {
                 if let Some(update) = self.update.take() {
                     self.dismissed_update = update.tag;
@@ -130,7 +177,9 @@ impl Workspace {
                     } else {
                         "Connect via AniList"
                     },
-                    self.auth_busy && !self.auth_retry_available(),
+                    self.stopping
+                        || self.writes_fenced()
+                        || self.auth_busy && !self.auth_retry_available(),
                 )
                 .debug_selector(|| "login-oauth".into())
                 .bg(rgb(ACCENT))
@@ -165,7 +214,9 @@ impl Workspace {
                     button(
                         "login-token-use",
                         "Use",
-                        self.auth_busy && !self.auth_retry_available(),
+                        self.stopping
+                            || self.writes_fenced()
+                            || self.auth_busy && !self.auth_retry_available(),
                     )
                     .on_click(cx.listener(|this, _, window, cx| this.login_with_token(window, cx))),
                 );
@@ -468,11 +519,14 @@ impl Workspace {
                                     button(
                                         "logout-confirm",
                                         "Sign out",
-                                        self.edits_fenced() || active != Some(ModalLayer::Logout),
+                                        self.edits_fenced()
+                                            || self.profile.is_none()
+                                            || active != Some(ModalLayer::Logout),
                                     )
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             if this.edits_fenced()
+                                                || this.profile.is_none()
                                                 || this.active_modal() != Some(ModalLayer::Logout)
                                             {
                                                 return;
@@ -572,6 +626,7 @@ impl Workspace {
         if let Some(update) = self.update.as_ref() {
             let version = update.version.clone();
             let current = update.current.clone();
+            let tag = update.tag.clone();
             let url = update.html_url.clone();
             let can_install = update.can_install;
             let restart_pending = self.restart_pending || update.restart_pending;
@@ -654,27 +709,12 @@ impl Workspace {
                                 if can_install {
                                     this.start_barrier(BarrierAction::Install, window, cx);
                                 } else {
-                                    let url = url.clone();
-                                    let core = this.core.clone();
-                                    cx.spawn_in(window, async move |this, cx| {
-                                        let result = super::joined(
-                                            core.spawn(async move {
-                                                tokio::task::spawn_blocking(move || {
-                                                    crate::platform::NativePlatform.open_url(&url)
-                                                })
-                                                .await
-                                                .map_err(|error| error.to_string())?
-                                            })
-                                            .await,
-                                        );
-                                        let _ = this.update_in(cx, |this, _, cx| {
-                                            if let Err(error) = result {
-                                                this.update_failed = error;
-                                                cx.notify();
-                                            }
-                                        });
-                                    })
-                                    .detach();
+                                    this.open_update_modal_release(
+                                        url.clone(),
+                                        tag.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 }
                             },
                         )),
@@ -683,31 +723,31 @@ impl Workspace {
             layers = layers.child(present(notice.into_any(), ModalLayer::Update, true));
         }
         if !self.update_failed.is_empty() {
-            layers =
-                layers.child(present(
-                    dialog("update-failed", "Update failed")
-                        .w(px(440.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .child(heading("Update failed"))
-                        .child(
-                            div()
-                                .text_color(rgb(ERROR))
-                                .child(self.update_failed.clone()),
-                        )
-                        .child(button("dismiss-update-error", "Got it", false).on_click(
-                            cx.listener(|this, _, _, cx| {
+            layers = layers.child(present(
+                dialog("update-failed", "Update failed")
+                    .w(px(440.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(heading("Update failed"))
+                    .child(
+                        div()
+                            .text_color(rgb(ERROR))
+                            .child(self.update_failed.clone()),
+                    )
+                    .child(
+                        button("dismiss-update-error", "Got it", false)
+                            .debug_selector(|| "dismiss-update-error".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if this.active_modal() == Some(ModalLayer::UpdateFailed) {
-                                    this.update_failed.clear();
-                                    cx.notify();
+                                    this.dismiss_update_failed(cx);
                                 }
-                            }),
-                        ))
-                        .into_any(),
-                    ModalLayer::UpdateFailed,
-                    true,
-                ));
+                            })),
+                    )
+                    .into_any(),
+                ModalLayer::UpdateFailed,
+                true,
+            ));
         }
         if self.close_ready {
             layers = layers.child(present(
@@ -766,21 +806,22 @@ impl Workspace {
                             ),
                     );
                 }
-                alert = alert
-                    .child(
+                if self.barrier_can_retry {
+                    alert = alert.child(
                         button("retry-barrier", "Retry saves", false)
                             .debug_selector(|| "retry-barrier".into())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.retry_barrier(window, cx)),
                             ),
-                    )
-                    .child(
-                        button("cancel-failed-barrier", "Cancel", false)
-                            .debug_selector(|| "cancel-failed-barrier".into())
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.cancel_barrier(window, cx)),
-                            ),
                     );
+                }
+                alert = alert.child(
+                    button("cancel-failed-barrier", "Cancel", false)
+                        .debug_selector(|| "cancel-failed-barrier".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.cancel_barrier(window, cx)),
+                        ),
+                );
             } else {
                 alert = alert
                     .child(
@@ -986,5 +1027,116 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, _| view.clicks), 0);
         cx.simulate_accessibility_action(click());
         assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
+    }
+
+    #[gpui::test]
+    fn view_release_stale_failure_does_not_open_update_failed_after_dismiss_or_stop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::{fixture, settle};
+
+        let sample_update = || kurisu_core::models::UpdateInfo {
+            available: true,
+            tag: "v9.9.9".into(),
+            version: "9.9.9".into(),
+            current: "1.0.0".into(),
+            html_url: "https://github.com/CateDesu/Kurisu/releases/tag/v9.9.9".into(),
+            can_install: false,
+            restart_pending: false,
+            body: String::new(),
+        };
+
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, win, cx| {
+            w.update = Some(sample_update());
+            w.open_update_release_with("v9.9.9".into(), async move { rx.await.unwrap() }, win, cx);
+            w.update = None;
+            cx.notify();
+        });
+        tx.send(Err("browser launch failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(w.update_failed.is_empty());
+            assert_ne!(w.active_modal(), Some(ModalLayer::UpdateFailed));
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, win, cx| {
+            w.update = Some(sample_update());
+            w.open_update_release_with("v9.9.9".into(), async move { rx.await.unwrap() }, win, cx);
+            w.stopping = true;
+            cx.notify();
+        });
+        tx.send(Err("browser launch failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(w.update_failed.is_empty());
+            assert_ne!(w.active_modal(), Some(ModalLayer::UpdateFailed));
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, win, cx| {
+            w.stopping = false;
+            w.update = Some(sample_update());
+            w.open_update_release_with("v9.9.9".into(), async move { rx.await.unwrap() }, win, cx);
+            cx.notify();
+        });
+        tx.send(Err("browser launch failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert_eq!(w.update_failed, "browser launch failed");
+            assert_eq!(w.active_modal(), Some(ModalLayer::UpdateFailed));
+        });
+    }
+
+    #[gpui::test]
+    fn logout_confirm_modal_clears_on_expiry_and_account_switch(cx: &mut gpui::TestAppContext) {
+        use super::super::workspace_tests::fixture;
+        use kurisu_core::models::User;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+
+        view.update_in(cx, |w, win, cx| {
+            w.profile = Some(User {
+                id: 7,
+                name: "Alice".into(),
+                ..Default::default()
+            });
+            w.request_logout(win, cx);
+            assert!(w.logout_confirming);
+            assert_eq!(w.active_modal(), Some(ModalLayer::Logout));
+
+            w.set_profile(None, win, cx);
+            assert!(!w.logout_confirming);
+            assert_ne!(w.active_modal(), Some(ModalLayer::Logout));
+        });
+
+        view.update_in(cx, |w, win, cx| {
+            w.profile = Some(User {
+                id: 7,
+                name: "Alice".into(),
+                ..Default::default()
+            });
+            w.request_logout(win, cx);
+            assert!(w.logout_confirming);
+
+            w.set_profile(
+                Some(User {
+                    id: 8,
+                    name: "Bob".into(),
+                    ..Default::default()
+                }),
+                win,
+                cx,
+            );
+            assert!(!w.logout_confirming);
+            assert_ne!(w.active_modal(), Some(ModalLayer::Logout));
+        });
     }
 }

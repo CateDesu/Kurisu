@@ -10,14 +10,14 @@ Eight runtime source files differ from the published crates:
 - `gpui-linux-gpui-unofficial-1.27.0/src/linux/x11/window.rs` maps and unmaps the existing X11 window and reads its window-manager minimized state.
 - `gpui-linux-gpui-unofficial-1.27.0/src/linux/x11/client.rs` requests XKB detectable autorepeat and marks repeated presses of a held key.
 - `gpui-linux-gpui-unofficial-1.27.0/src/linux/wayland/window.rs` unmaps the existing xdg surface with a null buffer, parks rendering, then remaps through a fresh configure and draw.
-- `gpui-windows-gpui-unofficial-1.27.0/src/window.rs` shows and hides the existing HWND, reads `IsIconic`, and restores it before activation.
+- `gpui-windows-gpui-unofficial-1.27.0/src/window.rs` shows and hides the existing HWND, reads `IsIconic`, restores it before activation, and toggles `SW_MAXIMIZE` and `SW_NORMAL` in `zoom`.
 - `gpui-unofficial-1.27.0/src/elements/list.rs` preserves row height estimates during first layout and width changes, and reports wheel visibility from the installed scroll position. Visible rows are still measured at the new width. Kurisu and UI library tests cover the range and bounded row work.
 
 The patch retains the existing view, renderer, and inactive window throttling. Native shell close and tray actions use this method after the Workspace save barrier.
 
 Two test-support source files also differ from the published `gpui-unofficial` crate:
 
-- `gpui-unofficial-1.27.0/src/app/test_context.rs` simulates test-window accessibility activation and action requests, reads captured tree updates, and runs test teardown when `TestAppContext` drops.
+- `gpui-unofficial-1.27.0/src/app/test_context.rs` simulates test-window accessibility activation and action requests, reads captured tree updates, queries rendered window control areas, and runs test teardown when `TestAppContext` drops.
 - `gpui-unofficial-1.27.0/src/platform/test/window.rs` retains the test window's accessibility callbacks and latest tree update.
 
 Three example images have their metadata removed with identical visible pixels. The JPEG orientation test creates its EXIF orientation in memory. The [dragon example](https://commons.wikimedia.org/wiki/File:Dragon_clip_art.svg) retains its CC BY-SA 3.0 license.

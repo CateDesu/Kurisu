@@ -14,7 +14,35 @@ use crate::components::{button, eyebrow};
 use crate::contracts::Route;
 use crate::theme::{ACCENT, BASE, DIM, EDGE, ERROR, PANEL, PANEL_2, serif_font};
 
+pub(super) const DETAIL_PERSON_LIMIT: usize = 40;
+
 impl Workspace {
+    fn open_detail_external_with(
+        &mut self,
+        open: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+        window: &gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let generation = self.generation;
+        let account = self.profile.as_ref().map(|user| user.id);
+        let core = self.core.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = super::joined(core.spawn(open).await);
+            let _ = this.update_in(cx, |this, _, cx| {
+                if !this.stopping
+                    && !this.close_ready
+                    && this.generation == generation
+                    && this.profile.as_ref().map(|user| user.id) == account
+                    && let Err(error) = result
+                {
+                    this.global_error = error;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn detail_entry_current(
         &self,
         id: i64,
@@ -183,30 +211,17 @@ impl Workspace {
                         return;
                     }
                     let url = format!("https://anilist.co/anime/{id}");
-                    let generation = this.generation;
-                    let core = this.core.clone();
-                    cx.spawn_in(window, async move |this, cx| {
-                        let result = super::joined(
-                            core.spawn(async move {
-                                tokio::task::spawn_blocking(move || {
-                                    crate::platform::NativePlatform.open_url(&url)
-                                })
-                                .await
-                                .map_err(|error| error.to_string())?
+                    this.open_detail_external_with(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::platform::NativePlatform.open_url(&url)
                             })
-                            .await,
-                        );
-                        let _ = this.update_in(cx, |this, _, cx| {
-                            if !this.stopping
-                                && this.generation == generation
-                                && let Err(error) = result
-                            {
-                                this.global_error = error;
-                                cx.notify();
-                            }
-                        });
-                    })
-                    .detach();
+                            .await
+                            .map_err(|error| error.to_string())?
+                        },
+                        window,
+                        cx,
+                    );
                 })),
         );
         intro = intro.child(heading_area);
@@ -305,6 +320,7 @@ impl Workspace {
             } else {
                 "Edit entry"
             };
+            let total = media.episodes.filter(|total| *total > 0);
             list_card =
                 list_card
                     .child(
@@ -319,7 +335,7 @@ impl Workspace {
                                 this.step_progress(id, -1, window, cx)
                             })),
                     )
-                    .child(div().child(if let Some(total) = media.episodes {
+                    .child(div().child(if let Some(total) = total {
                         format!("{progress}/{total}")
                     } else {
                         progress.to_string()
@@ -328,7 +344,7 @@ impl Workspace {
                         button(
                             "detail-more",
                             "+",
-                            stepper_locked || progress >= media.episodes.unwrap_or(9999),
+                            stepper_locked || progress >= total.unwrap_or(9999),
                         )
                         .aria_label("One more episode")
                         .on_click(cx.listener(
@@ -359,30 +375,17 @@ impl Workspace {
                             return;
                         }
                         let path = std::path::PathBuf::from(&path);
-                        let generation = this.generation;
-                        let core = this.core.clone();
-                        cx.spawn_in(window, async move |this, cx| {
-                            let result = super::joined(
-                                core.spawn(async move {
-                                    tokio::task::spawn_blocking(move || {
-                                        crate::platform::NativePlatform.open_path(&path)
-                                    })
-                                    .await
-                                    .map_err(|error| error.to_string())?
+                        this.open_detail_external_with(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::platform::NativePlatform.open_path(&path)
                                 })
-                                .await,
-                            );
-                            let _ = this.update_in(cx, |this, _, cx| {
-                                if !this.stopping
-                                    && this.generation == generation
-                                    && let Err(error) = result
-                                {
-                                    this.global_error = error;
-                                    cx.notify();
-                                }
-                            });
-                        })
-                        .detach();
+                                .await
+                                .map_err(|error| error.to_string())?
+                            },
+                            window,
+                            cx,
+                        );
                     })),
                 );
             }
@@ -522,7 +525,12 @@ impl Workspace {
                 .gap(px(10.))
                 .overflow_x_scroll()
                 .pb(px(4.));
-            for (index, character) in detail.characters.iter().enumerate().take(40) {
+            for (index, character) in detail
+                .characters
+                .iter()
+                .enumerate()
+                .take(DETAIL_PERSON_LIMIT)
+            {
                 let portrait = self
                     .cover_images
                     .get(&(-1 - index as i64, 112, 160))
@@ -567,7 +575,7 @@ impl Workspace {
                 .gap(px(10.))
                 .overflow_x_scroll()
                 .pb(px(4.));
-            for (index, person) in detail.staff.iter().enumerate().take(40) {
+            for (index, person) in detail.staff.iter().enumerate().take(DETAIL_PERSON_LIMIT) {
                 let portrait = self
                     .cover_images
                     .get(&(-200_001 - index as i64, 112, 160))
@@ -761,9 +769,12 @@ impl Workspace {
                     "Retry",
                     disabled || !self.can_retry_progress_errors(),
                 )
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.retry_progress_errors(window, cx)),
-                ),
+                .debug_selector(|| "detail-retry-progress".into())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if !this.progress.busy(this.generation, id) {
+                        this.retry_progress_errors(window, cx);
+                    }
+                })),
             );
         }
         Some(banner.into_any())
@@ -938,7 +949,7 @@ fn media_metadata(media: &Media) -> String {
     if let Some(format) = &media.format {
         parts.push(format.replace('_', " "));
     }
-    if let Some(episodes) = media.episodes {
+    if let Some(episodes) = media.known_episodes() {
         parts.push(format!("{episodes} eps"));
     }
     if let Some(duration) = media.duration {
@@ -2162,5 +2173,160 @@ mod tests {
         assert_eq!(airing_label(&media, 1_000), Some("Ep 3 airs in 1h".into()));
         media.next_airing_at = Some(87_400);
         assert_eq!(airing_label(&media, 1_000), Some("Ep 3 airs in 1d".into()));
+    }
+
+    #[gpui::test]
+    fn disabled_detail_retry_progress_blocks_retry_while_entry_is_busy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::fixture;
+        use kurisu_core::models::{ListEntry, Media, MediaDetail, User};
+        use std::time::Instant;
+
+        let (core, _runtime, _dir) = fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+        cx.simulate_resize(size(px(1100.), px(1000.)));
+        workspace.update_in(cx, |w, _, cx| {
+            w.profile = Some(User {
+                id: 47,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Anime(9);
+            let request = w.detail.start(9);
+            let entry9 = ListEntry {
+                id: Some(109),
+                media_id: 9,
+                status: "CURRENT".into(),
+                progress: 3,
+                media: Some(Media {
+                    id: 9,
+                    title_english: Some("Show Nine".into()),
+                    episodes: Some(12),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let entry10 = ListEntry {
+                id: Some(110),
+                media_id: 10,
+                status: "CURRENT".into(),
+                progress: 2,
+                media: Some(Media {
+                    id: 10,
+                    title_english: Some("Show Ten".into()),
+                    episodes: Some(12),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            w.list.replace(vec![entry9.clone(), entry10.clone()], 0);
+            w.detail.finish_detail(
+                9,
+                request,
+                Ok(MediaDetail {
+                    media: entry9.media.clone().unwrap(),
+                    relations: vec![],
+                    characters: vec![],
+                    staff: vec![],
+                    cached_at: None,
+                    warning: None,
+                    unavailable_sections: vec![],
+                }),
+            );
+            w.detail.finish_entry(9, request, Ok(Some(entry9.clone())));
+            let edit9 = w.progress.entry(w.generation, &entry9);
+            assert!(edit9.step(1, Instant::now()));
+            assert!(edit9.begin_save().is_some());
+            edit9.finish_save(Err("offline".into()));
+            let edit10 = w.progress.entry(w.generation, &entry10);
+            assert!(edit10.step(1, Instant::now()));
+            assert!(edit10.begin_save().is_some());
+            edit10.finish_save(Err("offline".into()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let retry_bounds = cx
+            .debug_bounds("detail-retry-progress")
+            .expect("detail retry button bounds");
+        workspace.update_in(cx, |w, _, _| {
+            assert!(w.progress.begin_delete(w.generation, 9));
+            assert!(w.progress.busy(w.generation, 9));
+        });
+        cx.simulate_click(retry_bounds.center(), gpui::Modifiers::default());
+        workspace.read_with(cx, |w, _| {
+            assert_eq!(
+                w.active_writes, 0,
+                "disabled detail retry button must not retry progress while entry is busy"
+            );
+            assert!(!w.progress.busy(w.generation, 10));
+        });
+    }
+
+    #[test]
+    fn media_metadata_omits_non_positive_episode_totals() {
+        let mut media = Media {
+            id: 1,
+            format: Some("TV".into()),
+            episodes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(super::media_metadata(&media), "TV");
+        media.episodes = Some(-3);
+        assert_eq!(super::media_metadata(&media), "TV");
+        media.episodes = Some(12);
+        assert_eq!(super::media_metadata(&media), "TV · 12 eps");
+    }
+
+    #[gpui::test]
+    fn detail_external_launch_failure_is_ignored_after_expiry_or_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::{fixture, settle};
+        use kurisu_core::models::User;
+
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core, window, cx, false)
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            let generation = w.generation;
+            w.open_detail_external_with(async move { rx.await.unwrap() }, window, cx);
+            w.set_profile_at(None, generation, window, cx);
+            assert_eq!(w.generation, generation);
+        });
+        tx.send(Err("open failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| assert!(w.global_error.is_empty()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, window, cx| {
+            w.profile = Some(User {
+                id: 7,
+                ..Default::default()
+            });
+            w.open_detail_external_with(async move { rx.await.unwrap() }, window, cx);
+            w.close_ready = true;
+        });
+        tx.send(Err("open failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| assert!(w.global_error.is_empty()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        view.update_in(cx, |w, window, cx| {
+            w.close_ready = false;
+            w.open_detail_external_with(async move { rx.await.unwrap() }, window, cx);
+        });
+        tx.send(Err("open failed".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| assert_eq!(w.global_error, "open failed"));
     }
 }

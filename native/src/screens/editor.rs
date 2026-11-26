@@ -308,6 +308,7 @@ impl Workspace {
                     }
                     if let (Some(editor), Ok(number)) =
                         (this.editor.as_mut(), value.trim().parse::<i64>())
+                        && (0..=i64::from(i32::MAX)).contains(&number)
                     {
                         editor.edit_progress(number);
                         if editor.status == "COMPLETED" && editor.progress != number {
@@ -631,18 +632,23 @@ impl Workspace {
             .read(cx)
             .value()
             .trim()
-            .parse()
-            .map_err(|_| "Enter a valid episode progress.".to_string())?;
-        if editor.progress != progress {
-            editor.set_progress(progress);
-        }
-        editor.repeat = inputs
+            .parse::<i64>()
+            .ok()
+            .filter(|value| (0..=i64::from(i32::MAX)).contains(value))
+            .ok_or_else(|| "Enter a valid episode progress.".to_string())?;
+        let repeat = inputs
             .repeat
             .read(cx)
             .value()
             .trim()
-            .parse()
-            .map_err(|_| "Enter a valid rewatch count.".to_string())?;
+            .parse::<i64>()
+            .ok()
+            .filter(|value| (0..=1000).contains(value))
+            .ok_or_else(|| "Enter a valid rewatch count.".to_string())?;
+        if editor.progress != progress {
+            editor.set_progress(progress);
+        }
+        editor.repeat = repeat;
         if editor.score_available() {
             let score = inputs.score.read(cx).value().trim();
             let score = if score.is_empty() {
@@ -1102,6 +1108,7 @@ impl Workspace {
             );
             let _ = this.update_in(cx, |this, _, cx| {
                 if !this.stopping
+                    && !this.close_ready
                     && this.generation == generation
                     && this.profile.as_ref().map(|user| user.id) == account
                     && let Err(error) = result
@@ -1193,24 +1200,34 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .gap(px(3.))
-                .child(
-                    div()
+                .child({
+                    let mut heading = div()
                         .id("editor-title")
+                        .debug_selector(|| "editor-title".into())
                         .role(gpui::Role::Button)
                         .aria_label(format!("Open details for {title}"))
-                        .focusable()
                         .tab_stop(!disabled)
-                        .cursor_pointer()
                         .font(serif_font())
                         .text_size(px(21.))
                         .line_height(px(26.))
                         .w_full()
                         .truncate()
-                        .child(title)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_editor_detail(id, window, cx)
-                        })),
-                )
+                        .child(title);
+                    if disabled {
+                        heading = heading
+                            .opacity(0.45)
+                            .aria_description("Unavailable")
+                            .a11y_synthetic_children(|builder| {
+                                crate::components::disable_control_node(builder.parent_node())
+                            })
+                            .capture_any_mouse_down(|_, _, cx| cx.stop_propagation());
+                    } else {
+                        heading = heading.focusable().cursor_pointer().on_click(cx.listener(
+                            move |this, _, window, cx| this.open_editor_detail(id, window, cx),
+                        ));
+                    }
+                    heading
+                })
                 .child(div().text_size(px(12.)).text_color(rgb(DIM)).child(watched)),
         );
         if let Some(next_episode) = editor.progress.checked_add(1)
@@ -1630,44 +1647,51 @@ impl Workspace {
                 } else {
                     div().w(px(96.)).h(px(128.)).bg(rgb(PANEL_2)).into_any()
                 };
-                recs = recs.child(
-                    div()
-                        .id(format!("editor-rec-{rec_id}"))
-                        .role(gpui::Role::Button)
-                        .aria_label(format!("{title} — add to Plan to Watch"))
-                        .focusable()
-                        .tab_stop(!busy)
-                        .w(px(96.))
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if !busy {
-                                this.add_media(rec_id, "PLANNING", origin, window, cx);
-                            }
-                        }))
-                        .child(
-                            div()
-                                .w(px(96.))
-                                .h(px(128.))
-                                .overflow_hidden()
-                                .rounded(px(4.))
-                                .child(cover),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .mt(px(4.))
-                                .text_size(px(12.))
-                                .text_color(rgb(DIM))
-                                .whitespace_normal()
-                                .line_clamp(2)
-                                .child(if added { "✓ Added".into() } else { title }),
-                        ),
-                );
+                let mut rec = div()
+                    .id(format!("editor-rec-{rec_id}"))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("{title} — add to Plan to Watch"))
+                    .tab_stop(!busy)
+                    .w(px(96.))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if !busy && !this.add_media_blocked(rec_id, origin) {
+                            this.add_media(rec_id, "PLANNING", origin, window, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .w(px(96.))
+                            .h(px(128.))
+                            .overflow_hidden()
+                            .rounded(px(4.))
+                            .child(cover),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .mt(px(4.))
+                            .text_size(px(12.))
+                            .text_color(rgb(DIM))
+                            .whitespace_normal()
+                            .line_clamp(2)
+                            .child(if added { "✓ Added".into() } else { title }),
+                    );
+                if busy {
+                    rec = rec
+                        .aria_description("Unavailable")
+                        .a11y_synthetic_children(|builder| {
+                            crate::components::disable_control_node(builder.parent_node())
+                        })
+                        .capture_any_mouse_down(|_, _, cx| cx.stop_propagation());
+                } else {
+                    rec = rec.focusable().cursor_pointer();
+                }
+                recs = recs.child(rec);
             }
             form = form.child(recs);
         }
@@ -6007,9 +6031,10 @@ mod tests {
             "launch failed after close"
         );
 
-        for case in ["account", "generation", "stopping"] {
+        for case in ["account", "generation", "stopping", "close_ready"] {
             workspace.update_in(cx, |w, window, cx| {
                 w.stopping = false;
+                w.close_ready = false;
                 w.global_error.clear();
                 w.profile = Some(kurisu_core::User {
                     id: 7,
@@ -6034,6 +6059,7 @@ mod tests {
                     });
                 }
                 "generation" => w.generation += 1,
+                "close_ready" => w.close_ready = true,
                 _ => w.stopping = true,
             });
             tx.send(Err(format!("stale {case} error"))).unwrap();
@@ -6048,6 +6074,7 @@ mod tests {
         let _unused = _hook.install(opened.clone());
         workspace.update_in(cx, |w, window, cx| {
             w.stopping = false;
+            w.close_ready = false;
             w.profile = Some(kurisu_core::User {
                 id: 7,
                 score_format: Some("POINT_100".into()),
@@ -6531,6 +6558,183 @@ mod tests {
                 "080"
             );
         });
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(core);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn negative_progress_and_repeat_fail_validation_and_disabled_rec_removes_a11y_actions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AccessibleAction, EntityInputHandler};
+
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(1000.)));
+        let (progress, repeat) = workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 47,
+                name: "Alice".into(),
+                score_format: Some("POINT_100".into()),
+                ..Default::default()
+            });
+            w.list.replace(vec![total_entry("COMPLETED", 12)], 0);
+            w.open_editor(71, window, cx);
+            let inputs = w.editor_inputs.as_ref().unwrap();
+            (inputs.progress.clone(), inputs.repeat.clone())
+        });
+        progress.update_in(cx, |input, window, cx| {
+            input.replace_text_in_range(Some(0..2), "-5", window, cx)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, _, cx| {
+            assert_eq!(w.editor.as_ref().unwrap().status, "COMPLETED");
+            assert_eq!(w.editor.as_ref().unwrap().progress, 12);
+            assert_eq!(
+                w.read_editor_inputs(cx).unwrap_err(),
+                "Enter a valid episode progress."
+            );
+        });
+        progress.update_in(cx, |input, window, cx| {
+            input.replace_text_in_range(Some(0..2), "12", window, cx)
+        });
+        repeat.update_in(cx, |input, window, cx| {
+            input.replace_text_in_range(Some(0..input.value().len()), "-2", window, cx)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, _, cx| {
+            assert_eq!(
+                w.read_editor_inputs(cx).unwrap_err(),
+                "Enter a valid rewatch count."
+            );
+
+            w.editor_recs = vec![kurisu_core::models::Media {
+                id: 99,
+                title_english: Some("Rec Show".into()),
+                ..Default::default()
+            }];
+            w.editor_adding.insert(99);
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let tree = cx.take_accessibility_tree_update().unwrap();
+        let (_, rec) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Rec Show — add to Plan to Watch"))
+            .expect("editor recommendation button node");
+        assert!(rec.is_disabled(), "busy recommendation should be disabled");
+        assert!(!rec.supports_action(AccessibleAction::Click));
+        assert!(!rec.supports_action(AccessibleAction::Focus));
+        cx.update(|window, _| window.remove_window());
+        drop(workspace);
+        drop(core);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn editor_rejects_out_of_range_progress_and_repeat_without_sending_requests_and_gates_title(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AccessibleAction, EntityInputHandler};
+
+        let (core, runtime, _dir) = editor_fixture();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_session_restore(core.clone(), window, cx, false)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(1000.)));
+        let (progress, repeat, notes) = workspace.update_in(cx, |w, window, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                name: "Tester".into(),
+                ..Default::default()
+            });
+            w.list.replace(vec![total_entry("CURRENT", 3)], 0);
+            w.open_editor(71, window, cx);
+            let inputs = w.editor_inputs.as_ref().unwrap();
+            (
+                inputs.progress.clone(),
+                inputs.repeat.clone(),
+                inputs.notes.clone(),
+            )
+        });
+
+        notes.update_in(cx, |input, window, cx| {
+            input.replace_text_in_range(Some(0..0), "dirty note", window, cx);
+        });
+        progress.update_in(cx, |input, window, cx| {
+            let len = input.value().len();
+            input.replace_text_in_range(Some(0..len), "2147483648", window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, window, cx| {
+            assert_eq!(w.editor.as_ref().unwrap().progress, 3);
+            w.save_editor(window, cx);
+            assert_eq!(w.active_writes, 0);
+            assert!(!w.editor.as_ref().unwrap().busy);
+            assert_eq!(
+                w.editor.as_ref().unwrap().error,
+                "Enter a valid episode progress."
+            );
+        });
+
+        progress.update_in(cx, |input, window, cx| {
+            let len = input.value().len();
+            input.replace_text_in_range(Some(0..len), "9", window, cx);
+        });
+        repeat.update_in(cx, |input, window, cx| {
+            let len = input.value().len();
+            input.replace_text_in_range(Some(0..len), "1001", window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, window, cx| {
+            w.editor.as_mut().unwrap().progress = 3;
+            w.save_editor(window, cx);
+            assert_eq!(w.active_writes, 0);
+            assert!(!w.editor.as_ref().unwrap().busy);
+            assert_eq!(w.editor.as_ref().unwrap().progress, 3);
+            assert_eq!(
+                w.editor.as_ref().unwrap().error,
+                "Enter a valid rewatch count."
+            );
+        });
+
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+        let find_title = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find_map(|(_, node)| {
+                    node.label()
+                        .is_some_and(|label| label.starts_with("Open details for "))
+                        .then_some(node)
+                })
+                .expect("editor-title button node")
+        };
+        let enabled = find_title(cx);
+        assert!(!enabled.is_disabled());
+        assert!(enabled.supports_action(AccessibleAction::Click));
+
+        workspace.update_in(cx, |w, _, cx| {
+            w.update_busy = true;
+            cx.notify();
+        });
+        let disabled = find_title(cx);
+        assert!(disabled.is_disabled());
+        assert_eq!(disabled.description(), Some("Unavailable"));
+        assert!(!disabled.supports_action(AccessibleAction::Click));
+        assert!(!disabled.supports_action(AccessibleAction::Focus));
+
         cx.update(|window, _| window.remove_window());
         drop(workspace);
         drop(core);

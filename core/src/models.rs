@@ -89,6 +89,10 @@ impl Media {
             .unwrap_or_else(|| format!("#{}", self.id))
     }
 
+    pub fn known_episodes(&self) -> Option<i64> {
+        self.episodes.filter(|total| *total > 0)
+    }
+
     fn title(&self) -> Option<&str> {
         self.title_english
             .as_deref()

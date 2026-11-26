@@ -152,7 +152,10 @@ def latest_stable(releases):
             continue
     if not versions:
         raise ValueError("No published stable numeric release was found")
-    return max(versions, key=lambda value: tuple(map(int, value.split("."))))
+    return max(
+        versions,
+        key=lambda value: (parts := tuple(map(int, value.split(".")))) + (0,) * (4 - len(parts)),
+    )
 
 
 def resolve_version(explicit, offline):

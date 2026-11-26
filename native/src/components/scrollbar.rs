@@ -186,6 +186,9 @@ fn render_scrollbar(
     changed: Rc<ScrollChanged>,
     notification: Rc<ScrollNotification>,
 ) -> gpui::Stateful<gpui::Div> {
+    if state.is_scrollbar_dragging() && notification.grab.get().is_none() {
+        state.scrollbar_drag_ended();
+    }
     let maximum = f32::from(state.max_offset_for_scrollbar().y);
     let position = (-f32::from(state.scroll_px_offset_for_scrollbar().y))
         .max(0.)
@@ -337,6 +340,7 @@ fn render_scrollbar(
                             return;
                         }
                         let Some(grab) = move_notification.grab.get() else {
+                            move_state.scrollbar_drag_ended();
                             return;
                         };
                         move_to_pointer(&move_state, bounds, event.position.y, grab);
@@ -359,6 +363,7 @@ fn render_scrollbar(
                             return;
                         }
                         let Some(grab) = painted_notification.grab.take() else {
+                            up_state.scrollbar_drag_ended();
                             return;
                         };
                         let at_end = move_to_pointer(&up_state, bounds, event.position.y, grab);
@@ -881,5 +886,58 @@ mod tests {
         assert_eq!(seen.get(), Some(state.logical_scroll_top().item_ix));
         assert!(seen.get().unwrap() < 20);
         assert_eq!(state.bounds_for_item(19).unwrap().size.height, px(150.));
+    }
+
+    #[gpui::test]
+    fn unmounting_scrollbar_mid_drag_releases_list_drag_state_on_remount(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct ToggleTrack {
+            state: ListState,
+            show_track: bool,
+        }
+
+        impl gpui::Render for ToggleTrack {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        gpui::list(self.state.clone(), |_, _, _| div().h(px(90.)).into_any())
+                            .size_full(),
+                    )
+                    .when(self.show_track, |view| {
+                        view.child(list_scrollbar(
+                            "toggle-track",
+                            "Rows",
+                            self.state.clone(),
+                            |_, _, _| {},
+                        ))
+                    })
+            }
+        }
+
+        let state =
+            ListState::new(250, ListAlignment::Top, px(0.)).with_uniform_item_height(px(90.));
+        let (view, cx) = cx.add_window_view(|_, _| ToggleTrack {
+            state: state.clone(),
+            show_track: true,
+        });
+        cx.run_until_parked();
+        let position = cx.update(|window, _| point(window.viewport_size().width - px(5.), px(2.)));
+        cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+        assert!(state.is_scrollbar_dragging());
+
+        view.update(cx, |this, cx| {
+            this.show_track = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |this, cx| {
+            this.show_track = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!state.is_scrollbar_dragging());
     }
 }

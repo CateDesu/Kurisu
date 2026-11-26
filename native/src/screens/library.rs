@@ -66,6 +66,13 @@ enum BindMode {
     Link,
     Numbering,
 }
+#[derive(Clone)]
+struct BindSubmission {
+    target: String,
+    media_id: i64,
+    offset: i64,
+    scope: BindScope,
+}
 struct BindDialog {
     id: u64,
     revision: u64,
@@ -84,6 +91,7 @@ struct BindDialog {
     relink: Option<i64>,
     restored: bool,
     offset_edited: bool,
+    submitted: Option<BindSubmission>,
 }
 pub(super) struct LibraryDraft {
     bind: BindDialog,
@@ -160,6 +168,8 @@ pub(super) struct LibraryState {
     busy: bool,
     picking: bool,
     opening_file: bool,
+    #[cfg(test)]
+    open_file_result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     action_error: String,
     scanned_count: Option<usize>,
     rescan_feedback: bool,
@@ -210,6 +220,8 @@ impl Default for LibraryState {
             busy: false,
             picking: false,
             opening_file: false,
+            #[cfg(test)]
+            open_file_result: None,
             action_error: String::new(),
             scanned_count: None,
             rescan_feedback: false,
@@ -221,6 +233,45 @@ impl Default for LibraryState {
 }
 
 impl LibraryState {
+    pub(super) fn barrier_error(&self) -> Option<(String, bool)> {
+        if let Some(bind) = &self.bind {
+            if !bind.error.is_empty() {
+                return Some((
+                    format!(
+                        "Could not save library link: {}. Kurisu is still open.",
+                        bind.error
+                    ),
+                    bind.submitted.is_some(),
+                ));
+            }
+            if bind.offset_edited || bind.relink.is_some() || bind.restored {
+                return Some((
+                    "Unsaved library link changes are still open. Save or discard them before continuing."
+                        .into(),
+                    false,
+                ));
+            }
+        }
+        if self.pending_draft.is_some() {
+            return Some((
+                "Unsaved library link changes are waiting on the Library tab. Review or discard them before continuing."
+                    .into(),
+                false,
+            ));
+        }
+        None
+    }
+
+    pub(super) fn discard_barrier_draft(&mut self) -> bool {
+        self.pending_draft = None;
+        if self.bind.as_ref().is_some_and(|bind| !bind.busy) {
+            self.bind = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn capture_fenced_inputs(&mut self, cx: &gpui::App) {
         if self.fenced_inputs.is_none() {
             let values = [&self.offset, &self.link_query];
@@ -389,6 +440,7 @@ impl Workspace {
                             this.prefetch_library_link_covers(cx);
                         } else if let Some(bind) = &mut this.library_screen.bind {
                             bind.offset_edited = true;
+                            bind.submitted = None;
                             bind.revision = bind.revision.wrapping_add(1);
                         }
                         cx.notify();
@@ -416,6 +468,7 @@ impl Workspace {
             draft.bind.loading = false;
             draft.bind.busy = false;
             draft.bind.relink = None;
+            draft.bind.submitted = None;
             draft.bind.error.clear();
             draft.bind.restored = true;
             self.library_screen.link_cover_query = draft.query.trim().to_lowercase();
@@ -437,6 +490,7 @@ impl Workspace {
             return self.library_screen.pending_draft.take();
         };
         bind.busy = false;
+        bind.submitted = None;
         let query = self
             .library_screen
             .link_query
@@ -476,9 +530,22 @@ impl Workspace {
         self.prefetch_library_link_covers_for(&query);
     }
 
-    fn refresh_library_link_covers(&mut self) {
+    pub(super) fn refresh_library_link_covers(&mut self) {
         let query = self.library_screen.link_cover_query.clone();
         self.prefetch_library_link_covers_for(&query);
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_library_link_dialog_for_test(
+        &mut self,
+        entries: Vec<ListEntry>,
+        path: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.library_screen.entries = entries;
+        self.open_library_bind(path, None, BindMode::Link, window, cx);
+        self.cancel_reads("library-binding");
     }
 
     fn prefetch_library_link_covers_for(&mut self, query: &str) {
@@ -869,6 +936,7 @@ impl Workspace {
             relink: None,
             restored: false,
             offset_edited: false,
+            submitted: None,
         };
         let allowed = self.library_screen.folders_loaded
             && dialog.folder_allowed(&self.library_screen.folders);
@@ -906,6 +974,7 @@ impl Workspace {
             bind.current = None;
             bind.checked = false;
             bind.relink = None;
+            bind.submitted = None;
             self.library_screen
                 .set_binding_input(OFFSET_INPUT, "0".into(), cx);
             self.load_library_binding(window, cx);
@@ -952,6 +1021,7 @@ impl Workspace {
         bind.current_title = None;
         bind.error.clear();
         bind.relink = None;
+        bind.submitted = None;
         let request = bind.request;
         let dialog_id = self.library_screen.bind_request;
         let mode = bind.mode;
@@ -1097,8 +1167,16 @@ impl Workspace {
                 .current
                 .is_some_and(|current| current.media_id != media_id)
         {
+            bind.submitted = None;
             bind.error = "This location is linked to a different show. Select this file only or relink it first.".into();
             cx.notify();
+            return;
+        }
+        if bind.mode == BindMode::Link
+            && bind
+                .current
+                .is_some_and(|current| current.media_id == media_id)
+        {
             return;
         }
         if bind.mode == BindMode::Link
@@ -1108,6 +1186,7 @@ impl Workspace {
             && bind.relink != Some(media_id)
         {
             bind.relink = Some(media_id);
+            bind.submitted = None;
             bind.revision = bind.revision.wrapping_add(1);
             cx.notify();
             return;
@@ -1119,13 +1198,54 @@ impl Workspace {
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_default();
         let Ok(offset) = raw.parse::<i64>() else {
+            bind.submitted = None;
             bind.error = "Enter a whole-number offset between -9999 and 9999.".into();
             cx.notify();
             return;
         };
         if !(-9999..=9999).contains(&offset) {
+            bind.submitted = None;
             bind.error = "Enter a whole-number offset between -9999 and 9999.".into();
             cx.notify();
+            return;
+        }
+        let submission = BindSubmission {
+            target,
+            media_id,
+            offset,
+            scope: bind.scope,
+        };
+        self.submit_library_bind(submission, window, cx);
+    }
+
+    pub(super) fn retry_library_bind(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !matches!(
+            self.barrier,
+            Some(super::BarrierAction::Close(_) | super::BarrierAction::Install)
+        ) {
+            return;
+        }
+        let submission = self
+            .library_screen
+            .bind
+            .as_ref()
+            .filter(|bind| !bind.busy && !bind.error.is_empty())
+            .and_then(|bind| bind.submitted.clone());
+        if let Some(submission) = submission {
+            self.submit_library_bind(submission, window, cx);
+        }
+    }
+
+    fn submit_library_bind(
+        &mut self,
+        submission: BindSubmission,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bind) = self.library_screen.bind.as_mut() else {
+            return;
+        };
+        if bind.busy {
             return;
         }
         if bind.id == 0 {
@@ -1135,7 +1255,7 @@ impl Workspace {
         bind.revision = bind.revision.wrapping_add(1);
         let bind_id = bind.id;
         let save_revision = bind.revision;
-        let scope = bind.scope;
+        bind.submitted = Some(submission.clone());
         bind.busy = true;
         bind.error.clear();
         if let Some(input) = &self.library_screen.offset {
@@ -1149,7 +1269,12 @@ impl Workspace {
             let result = joined(
                 core.spawn(async move {
                     worker
-                        .bind_library_path(target, media_id, Some(offset), scope)
+                        .bind_library_path(
+                            submission.target,
+                            submission.media_id,
+                            Some(submission.offset),
+                            submission.scope,
+                        )
                         .await
                 })
                 .await,
@@ -1678,6 +1803,8 @@ impl Workspace {
                 ),
         );
         if history_open {
+            let history_disabled =
+                self.library_screen.history_loading || self.stopping || self.writes_fenced();
             page = page
                 .child(
                     div()
@@ -1689,10 +1816,15 @@ impl Workspace {
                     button(
                         "library-history-refresh",
                         "Refresh history",
-                        self.library_screen.history_loading,
+                        history_disabled,
                     )
+                    .debug_selector(|| "library-history-refresh".into())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if scope_matches(this, generation, account) {
+                        if scope_matches(this, generation, account)
+                            && !this.library_screen.history_loading
+                            && !this.stopping
+                            && !this.writes_fenced()
+                        {
                             this.load_library_history(false, window, cx);
                         }
                     })),
@@ -1811,10 +1943,14 @@ impl Workspace {
                         } else {
                             "Load older history"
                         },
-                        self.library_screen.history_loading,
+                        history_disabled,
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if scope_matches(this, generation, account) {
+                        if scope_matches(this, generation, account)
+                            && !this.library_screen.history_loading
+                            && !this.stopping
+                            && !this.writes_fenced()
+                        {
                             this.load_library_history(true, window, cx);
                         }
                     })),
@@ -2048,8 +2184,11 @@ impl Workspace {
                         "Retry loading library folders",
                         disabled || self.library_screen.scanning,
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if !this.library_binding_inputs_disabled() {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if scope_matches(this, generation, account)
+                            && !this.library_binding_inputs_disabled()
+                            && !this.library_screen.scanning
+                        {
                             this.refresh_library_data(window, cx);
                         }
                     })),
@@ -2364,7 +2503,13 @@ fn open_file(
     this.library_screen.opening_file = true;
     this.library_screen.action_error.clear();
     let path = Path::new(path).to_path_buf();
+    #[cfg(test)]
+    let controlled = this.library_screen.open_file_result.take();
     let job = this.core.spawn(async move {
+        #[cfg(test)]
+        if let Some(controlled) = controlled {
+            return controlled.await.map_err(|error| error.to_string())?;
+        }
         tokio::task::spawn_blocking(move || {
             if reveal {
                 crate::platform::NativePlatform.reveal_path(&path)
@@ -2378,11 +2523,12 @@ fn open_file(
     cx.spawn(async move |this, cx| {
         let result = joined(job.await);
         let _ = this.update(cx, |this, cx| {
-            if !scope_matches(this, generation, account) {
+            if this.stopping || !scope_matches(this, generation, account) {
                 return;
             }
             this.library_screen.opening_file = false;
-            if this.core.generation() == generation
+            if !this.close_ready
+                && this.core.generation() == generation
                 && let Err(error) = result
             {
                 this.library_screen.action_error = error;
@@ -2419,7 +2565,7 @@ fn render_library_row(
                 .entry
                 .as_ref()
                 .and_then(|entry| entry.media.as_ref())
-                .and_then(|media| media.episodes);
+                .and_then(|media| media.known_episodes());
             let weak_toggle = weak.clone();
             let weak_detail = weak.clone();
             let weak_unlink = weak.clone();
@@ -2465,15 +2611,10 @@ fn render_library_row(
                         .flex_col()
                         .child(div().whitespace_normal().text_color(rgb(INK)).child(title))
                         .child(div().text_size(px(11.)).text_color(rgb(DIM)).child(format!(
-                                "{} · {} files",
-                                progress
-                                    .map(|progress| format!(
-                                        "Ep {progress}{} watched",
-                                        total.map(|total| format!("/{total}")).unwrap_or_default()
-                                    ))
-                                    .unwrap_or_else(|| "Not on your list".into()),
-                                group.files.len()
-                            ))),
+                            "{} · {} files",
+                            library_group_progress_label(progress, total),
+                            group.files.len()
+                        ))),
                 )
                 .child(
                     button(format!("library-detail-{id}"), "Details", false).on_click(
@@ -2710,6 +2851,20 @@ fn render_library_row(
                 .into_any()
         }
     }
+}
+
+fn library_group_progress_label(progress: Option<i64>, total: Option<i64>) -> String {
+    progress
+        .map(|progress| {
+            format!(
+                "Ep {progress}{} watched",
+                total
+                    .filter(|total| *total > 0)
+                    .map(|total| format!("/{total}"))
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| "Not on your list".into())
 }
 
 #[cfg(test)]
@@ -3448,7 +3603,7 @@ mod tests {
         });
     }
 
-    fn set_binding_draft(w: &mut Workspace) {
+    pub(super) fn set_binding_draft(w: &mut Workspace) {
         w.library_screen.bind = Some(BindDialog {
             id: 0,
             revision: 0,
@@ -3467,6 +3622,7 @@ mod tests {
             relink: None,
             restored: false,
             offset_edited: true,
+            submitted: None,
         });
         w.library_screen.binding_input_values[OFFSET_INPUT] = "3".into();
     }
@@ -3966,6 +4122,7 @@ mod tests {
                 relink: None,
                 restored: false,
                 offset_edited: false,
+                submitted: None,
             });
             this.library_screen.entries = (1..=101)
                 .map(|id| ListEntry {
@@ -4158,6 +4315,7 @@ mod tests {
                 relink: None,
                 restored: false,
                 offset_edited: false,
+                submitted: None,
             });
             let input = cx.new(|cx| TextInput::new("", "offset", window, cx));
             this.library_screen.offset = Some(input.clone());
@@ -4240,6 +4398,7 @@ mod tests {
                 relink: None,
                 restored: false,
                 offset_edited: false,
+                submitted: None,
             });
             this.load_library_binding_title(1, window, cx);
         });
@@ -4382,6 +4541,7 @@ mod tests {
             relink: None,
             restored: false,
             offset_edited: false,
+            submitted: None,
         };
         let roots = ["/controlled/root".into()];
         assert_eq!(bind.target(&roots, false), None);
@@ -4550,6 +4710,7 @@ mod tests {
             relink: None,
             restored: false,
             offset_edited: false,
+            submitted: None,
         };
         assert!(!dialog.folder_allowed(&[]));
         let (_core, _runtime, dir) = super::super::workspace_tests::fixture();
@@ -5059,6 +5220,741 @@ mod modal_regressions {
         wait_writes(cx);
         view.read_with(cx, |w, _| {
             assert!(w.library_drafts.contains_key(&7));
+        });
+    }
+
+    #[gpui::test]
+    fn link_mode_ignores_currently_linked_show_and_history_refresh_gates_loading(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (initial, runtime, dir) = fixture();
+        drop(initial);
+        let db = Db::open(&dir.0.join("kurisu.db")).unwrap();
+        let user = User {
+            id: 7,
+            offline: true,
+            ..Default::default()
+        };
+        db.replace_account("synthetic-token", &user).unwrap();
+        db.upsert_media(&kurisu_core::models::Media {
+            id: 9,
+            title_english: Some("Show".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_entry(&ListEntry {
+            media_id: 9,
+            status: "CURRENT".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let core = Core::open(
+            dir.0.clone(),
+            runtime.handle().clone(),
+            Arc::new(TestPlatform),
+            UpdateChannel::Native,
+        )
+        .unwrap();
+        let folder = dir.0.join("shows");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("Show - 13.mkv");
+        std::fs::write(&file, b"").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        runtime
+            .block_on(core.add_library_folder(folder.to_string_lossy().into_owned()))
+            .unwrap();
+        runtime
+            .block_on(core.bind_library_path(path.clone(), 9, Some(-12), BindScope::File))
+            .unwrap();
+
+        let (view, cx) = cx.add_window_view(|win, cx| {
+            Workspace::new_with_session_restore(core.clone(), win, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(1000.)));
+        view.update_in(cx, |w, win, cx| {
+            w.set_profile(Some(user.clone()), win, cx);
+            w.route = Route::Library;
+            w.enter_library(win, cx);
+            w.cancel_reads("library-data");
+            w.library_screen.scanning = false;
+            w.library_screen.folders = vec![folder.to_string_lossy().into_owned()];
+            w.library_screen.folders_loaded = true;
+            w.library_screen.history_open = true;
+            w.library_screen.history_loading = false;
+            w.library_screen.history_refresh_pending = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let refresh_bounds = cx
+            .debug_bounds("library-history-refresh")
+            .expect("history refresh button bounds");
+        view.update_in(cx, |w, _, _| {
+            w.library_screen.history_loading = true;
+            w.library_screen.history_refresh_pending = false;
+        });
+        cx.simulate_click(refresh_bounds.center(), gpui::Modifiers::default());
+        view.read_with(cx, |w, _| {
+            assert!(
+                !w.library_screen.history_refresh_pending,
+                "disabled history refresh queued a duplicate reload while already loading"
+            );
+        });
+
+        view.update_in(cx, |w, win, cx| {
+            w.library_screen.history_open = false;
+            w.library_screen.history_loading = false;
+            w.open_library_bind(path.clone(), None, BindMode::Link, win, cx);
+            w.cancel_reads("library-binding");
+            let bind = w.library_screen.bind.as_mut().unwrap();
+            bind.scope = BindScope::File;
+            bind.loading = false;
+            bind.checked = true;
+            bind.current = Some(LibraryBinding {
+                media_id: 9,
+                episode_offset: -12,
+                scope: Some(BindScope::File),
+            });
+            w.save_library_bind(9, win, cx);
+            assert_eq!(
+                w.active_writes, 0,
+                "link mode must not overwrite an existing link to the same show"
+            );
+            assert!(w.library_screen.bind.as_ref().is_some_and(|b| !b.busy));
+        });
+        settle(cx, &runtime);
+        let stored = runtime
+            .block_on(core.library_binding_details(path))
+            .unwrap()
+            .expect("existing binding should remain stored");
+        assert_eq!(stored.media_id, 9);
+        assert_eq!(stored.episode_offset, -12);
+    }
+
+    #[test]
+    fn library_group_progress_label_omits_non_positive_episode_totals() {
+        let zero_media = kurisu_core::models::Media {
+            id: 9,
+            episodes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            library_group_progress_label(Some(3), zero_media.known_episodes()),
+            "Ep 3 watched"
+        );
+        let known_media = kurisu_core::models::Media {
+            id: 9,
+            episodes: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            library_group_progress_label(Some(3), known_media.known_episodes()),
+            "Ep 3/12 watched"
+        );
+        assert_eq!(
+            library_group_progress_label(None, known_media.known_episodes()),
+            "Not on your list"
+        );
+    }
+
+    #[gpui::test]
+    fn library_bind_save_failure_blocks_close_and_install_until_discarded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::settle;
+        use super::super::{BarrierAction, CloseIntent, workspace_tests::fixture};
+
+        for action in [
+            BarrierAction::Close(CloseIntent::Quit),
+            BarrierAction::Install,
+        ] {
+            let (core, runtime, _dir) = fixture();
+            let (workspace, cx) = cx.add_window_view(|win, cx| {
+                Workspace::new_with_session_restore(core, win, cx, false)
+            });
+            workspace.update_in(cx, |w, win, cx| {
+                w.profile = Some(kurisu_core::User {
+                    id: 7,
+                    offline: true,
+                    ..Default::default()
+                });
+                w.route = Route::Library;
+                w.enter_library(win, cx);
+                w.cancel_reads("library-data");
+                w.library_screen.folders_loaded = true;
+                w.open_library_bind(
+                    "/shows/Show - 03.mkv".into(),
+                    Some((99, "Show".into())),
+                    BindMode::Numbering,
+                    win,
+                    cx,
+                );
+                w.cancel_reads("library-binding");
+                let bind = w.library_screen.bind.as_mut().unwrap();
+                bind.scope = BindScope::File;
+                bind.loading = false;
+                bind.checked = true;
+                w.save_library_bind(99, win, cx);
+                assert_eq!(w.active_writes, 1);
+                w.start_barrier(action, win, cx);
+                assert_eq!(w.barrier, Some(action));
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while workspace.read_with(cx, |w, _| w.active_writes > 0 || w.barrier_error.is_empty())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "initial bind failure did not settle"
+                );
+                settle(cx, &runtime);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            workspace.read_with(cx, |w, _| {
+                assert_eq!(w.active_writes, 0);
+                assert_eq!(w.barrier, Some(action));
+                assert!(!w.barrier_error.is_empty());
+                assert!(!w.close_ready && !w.update_busy);
+                let bind = w.library_screen.bind.as_ref().unwrap();
+                assert!(!bind.busy && !bind.error.is_empty());
+            });
+            cx.update(|win, app| win.draw(app).clear(app));
+            assert!(cx.debug_bounds("retry-barrier").is_some());
+            workspace.update_in(cx, |w, win, cx| {
+                w.retry_barrier(win, cx);
+                assert_eq!(w.barrier, Some(action));
+                assert_eq!(w.active_writes, 1);
+                assert!(w.barrier_error.is_empty());
+                let bind = w.library_screen.bind.as_ref().unwrap();
+                assert!(bind.busy && bind.error.is_empty());
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while workspace.read_with(cx, |w, _| w.active_writes > 0 || w.barrier_error.is_empty())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "retried bind failure did not settle"
+                );
+                settle(cx, &runtime);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            workspace.read_with(cx, |w, _| {
+                assert_eq!(w.active_writes, 0);
+                assert_eq!(w.barrier, Some(action));
+                assert!(!w.barrier_error.is_empty());
+                let bind = w.library_screen.bind.as_ref().unwrap();
+                assert!(!bind.busy && !bind.error.is_empty());
+            });
+            workspace.update_in(cx, |w, win, cx| {
+                w.cancel_barrier(win, cx);
+                assert!(w.barrier.is_none());
+                assert!(
+                    w.library_screen
+                        .bind
+                        .as_ref()
+                        .is_some_and(|b| !b.error.is_empty())
+                );
+                w.start_barrier(action, win, cx);
+                assert_eq!(w.barrier, Some(action));
+                assert!(!w.barrier_error.is_empty());
+                if action == BarrierAction::Install {
+                    w.restart_pending = true;
+                }
+                w.discard_barrier(win, cx);
+                assert!(w.barrier.is_none());
+                assert!(w.barrier_error.is_empty());
+                assert!(w.library_screen.bind.is_none());
+                assert_eq!(w.close_ready, matches!(action, BarrierAction::Close(_)));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn library_bind_transient_failure_recovers_on_retry_and_offset_edit_clears_retry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::{BarrierAction, CloseIntent, WorkspaceEvent};
+
+        let setup = |dir: &std::path::Path, runtime: &tokio::runtime::Runtime| {
+            let db = Db::open(&dir.join("kurisu.db")).unwrap();
+            let user = User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            };
+            db.replace_account("synthetic-token", &user).unwrap();
+            db.upsert_media(&kurisu_core::models::Media {
+                id: 9,
+                title_english: Some("Show".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_entry(&ListEntry {
+                media_id: 9,
+                status: "CURRENT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            let folder = dir.join("shows");
+            std::fs::create_dir_all(&folder).unwrap();
+            let file = folder.join("Show - 13.mkv");
+            std::fs::write(&file, b"").unwrap();
+            let core = Core::open(
+                dir.to_path_buf(),
+                runtime.handle().clone(),
+                Arc::new(TestPlatform),
+                UpdateChannel::Native,
+            )
+            .unwrap();
+            runtime
+                .block_on(core.add_library_folder(folder.to_string_lossy().into_owned()))
+                .unwrap();
+            db.0.lock()
+                .execute_batch(
+                    "CREATE TRIGGER reject_library_bindings BEFORE INSERT ON settings
+                     WHEN NEW.key = 'library_bindings'
+                     BEGIN SELECT RAISE(ABORT, 'controlled library bind failure'); END;",
+                )
+                .unwrap();
+            (
+                core,
+                db,
+                user,
+                folder.to_string_lossy().into_owned(),
+                file.to_string_lossy().into_owned(),
+            )
+        };
+
+        for action in [
+            BarrierAction::Close(CloseIntent::Quit),
+            BarrierAction::Install,
+        ] {
+            let (initial, runtime, dir) = fixture();
+            drop(initial);
+            let (core, db, user, folder, path) = setup(&dir.0, &runtime);
+            let (workspace, cx) = cx.add_window_view(|win, cx| {
+                Workspace::new_with_session_restore(core.clone(), win, cx, false)
+            });
+            cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+            let ready = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _sub = cx.update(|_, app| {
+                let ready = ready.clone();
+                app.subscribe(&workspace, move |_, event, _| {
+                    if let WorkspaceEvent::ReadyToClose(intent) = event {
+                        ready.lock().unwrap().push(*intent);
+                    }
+                })
+            });
+            workspace.update_in(cx, |w, win, cx| {
+                w.profile = Some(user.clone());
+                w.route = Route::Library;
+                w.enter_library(win, cx);
+                w.cancel_reads("library-data");
+                w.library_screen.folders = vec![folder.clone()];
+                w.library_screen.folders_loaded = true;
+                w.open_library_bind(
+                    path.clone(),
+                    Some((9, "Show".into())),
+                    BindMode::Numbering,
+                    win,
+                    cx,
+                );
+                w.cancel_reads("library-binding");
+                let bind = w.library_screen.bind.as_mut().unwrap();
+                bind.scope = BindScope::File;
+                bind.loading = false;
+                bind.checked = true;
+                w.library_screen
+                    .set_binding_input(OFFSET_INPUT, "-12".into(), cx);
+                w.save_library_bind(9, win, cx);
+                assert_eq!(w.active_writes, 1);
+                w.start_barrier(action, win, cx);
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while workspace.read_with(cx, |w, _| w.active_writes > 0 || w.barrier_error.is_empty())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "initial bind failure did not settle"
+                );
+                settle(cx, &runtime);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            workspace.read_with(cx, |w, _| {
+                assert_eq!(w.barrier, Some(action));
+                assert!(w.barrier_error.contains("controlled library bind failure"));
+                assert!(!w.close_ready && !w.update_busy);
+            });
+            assert!(ready.lock().unwrap().is_empty());
+            assert_eq!(
+                runtime
+                    .block_on(core.library_binding_details(path.clone()))
+                    .unwrap(),
+                None
+            );
+            cx.update(|win, app| win.draw(app).clear(app));
+            let retry = cx
+                .debug_bounds("retry-barrier")
+                .expect("retry-barrier missing after failed library bind save");
+
+            db.0.lock()
+                .execute_batch("DROP TRIGGER reject_library_bindings;")
+                .unwrap();
+            if action == BarrierAction::Install {
+                workspace.update_in(cx, |w, _, _| w.restart_pending = true);
+            }
+            cx.simulate_click(retry.center(), gpui::Modifiers::default());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while workspace.read_with(cx, |w, _| w.barrier.is_some() || w.active_writes > 0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "library bind retry did not finish"
+                );
+                settle(cx, &runtime);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            workspace.read_with(cx, |w, _| {
+                assert!(w.barrier.is_none());
+                assert!(w.barrier_error.is_empty());
+                assert!(w.library_screen.bind.is_none());
+                assert_eq!(w.close_ready, matches!(action, BarrierAction::Close(_)));
+            });
+            if matches!(action, BarrierAction::Close(_)) {
+                assert_eq!(*ready.lock().unwrap(), vec![CloseIntent::Quit]);
+            } else {
+                assert!(ready.lock().unwrap().is_empty());
+            }
+            assert_eq!(
+                runtime
+                    .block_on(core.library_binding_details(path.clone()))
+                    .unwrap(),
+                Some(LibraryBinding {
+                    media_id: 9,
+                    episode_offset: -12,
+                    scope: Some(BindScope::File),
+                })
+            );
+        }
+
+        let (initial, runtime, dir) = fixture();
+        drop(initial);
+        let (core, db, user, folder, path) = setup(&dir.0, &runtime);
+        let (workspace, cx) = cx.add_window_view(|win, cx| {
+            Workspace::new_with_session_restore(core.clone(), win, cx, false)
+        });
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        workspace.update_in(cx, |w, win, cx| {
+            w.profile = Some(user);
+            w.route = Route::Library;
+            w.enter_library(win, cx);
+            w.cancel_reads("library-data");
+            w.library_screen.folders = vec![folder];
+            w.library_screen.folders_loaded = true;
+            w.open_library_bind(
+                path.clone(),
+                Some((9, "Show".into())),
+                BindMode::Numbering,
+                win,
+                cx,
+            );
+            w.cancel_reads("library-binding");
+            let bind = w.library_screen.bind.as_mut().unwrap();
+            bind.scope = BindScope::File;
+            bind.loading = false;
+            bind.checked = true;
+            w.library_screen
+                .set_binding_input(OFFSET_INPUT, "-12".into(), cx);
+            w.save_library_bind(9, win, cx);
+            w.start_barrier(BarrierAction::Close(CloseIntent::Quit), win, cx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.active_writes > 0 || w.barrier_error.is_empty()) {
+            assert!(Instant::now() < deadline, "bind failure did not settle");
+            settle(cx, &runtime);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cx.update(|win, app| win.draw(app).clear(app));
+        assert!(cx.debug_bounds("retry-barrier").is_some());
+
+        let offset = workspace.update_in(cx, |w, win, cx| {
+            assert!(w.library_screen.bind.as_ref().unwrap().submitted.is_some());
+            w.cancel_barrier(win, cx);
+            w.library_screen.offset.clone().unwrap()
+        });
+        cx.update(|_, app| {
+            offset.update(app, |input, cx| {
+                input.set_value("-6", cx);
+                cx.emit(TextInputEvent::Changed("-6".into()));
+            });
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, win, cx| {
+            assert!(w.library_screen.bind.as_ref().unwrap().submitted.is_none());
+            w.start_barrier(BarrierAction::Close(CloseIntent::Quit), win, cx);
+            assert!(!w.barrier_can_retry);
+        });
+        cx.update(|win, app| win.draw(app).clear(app));
+        assert!(cx.debug_bounds("discard-barrier").is_some());
+        assert!(cx.debug_bounds("retry-barrier").is_none());
+
+        db.0.lock()
+            .execute_batch("DROP TRIGGER reject_library_bindings;")
+            .unwrap();
+        workspace.update_in(cx, |w, win, cx| {
+            w.retry_barrier(win, cx);
+            assert_eq!(w.active_writes, 0);
+            assert_eq!(w.barrier, Some(BarrierAction::Close(CloseIntent::Quit)));
+        });
+        assert_eq!(
+            runtime
+                .block_on(core.library_binding_details(path))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn restored_pending_draft_on_other_route_blocks_close_and_install(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::{BarrierAction, CloseIntent, workspace_tests::fixture};
+
+        for action in [
+            BarrierAction::Close(CloseIntent::Quit),
+            BarrierAction::Install,
+        ] {
+            let (core, _runtime, _dir) = fixture();
+            let (workspace, cx) = cx.add_window_view(|win, cx| {
+                Workspace::new_with_session_restore(core, win, cx, false)
+            });
+            workspace.update_in(cx, |w, win, cx| {
+                let user = kurisu_core::User {
+                    id: 71,
+                    offline: true,
+                    ..Default::default()
+                };
+                w.set_profile(Some(user.clone()), win, cx);
+                super::tests::set_binding_draft(w);
+                w.set_profile(None, win, cx);
+                w.route = Route::MyList;
+                w.set_profile(Some(user), win, cx);
+                assert!(w.library_screen.bind.is_none());
+                assert!(w.library_screen.pending_draft.is_some());
+
+                w.start_barrier(action, win, cx);
+                assert_eq!(w.barrier, Some(action));
+                assert!(!w.barrier_error.is_empty());
+                assert!(!w.close_ready && !w.update_busy);
+            });
+            cx.update(|win, app| win.draw(app).clear(app));
+            assert!(cx.debug_bounds("discard-barrier").is_some());
+            assert!(cx.debug_bounds("retry-barrier").is_none());
+            workspace.update_in(cx, |w, win, cx| {
+                w.retry_barrier(win, cx);
+                assert_eq!(w.barrier, Some(action));
+                assert!(w.library_screen.pending_draft.is_some());
+
+                w.cancel_barrier(win, cx);
+                assert!(w.barrier.is_none());
+                assert!(w.library_screen.pending_draft.is_some());
+
+                w.start_barrier(action, win, cx);
+                assert!(!w.barrier_error.is_empty());
+                if action == BarrierAction::Install {
+                    w.restart_pending = true;
+                }
+                w.discard_barrier(win, cx);
+                assert!(w.barrier.is_none());
+                assert!(w.barrier_error.is_empty());
+                assert!(w.library_screen.pending_draft.is_none());
+                assert_eq!(w.close_ready, matches!(action, BarrierAction::Close(_)));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn dirty_bind_blocks_close_and_install_while_clean_closes_and_logout_stashes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::{BarrierAction, CloseIntent, workspace_tests::fixture};
+
+        let (core, runtime, _dir) = fixture();
+        let (workspace, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        workspace.update_in(cx, |w, win, cx| {
+            let user = kurisu_core::User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            };
+            w.profile = Some(user);
+            w.route = Route::Library;
+            w.enter_library(win, cx);
+            w.open_library_bind(
+                "/shows/Show - 03.mkv".into(),
+                Some((9, "Show".into())),
+                BindMode::Numbering,
+                win,
+                cx,
+            );
+            w.cancel_reads("library-binding");
+            w.request_close(CloseIntent::Window, win, cx);
+            assert!(w.close_ready);
+            assert!(w.barrier_error.is_empty());
+            w.resume_after_close_visibility(true, win, cx);
+
+            w.library_screen.bind.as_mut().unwrap().offset_edited = true;
+        });
+        for action in [
+            BarrierAction::Close(CloseIntent::Quit),
+            BarrierAction::Install,
+        ] {
+            workspace.update_in(cx, |w, win, cx| {
+                w.start_barrier(action, win, cx);
+                assert_eq!(w.barrier, Some(action));
+                assert!(!w.barrier_error.is_empty());
+                assert!(!w.close_ready && !w.update_busy);
+            });
+            cx.update(|win, app| win.draw(app).clear(app));
+            assert!(cx.debug_bounds("discard-barrier").is_some());
+            assert!(cx.debug_bounds("retry-barrier").is_none());
+            workspace.update_in(cx, |w, win, cx| {
+                w.cancel_barrier(win, cx);
+                assert!(w.library_screen.bind.is_some());
+            });
+        }
+        workspace.update_in(cx, |w, win, cx| {
+            w.start_barrier(BarrierAction::Logout, win, cx);
+            assert!(w.barrier.is_none());
+            assert!(w.barrier_error.is_empty());
+            assert!(w.auth_busy);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workspace.read_with(cx, |w, _| w.auth_busy) {
+            assert!(Instant::now() < deadline, "logout did not finish");
+            super::super::workspace_tests::settle(cx, &runtime);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        workspace.read_with(cx, |w, _| {
+            assert!(w.profile.is_none());
+            assert!(w.library_screen.bind.is_none());
+            assert!(w.library_drafts.contains_key(&7));
+        });
+    }
+
+    #[gpui::test]
+    fn library_history_buttons_disable_while_writes_fenced(cx: &mut gpui::TestAppContext) {
+        use super::super::workspace_tests::fixture;
+        use gpui::AccessibleAction;
+
+        let (core, _runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+        cx.simulate_resize(gpui::size(px(1100.), px(900.)));
+        view.update_in(cx, |w, win, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Library;
+            w.enter_library(win, cx);
+            w.cancel_reads("library-data");
+            w.library_screen.history_open = true;
+            w.library_screen.history_loading = false;
+            w.library_screen.history_more = true;
+            cx.notify();
+        });
+        cx.simulate_accessibility_activation();
+        cx.run_until_parked();
+
+        let find_button = |cx: &mut gpui::VisualTestContext, label: &str| {
+            cx.update(|win, app| win.draw(app).clear(app));
+            cx.run_until_parked();
+            let tree = cx.take_accessibility_tree_update().unwrap();
+            tree.nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.label() == Some(label)).then_some(node))
+                .unwrap_or_else(|| panic!("missing library button {label}"))
+        };
+
+        for label in ["Refresh history", "Load older history"] {
+            let node = find_button(cx, label);
+            assert!(!node.is_disabled(), "{label} should start enabled");
+            assert!(node.supports_action(AccessibleAction::Click));
+        }
+
+        view.update_in(cx, |w, _, cx| {
+            w.close_ready = true;
+            cx.notify();
+        });
+        for label in ["Refresh history", "Load older history"] {
+            let node = find_button(cx, label);
+            assert!(node.is_disabled(), "{label} should disable while fenced");
+            assert!(!node.supports_action(AccessibleAction::Click));
+        }
+    }
+
+    #[gpui::test]
+    fn open_file_resets_busy_on_close_ready_and_suppresses_late_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::workspace_tests::{fixture, settle};
+
+        let (core, runtime, _dir) = fixture();
+        let (view, cx) =
+            cx.add_window_view(|win, cx| Workspace::new_with_session_restore(core, win, cx, false));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.update_in(cx, |w, _, cx| {
+            w.profile = Some(kurisu_core::User {
+                id: 7,
+                offline: true,
+                ..Default::default()
+            });
+            w.route = Route::Library;
+            w.library_screen.open_file_result = Some(rx);
+            let generation = w.generation;
+            open_file(w, "/shows/ep1.mkv", false, generation, Some(7), cx);
+            assert!(w.library_screen.opening_file);
+            w.close_ready = true;
+        });
+        tx.send(Err("tray close error".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(
+                !w.library_screen.opening_file,
+                "opening_file must reset on close_ready && !stopping so tray restore stays usable"
+            );
+            assert!(w.library_screen.action_error.is_empty());
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.update_in(cx, |w, _, cx| {
+            w.close_ready = false;
+            w.library_screen.open_file_result = Some(rx);
+            let generation = w.generation;
+            open_file(w, "/shows/ep1.mkv", false, generation, Some(7), cx);
+            assert!(w.library_screen.opening_file);
+            w.stopping = true;
+        });
+        tx.send(Err("shutdown error".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(w.library_screen.action_error.is_empty());
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        view.update_in(cx, |w, _, cx| {
+            w.stopping = false;
+            w.library_screen.opening_file = false;
+            w.library_screen.open_file_result = Some(rx);
+            let generation = w.generation;
+            open_file(w, "/shows/ep1.mkv", false, generation, Some(7), cx);
+        });
+        tx.send(Err("visible failure".into())).unwrap();
+        settle(cx, &runtime);
+        view.read_with(cx, |w, _| {
+            assert!(!w.library_screen.opening_file);
+            assert_eq!(w.library_screen.action_error, "visible failure");
         });
     }
 }

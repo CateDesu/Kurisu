@@ -120,9 +120,9 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
     let moving = ready.join(MOVING);
     let by_move = path_present(&moving)?;
     if by_move {
-        if !std::fs::metadata(&moving)
-            .map_err(|error| error.to_string())?
-            .is_file()
+        let metadata = std::fs::metadata(&moving).map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.len() != MOVE_CONTENT.len() as u64
             || std::fs::read(&moving).map_err(|error| error.to_string())? != MOVE_CONTENT
         {
             return Err(
@@ -190,9 +190,9 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
             }
             path.join(MARKER)
         };
-        if !std::fs::metadata(&marker)
-            .map_err(|error| error.to_string())?
-            .is_file()
+        let metadata = std::fs::metadata(&marker).map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.len() != b"kurisu-native-v1\n".len() as u64
             || std::fs::read(&marker).map_err(|error| error.to_string())? != b"kurisu-native-v1\n"
         {
             return Err("Profile initialization marker is damaged. Keep it for recovery".into());
@@ -232,9 +232,14 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
             }
             let stage = Stage::new(path)?;
             let temporary = stage.0.join(MOVING);
-            let mut record = File::options()
-                .write(true)
-                .create_new(true)
+            let mut options = File::options();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut record = options
                 .open(&temporary)
                 .map_err(|error| error.to_string())?;
             record
@@ -243,6 +248,7 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             drop(record);
             rename_new(&temporary, &moving).map_err(|error| error.to_string())?;
+            drop(stage);
             return recover(path);
         }
         sync_directory(path)?;
@@ -250,16 +256,25 @@ pub(super) fn recover(path: &Path) -> Result<(), String> {
             sync_directory(&ready)?;
         }
     }
-    // Unlink the recovery name atomically before best-effort removal of its owned files.
-    let cleanup = path.join(format!(
-        ".kurisu-native-init-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    if !path_present(&cleanup)? {
-        rename_stage(&ready, &cleanup).map_err(|error| error.to_string())?;
-        sync_directory(path)?;
-        drop(Stage(cleanup));
+    // Unlink the recovery name atomically before best effort removal of its owned files.
+    loop {
+        let cleanup = path.join(format!(
+            ".kurisu-native-init-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if path_present(&cleanup)? {
+            continue;
+        }
+        match rename_stage(&ready, &cleanup) {
+            Ok(()) => {
+                sync_directory(path)?;
+                drop(Stage(cleanup));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
     }
     Ok(())
 }
@@ -333,4 +348,91 @@ fn rename_new(source: &Path, destination: &Path) -> std::io::Result<()> {
 fn rename_new(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::hard_link(source, destination)?;
     std::fs::remove_file(source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempProfile(PathBuf);
+
+    impl TempProfile {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "kurisu-profile-init-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempProfile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seed_ready_stage(profile: &Path) -> PathBuf {
+        let ready = profile.join(READY);
+        std::fs::create_dir(&ready).unwrap();
+        let database = ready.join(DATABASE);
+        drop(kurisu_core::Db::open(&database).unwrap());
+        std::fs::write(ready.join(MARKER), b"kurisu-native-v1\n").unwrap();
+        ready
+    }
+
+    #[test]
+    fn recover_skips_occupied_cleanup_names_and_preserves_debris() {
+        let profile = TempProfile::new("cleanup-collision");
+        let _ready = seed_ready_stage(&profile.0);
+        let start = SEQUENCE.load(Ordering::Relaxed);
+        let debris: Vec<_> = (start..start + 32)
+            .map(|seq| {
+                let dir = profile
+                    .0
+                    .join(format!(".kurisu-native-init-{}-{seq}", std::process::id()));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("keep"), b"preserved").unwrap();
+                dir
+            })
+            .collect();
+
+        recover(&profile.0).unwrap();
+
+        assert!(
+            !profile.0.join(READY).exists(),
+            "recovery must unlink .kurisu-native-init even when earlier cleanup names are occupied"
+        );
+        assert!(profile.0.join(DATABASE).is_file());
+        assert!(profile.0.join(MARKER).is_file());
+        for dir in &debris {
+            assert_eq!(std::fs::read(dir.join("keep")).unwrap(), b"preserved");
+        }
+
+        // Replacing the published database with a fresh inode must not conflict with stale staging.
+        let copy = profile.0.join("kurisu.db.copy");
+        std::fs::copy(profile.0.join(DATABASE), &copy).unwrap();
+        std::fs::rename(&copy, profile.0.join(DATABASE)).unwrap();
+        recover(&profile.0).unwrap();
+    }
+
+    #[test]
+    fn recover_rejects_oversized_move_record_and_marker() {
+        let profile = TempProfile::new("oversized-moving");
+        let ready = seed_ready_stage(&profile.0);
+        std::fs::write(ready.join(MOVING), [MOVE_CONTENT, b"extra"].concat()).unwrap();
+        let error = recover(&profile.0).unwrap_err();
+        assert!(error.contains("publication record is damaged"), "{error}");
+
+        let profile = TempProfile::new("oversized-marker");
+        let ready = seed_ready_stage(&profile.0);
+        std::fs::write(ready.join(MOVING), MOVE_CONTENT).unwrap();
+        std::fs::write(ready.join(MARKER), b"kurisu-native-v1\nextra").unwrap();
+        let error = recover(&profile.0).unwrap_err();
+        assert!(error.contains("marker is damaged"), "{error}");
+    }
 }
